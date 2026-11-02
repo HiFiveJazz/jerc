@@ -174,15 +174,132 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
     })
 }
 
+#[derive(Clone, Debug)]
+struct MailReaderDecorator;
+
+impl html2text::render::TextDecorator for MailReaderDecorator {
+    type Annotation = ();
+
+    fn decorate_link_start(&mut self, _url: &str) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+
+    fn decorate_link_end(&mut self) -> String {
+        String::new()
+    }
+
+    fn decorate_em_start(&self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+
+    fn decorate_em_end(&self) -> String {
+        String::new()
+    }
+
+    fn decorate_strong_start(&self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+
+    fn decorate_strong_end(&self) -> String {
+        String::new()
+    }
+
+    fn decorate_strikeout_start(&self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+
+    fn decorate_strikeout_end(&self) -> String {
+        String::new()
+    }
+
+    fn decorate_code_start(&self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+
+    fn decorate_code_end(&self) -> String {
+        String::new()
+    }
+
+    fn decorate_preformat_first(&self) -> Self::Annotation {}
+
+    fn decorate_preformat_cont(&self) -> Self::Annotation {}
+
+    fn decorate_image(
+        &mut self,
+        _src: &str,
+        _title: &str,
+    ) -> (String, Self::Annotation) {
+        // Layout-heavy email frequently uses logos, avatars and tracking pixels.
+        // Suppress them in reader mode instead of turning alt text into noisy rows.
+        (String::new(), ())
+    }
+
+    fn header_prefix(&self, _level: usize) -> String {
+        String::new()
+    }
+
+    fn quote_prefix(&self) -> String {
+        "> ".to_owned()
+    }
+
+    fn unordered_item_prefix(&self) -> String {
+        "• ".to_owned()
+    }
+
+    fn ordered_item_prefix(&self, index: i64) -> String {
+        format!("{index}. ")
+    }
+
+    fn decorate_superscript_start(&self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+
+    fn decorate_superscript_end(&self) -> String {
+        String::new()
+    }
+
+    fn make_subblock_decorator(&self) -> Self {
+        Self
+    }
+}
+
 fn render_html_for_terminal(html: &str) -> String {
-    // html2text uses html5ever, so malformed real-world newsletter HTML is
-    // handled much more like a browser than a tag stripper. Keep mail-parser's
-    // lightweight converter as a defensive fallback rather than ever showing a
-    // blank preview because one HTML renderer rejected a message.
-    html2text::from_read(html.as_bytes(), 100)
+    // Email HTML is usually a pile of layout tables. The default html2text
+    // configuration tries to preserve those tables and emits numbered link
+    // footnotes, which makes notification mail dramatically noisier than the
+    // message a human sees. Reader mode intentionally flattens table cells,
+    // suppresses URL footnote dumps, and leaves only the visible content.
+    let rendered = html2text::config::with_decorator(MailReaderDecorator)
+        .raw_mode(true)
+        .no_table_borders()
+        .link_footnotes(false)
+        .string_from_read(html.as_bytes(), 100)
         .ok()
         .filter(|text| !text.trim().is_empty())
-        .unwrap_or_else(|| mail_parser::html_to_text(html))
+        .unwrap_or_else(|| mail_parser::html_to_text(html));
+    clean_reader_text(&rendered)
+}
+
+fn clean_reader_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blank_run = 0usize;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        let blank = line.trim().is_empty();
+        if blank {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out.trim().to_owned()
 }
 
 pub fn read_all(mut reader: impl Read) -> Result<Vec<u8>> {
@@ -237,6 +354,28 @@ Hello from the body.\r\n";
         let body = parse_body(MessageId("html".into()), raw).unwrap();
         assert!(body.plain_text.is_none());
         assert!(body.html_text.as_deref().is_some_and(|text| text.contains("Hello")));
+    }
+
+    #[test]
+    fn html_reader_mode_does_not_dump_tracking_links_or_table_borders() {
+        let raw = b"From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<table><tr><td><a href=\"https://tracking.example/very/long/url\">View in Figma</a></td></tr><tr><td>Comment text</td></tr></table>";
+        let body = parse_body(MessageId("html-reader".into()), raw).unwrap();
+        let rendered = body.html_text.unwrap();
+        assert!(rendered.contains("View in Figma"));
+        assert!(rendered.contains("Comment text"));
+        assert!(!rendered.contains("[View in Figma]"));
+        assert!(!rendered.contains("[1]:"));
+        assert!(!rendered.contains("tracking.example"));
+        assert!(!rendered.contains('│'));
+        assert!(!rendered.contains('─'));
+    }
+
+    #[test]
+    fn html_reader_mode_collapses_excess_blank_lines() {
+        let raw = b"From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>One</p><br><br><br><p>Two</p>";
+        let body = parse_body(MessageId("html-space".into()), raw).unwrap();
+        let rendered = body.html_text.unwrap();
+        assert!(!rendered.contains("\n\n\n"));
     }
 
     #[test]

@@ -3,10 +3,11 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{Command, Focus, command_for_key};
+use crate::app::{Command, Focus, HELP_ENTRIES, command_for_key};
 use crate::config::Config;
 use crate::model::{
-    Capabilities, Mailbox, MessageBody, MessageFlags, MessageId, MessageSummary, OutgoingMessage,
+    Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessageSummary,
+    OutgoingMessage,
 };
 use crate::theme::{Theme, THEMES, persist_theme, persisted_theme, theme_index};
 use crate::worker::{ActionKind, WorkerEvent, WorkerEventKind, WorkerHandle};
@@ -146,6 +147,37 @@ impl Composer {
         }
     }
 
+    fn forward(message: &MessageSummary, body: Option<&MessageBody>, prefer_html: bool) -> Self {
+        let subject = if message.subject.to_ascii_lowercase().starts_with("fwd:") {
+            message.subject.clone()
+        } else {
+            format!("Fwd: {}", message.subject)
+        };
+        let forwarded = body.map_or_else(String::new, |body| {
+            body.display_text(prefer_html).to_owned()
+        });
+        let body = if forwarded.trim().is_empty() {
+            "\n\n---------- Forwarded message ----------\n".to_owned()
+        } else {
+            format!(
+                "\n\n---------- Forwarded message ----------\nFrom: {}\nSubject: {}\n\n{}\n",
+                display_sender(message),
+                message.subject,
+                forwarded
+            )
+        };
+        Self {
+            to: String::new(),
+            cc: String::new(),
+            subject,
+            body,
+            field: ComposeField::To,
+            in_reply_to: None,
+            references: Vec::new(),
+            sending: false,
+        }
+    }
+
     fn field_mut(&mut self) -> &mut String {
         match self.field {
             ComposeField::To => &mut self.to,
@@ -154,6 +186,19 @@ impl Composer {
             ComposeField::Body => &mut self.body,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeIntent {
+    Reply,
+    Forward,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCompose {
+    account: usize,
+    message_id: MessageId,
+    intent: ComposeIntent,
 }
 
 pub struct AccountState {
@@ -170,6 +215,7 @@ pub struct AccountState {
     pub preview_scroll: u16,
     pub smooth_message_target: Option<usize>,
     pub smooth_preview_target: Option<u16>,
+    pub preview_max_scroll: u16,
     pub prefer_html: bool,
     pub bodies: HashMap<MessageId, MessageBody>,
     pub pending_bodies: HashSet<MessageId>,
@@ -180,6 +226,7 @@ pub struct AccountState {
     pub mailboxes_loading: bool,
     pub messages_loading: bool,
     pub last_scan_micros: Option<u128>,
+    pub restore_message_index: Option<usize>,
     pub worker: WorkerHandle,
 }
 
@@ -271,11 +318,18 @@ pub struct App {
     pub mailbox_width_percent: u16,
     pub message_open: bool,
     pub help_visible: bool,
+    pub help_query: String,
+    pub help_selected: usize,
+    pub help_scroll: usize,
     pub theme_picker_visible: bool,
+    pub theme_query: String,
+    pub theme_selected: usize,
+    pub theme_scroll: usize,
     pub theme_index: usize,
     theme_before_picker: usize,
     pub count_prefix: Option<usize>,
     pub composer: Option<Composer>,
+    pending_compose: Option<PendingCompose>,
 }
 
 impl App {
@@ -298,6 +352,7 @@ impl App {
                 preview_scroll: 0,
                 smooth_message_target: None,
                 smooth_preview_target: None,
+                preview_max_scroll: 0,
                 prefer_html: false,
                 bodies: HashMap::new(),
                 pending_bodies: HashSet::new(),
@@ -308,6 +363,7 @@ impl App {
                 mailboxes_loading: false,
                 messages_loading: false,
                 last_scan_micros: None,
+                restore_message_index: None,
                 worker,
             })
             .collect();
@@ -322,11 +378,18 @@ impl App {
             mailbox_width_percent: config.ui.mailbox_width_percent.clamp(20, 50),
             message_open: false,
             help_visible: false,
+            help_query: String::new(),
+            help_selected: 0,
+            help_scroll: 0,
             theme_picker_visible: false,
+            theme_query: String::new(),
+            theme_selected: theme_index,
+            theme_scroll: 0,
             theme_index,
             theme_before_picker: theme_index,
             count_prefix: None,
             composer: None,
+            pending_compose: None,
         }
     }
 
@@ -355,6 +418,14 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         if self.composer.is_some() {
             self.handle_composer_key(key);
+            return;
+        }
+        if self.theme_picker_visible {
+            self.handle_theme_picker_key(key);
+            return;
+        }
+        if self.help_visible {
+            self.handle_help_key(key);
             return;
         }
         self.handle_command(command_for_key(key));
@@ -418,8 +489,13 @@ impl App {
                 account.messages_loading = false;
                 account.current_mailbox = Some(name.clone());
                 account.messages = messages;
-                account.message_index = 0;
+                account.message_index = account
+                    .restore_message_index
+                    .take()
+                    .unwrap_or(0)
+                    .min(account.messages.len().saturating_sub(1));
                 account.preview_scroll = 0;
+                account.preview_max_scroll = 0;
                 account.smooth_message_target = None;
                 account.smooth_preview_target = None;
                 account.bodies.clear();
@@ -445,6 +521,26 @@ impl App {
                 let id = body.id.clone();
                 account.pending_bodies.remove(&id);
                 account.bodies.insert(id.clone(), body);
+
+                let pending = self.pending_compose.as_ref().filter(|pending| {
+                    pending.account == event.account && pending.message_id == id
+                });
+                let composer = pending.and_then(|pending| {
+                    let message = account
+                        .messages
+                        .iter()
+                        .find(|message| message.id == pending.message_id)?;
+                    let body = account.bodies.get(&pending.message_id);
+                    Some(match pending.intent {
+                        ComposeIntent::Reply => {
+                            Composer::reply(message, body, account.prefer_html)
+                        }
+                        ComposeIntent::Forward => {
+                            Composer::forward(message, body, account.prefer_html)
+                        }
+                    })
+                });
+
                 if self.message_open
                     && account
                         .selected_message()
@@ -453,6 +549,12 @@ impl App {
                     account.request_seen(id, true);
                 }
                 Self::pump_mailbox_status(account);
+
+                if let Some(composer) = composer {
+                    self.pending_compose = None;
+                    self.composer = Some(composer);
+                    self.status = StatusLine::info("ready to compose");
+                }
             }
             WorkerEventKind::MessageExported { path } => {
                 self.status = StatusLine::temporary(
@@ -508,6 +610,13 @@ impl App {
                 account.mailbox_status_inflight = false;
                 account.pending_bodies.clear();
                 account.pending_seen.clear();
+                if self
+                    .pending_compose
+                    .as_ref()
+                    .is_some_and(|pending| pending.account == event.account)
+                {
+                    self.pending_compose = None;
+                }
                 if event.account == self.account_index {
                     if let Some(composer) = self.composer.as_mut() {
                         composer.sending = false;
@@ -522,27 +631,6 @@ impl App {
     pub fn handle_command(&mut self, command: Command) {
         if self.status.expired() {
             self.status = StatusLine::info("ready");
-        }
-
-        if self.theme_picker_visible {
-            match command {
-                Command::Down => self.preview_theme(1),
-                Command::Up => self.preview_theme(-1),
-                Command::Open => self.commit_theme_picker(),
-                Command::ToggleThemePicker | Command::Escape | Command::Quit => {
-                    self.cancel_theme_picker();
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if self.help_visible {
-            match command {
-                Command::ToggleHelp | Command::Escape | Command::Quit => self.help_visible = false,
-                _ => {}
-            }
-            return;
         }
 
         match command {
@@ -564,6 +652,14 @@ impl App {
             Command::Up => {
                 let count = self.take_count(1);
                 self.move_selection(-isize::try_from(count).unwrap_or(isize::MAX));
+            }
+            Command::MessageDown => {
+                let count = self.take_count(1);
+                self.move_message_list(isize::try_from(count).unwrap_or(isize::MAX));
+            }
+            Command::MessageUp => {
+                let count = self.take_count(1);
+                self.move_message_list(-isize::try_from(count).unwrap_or(isize::MAX));
             }
             Command::SmoothDown => {
                 self.count_prefix = None;
@@ -597,6 +693,14 @@ impl App {
                 self.count_prefix = None;
                 self.toggle_seen();
             }
+            Command::Delete => {
+                self.count_prefix = None;
+                self.delete_selected();
+            }
+            Command::Archive => {
+                self.count_prefix = None;
+                self.archive_selected();
+            }
             Command::Refresh => {
                 self.count_prefix = None;
                 self.refresh();
@@ -611,7 +715,7 @@ impl App {
             }
             Command::ToggleHelp => {
                 self.count_prefix = None;
-                self.help_visible = true;
+                self.open_help();
             }
             Command::ToggleHtml => {
                 self.count_prefix = None;
@@ -624,6 +728,10 @@ impl App {
             Command::Reply => {
                 self.count_prefix = None;
                 self.begin_reply();
+            }
+            Command::Forward => {
+                self.count_prefix = None;
+                self.begin_forward();
             }
             Command::Escape => {
                 self.count_prefix = None;
@@ -718,6 +826,7 @@ impl App {
         }
         self.count_prefix = None;
         self.message_open = false;
+        self.pending_compose = None;
         self.focus = Focus::Messages;
         self.account_index = offset_index(self.account_index, self.accounts.len(), delta);
     }
@@ -743,9 +852,39 @@ impl App {
                 }
             }
             Focus::Preview => {
-                account.preview_scroll = bounded_scroll(account.preview_scroll, delta);
+                account.preview_scroll = bounded_scroll_to(account.preview_scroll, delta, account.preview_max_scroll);
             }
         }
+    }
+
+    fn move_message_list(&mut self, delta: isize) {
+        if self.message_open {
+            return;
+        }
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        account.smooth_message_target = None;
+        let previous = account.message_index;
+        account.message_index = bounded_index(account.message_index, account.messages.len(), delta);
+        if account.message_index != previous {
+            account.preview_scroll = 0;
+        }
+    }
+
+    /// Called by the renderer after wrapping the current message. Keeping the
+    /// exact visual bound in state prevents invisible overscroll, which used to
+    /// make Ctrl-k appear delayed after Ctrl-j reached the bottom of a message.
+    pub fn set_preview_max_scroll(&mut self, max_scroll: u16) {
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        account.preview_max_scroll = max_scroll;
+        account.preview_scroll = account.preview_scroll.min(max_scroll);
+        account.smooth_preview_target = account
+            .smooth_preview_target
+            .map(|target| target.min(max_scroll))
+            .filter(|target| *target != account.preview_scroll);
     }
 
     fn start_smooth_scroll(&mut self, delta: isize) {
@@ -766,8 +905,10 @@ impl App {
             Focus::Preview => {
                 let base = account
                     .smooth_preview_target
-                    .unwrap_or(account.preview_scroll);
-                account.smooth_preview_target = Some(bounded_scroll(base, delta));
+                    .unwrap_or(account.preview_scroll)
+                    .min(account.preview_max_scroll);
+                let target = bounded_scroll_to(base, delta, account.preview_max_scroll);
+                account.smooth_preview_target = (target != account.preview_scroll).then_some(target);
             }
             Focus::Mailboxes => {
                 account.mailbox_index =
@@ -800,7 +941,7 @@ impl App {
                 account.preview_scroll = 0;
             }
             Focus::Preview => {
-                account.preview_scroll = if bottom { u16::MAX } else { 0 };
+                account.preview_scroll = if bottom { account.preview_max_scroll } else { 0 };
             }
         }
     }
@@ -827,6 +968,11 @@ impl App {
                 self.message_open = true;
                 if let Some(account) = self.account_mut() {
                     account.preview_scroll = 0;
+                    account.preview_max_scroll = 0;
+                    // Prefer the sender's text/plain alternative for each newly
+                    // opened message. HTML-only mail still falls back to the
+                    // rendered HTML body automatically; `h` is per-reader opt-in.
+                    account.prefer_html = false;
                     account.request_selected_body();
                     Self::mark_cached_selected_seen(account);
                 }
@@ -869,30 +1015,296 @@ impl App {
         account.request_seen(id, seen);
     }
 
+    fn delete_selected(&mut self) {
+        let result = {
+            let Some(account) = self.accounts.get_mut(self.account_index) else {
+                return;
+            };
+            let Some(source) = account.current_mailbox.clone() else {
+                return;
+            };
+            let Some(id) = account.selected_message().map(|message| message.id.clone()) else {
+                return;
+            };
+            let current_role = account
+                .mailboxes
+                .iter()
+                .find(|mailbox| mailbox.name == source)
+                .map(|mailbox| mailbox.role.clone());
+
+            let action = if current_role == Some(MailboxRole::Trash) {
+                ActionKind::Delete {
+                    mailbox: source,
+                    id,
+                }
+            } else if let Some(trash) = account
+                .mailboxes
+                .iter()
+                .find(|mailbox| mailbox.role == MailboxRole::Trash)
+                .map(|mailbox| mailbox.name.clone())
+            {
+                ActionKind::Move {
+                    source,
+                    destination: trash,
+                    id,
+                }
+            } else {
+                // Some servers do not advertise a Trash role. Preserve useful
+                // delete semantics instead of making the key silently do nothing.
+                ActionKind::Delete {
+                    mailbox: source,
+                    id,
+                }
+            };
+
+            account.restore_message_index = Some(account.message_index);
+            match account.worker.post(action) {
+                Ok(_) => true,
+                Err(_) => {
+                    account.restore_message_index = None;
+                    false
+                }
+            }
+        };
+
+        if result && self.message_open {
+            self.close_message();
+        }
+        self.status = if result {
+            StatusLine::info("deleting message…")
+        } else {
+            StatusLine::error("mail worker queue is busy; delete not started")
+        };
+    }
+
+    fn archive_selected(&mut self) {
+        let prepared = self.account().and_then(|account| {
+            let source = account.current_mailbox.clone()?;
+            let id = account.selected_message()?.id.clone();
+            let destination = account
+                .mailboxes
+                .iter()
+                .find(|mailbox| mailbox.role == MailboxRole::Archive && mailbox.name != source)
+                .map(|mailbox| mailbox.name.clone());
+            Some((source, destination, id, account.message_index))
+        });
+        let Some((source, destination, id, restore_index)) = prepared else {
+            return;
+        };
+        let Some(destination) = destination else {
+            self.status = StatusLine::temporary(
+                "this account has no advertised Archive/All Mail mailbox",
+                Duration::from_secs(3),
+            );
+            return;
+        };
+
+        let started = {
+            let Some(account) = self.accounts.get_mut(self.account_index) else {
+                return;
+            };
+            account.restore_message_index = Some(restore_index);
+            match account.worker.post(ActionKind::Move {
+                source,
+                destination,
+                id,
+            }) {
+                Ok(_) => true,
+                Err(_) => {
+                    account.restore_message_index = None;
+                    false
+                }
+            }
+        };
+
+        if started && self.message_open {
+            self.close_message();
+        }
+        self.status = if started {
+            StatusLine::info("archiving message…")
+        } else {
+            StatusLine::error("mail worker queue is busy; archive not started")
+        };
+    }
+
     fn open_theme_picker(&mut self) {
         self.theme_before_picker = self.theme_index;
         self.theme_picker_visible = true;
+        self.theme_query.clear();
+        self.theme_selected = self.theme_index;
+        self.theme_scroll = 0;
     }
 
-    fn preview_theme(&mut self, delta: isize) {
-        self.theme_index = offset_index(self.theme_index, THEMES.len(), delta);
+    fn open_help(&mut self) {
+        self.help_visible = true;
+        self.help_query.clear();
+        self.help_selected = 0;
+        self.help_scroll = 0;
+    }
+
+    #[must_use]
+    pub fn help_matches(&self) -> Vec<usize> {
+        let query = self.help_query.trim().to_ascii_lowercase();
+        HELP_ENTRIES
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                query.is_empty()
+                    || entry.category.to_ascii_lowercase().contains(&query)
+                    || entry.key.to_ascii_lowercase().contains(&query)
+                    || entry.description.to_ascii_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn theme_matches(&self) -> Vec<usize> {
+        let query = self.theme_query.trim().to_ascii_lowercase();
+        THEMES
+            .iter()
+            .enumerate()
+            .filter(|(_, theme)| query.is_empty() || theme.name.to_ascii_lowercase().contains(&query))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn handle_help_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') if key.modifiers.is_empty() => {
+                self.help_visible = false;
+            }
+            KeyCode::Down if key.modifiers.is_empty() => {
+                self.move_help_selection(1);
+            }
+            KeyCode::Up if key.modifiers.is_empty() => {
+                self.move_help_selection(-1);
+            }
+            KeyCode::Home if key.modifiers.is_empty() => {
+                if let Some(first) = self.help_matches().first().copied() {
+                    self.help_selected = first;
+                    self.help_scroll = 0;
+                }
+            }
+            KeyCode::End if key.modifiers.is_empty() => {
+                let matches = self.help_matches();
+                if let Some(last) = matches.last().copied() {
+                    self.help_selected = last;
+                    self.help_scroll = matches.len().saturating_sub(7);
+                }
+            }
+            KeyCode::Backspace if key.modifiers.is_empty() => {
+                self.help_query.pop();
+                self.reset_help_selection();
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.help_query.push(ch);
+                self.reset_help_selection();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_theme_picker_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.cancel_theme_picker(),
+            KeyCode::Enter => self.commit_theme_picker(),
+            KeyCode::Down if key.modifiers.is_empty() => {
+                self.move_theme_selection(1);
+            }
+            KeyCode::Up if key.modifiers.is_empty() => {
+                self.move_theme_selection(-1);
+            }
+            KeyCode::Home if key.modifiers.is_empty() => {
+                if let Some(first) = self.theme_matches().first().copied() {
+                    self.theme_selected = first;
+                    self.theme_index = first;
+                    self.theme_scroll = 0;
+                }
+            }
+            KeyCode::End if key.modifiers.is_empty() => {
+                let matches = self.theme_matches();
+                if let Some(last) = matches.last().copied() {
+                    self.theme_selected = last;
+                    self.theme_index = last;
+                    self.theme_scroll = matches.len().saturating_sub(7);
+                }
+            }
+            KeyCode::Backspace if key.modifiers.is_empty() => {
+                self.theme_query.pop();
+                self.reset_theme_selection();
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.theme_query.push(ch);
+                self.reset_theme_selection();
+            }
+            _ => {}
+        }
+    }
+
+    fn reset_help_selection(&mut self) {
+        let matches = self.help_matches();
+        self.help_selected = matches.first().copied().unwrap_or(0);
+        self.help_scroll = 0;
+    }
+
+    fn move_help_selection(&mut self, delta: isize) {
+        let matches = self.help_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let position = matches
+            .iter()
+            .position(|index| *index == self.help_selected)
+            .unwrap_or(0);
+        let next = offset_index(position, matches.len(), delta);
+        self.help_selected = matches[next];
+        self.help_scroll = next.saturating_sub(6);
+    }
+
+    fn reset_theme_selection(&mut self) {
+        let matches = self.theme_matches();
+        if let Some(index) = matches.first().copied() {
+            self.theme_selected = index;
+            self.theme_index = index;
+        }
+        self.theme_scroll = 0;
+    }
+
+    fn move_theme_selection(&mut self, delta: isize) {
+        let matches = self.theme_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let position = matches
+            .iter()
+            .position(|index| *index == self.theme_selected)
+            .unwrap_or(0);
+        let next = offset_index(position, matches.len(), delta);
+        self.theme_selected = matches[next];
+        self.theme_index = self.theme_selected;
+        self.theme_scroll = next.saturating_sub(4);
     }
 
     fn commit_theme_picker(&mut self) {
         self.theme_picker_visible = false;
+        self.theme_query.clear();
         let name = self.theme().name;
         if let Err(error) = persist_theme(name) {
             self.status = StatusLine::error(format!("could not persist theme: {error:#}"));
         } else {
-            self.status = StatusLine::temporary(
-                format!("theme: {name}"),
-                Duration::from_secs(2),
-            );
+            self.status = StatusLine::temporary("theme saved", Duration::from_secs(2));
         }
     }
 
     fn cancel_theme_picker(&mut self) {
         self.theme_index = self.theme_before_picker;
+        self.theme_selected = self.theme_before_picker;
+        self.theme_query.clear();
         self.theme_picker_visible = false;
     }
 
@@ -978,26 +1390,59 @@ impl App {
     }
 
     fn begin_reply(&mut self) {
-        let composer = {
-            let Some(account) = self.account() else {
-                return;
-            };
+        self.begin_compose_from_selected(ComposeIntent::Reply);
+    }
+
+    fn begin_forward(&mut self) {
+        self.begin_compose_from_selected(ComposeIntent::Forward);
+    }
+
+    fn begin_compose_from_selected(&mut self, intent: ComposeIntent) {
+        let account_index = self.account_index;
+        let prepared = self.account().and_then(|account| {
             if !account.outgoing_configured {
-                None
-            } else {
-                account.selected_message().map(|message| {
-                    Composer::reply(message, account.selected_body(), account.prefer_html)
-                })
+                return None;
             }
-        };
+            let message = account.selected_message()?;
+            let body = account.selected_body();
+            let composer = body.map(|body| match intent {
+                ComposeIntent::Reply => Composer::reply(message, Some(body), account.prefer_html),
+                ComposeIntent::Forward => Composer::forward(message, Some(body), account.prefer_html),
+            });
+            Some((message.id.clone(), composer))
+        });
+
         if !self.account().is_some_and(|account| account.outgoing_configured) {
             self.status = StatusLine::error(
                 "no outgoing SMTP transport configured; add `outgoing = ...` to this account",
             );
             return;
         }
+
+        let Some((message_id, composer)) = prepared else {
+            return;
+        };
         if let Some(composer) = composer {
             self.composer = Some(composer);
+            return;
+        }
+
+        let started = self.account_mut().is_some_and(|account| {
+            account.request_selected_body();
+            account.pending_bodies.contains(&message_id)
+        });
+        if started {
+            self.pending_compose = Some(PendingCompose {
+                account: account_index,
+                message_id,
+                intent,
+            });
+            self.status = StatusLine::info(match intent {
+                ComposeIntent::Reply => "loading message for reply…",
+                ComposeIntent::Forward => "loading message for forward…",
+            });
+        } else {
+            self.status = StatusLine::error("message body could not be queued for loading");
         }
     }
 
@@ -1117,6 +1562,10 @@ fn bounded_scroll(current: u16, delta: isize) -> u16 {
     }
 }
 
+fn bounded_scroll_to(current: u16, delta: isize, max: u16) -> u16 {
+    bounded_scroll(current.min(max), delta).min(max)
+}
+
 fn offset_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -1127,7 +1576,7 @@ fn offset_index(current: usize, len: usize, delta: isize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_index, bounded_scroll, offset_index};
+    use super::{bounded_index, bounded_scroll, bounded_scroll_to, offset_index};
 
     #[test]
     fn list_navigation_is_bounded() {
@@ -1141,6 +1590,13 @@ mod tests {
         assert_eq!(bounded_scroll(0, -1), 0);
         assert_eq!(bounded_scroll(10, 5), 15);
         assert_eq!(bounded_scroll(u16::MAX - 1, 10), u16::MAX);
+    }
+
+    #[test]
+    fn preview_scroll_never_moves_beyond_rendered_bottom() {
+        assert_eq!(bounded_scroll_to(90, 22, 100), 100);
+        assert_eq!(bounded_scroll_to(u16::MAX, -1, 100), 99);
+        assert_eq!(bounded_scroll_to(0, -22, 100), 0);
     }
 
     #[test]

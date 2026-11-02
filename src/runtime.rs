@@ -1,7 +1,7 @@
 use std::io::{self, Stdout};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, KeyEventKind};
@@ -34,7 +34,7 @@ pub fn run_tui(config: Config) -> Result<()> {
     terminal.clear()?;
     spawn_input_thread(runtime_tx);
 
-    render(&mut terminal, &app)?;
+    render(&mut terminal, &mut app)?;
     event_loop(&mut terminal, &mut app, runtime_rx)?;
     Ok(())
 }
@@ -81,15 +81,30 @@ fn event_loop(
     app: &mut App,
     runtime_rx: Receiver<RuntimeEvent>,
 ) -> Result<()> {
+    // Animation is deadline-driven instead of timeout-driven.  The old loop only
+    // advanced smooth scrolling when recv_timeout() *timed out*, so a steady
+    // stream of worker events (mailbox STATUS refreshes are a common example)
+    // could starve Ctrl-j/Ctrl-k for hundreds of milliseconds.
+    let mut next_animation_frame = Instant::now();
+
     while !app.should_quit {
+        if app.animation_active() {
+            let now = Instant::now();
+            if now >= next_animation_frame {
+                app.advance_animation();
+                next_animation_frame = now + ANIMATION_FRAME;
+                render(terminal, app)?;
+                continue;
+            }
+        } else {
+            next_animation_frame = Instant::now();
+        }
+
         let received = if app.animation_active() {
-            match runtime_rx.recv_timeout(ANIMATION_FRAME) {
+            let timeout = next_animation_frame.saturating_duration_since(Instant::now());
+            match runtime_rx.recv_timeout(timeout) {
                 Ok(event) => Some(event),
-                Err(RecvTimeoutError::Timeout) => {
-                    app.advance_animation();
-                    render(terminal, app)?;
-                    None
-                }
+                Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(anyhow::anyhow!("runtime event channel closed"));
                 }
@@ -99,8 +114,12 @@ fn event_loop(
         };
 
         let Some(event) = received else {
+            // Do not advance here. The deadline check at the top of the next
+            // iteration owns animation progress, which also prevents event load
+            // from postponing a due frame.
             continue;
         };
+
         match event {
             RuntimeEvent::Input(event::Event::Key(key))
                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -113,12 +132,19 @@ fn event_loop(
             RuntimeEvent::Worker(event) => app.handle_worker_event(event),
             RuntimeEvent::InputStopped => break,
         }
+
+        // A key can start or reverse an animation. Draw its state immediately,
+        // then make its first row eligible without waiting on unrelated traffic.
+        if app.animation_active() && next_animation_frame <= Instant::now() {
+            app.advance_animation();
+            next_animation_frame = Instant::now() + ANIMATION_FRAME;
+        }
         render(terminal, app)?;
     }
     Ok(())
 }
 
-fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &App) -> Result<()> {
+fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     terminal.draw(|frame| ui::draw(frame, app))?;
     Ok(())
 }

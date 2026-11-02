@@ -5,11 +5,11 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap,
 };
 
-use crate::app::{App, ComposeField, Focus};
+use crate::app::{App, ComposeField, Focus, HELP_ENTRIES};
 use crate::model::MessageFlags;
 use crate::theme::THEMES;
 
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
@@ -47,7 +47,7 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.text()), area);
 }
 
-fn draw_main(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let Some(_account) = app.account() else {
         frame.render_widget(
             Paragraph::new("No accounts configured").style(app.theme().text()),
@@ -172,73 +172,79 @@ fn draw_messages(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn draw_message(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let theme = *app.theme();
-    let account = app.account().expect("account exists");
-    let Some(message) = account.selected_message() else {
+    if app.account().and_then(|account| account.selected_message()).is_none() {
         frame.render_widget(Paragraph::new("No message selected").style(theme.muted()), area);
+        app.set_preview_max_scroll(0);
         return;
+    }
+    let lines = {
+        let account = app.account().expect("account exists");
+        let message = account.selected_message().expect("message checked above");
+
+        let from = if message.from_name.is_empty() {
+            message.from_address.clone()
+        } else if message.from_address.is_empty() {
+            message.from_name.clone()
+        } else {
+            format!("{} <{}>", message.from_name, message.from_address)
+        };
+        let mut lines = vec![
+            Line::from(vec![Span::styled("From: ", theme.accent()), Span::raw(from)]),
+            Line::from(vec![
+                Span::styled("Subject: ", theme.accent()),
+                Span::raw(message.subject.clone()),
+            ]),
+        ];
+        if let Some(message_id) = &message.message_id {
+            lines.push(Line::from(vec![
+                Span::styled("Message-ID: ", theme.accent()),
+                Span::raw(format!("<{message_id}>")),
+            ]));
+        }
+        lines.push(Line::styled("─".repeat(usize::from(area.width)), theme.border()));
+        lines.push(Line::raw(""));
+
+        if let Some(body) = account.selected_body() {
+            lines.extend(Text::from(body.display_text(account.prefer_html).to_owned()).lines);
+            if body.has_html_alternative() {
+                let mode = if account.prefer_html || body.plain_is_empty() {
+                    "HTML rendered"
+                } else {
+                    "plain text"
+                };
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("[{mode}; press h to toggle alternative]"),
+                    theme.muted(),
+                ));
+            }
+            if body.attachment_count > 0 {
+                lines.push(Line::styled(
+                    format!("[{} attachment(s)]", body.attachment_count),
+                    theme.muted(),
+                ));
+            }
+        } else if account.is_loading_body() {
+            lines.push(Line::styled("Loading message…", theme.muted()));
+        } else {
+            lines.push(Line::styled("Message body not loaded", theme.muted()));
+        }
+        lines
     };
 
-    let from = if message.from_name.is_empty() {
-        message.from_address.clone()
-    } else if message.from_address.is_empty() {
-        message.from_name.clone()
-    } else {
-        format!("{} <{}>", message.from_name, message.from_address)
-    };
-    let mut lines = vec![
-        Line::from(vec![Span::styled("From: ", theme.accent()), Span::raw(from)]),
-        Line::from(vec![
-            Span::styled("Subject: ", theme.accent()),
-            Span::raw(message.subject.clone()),
-        ]),
-    ];
-    if let Some(message_id) = &message.message_id {
-        lines.push(Line::from(vec![
-            Span::styled("Message-ID: ", theme.accent()),
-            Span::raw(format!("<{message_id}>") ),
-        ]));
-    }
-    lines.push(Line::styled("─".repeat(usize::from(area.width)), theme.border()));
-    lines.push(Line::raw(""));
-
-    if let Some(body) = account.selected_body() {
-        lines.extend(Text::from(body.display_text(account.prefer_html).to_owned()).lines);
-        if body.has_html_alternative() {
-            let mode = if account.prefer_html || body.plain_is_empty() {
-                "HTML rendered"
-            } else {
-                "plain text"
-            };
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                format!("[{mode}; press h to toggle alternative]"),
-                theme.muted(),
-            ));
-        }
-        if body.attachment_count > 0 {
-            lines.push(Line::styled(
-                format!("[{} attachment(s)]", body.attachment_count),
-                theme.muted(),
-            ));
-        }
-    } else if account.is_loading_body() {
-        lines.push(Line::styled("Loading message…", theme.muted()));
-    } else {
-        lines.push(Line::styled("Message body not loaded", theme.muted()));
-    }
-
+    // Paragraph::line_count accounts for soft wrapping, so the scroll limit is
+    // the *visual* last row rather than the number of logical source lines.
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(theme.text())
+        .wrap(Wrap { trim: false });
+    let visual_lines = paragraph.line_count(area.width.max(1));
     let viewport_height = usize::from(area.height.max(1));
-    let max_scroll = u16::try_from(lines.len().saturating_sub(viewport_height)).unwrap_or(u16::MAX);
-    let scroll = account.preview_scroll.min(max_scroll);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .style(theme.text())
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        area,
-    );
+    let max_scroll = u16::try_from(visual_lines.saturating_sub(viewport_height)).unwrap_or(u16::MAX);
+    app.set_preview_max_scroll(max_scroll);
+    let scroll = app.account().map_or(0, |account| account.preview_scroll);
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -255,11 +261,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else if account.is_loading_body() {
             spans.push(Span::raw("Loading message…"));
         } else {
-            let style = if app.status.is_error {
-                theme.error()
-            } else {
-                theme.text()
-            };
+            let style = if app.status.is_error { theme.error() } else { theme.text() };
             spans.push(Span::styled(app.status.text.as_str(), style));
         }
     } else {
@@ -268,81 +270,133 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(count) = app.count_prefix {
         spans.push(Span::styled(format!("    {count}"), theme.accent()));
     }
-    let mode = if app.message_open { "message" } else { "browse" };
-    spans.push(Span::styled(
-        format!("    {mode} | theme:{}", theme.name),
-        theme.muted(),
-    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.status()), area);
+}
+
+fn draw_search_header(frame: &mut Frame<'_>, area: Rect, query: &str, app: &App) {
+    let theme = *app.theme();
+    let prompt = if query.is_empty() { "type to search…" } else { query };
+    let style = if query.is_empty() { theme.muted() } else { theme.text() };
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(theme.status()),
+        Paragraph::new(Line::from(vec![
+            Span::styled(" / ", theme.accent()),
+            Span::styled(prompt, style),
+        ])),
         area,
     );
 }
 
 fn draw_help(frame: &mut Frame<'_>, app: &App) {
     let theme = *app.theme();
-    let area = centered_rect(frame.area(), 76, 34);
+    let area = centered_rect(frame.area(), 86, 70);
     frame.render_widget(Clear, area);
-    let text = Text::from(vec![
-        Line::styled("Browse", theme.accent()),
-        Line::raw("  j/k or ↑/↓       move one row"),
-        Line::raw("  20j / 20k        relative-number jump"),
-        Line::raw("  Ctrl-j / Ctrl-k  smooth 22-row neoscroll"),
-        Line::raw("  g / G            top / bottom"),
-        Line::raw("  Ctrl-d / Ctrl-u  page down / up"),
-        Line::raw("  Tab / Shift-Tab  mailbox/message-list focus"),
-        Line::raw("  Enter / l        open mailbox or full-screen message"),
-        Line::raw(""),
-        Line::styled("Message", theme.accent()),
-        Line::raw("  Esc              return to message list"),
-        Line::raw("  h                toggle plain/HTML alternative"),
-        Line::raw("  e                export raw RFC 5322 message for debugging"),
-        Line::raw("  u                toggle read/unread"),
-        Line::raw("  R                reply"),
-        Line::raw(""),
-        Line::styled("General", theme.accent()),
-        Line::raw("  t                theme picker (j/k preview, Enter keep)"),
-        Line::raw("  r                refresh"),
-        Line::raw("  [ / ]            previous / next account"),
-        Line::raw("  c                new message"),
-        Line::raw("  ? / Esc           close popup"),
-        Line::raw("  Ctrl-c / q        quit"),
-    ]);
+    let block = Block::default()
+        .title(" Keybindings ")
+        .borders(Borders::ALL)
+        .border_style(theme.accent());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    draw_search_header(frame, chunks[0], &app.help_query, app);
+
+    let matches = app.help_matches();
+    let visible = usize::from(chunks[1].height.max(1));
+    let max_start = matches.len().saturating_sub(visible);
+    let start = app.help_scroll.min(max_start);
+    let shown: Vec<usize> = matches.iter().copied().skip(start).take(visible).collect();
+    if shown.is_empty() {
+        frame.render_widget(Paragraph::new(" No matching keybindings").style(theme.muted()), chunks[1]);
+    } else {
+        let rows = shown.iter().map(|index| {
+            let entry = HELP_ENTRIES[*index];
+            Row::new(vec![
+                Cell::from(entry.category),
+                Cell::from(entry.key),
+                Cell::from(entry.description),
+            ])
+        });
+        let table = Table::new(
+            rows,
+            [Constraint::Length(10), Constraint::Length(22), Constraint::Min(20)],
+        )
+        .style(theme.text())
+        .column_spacing(1)
+        .row_highlight_style(theme.selected());
+        let selected = shown.iter().position(|index| *index == app.help_selected);
+        let mut state = TableState::default().with_selected(selected);
+        frame.render_stateful_widget(table, chunks[1], &mut state);
+    }
+
     frame.render_widget(
-        Paragraph::new(text)
-            .style(theme.popup())
-            .block(
-                Block::default()
-                    .title(" Help ")
-                    .borders(Borders::ALL)
-                    .border_style(theme.accent())
-                    .style(theme.popup()),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓", theme.accent()),
+            Span::styled(" navigate   ", theme.muted()),
+            Span::styled("type", theme.accent()),
+            Span::styled(" filter   ", theme.muted()),
+            Span::styled("Backspace", theme.accent()),
+            Span::styled(" edit   ", theme.muted()),
+            Span::styled("Esc/?", theme.accent()),
+            Span::styled(" close", theme.muted()),
+        ])),
+        chunks[2],
     );
 }
 
 fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
     let theme = *app.theme();
-    let area = centered_rect(frame.area(), 44, 30);
+    let area = centered_rect(frame.area(), 52, 46);
     frame.render_widget(Clear, area);
-    let rows = THEMES.iter().map(|candidate| {
-        let marker = if candidate.name == theme.name { "●" } else { " " };
-        Row::new(vec![Cell::from(marker), Cell::from(candidate.name)])
-    });
-    let table = Table::new(rows, [Constraint::Length(2), Constraint::Min(12)])
-        .style(theme.popup())
-        .block(
-            Block::default()
-                .title(" Themes — j/k preview, Enter keep, Esc cancel ")
-                .borders(Borders::ALL)
-                .border_style(theme.accent())
-                .style(theme.popup()),
-        )
-        .row_highlight_style(theme.selected());
-    let mut state = TableState::default().with_selected(Some(app.theme_index));
-    frame.render_stateful_widget(table, area, &mut state);
+    let block = Block::default()
+        .title(" Themes ")
+        .borders(Borders::ALL)
+        .border_style(theme.accent());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    draw_search_header(frame, chunks[0], &app.theme_query, app);
+
+    let matches = app.theme_matches();
+    let visible = usize::from(chunks[1].height.max(1));
+    let max_start = matches.len().saturating_sub(visible);
+    let start = app.theme_scroll.min(max_start);
+    let shown: Vec<usize> = matches.iter().copied().skip(start).take(visible).collect();
+    if shown.is_empty() {
+        frame.render_widget(Paragraph::new(" No matching themes").style(theme.muted()), chunks[1]);
+    } else {
+        let rows = shown.iter().map(|index| {
+            let candidate = &THEMES[*index];
+            let marker = if *index == app.theme_selected { "●" } else { " " };
+            Row::new(vec![Cell::from(marker), Cell::from(candidate.name)])
+        });
+        let table = Table::new(rows, [Constraint::Length(2), Constraint::Min(12)])
+            .style(theme.text())
+            .row_highlight_style(theme.selected());
+        let selected = shown.iter().position(|index| *index == app.theme_selected);
+        let mut state = TableState::default().with_selected(selected);
+        frame.render_stateful_widget(table, chunks[1], &mut state);
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓", theme.accent()),
+            Span::styled(" preview   ", theme.muted()),
+            Span::styled("type", theme.accent()),
+            Span::styled(" filter   ", theme.muted()),
+            Span::styled("Enter", theme.accent()),
+            Span::styled(" keep   ", theme.muted()),
+            Span::styled("Esc", theme.accent()),
+            Span::styled(" cancel", theme.muted()),
+        ])),
+        chunks[2],
+    );
 }
 
 fn draw_composer(frame: &mut Frame<'_>, app: &App) {
@@ -359,8 +413,7 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
             " Compose — Ctrl-s send, Esc cancel "
         })
         .borders(Borders::ALL)
-        .border_style(theme.accent())
-        .style(theme.popup());
+        .border_style(theme.accent());
     let inside = inner.inner(area);
     frame.render_widget(inner, area);
 
@@ -385,11 +438,11 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
         composer.field == ComposeField::Subject,
         app,
     );
-    frame.render_widget(Paragraph::new("").style(theme.popup()), fields[3]);
+    frame.render_widget(Paragraph::new(""), fields[3]);
     let body_style = if composer.field == ComposeField::Body {
         theme.selected()
     } else {
-        theme.popup()
+        theme.text()
     };
     frame.render_widget(
         Paragraph::new(composer.body.as_str())
@@ -408,7 +461,7 @@ fn draw_compose_field(
     app: &App,
 ) {
     let theme = *app.theme();
-    let style = if active { theme.selected() } else { theme.popup() };
+    let style = if active { theme.selected() } else { theme.text() };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(format!("{name}: "), theme.accent()),
