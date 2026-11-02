@@ -1,8 +1,8 @@
-# aerc-rs milestone 2 configuration examples.
+# aerc-rs milestone 3 configuration examples.
 #
-# Pick one or more accounts. For credentials, source_cred_cmd is preferred:
-# it is executed by the account worker and its stdout becomes the password,
-# access token, or refresh token. Do not commit this file if you embed secrets.
+# source_cred_cmd / outgoing_cred_cmd are preferred over putting reusable
+# secrets in TOML. Their stdout becomes the password, access token, or refresh
+# token. Keep this file mode 0600 if it contains any account metadata/secrets.
 
 # Local/offline Maildir remains useful for tests and archives.
 [[accounts]]
@@ -10,31 +10,44 @@ name = "Kernel Maildir"
 source = "maildir://~/Mail/kernel"
 default_mailbox = "INBOX"
 
-# Gmail / normal IMAPS with an app password.
-# The URI intentionally has no password; the command supplies it.
+# Gmail / normal IMAPS with an app password + SMTP submission.
 # [[accounts]]
 # name = "Personal"
 # source = "imaps://you%40gmail.com@imap.gmail.com:993"
 # source_cred_cmd = "pass show mail/personal-app-password"
+# from = "Your Name <you@gmail.com>"
+# outgoing = "smtps://you%40gmail.com@smtp.gmail.com:465"
+# outgoing_cred_cmd = "pass show mail/personal-app-password"
 # default_mailbox = "INBOX"
 # max_messages = 500
 
-# aerc-compatible OAuth refresh-token flow. With token_endpoint present,
-# source_cred_cmd must print a REFRESH token; aerc-rs exchanges it for a
-# short-lived access token before authenticating IMAP with OAUTHBEARER.
+# OAuth refresh-token flow. With token_endpoint present, the credential command
+# supplies a refresh token and aerc-rs obtains a short-lived access token.
+# Gmail SMTP uses XOAUTH2 even when the incoming IMAP account uses OAUTHBEARER.
 # [[accounts]]
 # name = "University"
 # source = "imaps+oauthbearer://you%40example.edu@imap.gmail.com:993?client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
 # source_cred_cmd = "pass show mail/university-refresh-token"
+# from = "Your Name <you@example.edu>"
+# outgoing = "smtp+xoauth2://you%40example.edu@smtp.gmail.com:587?client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
+# outgoing_cred_cmd = "pass show mail/university-refresh-token"
 # default_mailbox = "INBOX"
 # max_messages = 500
 
-# For compatibility/testing, credentials may also be percent-encoded directly
-# in the URI, exactly like aerc. This is less safe because the config now holds
-# a reusable secret:
+# aerc-compatible URI credentials also work for one-off testing, but are less
+# safe because the config itself contains the reusable credential.
 # source = "imaps://you%40gmail.com:APP_PASSWORD@imap.gmail.com:993"
-# source = "imaps+oauthbearer://you%40example.edu:REFRESH_TOKEN@imap.gmail.com:993?client_id=...&client_secret=...&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
+# outgoing = "smtps://you%40gmail.com:APP_PASSWORD@smtp.gmail.com:465"
 
 [ui]
-sidebar_width = 24
-message_width_percent = 48
+# Browser layout: mailbox column on the left, message list on the right.
+mailbox_width_percent = 33
+
+# Initial theme. Press `t` in the TUI to preview/switch themes live; the chosen
+# theme is persisted in the aerc-rs config directory and overrides this value.
+theme = "default"
+
+# Legacy milestone-3 options are still accepted so existing configs keep
+# loading, but the split preview no longer exists.
+# sidebar_width = 24
+# message_width_percent = 48

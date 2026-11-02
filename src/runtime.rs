@@ -1,19 +1,25 @@
 use std::io::{self, Stdout};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{App, command_for_key};
+use crate::app::App;
 use crate::backend;
 use crate::config::Config;
+use crate::outgoing;
 use crate::ui;
 use crate::worker::{RuntimeEvent, WorkerHandle};
+
+const ANIMATION_FRAME: Duration = Duration::from_millis(10);
 
 pub fn run_tui(config: Config) -> Result<()> {
     let (runtime_tx, runtime_rx) = sync_channel::<RuntimeEvent>(4096);
@@ -40,7 +46,13 @@ fn create_workers(config: &Config, runtime_tx: SyncSender<RuntimeEvent>) -> Resu
         .enumerate()
         .map(|(index, account)| {
             let backend = backend::from_account(account)?;
-            Ok(WorkerHandle::spawn(index, backend, runtime_tx.clone()))
+            let sender = outgoing::from_account(account)?;
+            Ok(WorkerHandle::spawn(
+                index,
+                backend,
+                sender,
+                runtime_tx.clone(),
+            ))
         })
         .collect()
 }
@@ -70,12 +82,30 @@ fn event_loop(
     runtime_rx: Receiver<RuntimeEvent>,
 ) -> Result<()> {
     while !app.should_quit {
-        let event = runtime_rx.recv().context("runtime event channel closed")?;
+        let received = if app.animation_active() {
+            match runtime_rx.recv_timeout(ANIMATION_FRAME) {
+                Ok(event) => Some(event),
+                Err(RecvTimeoutError::Timeout) => {
+                    app.advance_animation();
+                    render(terminal, app)?;
+                    None
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow::anyhow!("runtime event channel closed"));
+                }
+            }
+        } else {
+            Some(runtime_rx.recv().context("runtime event channel closed")?)
+        };
+
+        let Some(event) = received else {
+            continue;
+        };
         match event {
             RuntimeEvent::Input(event::Event::Key(key))
                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
             {
-                app.handle_command(command_for_key(key));
+                app.handle_key(key);
             }
             RuntimeEvent::Input(event::Event::Key(_)) => continue,
             RuntimeEvent::Input(event::Event::Resize(_, _)) => {}

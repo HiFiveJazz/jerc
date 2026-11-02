@@ -338,26 +338,31 @@ impl MailBackend for ImapBackend {
             .collect();
         selectable.sort_by(|a, b| mailbox_sort_key(&a.0, &a.1).cmp(&mailbox_sort_key(&b.0, &b.1)));
 
-        let mut out = Vec::with_capacity(selectable.len());
-        for (name, role) in selectable {
-            let status = self.session()?.status(&name, "(MESSAGES UNSEEN)");
-            let (total, unread) = match status {
-                Ok(status) => (
-                    usize::try_from(status.exists).unwrap_or(usize::MAX),
-                    usize::try_from(status.unseen.unwrap_or(0)).unwrap_or(usize::MAX),
-                ),
-                // LIST should still remain useful when one provider rejects
-                // STATUS for a virtual/special mailbox.
-                Err(_) => (0, 0),
-            };
-            out.push(Mailbox {
+        // Deliberately do not issue STATUS once per folder here. On hosted IMAP
+        // that turns one fast LIST into N sequential network round trips and
+        // blocks first paint. The UI asks for mailbox_status() lazily after the
+        // selected folder and its message list are usable.
+        Ok(selectable
+            .into_iter()
+            .map(|(name, role)| Mailbox {
                 name,
                 role,
-                total,
-                unread,
-            });
-        }
-        Ok(out)
+                total: 0,
+                unread: 0,
+                counts_known: false,
+            })
+            .collect())
+    }
+
+    fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)> {
+        let status = self
+            .session()?
+            .status(name, "(MESSAGES UNSEEN)")
+            .with_context(|| format!("reading status for {name:?}"))?;
+        Ok((
+            usize::try_from(status.exists).unwrap_or(usize::MAX),
+            usize::try_from(status.unseen.unwrap_or(0)).unwrap_or(usize::MAX),
+        ))
     }
 
     fn open_mailbox(&mut self, name: &str) -> Result<Vec<MessageSummary>> {
@@ -378,7 +383,10 @@ impl MailBackend for ImapBackend {
         let sequence = format!("{start}:*");
         let fetched = self
             .session()?
-            .fetch(&sequence, "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])")
+            .fetch(
+                &sequence,
+                "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT MESSAGE-ID IN-REPLY-TO REFERENCES)])",
+            )
             .with_context(|| format!("fetching headers from {name:?}"))?;
 
         let mut messages = Vec::with_capacity(fetched.len());
@@ -405,6 +413,11 @@ impl MailBackend for ImapBackend {
     }
 
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody> {
+        let raw = self.fetch_raw(mailbox, id)?;
+        parse_body(id.clone(), &raw).context("parsing IMAP message body")
+    }
+
+    fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
         self.ensure_selected(mailbox)?;
         let uid = Self::uid_from_id(id)?;
         let fetched = self
@@ -418,7 +431,7 @@ impl MailBackend for ImapBackend {
         let raw = fetch
             .body()
             .ok_or_else(|| anyhow!("IMAP server returned UID {uid} without a body"))?;
-        parse_body(id.clone(), raw).context("parsing IMAP message body")
+        Ok(raw.to_vec())
     }
 
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()> {
@@ -644,10 +657,10 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        ImapAuth, ImapSource, OAuthAuthenticator, oauthbearer_response, role_from_attributes,
-        sasl_name, xoauth2_response,
+        ImapAuth, ImapSource, OAuthAuthenticator, flags_from_imap, oauthbearer_response,
+        role_from_attributes, sasl_name, xoauth2_response,
     };
-    use imap::{Authenticator, types::NameAttribute};
+    use imap::{Authenticator, types::{Flag, NameAttribute}};
 
     #[test]
     fn parses_aerc_style_password_source() {
@@ -699,6 +712,13 @@ mod tests {
         assert!(!debug.contains("refresh-secret"));
         assert!(!debug.contains("client-secret"));
         assert!(!debug.contains("oauth.example.com"));
+    }
+
+    #[test]
+    fn seen_flag_maps_to_local_read_state() {
+        let flags = flags_from_imap(&[Flag::Seen, Flag::Answered]);
+        assert!(flags.contains(crate::model::MessageFlags::SEEN));
+        assert!(flags.contains(crate::model::MessageFlags::ANSWERED));
     }
 
     #[test]

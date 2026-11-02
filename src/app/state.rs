@@ -1,10 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::app::{Command, Focus};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::app::{Command, Focus, command_for_key};
 use crate::config::Config;
-use crate::model::{Capabilities, Mailbox, MessageBody, MessageFlags, MessageId, MessageSummary};
+use crate::model::{
+    Capabilities, Mailbox, MessageBody, MessageFlags, MessageId, MessageSummary, OutgoingMessage,
+};
+use crate::theme::{Theme, THEMES, persist_theme, persisted_theme, theme_index};
 use crate::worker::{ActionKind, WorkerEvent, WorkerEventKind, WorkerHandle};
+
+const SMOOTH_SCROLL_ROWS: isize = 22;
+const MAX_COUNT_PREFIX: usize = 99_999;
 
 #[derive(Debug, Clone)]
 pub struct StatusLine {
@@ -44,9 +52,115 @@ impl StatusLine {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeField {
+    To,
+    Cc,
+    Subject,
+    Body,
+}
+
+impl ComposeField {
+    const fn next(self) -> Self {
+        match self {
+            Self::To => Self::Cc,
+            Self::Cc => Self::Subject,
+            Self::Subject => Self::Body,
+            Self::Body => Self::To,
+        }
+    }
+
+    const fn previous(self) -> Self {
+        match self {
+            Self::To => Self::Body,
+            Self::Cc => Self::To,
+            Self::Subject => Self::Cc,
+            Self::Body => Self::Subject,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Composer {
+    pub to: String,
+    pub cc: String,
+    pub subject: String,
+    pub body: String,
+    pub field: ComposeField,
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
+    pub sending: bool,
+}
+
+impl Composer {
+    fn new() -> Self {
+        Self {
+            to: String::new(),
+            cc: String::new(),
+            subject: String::new(),
+            body: String::new(),
+            field: ComposeField::To,
+            in_reply_to: None,
+            references: Vec::new(),
+            sending: false,
+        }
+    }
+
+    fn reply(message: &MessageSummary, body: Option<&MessageBody>, prefer_html: bool) -> Self {
+        let subject = if message.subject.to_ascii_lowercase().starts_with("re:") {
+            message.subject.clone()
+        } else {
+            format!("Re: {}", message.subject)
+        };
+        let mut references = message.references.clone();
+        if let Some(id) = &message.message_id {
+            if references.last() != Some(id) {
+                references.push(id.clone());
+            }
+        }
+        let quoted = body.map_or_else(String::new, |body| {
+            body.display_text(prefer_html)
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        let body = if quoted.is_empty() {
+            "\n\n".to_owned()
+        } else {
+            format!("\n\nOn the previous message, {} wrote:\n{quoted}\n", display_sender(message))
+        };
+        Self {
+            to: if message.from_name.is_empty() {
+                message.from_address.clone()
+            } else {
+                format!("{} <{}>", message.from_name, message.from_address)
+            },
+            cc: String::new(),
+            subject,
+            body,
+            field: ComposeField::Body,
+            in_reply_to: message.message_id.clone(),
+            references,
+            sending: false,
+        }
+    }
+
+    fn field_mut(&mut self) -> &mut String {
+        match self.field {
+            ComposeField::To => &mut self.to,
+            ComposeField::Cc => &mut self.cc,
+            ComposeField::Subject => &mut self.subject,
+            ComposeField::Body => &mut self.body,
+        }
+    }
+}
+
 pub struct AccountState {
     pub name: String,
     pub default_mailbox: String,
+    pub from: String,
+    pub outgoing_configured: bool,
     pub capabilities: Option<Capabilities>,
     pub mailboxes: Vec<Mailbox>,
     pub mailbox_index: usize,
@@ -54,8 +168,17 @@ pub struct AccountState {
     pub messages: Vec<MessageSummary>,
     pub message_index: usize,
     pub preview_scroll: u16,
+    pub smooth_message_target: Option<usize>,
+    pub smooth_preview_target: Option<u16>,
+    pub prefer_html: bool,
     pub bodies: HashMap<MessageId, MessageBody>,
     pub pending_bodies: HashSet<MessageId>,
+    pub pending_seen: HashSet<MessageId>,
+    pub mailbox_status_queue: VecDeque<String>,
+    pub mailbox_status_inflight: bool,
+    pub connecting: bool,
+    pub mailboxes_loading: bool,
+    pub messages_loading: bool,
     pub last_scan_micros: Option<u128>,
     pub worker: WorkerHandle,
 }
@@ -73,7 +196,14 @@ impl AccountState {
 
     #[must_use]
     pub fn selected_body(&self) -> Option<&MessageBody> {
-        self.selected_message().and_then(|msg| self.bodies.get(&msg.id))
+        self.selected_message()
+            .and_then(|msg| self.bodies.get(&msg.id))
+    }
+
+    #[must_use]
+    pub fn is_loading_body(&self) -> bool {
+        self.selected_message()
+            .is_some_and(|message| self.pending_bodies.contains(&message.id))
     }
 
     fn clamp_selection(&mut self) {
@@ -103,7 +233,31 @@ impl AccountState {
             })
             .is_ok()
         {
+            // Only the newest requested reader body matters. The worker coalesces
+            // queued body fetches to the newest opened selection; mirror that here so
+            // discarded requests cannot leave a permanent "loading" marker.
+            self.pending_bodies.clear();
             self.pending_bodies.insert(id);
+        }
+    }
+
+    fn request_seen(&mut self, id: MessageId, seen: bool) {
+        let Some(mailbox) = self.current_mailbox.clone() else {
+            return;
+        };
+        if self.pending_seen.contains(&id) {
+            return;
+        }
+        if self
+            .worker
+            .post(ActionKind::SetSeen {
+                mailbox,
+                id: id.clone(),
+                seen,
+            })
+            .is_ok()
+        {
+            self.pending_seen.insert(id);
         }
     }
 }
@@ -114,8 +268,14 @@ pub struct App {
     pub focus: Focus,
     pub status: StatusLine,
     pub should_quit: bool,
-    pub sidebar_width: u16,
-    pub message_width_percent: u16,
+    pub mailbox_width_percent: u16,
+    pub message_open: bool,
+    pub help_visible: bool,
+    pub theme_picker_visible: bool,
+    pub theme_index: usize,
+    theme_before_picker: usize,
+    pub count_prefix: Option<usize>,
+    pub composer: Option<Composer>,
 }
 
 impl App {
@@ -127,6 +287,8 @@ impl App {
             .map(|(config, worker)| AccountState {
                 name: config.name.clone(),
                 default_mailbox: config.default_mailbox.clone(),
+                from: config.from.clone().unwrap_or_default(),
+                outgoing_configured: config.outgoing.is_some(),
                 capabilities: None,
                 mailboxes: Vec::new(),
                 mailbox_index: 0,
@@ -134,20 +296,37 @@ impl App {
                 messages: Vec::new(),
                 message_index: 0,
                 preview_scroll: 0,
+                smooth_message_target: None,
+                smooth_preview_target: None,
+                prefer_html: false,
                 bodies: HashMap::new(),
                 pending_bodies: HashSet::new(),
+                pending_seen: HashSet::new(),
+                mailbox_status_queue: VecDeque::new(),
+                mailbox_status_inflight: false,
+                connecting: false,
+                mailboxes_loading: false,
+                messages_loading: false,
                 last_scan_micros: None,
                 worker,
             })
             .collect();
+        let configured_theme = persisted_theme().unwrap_or_else(|| config.ui.theme.clone());
+        let theme_index = theme_index(&configured_theme);
         Self {
             accounts,
             account_index: 0,
             focus: Focus::Messages,
             status: StatusLine::info("starting workers…"),
             should_quit: false,
-            sidebar_width: config.ui.sidebar_width,
-            message_width_percent: config.ui.message_width_percent,
+            mailbox_width_percent: config.ui.mailbox_width_percent.clamp(20, 50),
+            message_open: false,
+            help_visible: false,
+            theme_picker_visible: false,
+            theme_index,
+            theme_before_picker: theme_index,
+            count_prefix: None,
+            composer: None,
         }
     }
 
@@ -160,10 +339,25 @@ impl App {
         self.accounts.get_mut(self.account_index)
     }
 
+    #[must_use]
+    pub fn theme(&self) -> &'static Theme {
+        &THEMES[self.theme_index.min(THEMES.len().saturating_sub(1))]
+    }
+
     pub fn bootstrap(&mut self) {
-        for account in &self.accounts {
-            let _ = account.worker.post(ActionKind::Connect);
+        for account in &mut self.accounts {
+            if account.worker.post(ActionKind::Connect).is_ok() {
+                account.connecting = true;
+            }
         }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.composer.is_some() {
+            self.handle_composer_key(key);
+            return;
+        }
+        self.handle_command(command_for_key(key));
     }
 
     pub fn handle_worker_event(&mut self, event: WorkerEvent) {
@@ -172,11 +366,15 @@ impl App {
         };
         match event.kind {
             WorkerEventKind::Connected { capabilities } => {
+                account.connecting = false;
                 account.capabilities = Some(capabilities);
-                let _ = account.worker.post(ActionKind::ListMailboxes);
+                if account.worker.post(ActionKind::ListMailboxes).is_ok() {
+                    account.mailboxes_loading = true;
+                }
                 self.status = StatusLine::info(format!("{} connected", account.name));
             }
             WorkerEventKind::Mailboxes(mailboxes) => {
+                account.mailboxes_loading = false;
                 account.mailboxes = mailboxes;
                 account.mailbox_index = account
                     .mailboxes
@@ -184,26 +382,53 @@ impl App {
                     .position(|m| m.name == account.default_mailbox)
                     .unwrap_or(0);
                 account.clamp_selection();
+                account.mailbox_status_queue = account
+                    .mailboxes
+                    .iter()
+                    .filter(|mailbox| !mailbox.counts_known)
+                    .map(|mailbox| mailbox.name.clone())
+                    .collect();
                 if let Some(mailbox) = account.selected_mailbox() {
-                    let _ = account
-                        .worker
-                        .post(ActionKind::OpenMailbox(mailbox.name.clone()));
+                    let name = mailbox.name.clone();
+                    if account.worker.post(ActionKind::OpenMailbox(name)).is_ok() {
+                        account.messages_loading = true;
+                    }
+                } else {
+                    Self::pump_mailbox_status(account);
                 }
+            }
+            WorkerEventKind::MailboxStatus {
+                name,
+                total,
+                unread,
+            } => {
+                account.mailbox_status_inflight = false;
+                if let Some(mailbox) = account.mailboxes.iter_mut().find(|m| m.name == name) {
+                    mailbox.total = total;
+                    mailbox.unread = unread;
+                    mailbox.counts_known = true;
+                }
+                Self::pump_mailbox_status(account);
             }
             WorkerEventKind::MailboxOpened {
                 name,
                 messages,
                 elapsed_micros,
             } => {
+                account.messages_loading = false;
                 account.current_mailbox = Some(name.clone());
                 account.messages = messages;
                 account.message_index = 0;
                 account.preview_scroll = 0;
+                account.smooth_message_target = None;
+                account.smooth_preview_target = None;
                 account.bodies.clear();
                 account.pending_bodies.clear();
+                account.pending_seen.clear();
                 account.last_scan_micros = Some(elapsed_micros);
                 account.clamp_selection();
-                account.request_selected_body();
+                self.message_open = false;
+                self.focus = Focus::Messages;
                 self.status = StatusLine::temporary(
                     format!(
                         "{}: loaded {} messages from {} in {:.2} ms",
@@ -214,18 +439,80 @@ impl App {
                     ),
                     Duration::from_secs(4),
                 );
+                Self::pump_mailbox_status(account);
             }
             WorkerEventKind::BodyLoaded(body) => {
-                account.pending_bodies.remove(&body.id);
-                account.bodies.insert(body.id.clone(), body);
+                let id = body.id.clone();
+                account.pending_bodies.remove(&id);
+                account.bodies.insert(id.clone(), body);
+                if self.message_open
+                    && account
+                        .selected_message()
+                        .is_some_and(|message| message.id == id && message.unread())
+                {
+                    account.request_seen(id, true);
+                }
+                Self::pump_mailbox_status(account);
+            }
+            WorkerEventKind::MessageExported { path } => {
+                self.status = StatusLine::temporary(
+                    format!("raw message exported to {}", path.display()),
+                    Duration::from_secs(8),
+                );
+            }
+            WorkerEventKind::SeenChanged { id, seen } => {
+                account.pending_seen.remove(&id);
+                let mut unread_delta = 0isize;
+                if let Some(message) = account.messages.iter_mut().find(|message| message.id == id) {
+                    let was_unread = message.unread();
+                    message.flags.set(MessageFlags::SEEN, seen);
+                    let is_unread = message.unread();
+                    unread_delta = match (was_unread, is_unread) {
+                        (true, false) => -1,
+                        (false, true) => 1,
+                        _ => 0,
+                    };
+                }
+                if unread_delta != 0 {
+                    if let Some(current) = account.current_mailbox.as_deref() {
+                        if let Some(mailbox) = account
+                            .mailboxes
+                            .iter_mut()
+                            .find(|mailbox| mailbox.name == current && mailbox.counts_known)
+                        {
+                            mailbox.unread = mailbox.unread.saturating_add_signed(unread_delta);
+                        }
+                    }
+                }
             }
             WorkerEventKind::MutationComplete => {
                 if let Some(name) = account.current_mailbox.clone() {
-                    let _ = account.worker.post(ActionKind::OpenMailbox(name));
-                    let _ = account.worker.post(ActionKind::ListMailboxes);
+                    if account.worker.post(ActionKind::OpenMailbox(name)).is_ok() {
+                        account.messages_loading = true;
+                    }
+                    if account.worker.post(ActionKind::ListMailboxes).is_ok() {
+                        account.mailboxes_loading = true;
+                    }
                 }
             }
+            WorkerEventKind::MessageSent => {
+                if event.account == self.account_index {
+                    self.composer = None;
+                }
+                self.status = StatusLine::temporary("message sent", Duration::from_secs(4));
+            }
             WorkerEventKind::Error(error) => {
+                account.connecting = false;
+                account.mailboxes_loading = false;
+                account.messages_loading = false;
+                account.mailbox_status_inflight = false;
+                account.pending_bodies.clear();
+                account.pending_seen.clear();
+                if event.account == self.account_index {
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.sending = false;
+                    }
+                }
                 self.status = StatusLine::error(format!("{}: {error}", account.name));
             }
             WorkerEventKind::Stopped => {}
@@ -236,22 +523,192 @@ impl App {
         if self.status.expired() {
             self.status = StatusLine::info("ready");
         }
+
+        if self.theme_picker_visible {
+            match command {
+                Command::Down => self.preview_theme(1),
+                Command::Up => self.preview_theme(-1),
+                Command::Open => self.commit_theme_picker(),
+                Command::ToggleThemePicker | Command::Escape | Command::Quit => {
+                    self.cancel_theme_picker();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.help_visible {
+            match command {
+                Command::ToggleHelp | Command::Escape | Command::Quit => self.help_visible = false,
+                _ => {}
+            }
+            return;
+        }
+
         match command {
             Command::Quit => self.should_quit = true,
-            Command::FocusNext => self.focus = self.focus.next(),
-            Command::FocusPrevious => self.focus = self.focus.previous(),
+            Command::FocusNext => {
+                self.count_prefix = None;
+                self.focus = self.focus.next(self.message_open);
+            }
+            Command::FocusPrevious => {
+                self.count_prefix = None;
+                self.focus = self.focus.previous(self.message_open);
+            }
             Command::NextAccount => self.change_account(1),
             Command::PreviousAccount => self.change_account(-1),
-            Command::Down => self.move_selection(1),
-            Command::Up => self.move_selection(-1),
-            Command::PageDown => self.move_selection(10),
-            Command::PageUp => self.move_selection(-10),
-            Command::Top => self.jump(false),
-            Command::Bottom => self.jump(true),
-            Command::Open => self.open_selection(),
-            Command::ToggleSeen => self.toggle_seen(),
-            Command::Refresh => self.refresh(),
+            Command::Down => {
+                let count = self.take_count(1);
+                self.move_selection(isize::try_from(count).unwrap_or(isize::MAX));
+            }
+            Command::Up => {
+                let count = self.take_count(1);
+                self.move_selection(-isize::try_from(count).unwrap_or(isize::MAX));
+            }
+            Command::SmoothDown => {
+                self.count_prefix = None;
+                self.start_smooth_scroll(SMOOTH_SCROLL_ROWS);
+            }
+            Command::SmoothUp => {
+                self.count_prefix = None;
+                self.start_smooth_scroll(-SMOOTH_SCROLL_ROWS);
+            }
+            Command::PageDown => {
+                let count = self.take_count(10);
+                self.move_selection(isize::try_from(count).unwrap_or(isize::MAX));
+            }
+            Command::PageUp => {
+                let count = self.take_count(10);
+                self.move_selection(-isize::try_from(count).unwrap_or(isize::MAX));
+            }
+            Command::Top => {
+                self.count_prefix = None;
+                self.jump(false);
+            }
+            Command::Bottom => {
+                self.count_prefix = None;
+                self.jump(true);
+            }
+            Command::Open => {
+                self.count_prefix = None;
+                self.open_selection();
+            }
+            Command::ToggleSeen => {
+                self.count_prefix = None;
+                self.toggle_seen();
+            }
+            Command::Refresh => {
+                self.count_prefix = None;
+                self.refresh();
+            }
+            Command::ToggleThemePicker => {
+                self.count_prefix = None;
+                self.open_theme_picker();
+            }
+            Command::ExportRaw => {
+                self.count_prefix = None;
+                self.export_selected_raw();
+            }
+            Command::ToggleHelp => {
+                self.count_prefix = None;
+                self.help_visible = true;
+            }
+            Command::ToggleHtml => {
+                self.count_prefix = None;
+                self.toggle_html();
+            }
+            Command::Compose => {
+                self.count_prefix = None;
+                self.begin_compose();
+            }
+            Command::Reply => {
+                self.count_prefix = None;
+                self.begin_reply();
+            }
+            Command::Escape => {
+                self.count_prefix = None;
+                if self.message_open {
+                    self.close_message();
+                } else {
+                    self.focus = Focus::Messages;
+                }
+            }
+            Command::Digit(digit) => self.push_count_digit(digit),
             Command::None => {}
+        }
+    }
+
+    #[must_use]
+    pub fn animation_active(&self) -> bool {
+        self.account().is_some_and(|account| {
+            account.smooth_message_target.is_some() || account.smooth_preview_target.is_some()
+        })
+    }
+
+    /// Advance one visual row of a pending Ctrl-j/Ctrl-k animation. Additional
+    /// key presses adjust the target rather than queueing independent animations,
+    /// so reversing direction is immediate.
+    pub fn advance_animation(&mut self) {
+        let focus = self.focus;
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        match focus {
+            Focus::Messages => {
+                let Some(target) = account.smooth_message_target else {
+                    return;
+                };
+                if account.message_index < target {
+                    account.message_index += 1;
+                } else if account.message_index > target {
+                    account.message_index = account.message_index.saturating_sub(1);
+                }
+                account.preview_scroll = 0;
+                if account.message_index == target {
+                    account.smooth_message_target = None;
+                }
+            }
+            Focus::Preview => {
+                let Some(target) = account.smooth_preview_target else {
+                    return;
+                };
+                if account.preview_scroll < target {
+                    account.preview_scroll = account.preview_scroll.saturating_add(1);
+                } else if account.preview_scroll > target {
+                    account.preview_scroll = account.preview_scroll.saturating_sub(1);
+                }
+                if account.preview_scroll == target {
+                    account.smooth_preview_target = None;
+                }
+            }
+            Focus::Mailboxes => account.smooth_message_target = None,
+        }
+    }
+
+    fn pump_mailbox_status(account: &mut AccountState) {
+        if account.mailbox_status_inflight
+            || account.messages_loading
+            || !account.pending_bodies.is_empty()
+        {
+            return;
+        }
+        while let Some(name) = account.mailbox_status_queue.pop_front() {
+            if account
+                .mailboxes
+                .iter()
+                .find(|mailbox| mailbox.name == name)
+                .is_some_and(|mailbox| mailbox.counts_known)
+            {
+                continue;
+            }
+            if account
+                .worker
+                .post(ActionKind::MailboxStatus(name.clone()))
+                .is_ok()
+            {
+                account.mailbox_status_inflight = true;
+            }
+            break;
         }
     }
 
@@ -259,6 +716,9 @@ impl App {
         if self.accounts.is_empty() {
             return;
         }
+        self.count_prefix = None;
+        self.message_open = false;
+        self.focus = Focus::Messages;
         self.account_index = offset_index(self.account_index, self.accounts.len(), delta);
     }
 
@@ -267,9 +727,12 @@ impl App {
         let Some(account) = self.account_mut() else {
             return;
         };
+        account.smooth_message_target = None;
+        account.smooth_preview_target = None;
         match focus {
             Focus::Mailboxes => {
-                account.mailbox_index = bounded_index(account.mailbox_index, account.mailboxes.len(), delta);
+                account.mailbox_index =
+                    bounded_index(account.mailbox_index, account.mailboxes.len(), delta);
             }
             Focus::Messages => {
                 let previous = account.message_index;
@@ -278,10 +741,37 @@ impl App {
                 if account.message_index != previous {
                     account.preview_scroll = 0;
                 }
-                account.request_selected_body();
             }
             Focus::Preview => {
                 account.preview_scroll = bounded_scroll(account.preview_scroll, delta);
+            }
+        }
+    }
+
+    fn start_smooth_scroll(&mut self, delta: isize) {
+        let focus = self.focus;
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        match focus {
+            Focus::Messages => {
+                if account.messages.is_empty() {
+                    return;
+                }
+                let base = account
+                    .smooth_message_target
+                    .unwrap_or(account.message_index);
+                account.smooth_message_target = Some(bounded_index(base, account.messages.len(), delta));
+            }
+            Focus::Preview => {
+                let base = account
+                    .smooth_preview_target
+                    .unwrap_or(account.preview_scroll);
+                account.smooth_preview_target = Some(bounded_scroll(base, delta));
+            }
+            Focus::Mailboxes => {
+                account.mailbox_index =
+                    bounded_index(account.mailbox_index, account.mailboxes.len(), delta.signum());
             }
         }
     }
@@ -291,6 +781,8 @@ impl App {
         let Some(account) = self.account_mut() else {
             return;
         };
+        account.smooth_message_target = None;
+        account.smooth_preview_target = None;
         match focus {
             Focus::Mailboxes => {
                 account.mailbox_index = if bottom {
@@ -306,7 +798,6 @@ impl App {
                     0
                 };
                 account.preview_scroll = 0;
-                account.request_selected_body();
             }
             Focus::Preview => {
                 account.preview_scroll = if bottom { u16::MAX } else { 0 };
@@ -323,46 +814,291 @@ impl App {
                 let Some(name) = account.selected_mailbox().map(|m| m.name.clone()) else {
                     return;
                 };
-                let _ = account.worker.post(ActionKind::OpenMailbox(name));
+                if account.worker.post(ActionKind::OpenMailbox(name)).is_ok() {
+                    account.messages_loading = true;
+                }
+                self.message_open = false;
                 self.focus = Focus::Messages;
             }
             Focus::Messages => {
+                if self.account().is_none_or(|account| account.selected_message().is_none()) {
+                    return;
+                }
+                self.message_open = true;
                 if let Some(account) = self.account_mut() {
                     account.preview_scroll = 0;
                     account.request_selected_body();
+                    Self::mark_cached_selected_seen(account);
                 }
                 self.focus = Focus::Preview;
             }
-            Focus::Preview => self.focus = Focus::Messages,
+            Focus::Preview => {}
         }
+    }
+
+    fn close_message(&mut self) {
+        self.message_open = false;
+        self.focus = Focus::Messages;
+        if let Some(account) = self.account_mut() {
+            account.smooth_preview_target = None;
+            account.preview_scroll = 0;
+        }
+    }
+
+    fn mark_cached_selected_seen(account: &mut AccountState) {
+        let Some(id) = account
+            .selected_message()
+            .filter(|message| message.unread() && account.bodies.contains_key(&message.id))
+            .map(|message| message.id.clone())
+        else {
+            return;
+        };
+        account.request_seen(id, true);
     }
 
     fn toggle_seen(&mut self) {
         let Some(account) = self.account_mut() else {
             return;
         };
+        let Some((id, seen)) = account
+            .selected_message()
+            .map(|message| (message.id.clone(), !message.flags.contains(MessageFlags::SEEN)))
+        else {
+            return;
+        };
+        account.request_seen(id, seen);
+    }
+
+    fn open_theme_picker(&mut self) {
+        self.theme_before_picker = self.theme_index;
+        self.theme_picker_visible = true;
+    }
+
+    fn preview_theme(&mut self, delta: isize) {
+        self.theme_index = offset_index(self.theme_index, THEMES.len(), delta);
+    }
+
+    fn commit_theme_picker(&mut self) {
+        self.theme_picker_visible = false;
+        let name = self.theme().name;
+        if let Err(error) = persist_theme(name) {
+            self.status = StatusLine::error(format!("could not persist theme: {error:#}"));
+        } else {
+            self.status = StatusLine::temporary(
+                format!("theme: {name}"),
+                Duration::from_secs(2),
+            );
+        }
+    }
+
+    fn cancel_theme_picker(&mut self) {
+        self.theme_index = self.theme_before_picker;
+        self.theme_picker_visible = false;
+    }
+
+    fn export_selected_raw(&mut self) {
+        let path = dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("aerc-rs")
+            .join("debug-message.eml");
+        let Some(account) = self.account_mut() else {
+            return;
+        };
         let Some(mailbox) = account.current_mailbox.clone() else {
             return;
         };
-        let Some(message) = account.selected_message() else {
+        let Some(id) = account.selected_message().map(|message| message.id.clone()) else {
             return;
         };
-        let seen = !message.flags.contains(MessageFlags::SEEN);
-        let _ = account.worker.post(ActionKind::SetSeen {
-            mailbox,
-            id: message.id.clone(),
-            seen,
-        });
+        match account.worker.post(ActionKind::ExportRaw { mailbox, id, path }) {
+            Ok(_) => self.status = StatusLine::info("exporting raw message…"),
+            Err(_) => {
+                self.status = StatusLine::error("mail worker queue is busy; export not started");
+            }
+        }
+    }
+
+    fn toggle_html(&mut self) {
+        let mode = {
+            let Some(account) = self.account_mut() else {
+                return;
+            };
+            if !account
+                .selected_body()
+                .is_some_and(MessageBody::has_html_alternative)
+            {
+                None
+            } else {
+                account.prefer_html = !account.prefer_html;
+                Some(account.prefer_html)
+            }
+        };
+        let Some(prefer_html) = mode else {
+            self.status = StatusLine::temporary(
+                "selected message has no HTML alternative",
+                Duration::from_secs(2),
+            );
+            return;
+        };
+        self.status = StatusLine::temporary(
+            if prefer_html {
+                "HTML mail rendering enabled"
+            } else {
+                "plain-text mail rendering enabled"
+            },
+            Duration::from_secs(2),
+        );
     }
 
     fn refresh(&mut self) {
         let Some(account) = self.account_mut() else {
             return;
         };
-        let _ = account.worker.post(ActionKind::ListMailboxes);
-        if let Some(name) = account.current_mailbox.clone() {
-            let _ = account.worker.post(ActionKind::OpenMailbox(name));
+        if account.worker.post(ActionKind::ListMailboxes).is_ok() {
+            account.mailboxes_loading = true;
         }
+        if let Some(name) = account.current_mailbox.clone() {
+            if account.worker.post(ActionKind::OpenMailbox(name)).is_ok() {
+                account.messages_loading = true;
+            }
+        }
+    }
+
+    fn begin_compose(&mut self) {
+        let Some(account) = self.account() else {
+            return;
+        };
+        if !account.outgoing_configured {
+            self.status = StatusLine::error(
+                "no outgoing SMTP transport configured; add `outgoing = ...` to this account",
+            );
+            return;
+        }
+        self.composer = Some(Composer::new());
+    }
+
+    fn begin_reply(&mut self) {
+        let composer = {
+            let Some(account) = self.account() else {
+                return;
+            };
+            if !account.outgoing_configured {
+                None
+            } else {
+                account.selected_message().map(|message| {
+                    Composer::reply(message, account.selected_body(), account.prefer_html)
+                })
+            }
+        };
+        if !self.account().is_some_and(|account| account.outgoing_configured) {
+            self.status = StatusLine::error(
+                "no outgoing SMTP transport configured; add `outgoing = ...` to this account",
+            );
+            return;
+        }
+        if let Some(composer) = composer {
+            self.composer = Some(composer);
+        }
+    }
+
+    fn handle_composer_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.send_composer();
+            return;
+        }
+        let sending = self.composer.as_ref().is_some_and(|composer| composer.sending);
+        if key.code == KeyCode::Esc {
+            if sending {
+                self.status = StatusLine::temporary(
+                    "send is already in progress",
+                    Duration::from_secs(2),
+                );
+            } else {
+                self.composer = None;
+            }
+            return;
+        }
+        let Some(composer) = self.composer.as_mut() else {
+            return;
+        };
+        if composer.sending {
+            return;
+        }
+        match key.code {
+            KeyCode::Tab => composer.field = composer.field.next(),
+            KeyCode::BackTab => composer.field = composer.field.previous(),
+            KeyCode::Enter if composer.field != ComposeField::Body => {
+                composer.field = composer.field.next();
+            }
+            KeyCode::Enter => composer.body.push('\n'),
+            KeyCode::Backspace => {
+                composer.field_mut().pop();
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                composer.field_mut().push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    fn send_composer(&mut self) {
+        let Some(composer) = self.composer.as_ref() else {
+            return;
+        };
+        if composer.sending {
+            return;
+        }
+        if composer.to.trim().is_empty() {
+            self.status = StatusLine::error("To cannot be empty");
+            return;
+        }
+        let Some(account) = self.account() else {
+            return;
+        };
+        let message = OutgoingMessage {
+            from: account.from.clone(),
+            to: composer.to.clone(),
+            cc: composer.cc.clone(),
+            subject: composer.subject.clone(),
+            body: composer.body.clone(),
+            in_reply_to: composer.in_reply_to.clone(),
+            references: composer.references.clone(),
+        };
+        if account.worker.post(ActionKind::Send(message)).is_ok() {
+            if let Some(composer) = self.composer.as_mut() {
+                composer.sending = true;
+            }
+            self.status = StatusLine::info("sending message…");
+        } else {
+            self.status = StatusLine::error("mail worker queue is busy; message was not sent");
+        }
+    }
+
+    fn push_count_digit(&mut self, digit: u8) {
+        if digit == 0 && self.count_prefix.is_none() {
+            return;
+        }
+        let next = self
+            .count_prefix
+            .unwrap_or(0)
+            .saturating_mul(10)
+            .saturating_add(usize::from(digit))
+            .min(MAX_COUNT_PREFIX);
+        self.count_prefix = Some(next);
+    }
+
+    fn take_count(&mut self, default: usize) -> usize {
+        self.count_prefix.take().unwrap_or(default).max(1)
+    }
+}
+
+fn display_sender(message: &MessageSummary) -> String {
+    if message.from_name.is_empty() {
+        message.from_address.clone()
+    } else {
+        message.from_name.clone()
     }
 }
 

@@ -1,39 +1,52 @@
-# aerc-rs — milestone 2: real IMAP
+# aerc-rs — milestone 3.1: aerc-style browser + themes
 
-A Rust terminal email client foundation inspired by aerc's backend/worker/model split, optimized around the same principles we have been using for lazygitrs: fast startup, event-driven redraws, bounded background work, measurable performance, and tests around behavior rather than visual guesswork.
+A Rust terminal email client inspired by aerc's backend/worker/model split and by lazygitrs' responsiveness model: bounded background work, event-driven redraws, Vim-first navigation, measurable performance, and tests around behavior.
 
-Milestone 2 adds **real TLS IMAP and aerc-compatible authentication**. The TUI is still intentionally rough; protocol/model correctness and responsiveness come first.
+Milestone 3.1 makes the browsing model much closer to aerc: mailbox + message list is the normal screen, Enter opens a full-screen reader, Esc returns to the list, and no body is fetched while you move through the inbox. It also adds live persistent themes and raw-message export for debugging difficult MIME/HTML mail.
 
-## What works now
+## What works
 
-- Rust 2024 project using Ratatui 0.30.2 + Crossterm 0.29.
-- Cross-platform terminal/runtime design (Linux/macOS/Windows).
-- Multiple accounts in core state/runtime.
-- aerc-like typed worker action/event boundary with request correlation.
-- Maildir backend for local/offline testing and archives.
-- IMAP backend:
-  - TLS IMAP (`imaps://`) using rustls and the platform certificate verifier,
-  - password/app-password login,
-  - SASL `OAUTHBEARER` and `XOAUTH2`,
-  - aerc-compatible refresh-token exchange when `token_endpoint` is present,
-  - `LIST` + `STATUS` mailbox discovery/counts,
-  - bounded newest-message header fetches using UID-bearing `FETCH`,
-  - lazy full-message fetch by UID,
-  - seen/unseen updates,
-  - MOVE with COPY/delete fallback,
-  - UID-scoped delete/expunge.
-- `source_cred_cmd` support so reusable credentials do not have to live in TOML.
-- URI/debug/output redaction: passwords, tokens, client secrets, and OAuth query parameters are not printed by backend diagnostics or `--headless-check`.
-- Three-pane TUI: folders, message list, preview.
-- Vim-style navigation: `j/k`, `g/G`, `Tab`, `Enter`, `u`, `r`, `q`; preview scrolls independently.
-- Message model keeps `Message-ID`, `In-Reply-To`, and `References` for kernel-style threading/patch series.
-- No periodic redraw loop. Terminal input and backend workers wake one bounded event queue; UI→worker requests are non-blocking.
-- Unit/integration tests plus a 10k-message Maildir fixture generator and repeated performance-smoke script.
-- CI definition for formatting/Clippy, Linux/macOS/Windows tests, and Rust 1.98.1 MSRV checking.
+- Rust 2024 + Ratatui 0.30/Crossterm 0.29, Linux/macOS/Windows-oriented design.
+- Multiple accounts with one blocking backend worker per account; network stalls never block terminal input/rendering.
+- Maildir and real TLS IMAP backends.
+- IMAP password/app-password, OAUTHBEARER, XOAUTH2, refresh-token exchange, UID-based mutations, MOVE/delete, bounded header windows.
+- Faster first paint:
+  - `LIST` no longer waits for one `STATUS` round trip per folder;
+  - mailbox unread counts fill lazily after the selected mailbox is usable;
+  - IMAP list scans fetch only the header fields the model needs;
+  - stale queued body requests collapse to the newest selected message.
+- aerc-style browser/reader split:
+  - account tabs on top;
+  - browser view is a proportional mailbox column (33% by default) plus a message list using the remaining width;
+  - there is no permanent preview pane;
+  - `Enter`/`l` opens the selected message in a full-screen reader;
+  - `Esc` returns to the same message-list selection;
+  - browsing and smooth scrolling never trigger body downloads.
+- Vim/lazygitrs navigation:
+  - relative line numbers (current line is absolute);
+  - `20j`, `20k`, etc.;
+  - `Ctrl-j` / `Ctrl-k` interruptible smooth 22-row movement;
+  - `g/G`, page movement, pane focus.
+- Loading feedback for account/folder/message-body work.
+- Viewing a body automatically sets `\\Seen`; merely passing over messages during smooth movement does not.
+- `u` explicitly toggles seen/unseen and updates local unread counts after server acknowledgement.
+- Built-in HTML-mail rendering: plain text is preferred when useful; HTML-only messages get a clean terminal rendering without requiring w3m. `h` switches alternatives where available.
+- `?` opens a help popup; the status bar no longer permanently consumes space with key hints.
+- Hot-swappable themes: press `t`, use `j/k` to preview themes live, `Enter` to persist, or `Esc` to revert. Built-ins: default, Nord, Gruvbox, Catppuccin, Tokyo Night, and monochrome.
+- `e` exports the selected message's raw RFC 5322 source to the aerc-rs cache directory (`debug-message.eml`) with mode 0600 on Unix, making broken MIME/HTML mail easy to inspect outside the alternate-screen TUI.
+- SMTP compose/send foundation:
+  - `c` new message;
+  - `R` reply with `In-Reply-To`/`References` threading metadata;
+  - `Ctrl-s` send;
+  - implicit TLS (`smtps://`) or required STARTTLS (`smtp://`);
+  - PLAIN, LOGIN, and XOAUTH2;
+  - refresh-token exchange for XOAUTH2;
+  - `outgoing_cred_cmd` for external secret storage.
+- `--headless-check` reports connect, LIST, header scan, and first-body load timing.
 
-## Test a real IMAP account
+## Configure a real account
 
-Copy `config.example.toml` to:
+Copy `config.example.toml` to `~/.config/aerc-rs/config.toml` and keep it private:
 
 ```bash
 mkdir -p ~/.config/aerc-rs
@@ -41,100 +54,66 @@ cp config.example.toml ~/.config/aerc-rs/config.toml
 chmod 600 ~/.config/aerc-rs/config.toml
 ```
 
-For a Gmail account using an app password, an account can look like:
+For Gmail with an app password:
 
 ```toml
 [[accounts]]
 name = "Personal"
 source = "imaps://you%40gmail.com@imap.gmail.com:993"
 source_cred_cmd = "pass show mail/personal-app-password"
+from = "Your Name <you@gmail.com>"
+outgoing = "smtps://you%40gmail.com@smtp.gmail.com:465"
+outgoing_cred_cmd = "pass show mail/personal-app-password"
 default_mailbox = "INBOX"
 max_messages = 500
 ```
 
-For the same style of OAuth refresh-token setup used by aerc:
+For an aerc-like OAuth refresh-token account, incoming IMAP can use OAUTHBEARER while Gmail submission uses XOAUTH2:
 
 ```toml
 [[accounts]]
 name = "University"
 source = "imaps+oauthbearer://you%40example.edu@imap.gmail.com:993?client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
 source_cred_cmd = "pass show mail/university-refresh-token"
+from = "Your Name <you@example.edu>"
+outgoing = "smtp+xoauth2://you%40example.edu@smtp.gmail.com:587?client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
+outgoing_cred_cmd = "pass show mail/university-refresh-token"
 default_mailbox = "INBOX"
 max_messages = 500
 ```
 
-With `token_endpoint` present, the supplied credential is treated as a **refresh token** and exchanged for a short-lived access token. Without `token_endpoint`, the supplied credential is treated as the access token itself. This mirrors aerc's source-URI model.
+The URI password component is still accepted for aerc compatibility, but external credential commands are preferred. There is intentionally no CLI secret flag.
 
-For a one-off compatibility test you can also put the percent-encoded password/refresh token directly in the source URI just as aerc does. Prefer `source_cred_cmd` afterward; command-line arguments are deliberately not provided for secrets because shell history and process listings are poor credential stores.
-
-Before opening the TUI, test authentication and mailbox/header retrieval:
-
-```bash
-cargo run --release -- --headless-check
-```
-
-Expected shape (the URI is redacted):
-
-```text
-Personal: imaps://you@gmail.com@imap.gmail.com:993 | connect=... ms list=... folders/... ms scan=500 messages/... ms (... msg/s)
-```
-
-Then run the TUI:
-
-```bash
-cargo run --release
-```
-
-`max_messages` bounds the initial newest-message window while the UI has no pagination. Set it to `0` to fetch all headers, but that is intentionally not the default for very large Gmail folders.
-
-## Run against Maildir
-
-```bash
-cargo run --release -- --maildir ~/Mail/kernel
-```
-
-The Maildir backend accepts both normal `:2,` flags and the Windows-safe `!2,` spelling.
-
-## Validate
+## Validate and benchmark
 
 ```bash
 ./scripts/validate.sh
+cargo run --release -- --headless-check
 ```
 
-For a repeatable local scan benchmark:
+The headless output now includes a first-message body timing, for example:
+
+```text
+Personal: imaps://you@gmail.com@imap.gmail.com:993 | connect=... ms list=... folders/... ms scan=... messages/... ms (... msg/s) body=... ms
+```
+
+That lets us separately track the mailbox-list regression you saw, header-list speed, and actual message-open latency.
+
+For a repeatable local workload:
 
 ```bash
 cargo run --release --example generate_fixture -- /tmp/aerc-rs-maildir 10000
-cargo run --release -- --maildir /tmp/aerc-rs-maildir --headless-check
 ./scripts/perf-smoke.sh /tmp/aerc-rs-maildir 10000 5
 ```
 
-## Key bindings
+## Main controls
 
-| Key | Action |
-| --- | --- |
-| `j` / `k` | move down / up |
-| `g` / `G` | first / last |
-| `Space` / `PgDn` | move 10 down |
-| `PgUp` | move 10 up |
-| `Tab` / `Shift-Tab` | change pane |
-| `Enter` / `l` | open mailbox / preview |
-| `u` | toggle seen/unseen |
-| `r` | refresh |
-| `[` / `]` | previous / next account |
-| `q` / `Ctrl-C` | quit |
+Press `?` in the client for the complete map. The important controls are `j/k`, numeric prefixes such as `20j`, `Ctrl-j/Ctrl-k` smooth movement, `g/G`, `Tab`, `Enter` to open a full-screen message, `Esc` to return, `u` seen/unseen, `h` plain/HTML, `e` raw-message export, `t` themes, `c` compose, `R` reply, and `q` quit.
 
-## Why blocking IMAP is intentional here
+The composer is intentionally simple in this milestone: append-at-cursor-end editing, To/Cc/Subject/Body fields, and SMTP send. A proper editor integration, drafts, attachments, reply-all/forward, signatures, aliases, and sent-copy policy belong in subsequent parity work.
 
-Each account already owns a dedicated backend worker thread. IMAP/TLS/OAuth can therefore block on network I/O without blocking Crossterm input or Ratatui rendering. This keeps Tokio out of the hot UI path and preserves a simple backend trait. If we later need multiplexed connections, IDLE management, or JMAP concurrency, those details can live behind the same worker/backend boundary.
+## Still intentionally incomplete versus aerc
 
-## Next milestones
+Milestone 3 is not claiming full aerc parity yet. Major remaining pieces include IMAP IDLE/reconnect, header pagination/persistent cache, search/sort/thread views, drafts/sent synchronization, attachments, external editor composition, MIME attachment viewing/opening, address book/aliases, reply-all/forward, account/folder configuration parity, and the developer-mail features that are the eventual differentiator (patch-series grouping, rich diffs, and lazygitrs integration).
 
-1. Capability negotiation + IDLE/reconnect/new-mail updates.
-2. IMAP pagination/cache so huge folders never require a large header window.
-3. SMTP/sendmail abstraction and composer/reply/forward.
-4. Local thread builder from `Message-ID`/`References`, then server THREAD where useful.
-5. Patch-series grouping/rendering and lazygitrs-quality diffs.
-6. Apply mailed patches to a selected repository/branch and integrate directly with lazygitrs.
-
-The implementation is a clean Rust design informed by aerc's separation of protocol workers, backend-neutral models, account/message state, and UI; it is not a line-for-line port.
+The important part is that those features now sit on stable backend-neutral seams instead of requiring UI/protocol rewrites.

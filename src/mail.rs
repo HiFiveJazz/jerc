@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Read};
 
 use anyhow::{Context, Result, anyhow};
-use mail_parser::MessageParser;
+use mail_parser::{MessageParser, PartKind};
 
 use crate::model::{MessageBody, MessageFlags, MessageId, MessageSummary};
 
@@ -152,16 +152,37 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         .parse(raw)
         .ok_or_else(|| anyhow!("unable to parse RFC 5322 message"))?;
 
-    let text = message
-        .body_text(0)
-        .map(|body| body.into_owned())
-        .unwrap_or_else(|| "(message has no displayable text body)".to_owned());
+    // mail-parser's RFC 8621 body lists intentionally include synthesized
+    // alternatives: an HTML part may stand in for missing text/plain, and a
+    // text part may stand in for missing text/html. Inspect PartKind so the UI
+    // only exposes `h` when the sender actually supplied both alternatives.
+    let plain_text = message.text_body().find_map(|part| match part.kind() {
+        PartKind::Text => part.text().map(|text| text.into_owned()),
+        _ => None,
+    });
+
+    let html_text = message.html_body().find_map(|part| match part.kind() {
+        PartKind::Html => part.text().map(|html| render_html_for_terminal(html.as_ref())),
+        _ => None,
+    });
 
     Ok(MessageBody {
         id,
-        text,
+        plain_text,
+        html_text,
         attachment_count: message.attachments().count(),
     })
+}
+
+fn render_html_for_terminal(html: &str) -> String {
+    // html2text uses html5ever, so malformed real-world newsletter HTML is
+    // handled much more like a browser than a tag stripper. Keep mail-parser's
+    // lightweight converter as a defensive fallback rather than ever showing a
+    // blank preview because one HTML renderer rejected a message.
+    html2text::from_read(html.as_bytes(), 100)
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| mail_parser::html_to_text(html))
 }
 
 pub fn read_all(mut reader: impl Read) -> Result<Vec<u8>> {
@@ -204,6 +225,21 @@ Hello from the body.\r\n";
     }
 
     #[test]
+    fn plain_only_mail_does_not_invent_an_html_toggle() {
+        let body = parse_body(MessageId("plain".into()), MAIL).unwrap();
+        assert!(body.plain_text.is_some());
+        assert!(body.html_text.is_none());
+    }
+
+    #[test]
+    fn html_only_mail_uses_terminal_html_renderer() {
+        let raw = b"From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><h1>Hello</h1><p>World</p></body></html>";
+        let body = parse_body(MessageId("html".into()), raw).unwrap();
+        assert!(body.plain_text.is_none());
+        assert!(body.html_text.as_deref().is_some_and(|text| text.contains("Hello")));
+    }
+
+    #[test]
     fn parses_summary_and_body() {
         let headers = read_header_block(Cursor::new(MAIL)).unwrap();
         let summary = parse_summary(
@@ -218,6 +254,19 @@ Hello from the body.\r\n";
         assert!(summary.unread());
 
         let body = parse_body(MessageId("fixture".into()), MAIL).unwrap();
-        assert!(body.text.contains("Hello from the body"));
+        assert!(body.display_text(false).contains("Hello from the body"));
     }
+
+    #[test]
+    fn renders_html_only_mail_without_external_filters() {
+        let raw = b"From: Example <e@example.com>\r\n\
+Subject: HTML\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<table><tr><td>Hello</td><td>World</td></tr></table>";
+        let body = parse_body(MessageId("html".into()), raw).unwrap();
+        assert!(body.html_text.as_deref().is_some_and(|text| text.contains("Hello")));
+        assert!(body.display_text(false).contains("Hello"));
+    }
+
 }

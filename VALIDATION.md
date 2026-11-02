@@ -1,45 +1,42 @@
-# Validation status — milestone 2
+# Validation status — milestone 3.1
 
-Normal validation is one command:
+Normal local validation:
 
 ```bash
 ./scripts/validate.sh
 ```
 
-It runs formatting checks, Clippy with warnings denied, and all targets/tests. A 10,000-message Maildir fixture plus `--headless-check` provides a repeatable local header-scan benchmark. For an IMAP account, `--headless-check` also measures TLS/authentication, folder listing, and the bounded initial header scan.
+It runs formatting, Clippy with warnings denied, and all targets/tests. `--headless-check` now measures four network stages independently: connect/auth, mailbox LIST, selected-mailbox header scan, and first selected-body load.
 
-## New milestone-2 tests/checks
+## Milestone-3.1 test coverage added/updated
 
-The source includes tests for:
+The source now includes tests for:
 
-- parsing aerc-style percent-encoded password IMAP sources,
-- parsing OAuth refresh-token source parameters,
-- secret-safe source/debug redaction,
-- URI-credential precedence over `source_cred_cmd`,
-- Gmail XOAUTH2 payload shape,
-- RFC 7628 OAUTHBEARER payload shape and authzid escaping,
-- one-shot SASL secret response behavior,
-- mapping RFC 6154 special-use attributes exposed by `imap` 2.4.1 as custom attributes,
-- all milestone-1 mail parsing, Maildir, navigation, worker, and integration behavior.
+- Vim/lazygitrs-style key mapping including numeric prefixes, smooth Ctrl-j/Ctrl-k commands, theme picker and raw export;
+- Vim-style relative line-number calculation;
+- built-in theme lookup/uniqueness;
+- HTML-only message rendering without an external browser/filter;
+- body plain/HTML fallback behavior;
+- outgoing SMTP source parsing and secret redaction;
+- outgoing account configuration redaction;
+- the updated worker protocol, including the new mailbox-status and outgoing seams;
+- all previous Maildir, threading, IMAP-source/auth, redaction, and model tests.
 
 ## Validation performed in this build environment
 
-The artifact is statically checked here for:
+This environment still does not contain a Rust toolchain, and its package repository update path timed out. Therefore this artifact is **not claimed to be compiler-tested here**.
 
-- valid `Cargo.toml` and example TOML configuration,
-- valid shell syntax,
-- valid GitHub Actions YAML structure,
-- balanced Rust delimiters,
-- no `unsafe` blocks,
-- no copied user credentials/secrets in the source tree,
-- API shapes cross-checked against the current documentation for `imap` 2.4.1, `rustls-connector` 0.23, and `ureq` 3.x.
+Static checks performed before packaging include:
 
-A Rust toolchain is not installed in this execution container, so the artifact is **not claimed to be compiler-tested here**. Run `./scripts/validate.sh` on a Rust 1.98+ machine. Real IMAP authentication also necessarily requires testing against an account outside this sandbox.
+- TOML parsing for `Cargo.toml` and `config.example.toml`;
+- GitHub Actions YAML parsing;
+- shell syntax checks;
+- Rust delimiter/string/comment structural scan;
+- search for stale milestone-2 field/signature uses;
+- no `unsafe` blocks;
+- no copied user credentials/tokens in the artifact;
+- source-level review of the new browser/message state split, theme persistence, and raw-message export paths.
 
-## CI included
+The previous HTML fix uses `html2text`; `august` is no longer a dependency.
 
-`.github/workflows/ci.yml` runs:
-
-- `cargo fmt -- --check` and Clippy with warnings denied on Linux,
-- the full test suite on Linux, macOS, and Windows,
-- `cargo check` with Rust 1.98.1 to guard the declared MSRV.
+Run `./scripts/validate.sh` on the user's Rust machine. Any compiler/API error from that run should be treated as the next test result rather than hidden or assumed away.

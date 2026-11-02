@@ -50,7 +50,7 @@ fn maildir_is_usable_end_to_end() {
 
     let unread = messages.iter().find(|m| m.unread()).unwrap();
     let body = backend.fetch_body("INBOX", &unread.id).unwrap();
-    assert!(body.text.contains("body one"));
+    assert!(body.display_text(false).contains("body one"));
 
     backend.set_seen("INBOX", &unread.id, true).unwrap();
     let messages = backend.open_mailbox("INBOX").unwrap();

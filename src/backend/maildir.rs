@@ -198,9 +198,15 @@ impl MailBackend for MaildirBackend {
                     name,
                     total,
                     unread,
+                    counts_known: true,
                 })
             })
             .collect()
+    }
+
+    fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)> {
+        let path = self.mailbox_path(name)?;
+        Self::mailbox_counts(&path)
     }
 
     fn open_mailbox(&mut self, name: &str) -> Result<Vec<MessageSummary>> {
@@ -208,10 +214,13 @@ impl MailBackend for MaildirBackend {
     }
 
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody> {
+        let raw = self.fetch_raw(mailbox, id)?;
+        parse_body(id.clone(), &raw).context("parsing Maildir message body")
+    }
+
+    fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
         let path = self.locate(mailbox, id)?;
-        let raw = read_all(File::open(&path)?)?;
-        parse_body(id.clone(), &raw)
-            .with_context(|| format!("parsing message body from {}", path.display()))
+        read_all(File::open(&path)?).with_context(|| format!("reading message from {}", path.display()))
     }
 
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()> {

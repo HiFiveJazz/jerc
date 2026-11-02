@@ -41,6 +41,9 @@ pub fn from_source(source: &str) -> Result<Box<dyn MailBackend>> {
         source: source.to_owned(),
         default_mailbox: "INBOX".to_owned(),
         source_cred_cmd: None,
+        from: None,
+        outgoing: None,
+        outgoing_cred_cmd: None,
         max_messages: 500,
     };
     from_account(&account)
@@ -82,8 +85,10 @@ pub trait MailBackend: Send {
     fn capabilities(&self) -> Capabilities;
     fn connect(&mut self) -> Result<()>;
     fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>>;
+    fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)>;
     fn open_mailbox(&mut self, name: &str) -> Result<Vec<MessageSummary>>;
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody>;
+    fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>>;
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()>;
     fn delete(&mut self, mailbox: &str, id: &MessageId) -> Result<()>;
     fn move_to(&mut self, source: &str, destination: &str, id: &MessageId) -> Result<()>;

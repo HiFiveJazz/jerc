@@ -23,6 +23,18 @@ pub struct AccountConfig {
     /// storing long-lived credentials in config.toml.
     #[serde(default)]
     pub source_cred_cmd: Option<String>,
+    /// RFC 5322 From value used for new outgoing messages, e.g.
+    /// `Jazz Bhatia <jazz@example.com>`. If omitted, the SMTP username is used.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Optional aerc-style SMTP URI. Supported secure schemes are smtp://
+    /// (STARTTLS) and smtps:// (implicit TLS), with +plain, +login or +xoauth2.
+    #[serde(default)]
+    pub outgoing: Option<String>,
+    /// Optional command that prints the outgoing password or OAuth refresh/access
+    /// token. URI credentials take precedence, mirroring aerc.
+    #[serde(default)]
+    pub outgoing_cred_cmd: Option<String>,
     /// Maximum number of newest messages fetched when opening an IMAP
     /// mailbox. Maildir ignores this. The current UI is not paginated yet, so
     /// a bounded initial window keeps large Gmail folders responsive.
@@ -41,6 +53,18 @@ impl std::fmt::Debug for AccountConfig {
                 "source_cred_cmd",
                 &self.source_cred_cmd.as_ref().map(|_| "<configured>"),
             )
+            .field("from", &self.from)
+            .field(
+                "outgoing",
+                &self.outgoing.as_ref().map(|value| {
+                    let scheme = value.split_once("://").map_or("<invalid>", |(scheme, _)| scheme);
+                    format!("{scheme}://<redacted>")
+                }),
+            )
+            .field(
+                "outgoing_cred_cmd",
+                &self.outgoing_cred_cmd.as_ref().map(|_| "<configured>"),
+            )
             .field("max_messages", &self.max_messages)
             .finish()
     }
@@ -48,10 +72,22 @@ impl std::fmt::Debug for AccountConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UiConfig {
+    /// Legacy milestone-3 setting. Kept so existing config files continue to
+    /// parse; the browser now uses a proportional mailbox column instead.
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u16,
+    /// Legacy split-preview setting. The browser and message reader are now
+    /// separate screens, so this is intentionally ignored.
     #[serde(default = "default_message_width_percent")]
     pub message_width_percent: u16,
+    /// Width of the mailbox column while browsing. The message list consumes
+    /// the remaining horizontal space.
+    #[serde(default = "default_mailbox_width_percent")]
+    pub mailbox_width_percent: u16,
+    /// Initial theme. A theme selected from the in-TUI picker is persisted and
+    /// takes precedence on the next launch.
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 impl Default for UiConfig {
@@ -59,6 +95,8 @@ impl Default for UiConfig {
         Self {
             sidebar_width: default_sidebar_width(),
             message_width_percent: default_message_width_percent(),
+            mailbox_width_percent: default_mailbox_width_percent(),
+            theme: default_theme(),
         }
     }
 }
@@ -84,6 +122,9 @@ impl Config {
                 source: format!("maildir://{}", path.display()),
                 default_mailbox: default_mailbox(),
                 source_cred_cmd: None,
+                from: None,
+                outgoing: None,
+                outgoing_cred_cmd: None,
                 max_messages: default_max_messages(),
             }],
             ui: UiConfig::default(),
@@ -115,6 +156,14 @@ const fn default_message_width_percent() -> u16 {
     48
 }
 
+const fn default_mailbox_width_percent() -> u16 {
+    33
+}
+
+fn default_theme() -> String {
+    "default".to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;
@@ -130,12 +179,16 @@ mod tests {
 
                 [ui]
                 sidebar_width = 27
+                mailbox_width_percent = 35
+                theme = "nord"
             "#,
         )
         .unwrap();
         assert_eq!(config.accounts[0].name, "Kernel");
         assert_eq!(config.accounts[0].max_messages, 500);
         assert_eq!(config.ui.sidebar_width, 27);
+        assert_eq!(config.ui.mailbox_width_percent, 35);
+        assert_eq!(config.ui.theme, "nord");
     }
 
     #[test]
@@ -155,5 +208,23 @@ mod tests {
             Some("pass show mail/example")
         );
         assert_eq!(config.accounts[0].max_messages, 250);
+    }
+
+    #[test]
+    fn parses_outgoing_transport_without_printing_credentials() {
+        let config: Config = toml::from_str(
+            r#"
+                [[accounts]]
+                name = "Personal"
+                source = "imaps://user%40example.com@imap.example.com:993"
+                from = "User <user@example.com>"
+                outgoing = "smtps://user%40example.com:secret@smtp.example.com:465"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.accounts[0].from.as_deref(), Some("User <user@example.com>"));
+        let debug = format!("{:?}", config.accounts[0]);
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("smtps://<redacted>"));
     }
 }

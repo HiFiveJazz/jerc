@@ -91,6 +91,9 @@ pub struct Mailbox {
     pub role: MailboxRole,
     pub total: usize,
     pub unread: usize,
+    /// IMAP mailbox counts are intentionally filled lazily so LIST can render
+    /// immediately instead of waiting for one STATUS round trip per folder.
+    pub counts_known: bool,
 }
 
 impl Mailbox {
@@ -101,6 +104,7 @@ impl Mailbox {
             role,
             total: 0,
             unread: 0,
+            counts_known: false,
         }
     }
 }
@@ -130,8 +134,55 @@ impl MessageSummary {
 #[derive(Debug, Clone)]
 pub struct MessageBody {
     pub id: MessageId,
-    pub text: String,
+    /// The MIME text/plain representation when one exists.
+    pub plain_text: Option<String>,
+    /// A terminal-oriented rendering of the HTML body. This is generated with
+    /// an e-mail-specific HTML renderer and never executes remote content.
+    pub html_text: Option<String>,
     pub attachment_count: usize,
+}
+
+impl MessageBody {
+    #[must_use]
+    pub fn display_text(&self, prefer_html: bool) -> &str {
+        if prefer_html {
+            if let Some(html) = self.html_text.as_deref().filter(|text| !text.trim().is_empty()) {
+                return html;
+            }
+        }
+        if let Some(plain) = self.plain_text.as_deref().filter(|text| !text.trim().is_empty()) {
+            return plain;
+        }
+        if let Some(html) = self.html_text.as_deref().filter(|text| !text.trim().is_empty()) {
+            return html;
+        }
+        "(message has no displayable text body)"
+    }
+
+    #[must_use]
+    pub fn has_html_alternative(&self) -> bool {
+        self.html_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+    }
+
+    #[must_use]
+    pub fn plain_is_empty(&self) -> bool {
+        self.plain_text
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingMessage {
+    pub from: String,
+    pub to: String,
+    pub cc: String,
+    pub subject: String,
+    pub body: String,
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +220,7 @@ impl Capabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageFlags, MessageId};
+    use super::{MessageBody, MessageFlags, MessageId};
 
     #[test]
     fn maildir_flags_round_trip() {
@@ -186,5 +237,17 @@ mod tests {
         let a = MessageId("cur/123:2,S".into());
         let b = MessageId("cur/123:2,S".into());
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn body_falls_back_to_html_when_plain_is_empty() {
+        let body = MessageBody {
+            id: MessageId("1".into()),
+            plain_text: Some("   ".into()),
+            html_text: Some("HTML version".into()),
+            attachment_count: 0,
+        };
+        assert_eq!(body.display_text(false), "HTML version");
+        assert!(body.plain_is_empty());
     }
 }

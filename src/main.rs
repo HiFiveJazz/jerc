@@ -64,8 +64,15 @@ fn headless_check(config: &Config) -> Result<()> {
         let scan_start = Instant::now();
         let messages = backend.open_mailbox(&target.name)?;
         let scan_elapsed = scan_start.elapsed();
+        let body_metric = if let Some(message) = messages.first() {
+            let body_start = Instant::now();
+            backend.fetch_body(&target.name, &message.id)?;
+            format!(" body={:.3} ms", body_start.elapsed().as_secs_f64() * 1000.0)
+        } else {
+            String::new()
+        };
         println!(
-            "{}: {} | connect={:.3} ms list={} folders/{:.3} ms scan={} messages/{:.3} ms ({:.1} msg/s)",
+            "{}: {} | connect={:.3} ms list={} folders/{:.3} ms scan={} messages/{:.3} ms ({:.1} msg/s){}",
             account.name,
             backend::redact_source(&account.source),
             connect_elapsed.as_secs_f64() * 1000.0,
@@ -77,7 +84,8 @@ fn headless_check(config: &Config) -> Result<()> {
                 0.0
             } else {
                 messages.len() as f64 / scan_elapsed.as_secs_f64()
-            }
+            },
+            body_metric,
         );
     }
     Ok(())
