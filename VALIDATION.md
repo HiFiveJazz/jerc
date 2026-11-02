@@ -1,25 +1,40 @@
-# Validation status
+# Validation status — milestone 2
 
-This milestone is structured so its normal validation is one command:
+Normal validation is one command:
 
 ```bash
 ./scripts/validate.sh
 ```
 
-That script runs formatting checks, Clippy with warnings denied, and all targets/tests. A 10,000-message Maildir fixture plus `--headless-check` provides a repeatable local header-scan benchmark.
+It runs formatting checks, Clippy with warnings denied, and all targets/tests. A 10,000-message Maildir fixture plus `--headless-check` provides a repeatable local header-scan benchmark. For an IMAP account, `--headless-check` also measures TLS/authentication, folder listing, and the bounded initial header scan.
 
-## Validation performed in the build environment
+## New milestone-2 tests/checks
 
-The artifact was statically checked here for:
+The source includes tests for:
 
-- balanced Rust delimiters across all `.rs` sources,
+- parsing aerc-style percent-encoded password IMAP sources,
+- parsing OAuth refresh-token source parameters,
+- secret-safe source/debug redaction,
+- URI-credential precedence over `source_cred_cmd`,
+- Gmail XOAUTH2 payload shape,
+- RFC 7628 OAUTHBEARER payload shape and authzid escaping,
+- one-shot SASL secret response behavior,
+- mapping RFC 6154 special-use attributes exposed by `imap` 2.4.1 as custom attributes,
+- all milestone-1 mail parsing, Maildir, navigation, worker, and integration behavior.
+
+## Validation performed in this build environment
+
+The artifact is statically checked here for:
+
 - valid `Cargo.toml` and example TOML configuration,
-- valid shell syntax for `scripts/validate.sh` and `scripts/perf-smoke.sh`,
-- no `unsafe` blocks,
+- valid shell syntax,
 - valid GitHub Actions YAML structure,
-- source-tree consistency after the final edits.
+- balanced Rust delimiters,
+- no `unsafe` blocks,
+- no copied user credentials/secrets in the source tree,
+- API shapes cross-checked against the current documentation for `imap` 2.4.1, `rustls-connector` 0.23, and `ureq` 3.x.
 
-A Rust toolchain was not available in this execution container, and network package installation was unavailable, so `cargo check`, Clippy, and `cargo test` could not honestly be claimed as executed here. Run `./scripts/validate.sh` on a Rust 1.98+ machine before treating this milestone as compiler-validated.
+A Rust toolchain is not installed in this execution container, so the artifact is **not claimed to be compiler-tested here**. Run `./scripts/validate.sh` on a Rust 1.98+ machine. Real IMAP authentication also necessarily requires testing against an account outside this sandbox.
 
 ## CI included
 

@@ -155,6 +155,16 @@ impl Capabilities {
         server_sort: false,
         server_thread: false,
     };
+
+    pub const IMAP_BASIC: Self = Self {
+        folders: true,
+        flags: true,
+        move_messages: true,
+        delete_messages: true,
+        server_search: true,
+        server_sort: false,
+        server_thread: false,
+    };
 }
 
 #[cfg(test)]

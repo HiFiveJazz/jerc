@@ -39,7 +39,7 @@ fn create_workers(config: &Config, runtime_tx: SyncSender<RuntimeEvent>) -> Resu
         .iter()
         .enumerate()
         .map(|(index, account)| {
-            let backend = backend::from_source(&account.source)?;
+            let backend = backend::from_account(account)?;
             Ok(WorkerHandle::spawn(index, backend, runtime_tx.clone()))
         })
         .collect()

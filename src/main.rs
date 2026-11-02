@@ -46,7 +46,7 @@ fn load_config(cli: &Cli) -> Result<Config> {
 
 fn headless_check(config: &Config) -> Result<()> {
     for account in &config.accounts {
-        let mut backend = backend::from_source(&account.source)?;
+        let mut backend = backend::from_account(account)?;
         let connect_start = Instant::now();
         backend.connect()?;
         let connect_elapsed = connect_start.elapsed();
@@ -67,7 +67,7 @@ fn headless_check(config: &Config) -> Result<()> {
         println!(
             "{}: {} | connect={:.3} ms list={} folders/{:.3} ms scan={} messages/{:.3} ms ({:.1} msg/s)",
             account.name,
-            account.source,
+            backend::redact_source(&account.source),
             connect_elapsed.as_secs_f64() * 1000.0,
             mailboxes.len(),
             list_elapsed.as_secs_f64() * 1000.0,

@@ -12,12 +12,38 @@ pub struct Config {
     pub ui: UiConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AccountConfig {
     pub name: String,
     pub source: String,
     #[serde(default = "default_mailbox")]
     pub default_mailbox: String,
+    /// Optional command that prints the account password/refresh token/access
+    /// token on stdout. This mirrors aerc's source-cred-cmd idea and avoids
+    /// storing long-lived credentials in config.toml.
+    #[serde(default)]
+    pub source_cred_cmd: Option<String>,
+    /// Maximum number of newest messages fetched when opening an IMAP
+    /// mailbox. Maildir ignores this. The current UI is not paginated yet, so
+    /// a bounded initial window keeps large Gmail folders responsive.
+    #[serde(default = "default_max_messages")]
+    pub max_messages: usize,
+}
+
+impl std::fmt::Debug for AccountConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scheme = self.source.split_once("://").map_or("<invalid>", |(scheme, _)| scheme);
+        f.debug_struct("AccountConfig")
+            .field("name", &self.name)
+            .field("source", &format_args!("{scheme}://<redacted>"))
+            .field("default_mailbox", &self.default_mailbox)
+            .field(
+                "source_cred_cmd",
+                &self.source_cred_cmd.as_ref().map(|_| "<configured>"),
+            )
+            .field("max_messages", &self.max_messages)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +83,8 @@ impl Config {
                 name,
                 source: format!("maildir://{}", path.display()),
                 default_mailbox: default_mailbox(),
+                source_cred_cmd: None,
+                max_messages: default_max_messages(),
             }],
             ui: UiConfig::default(),
         }
@@ -73,6 +101,10 @@ pub fn default_config_path() -> PathBuf {
 
 fn default_mailbox() -> String {
     "INBOX".to_owned()
+}
+
+const fn default_max_messages() -> usize {
+    500
 }
 
 const fn default_sidebar_width() -> u16 {
@@ -102,7 +134,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.accounts[0].name, "Kernel");
+        assert_eq!(config.accounts[0].max_messages, 500);
         assert_eq!(config.ui.sidebar_width, 27);
     }
 
+    #[test]
+    fn parses_external_credential_command() {
+        let config: Config = toml::from_str(
+            r#"
+                [[accounts]]
+                name = "Personal"
+                source = "imaps://user%40example.com@imap.example.com:993"
+                source_cred_cmd = "pass show mail/example"
+                max_messages = 250
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.accounts[0].source_cred_cmd.as_deref(),
+            Some("pass show mail/example")
+        );
+        assert_eq!(config.accounts[0].max_messages, 250);
+    }
 }

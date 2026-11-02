@@ -1,14 +1,39 @@
-# Milestone 1: Maildir. IMAP/JMAP/SMTP will plug into the same worker/backend boundary.
+# aerc-rs milestone 2 configuration examples.
+#
+# Pick one or more accounts. For credentials, source_cred_cmd is preferred:
+# it is executed by the account worker and its stdout becomes the password,
+# access token, or refresh token. Do not commit this file if you embed secrets.
+
+# Local/offline Maildir remains useful for tests and archives.
 [[accounts]]
-name = "Kernel"
+name = "Kernel Maildir"
 source = "maildir://~/Mail/kernel"
 default_mailbox = "INBOX"
 
-# Multiple accounts already have UI/runtime support.
+# Gmail / normal IMAPS with an app password.
+# The URI intentionally has no password; the command supplies it.
 # [[accounts]]
 # name = "Personal"
-# source = "maildir://~/Mail/personal"
+# source = "imaps://you%40gmail.com@imap.gmail.com:993"
+# source_cred_cmd = "pass show mail/personal-app-password"
 # default_mailbox = "INBOX"
+# max_messages = 500
+
+# aerc-compatible OAuth refresh-token flow. With token_endpoint present,
+# source_cred_cmd must print a REFRESH token; aerc-rs exchanges it for a
+# short-lived access token before authenticating IMAP with OAUTHBEARER.
+# [[accounts]]
+# name = "University"
+# source = "imaps+oauthbearer://you%40example.edu@imap.gmail.com:993?client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
+# source_cred_cmd = "pass show mail/university-refresh-token"
+# default_mailbox = "INBOX"
+# max_messages = 500
+
+# For compatibility/testing, credentials may also be percent-encoded directly
+# in the URI, exactly like aerc. This is less safe because the config now holds
+# a reusable secret:
+# source = "imaps://you%40gmail.com:APP_PASSWORD@imap.gmail.com:993"
+# source = "imaps+oauthbearer://you%40example.edu:REFRESH_TOKEN@imap.gmail.com:993?client_id=...&client_secret=...&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
 
 [ui]
 sidebar_width = 24

@@ -1,47 +1,71 @@
 # Architecture
 
-This first milestone intentionally borrows **aerc's separation of concerns** without porting its Go implementation.
+The project borrows **aerc's separation of concerns** without porting its Go implementation.
 
 ```text
-Crossterm input thread ───────────────┐
-                                     │ bounded RuntimeEvent queue
-Account worker 0 ── backend ─────────┤
-Account worker 1 ── backend ─────────┤
-                                     ▼
-                              single UI/state loop
-                                     │
-                                     ▼
-                                  Ratatui
+Crossterm input thread ──────────────────────┐
+                                             │ bounded RuntimeEvent queue
+Account worker 0 ── Maildir/IMAP backend ───┤
+Account worker 1 ── Maildir/IMAP backend ───┤
+                                             ▼
+                                      single UI/state loop
+                                             │
+                                             ▼
+                                          Ratatui
 ```
 
 ## Layers
 
-- `model.rs`: backend-neutral mailbox/message/body types. Threading metadata (`Message-ID`, `In-Reply-To`, `References`) is in the core model from day one.
-- `backend/`: synchronous protocol/storage implementations. The worker owns each backend, so backend latency cannot block terminal input/rendering.
-- `worker.rs`: typed actions and typed events with request IDs, inspired by aerc's worker protocol. Channels are bounded so a runaway producer cannot grow memory without limit. Ordinary UI→worker actions use non-blocking `try_send`, so backend pressure cannot stall terminal input.
-- `app/`: account state, selection state, message/body caches, and commands. This layer contains no filesystem or protocol code.
-- `ui/`: pure-ish rendering of app state with Ratatui.
-- `runtime.rs`: one blocking event loop. There is no animation tick and no redraw polling: input or backend work wakes the loop and causes a redraw.
-- `mail.rs`: RFC 5322/MIME parsing. Header scanning reads only the header block; full messages are read only when a body is actually requested.
+- `model.rs`: backend-neutral mailbox/message/body types. Threading metadata (`Message-ID`, `In-Reply-To`, `References`) is core data from day one.
+- `backend/`: synchronous protocol/storage implementations. The worker owns each backend, so filesystem/network latency cannot block terminal input/rendering.
+- `backend/imap.rs`: TLS, auth, refresh-token exchange, mailbox discovery, UID-based fetch/mutations. Secrets are held only where needed and custom `Debug` output redacts them.
+- `worker.rs`: typed actions/events with request IDs. Channels are bounded. Ordinary UI→worker actions use non-blocking `try_send`.
+- `app/`: account state, selection state, message/body caches, and commands. No filesystem or protocol code.
+- `ui/`: rendering of app state with Ratatui.
+- `runtime.rs`: one blocking event loop. There is no animation tick or redraw polling: input or backend work wakes the loop.
+- `mail.rs`: RFC 5322/MIME parsing. Header scans parse header blocks; full messages are parsed only when bodies are requested.
 
-## Why no Tokio yet?
+## Why synchronous IMAP instead of Tokio?
 
-The initial Maildir backend is naturally blocking. Giving every account a dedicated worker thread keeps the UI responsive and mirrors the architecture that already works well in lazygitrs: no async runtime or per-keypress task churn on the hot path. IMAP/JMAP may justify an internal async adapter later, but that does not need to leak through the backend trait or into rendering.
+The runtime already gives every account its own worker thread. A blocking TLS handshake, IMAP `FETCH`, or OAuth HTTP exchange blocks only that account worker, never the terminal input/render loop. That gives us a simple, testable backend trait and avoids introducing an async runtime into the UI hot path.
+
+If later requirements make async worthwhile—multiple simultaneous IMAP connections per account, JMAP request fan-out, or sophisticated IDLE/reconnect management—we can put an async adapter *inside* the backend. The UI/worker protocol does not need to change.
+
+## IMAP identity rule
+
+UI-visible message IDs are backend-opaque. Maildir uses paths; IMAP uses `imap-uid:<uid>`. Sequence numbers are used only to choose the initial newest-message range. Once fetched, all message operations are UID-based so expunges/inserts from another client do not retarget actions.
+
+Future IMAP caching must pair UIDs with `UIDVALIDITY`; this milestone does not persist IMAP UIDs across sessions yet.
+
+## Credential model
+
+Supported source schemes:
+
+- `imaps://` / `imaps+login://`: password or app-password login.
+- `imaps+oauthbearer://`: SASL OAUTHBEARER.
+- `imaps+xoauth2://`: SASL XOAUTH2.
+
+The URI password component can carry a credential for aerc compatibility. If an OAuth source has `token_endpoint`, that credential is a refresh token; otherwise it is an access token. `source_cred_cmd` is preferred and supplies the credential from an external store. URI credentials take precedence, matching aerc's behavior.
+
+No CLI secret flag exists on purpose: process listings and shell history are inappropriate places for reusable tokens.
 
 ## Performance invariants
 
-1. Rendering never performs filesystem or network I/O.
-2. Moving the selection never reparses a cached body.
-3. Opening a Maildir reads only message headers, not attachments or bodies.
-4. Channels are bounded, and the UI never blocks waiting to enqueue ordinary backend work.
-5. There is no fixed redraw timer; idle CPU should approach zero.
-6. Folder scans report their wall-clock duration in the UI and `--headless-check`.
-7. Tests exercise backend behavior separately from the TUI.
+1. Rendering never performs filesystem/network I/O.
+2. Moving selection never reparses a cached body.
+3. Maildir opening reads headers rather than attachments/bodies.
+4. IMAP opening fetches a bounded newest-header window (`max_messages`, default 500).
+5. Full IMAP message bodies are fetched lazily by UID.
+6. Channels are bounded; UI never blocks to enqueue ordinary backend work.
+7. There is no fixed redraw timer; idle CPU should approach zero.
+8. Network operations have explicit timeouts.
+9. Folder scans report wall-clock duration in the UI and `--headless-check`.
+10. Tests exercise backend/auth/model behavior separately from the TUI.
 
-## Near-term backend plan
+## Near-term plan
 
-1. Maildir feature completeness: watch filesystem changes, copy, flag/star, folder create/remove, robust Maildir++ nesting.
-2. IMAP worker: TLS, LOGIN/OAUTHBEARER/XOAUTH2, LIST/STATUS, UID FETCH, STORE, MOVE, IDLE, SORT/THREAD capability negotiation.
+1. Capability negotiation, IDLE/reconnect, and unsolicited response handling.
+2. Header pagination and a cache keyed by account/mailbox/UIDVALIDITY/UID.
 3. SMTP/sendmail abstraction and composer.
-4. Local thread builder from `Message-ID`/`References` plus provider/server thread IDs when available.
-5. Patch-aware message model and diff renderer shared conceptually with lazygitrs.
+4. Thread builder and patch-series model.
+5. Shared-quality diff renderer and Git patch application with lazygitrs integration.
