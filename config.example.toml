@@ -1,0 +1,15 @@
+# Milestone 1: Maildir. IMAP/JMAP/SMTP will plug into the same worker/backend boundary.
+[[accounts]]
+name = "Kernel"
+source = "maildir://~/Mail/kernel"
+default_mailbox = "INBOX"
+
+# Multiple accounts already have UI/runtime support.
+# [[accounts]]
+# name = "Personal"
+# source = "maildir://~/Mail/personal"
+# default_mailbox = "INBOX"
+
+[ui]
+sidebar_width = 24
+message_width_percent = 48
