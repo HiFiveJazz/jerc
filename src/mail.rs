@@ -181,8 +181,7 @@ Subject: [PATCH v2 1/2] usb: fix thing\r\n\
 Date: Thu, 22 Oct 2026 01:17:54 +0200\r\n\
 Message-ID: <patch-1@example.com>\r\n\
 In-Reply-To: <cover@example.com>\r\n\
-References: <root@example.com>\r\n\
- <cover@example.com>\r\n\
+References: <root@example.com>\r\n\t<cover@example.com>\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 Hello from the body.\r\n";
