@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::backend::MailBackend;
 use crate::mail::{parse_body, parse_summary, read_all, read_header_block};
-use crate::model::{Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessageSummary};
+use crate::model::{Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage, MessageSummary};
 
 #[derive(Debug)]
 pub struct MaildirBackend {
@@ -209,8 +209,21 @@ impl MailBackend for MaildirBackend {
         Self::mailbox_counts(&path)
     }
 
-    fn open_mailbox(&mut self, name: &str) -> Result<Vec<MessageSummary>> {
-        self.scan_mailbox(name)
+    fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage> {
+        let messages = self.scan_mailbox(name)?;
+        let start = offset.min(messages.len());
+        let end = if limit == 0 {
+            messages.len()
+        } else {
+            start.saturating_add(limit).min(messages.len())
+        };
+        let page = messages[start..end].to_vec();
+        Ok(MessagePage {
+            messages: page,
+            offset,
+            next_offset: end,
+            has_more: end < messages.len(),
+        })
     }
 
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody> {

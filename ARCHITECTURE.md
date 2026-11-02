@@ -1,6 +1,6 @@
-# Architecture — milestone 3.1
+# Architecture — milestone 5
 
-The project borrows aerc's separation of concerns without porting its Go implementation.
+The project keeps aerc's separation of UI state from blocking mail protocols while using a modal, lazygitrs-like terminal interaction model.
 
 ```text
 Crossterm input thread ───────────────────────────┐
@@ -15,59 +15,53 @@ Account worker 1 ── Maildir/IMAP + SMTP sender ──┤
                                                Ratatui
 ```
 
-## Layers
+## Browser model
 
-- `model.rs`: backend-neutral mailbox, summary, body, flags, capabilities, and outgoing-message types. Thread metadata (`Message-ID`, `In-Reply-To`, `References`) is core data.
-- `backend/`: synchronous storage/protocol implementations behind `MailBackend`.
-- `backend/imap.rs`: TLS/auth/OAuth, mailbox discovery, lazy mailbox status, bounded header scans, UID body/mutations.
-- `outgoing/`: transport-neutral `MailSender`; milestone 3 implements SMTP using Lettre.
-- `worker.rs`: per-account typed actions/events. UI posts are bounded/non-blocking. Queued body fetches coalesce to the newest selection.
-- `app/`: browser/message mode, selection, count prefixes, smooth-scroll targets, loading flags, body cache, read-state policy, help/theme/composer state.
-- `ui/`: Ratatui rendering only; no filesystem or network access. Theme colors are centralized in `theme.rs` rather than hard-coded into widgets.
-- `theme.rs`: built-in palettes plus the tiny persisted active-theme state.
-- `runtime.rs`: blocks when idle. A 10 ms timeout exists only while a smooth-scroll animation is active, so there is still no permanent polling/redraw timer.
-- `mail.rs`: RFC 5322/MIME parsing plus safe terminal-oriented HTML conversion.
+The browser has one logical message cursor and one mailbox cursor. `j/k` moves messages; `J/K` changes mailboxes. Smooth mailbox motion delays opening the destination until animation finishes, so rapidly traversing folders does not serialize expensive intermediate mailbox loads.
 
-## Read-state rule
+The message renderer draws only the visible filtered slice and clears that region before painting. The state layer owns the viewport offset and maintains a four-row scrolloff. This avoids `TableState` changing the viewport behind the application and prevents stale characters in the line-number gutter.
 
-`BODY.PEEK[]` never implicitly sets IMAP `\\Seen`. Browsing never requests a body. After Enter opens the reader, the selected body is fetched; when it actually arrives while that message is still open, the app sends an explicit `SetSeen(true)`. Smooth list animation therefore performs zero body requests and cannot mark intermediate mail read.
+`v` stores a visual anchor. Actions operate on the inclusive anchor-to-cursor range; `Esc` clears that anchor before it performs any other escape action.
 
-Explicit `u` uses the same action and the UI updates when the server acknowledges the flag change.
+## Pagination and mailbox cache
 
-## First-paint performance
+`AccountState` keeps an in-memory cache per opened mailbox: loaded summaries, bodies already fetched, cursor/viewport state, and pagination progress. `page_size` controls each interactive header request (default 100). The first page contains newest mail; reaching the bottom requests the next older page and merges it into the existing list.
 
-Milestone 2 originally performed `LIST` and then one sequential `STATUS` round trip per mailbox. On hosted Gmail this made a small folder list take seconds. Milestone 3 changes the pipeline to:
+Switching to a cached mailbox restores it synchronously. A first-page refresh performs a real IMAP `SELECT` so new arrivals are visible; subsequent pages reuse the selected mailbox count where possible. The worker coalesces stale queued mailbox opens and body fetches.
 
-```text
-connect -> LIST -> render folders -> SELECT/FETCH selected mailbox -> browser
-                            \\-> lazy STATUS requests when worker is otherwise free
-```
+Search is a presentation filter over the currently selected mailbox cache. When a filter is active and too few matches are loaded to fill the viewport, pagination continues progressively until enough matches are available or the server-side mailbox window is exhausted.
 
-The initial IMAP header fetch also asks only for `DATE`, `FROM`, `SUBJECT`, `MESSAGE-ID`, `IN-REPLY-TO`, and `REFERENCES`, plus UID/flags/size.
+## Mutation policy
 
-Full message data is still fetched when the user explicitly opens a message. Because the browser never prefetches bodies, scrolling no longer competes with mailbox/status work. A later optimization can use IMAP `BODYSTRUCTURE` and section fetches to download only the selected text/HTML MIME parts before attachments.
+`d` asks for confirmation; `D` deliberately bypasses confirmation. Outside Trash the action prefers the advertised Trash role; inside Trash it becomes permanent deletion. `a` prefers the advertised Archive/All Mail role.
 
-## Smooth navigation
+Bulk IMAP mutations build one UID sequence for the whole selection. Successful mutations update the current list/cache optimistically and never re-LIST the account or jump to the configured default mailbox. A failed mutation reloads only the current mailbox to reconcile state.
 
-Normal `j/k` changes selection immediately. Numeric prefixes apply to ordinary movement. `Ctrl-j/Ctrl-k` maintain a target 22 rows away and advance one visible row per animation frame. Repeated/opposite input adjusts the current target rather than queuing animations, so the motion is interruptible and reversible. No body fetch occurs at the target; mail content is loaded only after Enter opens the reader.
+## Split preview and body loading
 
-## Outgoing mail
+`P` toggles a vertical preview beside the message list. Browser movement still loads only headers until a preview or full reader needs a body. Cached bodies are reused by both surfaces. `b` can hide the mailbox sidebar so the browser/preview can use the full terminal width.
 
-`MailSender` is separate from `MailBackend`; receiving and sending therefore do not have to use the same protocol/provider forever.
+## HTML mail
 
-SMTP supports implicit TLS and required STARTTLS, PLAIN/LOGIN/XOAUTH2, and the same refresh-token exchange model as IMAP OAuth. `from` is configurable; if absent, the SMTP username becomes the envelope/header From address.
+MIME parsing remains in `mail-parser`. HTML uses `html2text`'s rich line API, which preserves table box drawing and annotations such as links, images, emphasis, strong text, strikeout and code. Those annotations are converted into model-level spans and styled by Ratatui using the active aerc-rs theme. This produces text-browser-like visual structure without spawning an external process for every preview.
 
-The current SMTP sender shares its account worker with IMAP, which keeps the implementation simple and keeps network work off the UI. A dedicated outgoing worker/queue is an easy later optimization if large sends should never serialize with receive operations.
+The parser also strips common zero-width preheader padding and collapses useless blank runs. The reader can select rendered links with Tab/Shift-Tab and launch one with `o`.
+
+## Modal composer
+
+The composer has NORMAL, INSERT and VISUAL modes. Recipient/subject fields and the body share the same modal editing core, while Tab/Shift-Tab changes fields. Labels are rendered separately from editable text, so active fields do not lose their To/Cc/Subject identity.
+
+Esc follows modal semantics: VISUAL → NORMAL, INSERT → NORMAL, and only Esc from NORMAL closes the composer. Enter from NORMAL opens a send confirmation; sending is never bound to Ctrl-S. Reply supports quoted and unquoted variants.
 
 ## Performance invariants
 
 1. Rendering performs no filesystem/network I/O.
 2. Idle UI has no redraw polling.
 3. Ordinary UI→worker enqueue never blocks the terminal thread.
-4. Maildir and IMAP list views do not parse/download message bodies.
-5. IMAP startup does not wait for every mailbox unread count.
-6. Header scans are bounded (`max_messages`, default 500).
-7. Browser navigation never fetches bodies; only an explicitly opened message does.
-8. Network operations have explicit timeouts.
-9. Secrets are redacted from diagnostics/debug output.
-10. Headless metrics separate connect, folder list, header scan, and body latency.
+4. Browser navigation never fetches bodies unless split preview is enabled.
+5. Initial IMAP mailbox paint is bounded by `page_size`, not the full folder.
+6. Loaded mailbox pages/bodies are reused when revisiting a folder.
+7. Rapid body/mailbox requests coalesce when older queued work is stale.
+8. Successful mutations do not refresh the mailbox tree.
+9. Search reuses cached headers and pages older mail progressively.
+10. Network operations retain explicit timeouts and credential diagnostics remain redacted.

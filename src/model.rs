@@ -131,15 +131,54 @@ impl MessageSummary {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HtmlSpanStyle {
+    pub foreground: Option<(u8, u8, u8)>,
+    pub background: Option<(u8, u8, u8)>,
+    pub bold: bool,
+    pub italic: bool,
+    pub strikeout: bool,
+    pub code: bool,
+    pub link: Option<String>,
+    pub image: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HtmlSpan {
+    pub text: String,
+    pub style: HtmlSpanStyle,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HtmlLine {
+    pub spans: Vec<HtmlSpan>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageBody {
     pub id: MessageId,
     /// The MIME text/plain representation when one exists.
     pub plain_text: Option<String>,
-    /// A terminal-oriented rendering of the HTML body. This is generated with
-    /// an e-mail-specific HTML renderer and never executes remote content.
+    /// Plain-string projection of the rich HTML rendering. This is also used
+    /// when quoting HTML-only mail in a reply.
     pub html_text: Option<String>,
+    /// Rich terminal representation produced once on the worker thread. Table
+    /// borders plus semantic links/emphasis survive into Ratatui, where they are
+    /// coloured using the active terminal theme.
+    pub html_lines: Option<Vec<HtmlLine>>,
+    /// Human-readable renderer label shown in reader mode.
+    pub html_renderer: Option<String>,
     pub attachment_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessagePage {
+    pub messages: Vec<MessageSummary>,
+    /// Number of newer server-side entries skipped before this page.
+    pub offset: usize,
+    /// Offset to request for the next older page.
+    pub next_offset: usize,
+    pub has_more: bool,
 }
 
 impl MessageBody {
@@ -164,6 +203,23 @@ impl MessageBody {
         self.html_text
             .as_deref()
             .is_some_and(|text| !text.trim().is_empty())
+    }
+
+    #[must_use]
+    pub fn html_links(&self) -> Vec<String> {
+        let mut links = Vec::new();
+        if let Some(lines) = &self.html_lines {
+            for line in lines {
+                for span in &line.spans {
+                    if let Some(link) = &span.style.link
+                        && !links.iter().any(|existing| existing == link)
+                    {
+                        links.push(link.clone());
+                    }
+                }
+            }
+        }
+        links
     }
 
     #[must_use]
@@ -245,6 +301,8 @@ mod tests {
             id: MessageId("1".into()),
             plain_text: Some("   ".into()),
             html_text: Some("HTML version".into()),
+            html_lines: None,
+            html_renderer: Some("test".into()),
             attachment_count: 0,
         };
         assert_eq!(body.display_text(false), "HTML version");

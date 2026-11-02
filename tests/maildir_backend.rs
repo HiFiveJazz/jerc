@@ -44,7 +44,16 @@ fn maildir_is_usable_end_to_end() {
     assert_eq!(folders[0].name, "INBOX");
     assert!(folders.iter().any(|m| m.name == "Archive"));
 
-    let messages = backend.open_mailbox("INBOX").unwrap();
+    let first_page = backend.open_mailbox("INBOX", 0, 1).unwrap();
+    assert_eq!(first_page.messages.len(), 1);
+    assert_eq!(first_page.next_offset, 1);
+    assert!(first_page.has_more);
+    let second_page = backend.open_mailbox("INBOX", first_page.next_offset, 1).unwrap();
+    assert_eq!(second_page.messages.len(), 1);
+    assert_eq!(second_page.next_offset, 2);
+    assert!(!second_page.has_more);
+
+    let messages = backend.open_mailbox("INBOX", 0, 100).unwrap().messages;
     assert_eq!(messages.len(), 2);
     assert_eq!(messages.iter().filter(|m| m.unread()).count(), 1);
 
@@ -53,11 +62,11 @@ fn maildir_is_usable_end_to_end() {
     assert!(body.display_text(false).contains("body one"));
 
     backend.set_seen("INBOX", &unread.id, true).unwrap();
-    let messages = backend.open_mailbox("INBOX").unwrap();
+    let messages = backend.open_mailbox("INBOX", 0, 100).unwrap().messages;
     let updated = messages.iter().find(|m| m.subject == "patch-one").unwrap();
     assert!(updated.flags.contains(MessageFlags::SEEN));
 
     backend.move_to("INBOX", "Archive", &updated.id).unwrap();
-    assert_eq!(backend.open_mailbox("INBOX").unwrap().len(), 1);
-    assert_eq!(backend.open_mailbox("Archive").unwrap().len(), 1);
+    assert_eq!(backend.open_mailbox("INBOX", 0, 100).unwrap().messages.len(), 1);
+    assert_eq!(backend.open_mailbox("Archive", 0, 100).unwrap().messages.len(), 1);
 }

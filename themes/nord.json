@@ -1,0 +1,15 @@
+{
+  "id": "nord",
+  "name": "Nord",
+  "primary": "#88c0d0",
+  "success": "#a3be8c",
+  "error": "#bf616a",
+  "warning": "#ebcb8b",
+  "text": "#d8dee9",
+  "text_muted": "#7b88a1",
+  "background": "#2e3440",
+  "surface": "#3b4252",
+  "border": "#4c566a",
+  "selected_fg": "#2e3440",
+  "selected_bg": "#88c0d0"
+}

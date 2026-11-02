@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aerc-rs"
-version = "0.3.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -32,6 +32,7 @@ dependencies = [
  "percent-encoding",
  "ratatui",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "ureq",
@@ -655,6 +656,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31e981cc9b710410461bf2e474b54da9ccb2fa3212936295bc5c02cb09f3d3f2"
 dependencies = [
  "html5ever",
+ "nom 8.0.0",
  "tendril",
  "thiserror 2.0.21",
  "unicode-width",

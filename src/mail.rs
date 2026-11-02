@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read};
 use anyhow::{Context, Result, anyhow};
 use mail_parser::{MessageParser, PartKind};
 
-use crate::model::{MessageBody, MessageFlags, MessageId, MessageSummary};
+use crate::model::{HtmlLine, HtmlSpan, HtmlSpanStyle, MessageBody, MessageFlags, MessageId, MessageSummary};
 
 const MAX_HEADER_BYTES: usize = 512 * 1024;
 
@@ -161,126 +161,163 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         _ => None,
     });
 
-    let html_text = message.html_body().find_map(|part| match part.kind() {
-        PartKind::Html => part.text().map(|html| render_html_for_terminal(html.as_ref())),
+    let rendered_html = message.html_body().find_map(|part| match part.kind() {
+        PartKind::Html => part
+            .text()
+            .map(|html| render_html_for_terminal(html.as_ref())),
         _ => None,
     });
+    let (html_text, html_lines, html_renderer) = rendered_html
+        .map(|(text, lines, renderer)| (Some(text), Some(lines), Some(renderer)))
+        .unwrap_or((None, None, None));
 
     Ok(MessageBody {
         id,
         plain_text,
         html_text,
+        html_lines,
+        html_renderer,
         attachment_count: message.attachments().count(),
     })
 }
 
-#[derive(Clone, Debug)]
-struct MailReaderDecorator;
+fn render_html_for_terminal(html: &str) -> (String, Vec<HtmlLine>, String) {
+    // html2text's rich renderer is intentionally closer to a text browser than
+    // its String-only API: tables keep their box drawing and semantic markup
+    // such as links/strong/emphasis remains tagged. Ratatui maps those tags to
+    // the active aerc-rs theme, which gives HTML mail the same useful visual
+    // landmarks as a terminal browser without spawning an external process for
+    // every message. Rendering happens once on the account worker, never in the
+    // draw loop, so rich mail cannot make scrolling stutter.
+    let rich = html2text::config::rich()
+        .use_doc_css()
+        .link_footnotes(false)
+        .no_link_wrapping()
+        .lines_from_read(html.as_bytes(), 100);
 
-impl html2text::render::TextDecorator for MailReaderDecorator {
-    type Annotation = ();
-
-    fn decorate_link_start(&mut self, _url: &str) -> (String, Self::Annotation) {
-        (String::new(), ())
+    if let Ok(lines) = rich {
+        let mut converted = Vec::with_capacity(lines.len());
+        for line in lines {
+            let spans = line
+                .tagged_strings()
+                .map(|tagged| HtmlSpan {
+                    text: tagged.s.clone(),
+                    style: rich_style(&tagged.tag),
+                })
+                .collect::<Vec<_>>();
+            converted.push(HtmlLine { spans });
+        }
+        let converted = clean_rich_lines(converted);
+        let text = rich_lines_to_text(&converted);
+        if !text.trim().is_empty() {
+            return (text, converted, "html2text-rich".to_owned());
+        }
     }
 
-    fn decorate_link_end(&mut self) -> String {
-        String::new()
-    }
-
-    fn decorate_em_start(&self) -> (String, Self::Annotation) {
-        (String::new(), ())
-    }
-
-    fn decorate_em_end(&self) -> String {
-        String::new()
-    }
-
-    fn decorate_strong_start(&self) -> (String, Self::Annotation) {
-        (String::new(), ())
-    }
-
-    fn decorate_strong_end(&self) -> String {
-        String::new()
-    }
-
-    fn decorate_strikeout_start(&self) -> (String, Self::Annotation) {
-        (String::new(), ())
-    }
-
-    fn decorate_strikeout_end(&self) -> String {
-        String::new()
-    }
-
-    fn decorate_code_start(&self) -> (String, Self::Annotation) {
-        (String::new(), ())
-    }
-
-    fn decorate_code_end(&self) -> String {
-        String::new()
-    }
-
-    fn decorate_preformat_first(&self) -> Self::Annotation {}
-
-    fn decorate_preformat_cont(&self) -> Self::Annotation {}
-
-    fn decorate_image(
-        &mut self,
-        _src: &str,
-        _title: &str,
-    ) -> (String, Self::Annotation) {
-        // Layout-heavy email frequently uses logos, avatars and tracking pixels.
-        // Suppress them in reader mode instead of turning alt text into noisy rows.
-        (String::new(), ())
-    }
-
-    fn header_prefix(&self, _level: usize) -> String {
-        String::new()
-    }
-
-    fn quote_prefix(&self) -> String {
-        "> ".to_owned()
-    }
-
-    fn unordered_item_prefix(&self) -> String {
-        "• ".to_owned()
-    }
-
-    fn ordered_item_prefix(&self, index: i64) -> String {
-        format!("{index}. ")
-    }
-
-    fn decorate_superscript_start(&self) -> (String, Self::Annotation) {
-        (String::new(), ())
-    }
-
-    fn decorate_superscript_end(&self) -> String {
-        String::new()
-    }
-
-    fn make_subblock_decorator(&self) -> Self {
-        Self
-    }
+    // Malformed HTML should still be readable. mail-parser's fallback is plain
+    // text, so expose it as one unstyled span per line rather than failing the
+    // whole message body.
+    let text = clean_reader_text(&mail_parser::html_to_text(html));
+    let lines = text
+        .lines()
+        .map(|line| HtmlLine {
+            spans: vec![HtmlSpan {
+                text: line.to_owned(),
+                style: HtmlSpanStyle::default(),
+            }],
+        })
+        .collect();
+    (text, lines, "mail-parser fallback".to_owned())
 }
 
-fn render_html_for_terminal(html: &str) -> String {
-    // Email HTML is usually a pile of layout tables. The default html2text
-    // configuration tries to preserve those tables and emits numbered link
-    // footnotes, which makes notification mail dramatically noisier than the
-    // message a human sees. Reader mode intentionally flattens table cells,
-    // suppresses URL footnote dumps, and leaves only the visible content.
-    let rendered = html2text::config::with_decorator(MailReaderDecorator)
-        .raw_mode(true)
-        .no_table_borders()
-        .link_footnotes(false)
-        .string_from_read(html.as_bytes(), 100)
-        .ok()
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or_else(|| mail_parser::html_to_text(html));
-    clean_reader_text(&rendered)
+fn rich_style(annotations: &[html2text::render::RichAnnotation]) -> HtmlSpanStyle {
+    use html2text::render::RichAnnotation;
+
+    let mut style = HtmlSpanStyle::default();
+    for annotation in annotations {
+        match annotation {
+            RichAnnotation::Link(url) => style.link = Some(url.clone()),
+            RichAnnotation::Image(src) => style.image = Some(src.clone()),
+            RichAnnotation::Emphasis => style.italic = true,
+            RichAnnotation::Strong => style.bold = true,
+            RichAnnotation::Strikeout => style.strikeout = true,
+            RichAnnotation::Code | RichAnnotation::Preformat(_) => style.code = true,
+            RichAnnotation::Colour(colour) => {
+                style.foreground = Some((colour.r, colour.g, colour.b));
+            }
+            RichAnnotation::BgColour(colour) => {
+                style.background = Some((colour.r, colour.g, colour.b));
+            }
+            RichAnnotation::Default => {}
+            _ => {}
+        }
+    }
+    style
+}
+
+fn clean_rich_lines(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
+    let mut cleaned = Vec::with_capacity(lines.len());
+    let mut blank_run = 0usize;
+    for mut line in lines {
+        for span in &mut line.spans {
+            span.text = clean_html_text(&span.text);
+        }
+        line.spans.retain(|span| !span.text.is_empty());
+        while line
+            .spans
+            .last()
+            .is_some_and(|span| span.text.chars().all(char::is_whitespace))
+        {
+            line.spans.pop();
+        }
+        let blank = line.spans.iter().all(|span| span.text.trim().is_empty());
+        if blank {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        cleaned.push(line);
+    }
+    while cleaned
+        .last()
+        .is_some_and(|line| line.spans.iter().all(|span| span.text.trim().is_empty()))
+    {
+        cleaned.pop();
+    }
+    cleaned
+}
+
+fn rich_lines_to_text(lines: &[HtmlLine]) -> String {
+    let mut out = String::new();
+    for (line_index, line) in lines.iter().enumerate() {
+        if line_index > 0 {
+            out.push('\n');
+        }
+        for span in &line.spans {
+            out.push_str(&span.text);
+        }
+    }
+    out
+}
+
+fn clean_html_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|ch| match ch {
+            // Marketing/design mail often contains long preheader runs of
+            // zero-width characters. They are useful in graphical clients but
+            // turn into giant blank/indented regions in a terminal reader.
+            '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}' => None,
+            '\u{00a0}' => Some(' '),
+            _ => Some(ch),
+        })
+        .collect()
 }
 
 fn clean_reader_text(text: &str) -> String {
+    let text = clean_html_text(text);
     let mut out = String::with_capacity(text.len());
     let mut blank_run = 0usize;
 
@@ -346,6 +383,7 @@ Hello from the body.\r\n";
         let body = parse_body(MessageId("plain".into()), MAIL).unwrap();
         assert!(body.plain_text.is_some());
         assert!(body.html_text.is_none());
+        assert!(body.html_lines.is_none());
     }
 
     #[test]
@@ -354,20 +392,47 @@ Hello from the body.\r\n";
         let body = parse_body(MessageId("html".into()), raw).unwrap();
         assert!(body.plain_text.is_none());
         assert!(body.html_text.as_deref().is_some_and(|text| text.contains("Hello")));
+        assert!(body.html_lines.as_ref().is_some_and(|lines| !lines.is_empty()));
     }
 
     #[test]
-    fn html_reader_mode_does_not_dump_tracking_links_or_table_borders() {
-        let raw = b"From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<table><tr><td><a href=\"https://tracking.example/very/long/url\">View in Figma</a></td></tr><tr><td>Comment text</td></tr></table>";
+    fn html_reader_mode_preserves_table_structure_and_links() {
+        let raw = b"From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<table><tr><td><a href=\"https://tracking.example/very/long/url\">View in Figma</a></td><td><strong>Open</strong></td></tr><tr><td>Comment text</td><td>More</td></tr></table>";
         let body = parse_body(MessageId("html-reader".into()), raw).unwrap();
-        let rendered = body.html_text.unwrap();
+        let rendered = body.html_text.as_deref().unwrap();
         assert!(rendered.contains("View in Figma"));
         assert!(rendered.contains("Comment text"));
-        assert!(!rendered.contains("[View in Figma]"));
-        assert!(!rendered.contains("[1]:"));
-        assert!(!rendered.contains("tracking.example"));
-        assert!(!rendered.contains('│'));
-        assert!(!rendered.contains('─'));
+        assert!(rendered.chars().any(|ch| matches!(ch, '│' | '─' | '┌' | '┐')));
+        assert_eq!(
+            body.html_links(),
+            vec!["https://tracking.example/very/long/url".to_owned()]
+        );
+        assert_eq!(body.html_renderer.as_deref(), Some("html2text-rich"));
+    }
+
+
+    #[test]
+    fn html_reader_preserves_supported_css_colours() {
+        let raw = b"From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p style=\"color:#ff0000;background-color:#0000ff\"><a href=\"https://example.com\">Colour link</a></p>";
+        let body = parse_body(MessageId("html-colour".into()), raw).unwrap();
+        let styles = body
+            .html_lines
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| &span.style)
+            .collect::<Vec<_>>();
+        assert!(styles.iter().any(|style| style.foreground == Some((255, 0, 0))));
+        assert!(styles.iter().any(|style| style.background == Some((0, 0, 255))));
+        assert!(styles.iter().any(|style| style.link.as_deref() == Some("https://example.com")));
+    }
+
+    #[test]
+    fn html_reader_strips_zero_width_preheader_padding() {
+        let raw = "From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>\u{200c}\u{200c}Visible</p>";
+        let body = parse_body(MessageId("html-zero-width".into()), raw.as_bytes()).unwrap();
+        assert_eq!(body.html_text.as_deref().map(str::trim), Some("Visible"));
     }
 
     #[test]

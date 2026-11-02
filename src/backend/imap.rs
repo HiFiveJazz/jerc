@@ -29,7 +29,7 @@ use url::Url;
 use crate::backend::MailBackend;
 use crate::mail::{parse_body, parse_summary};
 use crate::model::{
-    Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessageSummary,
+    Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage, MessageSummary,
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(90);
@@ -210,6 +210,7 @@ pub struct ImapBackend {
     max_messages: usize,
     session: Option<ImapClientStd>,
     selected_mailbox: Option<String>,
+    selected_exists: Option<u32>,
 }
 
 impl std::fmt::Debug for ImapBackend {
@@ -223,6 +224,7 @@ impl std::fmt::Debug for ImapBackend {
             .field("max_messages", &self.max_messages)
             .field("connected", &self.session.is_some())
             .field("selected_mailbox", &self.selected_mailbox)
+            .field("selected_exists", &self.selected_exists)
             .finish()
     }
 }
@@ -240,6 +242,7 @@ impl ImapBackend {
             max_messages,
             session: None,
             selected_mailbox: None,
+            selected_exists: None,
         }
     }
 
@@ -256,7 +259,25 @@ impl ImapBackend {
             .select(mailbox_name, ImapMailboxSelectOptions::default())
             .with_context(|| format!("selecting IMAP mailbox {mailbox:?}"))?;
         self.selected_mailbox = Some(mailbox.to_owned());
+        self.selected_exists = Some(selected.exists.unwrap_or(0));
         Ok(selected)
+    }
+
+    fn mailbox_exists(&mut self, mailbox: &str) -> Result<u32> {
+        if self.selected_mailbox.as_deref() == Some(mailbox)
+            && let Some(exists) = self.selected_exists
+        {
+            return Ok(exists);
+        }
+        let selected = self.select(mailbox)?;
+        Ok(selected.exists.unwrap_or(0))
+    }
+
+    fn note_removed(&mut self, mailbox: &str, count: usize) {
+        if self.selected_mailbox.as_deref() == Some(mailbox) {
+            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            self.selected_exists = self.selected_exists.map(|exists| exists.saturating_sub(count));
+        }
     }
 
     fn uid_from_id(id: &MessageId) -> Result<u32> {
@@ -268,10 +289,28 @@ impl ImapBackend {
     }
 
     fn uid_sequence(id: &MessageId) -> Result<SequenceSet> {
-        Self::uid_from_id(id)?
-            .to_string()
+        let sequence = Self::uid_from_id(id)?.to_string();
+        sequence
+            .as_str()
             .try_into()
             .context("building IMAP UID sequence")
+    }
+
+    fn uid_sequence_many(ids: &[MessageId]) -> Result<SequenceSet> {
+        let text = ids
+            .iter()
+            .map(Self::uid_from_id)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if text.is_empty() {
+            bail!("cannot build an empty IMAP UID sequence");
+        }
+        text.as_str()
+            .try_into()
+            .context("building IMAP UID sequence set")
     }
 
     fn ensure_selected(&mut self, mailbox: &str) -> Result<()> {
@@ -340,6 +379,7 @@ impl MailBackend for ImapBackend {
 
         self.session = Some(client);
         self.selected_mailbox = None;
+        self.selected_exists = None;
         Ok(())
     }
 
@@ -396,20 +436,44 @@ impl MailBackend for ImapBackend {
         Ok((total, unread))
     }
 
-    fn open_mailbox(&mut self, name: &str) -> Result<Vec<MessageSummary>> {
-        let selected = self.select(name)?;
-        let exists = selected.exists.unwrap_or(0);
-        if exists == 0 {
-            return Ok(Vec::new());
+    fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage> {
+        // Always re-SELECT the first page so a manual refresh sees new arrivals.
+        // Later pages can reuse the selected mailbox's EXISTS count without an
+        // extra round trip.
+        let exists = if offset == 0 {
+            self.select(name)?.exists.unwrap_or(0)
+        } else {
+            self.mailbox_exists(name)?
+        };
+        if exists == 0 || offset >= exists as usize {
+            return Ok(MessagePage {
+                messages: Vec::new(),
+                offset,
+                next_offset: offset,
+                has_more: false,
+            });
         }
 
-        let window = if self.max_messages == 0 {
-            u32::MAX
+        let configured = if limit == 0 { self.max_messages } else { limit };
+        let window = if configured == 0 {
+            exists
         } else {
-            u32::try_from(self.max_messages).unwrap_or(u32::MAX)
+            u32::try_from(configured).unwrap_or(u32::MAX).min(exists)
         };
-        let start = exists.saturating_sub(window.saturating_sub(1)).max(1);
-        let sequence: SequenceSet = format!("{start}:*")
+        let skipped = u32::try_from(offset).unwrap_or(u32::MAX).min(exists);
+        let end = exists.saturating_sub(skipped);
+        if end == 0 {
+            return Ok(MessagePage {
+                messages: Vec::new(),
+                offset,
+                next_offset: offset,
+                has_more: false,
+            });
+        }
+        let start = end.saturating_sub(window.saturating_sub(1)).max(1);
+        let sequence_text = format!("{start}:{end}");
+        let sequence: SequenceSet = sequence_text
+            .as_str()
             .try_into()
             .context("building IMAP fetch range")?;
         let items: MacroOrMessageDataItemNames<'static> = vec![
@@ -454,7 +518,14 @@ impl MailBackend for ImapBackend {
                 .cmp(&a.timestamp)
                 .then_with(|| b.id.cmp(&a.id))
         });
-        Ok(messages)
+        let consumed = usize::try_from(end.saturating_sub(start).saturating_add(1)).unwrap_or(usize::MAX);
+        let next_offset = offset.saturating_add(consumed);
+        Ok(MessagePage {
+            messages,
+            offset,
+            next_offset,
+            has_more: start > 1,
+        })
     }
 
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody> {
@@ -499,6 +570,25 @@ impl MailBackend for ImapBackend {
         self.session()?
             .uid_expunge(sequence)
             .context("expunging IMAP message")?;
+        self.note_removed(mailbox, 1);
+        Ok(())
+    }
+
+    fn delete_many(&mut self, mailbox: &str, ids: &[MessageId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.ensure_selected(mailbox)?;
+        let sequence = Self::uid_sequence_many(ids)?;
+        let mut opts = ImapMessageStoreOptions::default();
+        opts.uid = true;
+        self.session()?
+            .store(sequence.clone(), StoreType::Add, vec![Flag::Deleted], opts)
+            .context("marking IMAP messages deleted")?;
+        self.session()?
+            .uid_expunge(sequence)
+            .context("expunging IMAP messages")?;
+        self.note_removed(mailbox, ids.len());
         Ok(())
     }
 
@@ -513,6 +603,7 @@ impl MailBackend for ImapBackend {
             .r#move(sequence.clone(), destination_mailbox.clone(), move_opts)
             .is_ok()
         {
+            self.note_removed(source, 1);
             return Ok(());
         }
 
@@ -534,6 +625,42 @@ impl MailBackend for ImapBackend {
         self.session()?
             .uid_expunge(sequence)
             .context("expunging moved IMAP message")?;
+        self.note_removed(source, 1);
+        Ok(())
+    }
+
+    fn move_many(&mut self, source: &str, destination: &str, ids: &[MessageId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.ensure_selected(source)?;
+        let destination_mailbox = mailbox_from_name(destination)?;
+        let sequence = Self::uid_sequence_many(ids)?;
+        let mut move_opts = ImapMessageMoveOptions::default();
+        move_opts.uid = true;
+        if self
+            .session()?
+            .r#move(sequence.clone(), destination_mailbox.clone(), move_opts)
+            .is_ok()
+        {
+            self.note_removed(source, ids.len());
+            return Ok(());
+        }
+
+        let mut copy_opts = ImapMessageCopyOptions::default();
+        copy_opts.uid = true;
+        self.session()?
+            .copy(sequence.clone(), destination_mailbox, copy_opts)
+            .with_context(|| format!("copying IMAP messages to {destination:?}"))?;
+        let mut store_opts = ImapMessageStoreOptions::default();
+        store_opts.uid = true;
+        self.session()?
+            .store(sequence.clone(), StoreType::Add, vec![Flag::Deleted], store_opts)
+            .context("marking moved IMAP messages deleted")?;
+        self.session()?
+            .uid_expunge(sequence)
+            .context("expunging moved IMAP messages")?;
+        self.note_removed(source, ids.len());
         Ok(())
     }
 }

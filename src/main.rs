@@ -62,7 +62,8 @@ fn headless_check(config: &Config) -> Result<()> {
             .with_context(|| format!("{} has no mailboxes", account.name))?;
 
         let scan_start = Instant::now();
-        let messages = backend.open_mailbox(&target.name)?;
+        let page = backend.open_mailbox(&target.name, 0, account.max_messages)?;
+        let messages = &page.messages;
         let scan_elapsed = scan_start.elapsed();
         let body_metric = if let Some(message) = messages.first() {
             let body_start = Instant::now();

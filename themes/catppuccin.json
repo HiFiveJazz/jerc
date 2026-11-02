@@ -1,0 +1,15 @@
+{
+  "id": "catppuccin",
+  "name": "Catppuccin Mocha",
+  "primary": "#89b4fa",
+  "success": "#a6e3a1",
+  "error": "#f38ba8",
+  "warning": "#f9e2af",
+  "text": "#cdd6f4",
+  "text_muted": "#6c7086",
+  "background": "#1e1e2e",
+  "surface": "#313244",
+  "border": "#585b70",
+  "selected_fg": "#1e1e2e",
+  "selected_bg": "#89b4fa"
+}

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 
 use crate::config::AccountConfig;
-use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessageSummary};
+use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage};
 
 pub use imap::{ImapBackend, ImapSource};
 pub use maildir::MaildirBackend;
@@ -44,7 +44,8 @@ pub fn from_source(source: &str) -> Result<Box<dyn MailBackend>> {
         from: None,
         outgoing: None,
         outgoing_cred_cmd: None,
-        max_messages: 500,
+        max_messages: 200,
+        page_size: 100,
     };
     from_account(&account)
 }
@@ -86,12 +87,24 @@ pub trait MailBackend: Send {
     fn connect(&mut self) -> Result<()>;
     fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>>;
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)>;
-    fn open_mailbox(&mut self, name: &str) -> Result<Vec<MessageSummary>>;
+    fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage>;
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody>;
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>>;
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()>;
     fn delete(&mut self, mailbox: &str, id: &MessageId) -> Result<()>;
+    fn delete_many(&mut self, mailbox: &str, ids: &[MessageId]) -> Result<()> {
+        for id in ids {
+            self.delete(mailbox, id)?;
+        }
+        Ok(())
+    }
     fn move_to(&mut self, source: &str, destination: &str, id: &MessageId) -> Result<()>;
+    fn move_many(&mut self, source: &str, destination: &str, ids: &[MessageId]) -> Result<()> {
+        for id in ids {
+            self.move_to(source, destination, id)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

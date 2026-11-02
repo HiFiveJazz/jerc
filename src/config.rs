@@ -35,11 +35,15 @@ pub struct AccountConfig {
     /// token. URI credentials take precedence, mirroring aerc.
     #[serde(default)]
     pub outgoing_cred_cmd: Option<String>,
-    /// Maximum number of newest messages fetched when opening an IMAP
-    /// mailbox. Maildir ignores this. The current UI is not paginated yet, so
-    /// a bounded initial window keeps large Gmail folders responsive.
+    /// Legacy/backend fallback header limit. Headless checks still use this
+    /// value; the interactive TUI uses `page_size` and paginates older mail.
     #[serde(default = "default_max_messages")]
     pub max_messages: usize,
+    /// Number of message headers fetched per interactive page. This is kept
+    /// separate from max_messages so old configs that used a large initial
+    /// window become fast automatically when milestone-5 pagination is enabled.
+    #[serde(default = "default_page_size")]
+    pub page_size: usize,
 }
 
 impl std::fmt::Debug for AccountConfig {
@@ -66,6 +70,7 @@ impl std::fmt::Debug for AccountConfig {
                 &self.outgoing_cred_cmd.as_ref().map(|_| "<configured>"),
             )
             .field("max_messages", &self.max_messages)
+            .field("page_size", &self.page_size)
             .finish()
     }
 }
@@ -76,8 +81,8 @@ pub struct UiConfig {
     /// parse; the browser now uses a proportional mailbox column instead.
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u16,
-    /// Legacy split-preview setting. The browser and message reader are now
-    /// separate screens, so this is intentionally ignored.
+    /// Legacy split-preview width setting. Milestone 5 restored a responsive
+    /// preview split, but keeps this field only so older configs still parse.
     #[serde(default = "default_message_width_percent")]
     pub message_width_percent: u16,
     /// Width of the mailbox column while browsing. The message list consumes
@@ -126,6 +131,7 @@ impl Config {
                 outgoing: None,
                 outgoing_cred_cmd: None,
                 max_messages: default_max_messages(),
+                page_size: default_page_size(),
             }],
             ui: UiConfig::default(),
         }
@@ -145,7 +151,11 @@ fn default_mailbox() -> String {
 }
 
 const fn default_max_messages() -> usize {
-    500
+    200
+}
+
+const fn default_page_size() -> usize {
+    100
 }
 
 const fn default_sidebar_width() -> u16 {
@@ -185,7 +195,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.accounts[0].name, "Kernel");
-        assert_eq!(config.accounts[0].max_messages, 500);
+        assert_eq!(config.accounts[0].max_messages, 200);
+        assert_eq!(config.accounts[0].page_size, 100);
         assert_eq!(config.ui.sidebar_width, 27);
         assert_eq!(config.ui.mailbox_width_percent, 35);
         assert_eq!(config.ui.theme, "nord");
@@ -200,6 +211,7 @@ mod tests {
                 source = "imaps://user%40example.com@imap.example.com:993"
                 source_cred_cmd = "pass show mail/example"
                 max_messages = 250
+                page_size = 64
             "#,
         )
         .unwrap();
@@ -208,6 +220,7 @@ mod tests {
             Some("pass show mail/example")
         );
         assert_eq!(config.accounts[0].max_messages, 250);
+        assert_eq!(config.accounts[0].page_size, 64);
     }
 
     #[test]

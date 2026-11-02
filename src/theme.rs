@@ -3,10 +3,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ratatui::style::{Color, Modifier, Style};
+use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Theme {
-    pub name: &'static str,
+    pub id: String,
+    pub name: String,
     pub foreground: Color,
     pub muted: Color,
     pub accent: Color,
@@ -21,27 +23,27 @@ pub struct Theme {
 
 impl Theme {
     #[must_use]
-    pub fn text(self) -> Style {
+    pub fn text(&self) -> Style {
         Style::default().fg(self.foreground)
     }
 
     #[must_use]
-    pub fn muted(self) -> Style {
+    pub fn muted(&self) -> Style {
         Style::default().fg(self.muted).add_modifier(Modifier::DIM)
     }
 
     #[must_use]
-    pub fn accent(self) -> Style {
+    pub fn accent(&self) -> Style {
         Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
     }
 
     #[must_use]
-    pub fn unread(self) -> Style {
+    pub fn unread(&self) -> Style {
         Style::default().fg(self.unread).add_modifier(Modifier::BOLD)
     }
 
     #[must_use]
-    pub fn selected(self) -> Style {
+    pub fn selected(&self) -> Style {
         Style::default()
             .fg(self.selected_fg)
             .bg(self.selected_bg)
@@ -49,29 +51,167 @@ impl Theme {
     }
 
     #[must_use]
-    pub fn border(self) -> Style {
+    pub fn border(&self) -> Style {
         Style::default().fg(self.border)
     }
 
     #[must_use]
-    pub fn error(self) -> Style {
+    pub fn error(&self) -> Style {
         Style::default().fg(self.error).add_modifier(Modifier::BOLD)
     }
 
     #[must_use]
-    pub fn popup(self) -> Style {
+    pub fn popup(&self) -> Style {
         Style::default().fg(self.foreground).bg(self.popup_bg)
     }
 
     #[must_use]
-    pub fn status(self) -> Style {
+    pub fn status(&self) -> Style {
         Style::default().fg(self.foreground).bg(self.status_bg)
     }
 }
 
-pub const THEMES: [Theme; 6] = [
+#[derive(Debug, Clone, Deserialize)]
+struct ThemeSpec {
+    id: Option<String>,
+    name: Option<String>,
+    primary: Option<String>,
+    success: Option<String>,
+    error: Option<String>,
+    warning: Option<String>,
+    text: Option<String>,
+    text_strong: Option<String>,
+    text_muted: Option<String>,
+    background: Option<String>,
+    surface: Option<String>,
+    border: Option<String>,
+    selected_fg: Option<String>,
+    selected_bg: Option<String>,
+}
+
+const BUILTIN_THEMES: &[(&str, &str)] = &[
+    ("default", include_str!("../themes/default.json")),
+    ("nord", include_str!("../themes/nord.json")),
+    ("gruvbox", include_str!("../themes/gruvbox.json")),
+    ("catppuccin", include_str!("../themes/catppuccin.json")),
+    ("tokyo-night", include_str!("../themes/tokyo-night.json")),
+    ("monochrome", include_str!("../themes/monochrome.json")),
+];
+
+#[must_use]
+pub fn load_themes() -> Vec<Theme> {
+    let mut themes = BUILTIN_THEMES
+        .iter()
+        .filter_map(|(fallback_id, json)| parse_theme(json, fallback_id).ok())
+        .collect::<Vec<_>>();
+
+    if let Ok(entries) = fs::read_dir(theme_dir()) {
+        let mut paths = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            let Ok(json) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let fallback_id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("custom");
+            let Ok(theme) = parse_theme(&json, fallback_id) else {
+                continue;
+            };
+            if let Some(index) = themes
+                .iter()
+                .position(|existing| existing.id.eq_ignore_ascii_case(&theme.id))
+            {
+                themes[index] = theme;
+            } else {
+                themes.push(theme);
+            }
+        }
+    }
+
+    if themes.is_empty() {
+        themes.push(fallback_theme());
+    }
+    themes
+}
+
+fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
+    let spec: ThemeSpec = serde_json::from_str(json).context("parsing theme JSON")?;
+    let id = spec.id.unwrap_or_else(|| fallback_id.to_owned());
+    let name = spec.name.unwrap_or_else(|| id.clone());
+    let primary = parse_color(spec.primary.as_deref().unwrap_or("#7aa2f7"))?;
+    let success = parse_color(spec.success.as_deref().unwrap_or("#9ece6a"))?;
+    let error = parse_color(spec.error.as_deref().unwrap_or("#f7768e"))?;
+    let _ = parse_color(spec.warning.as_deref().unwrap_or("#e0af68"))?;
+    let foreground = parse_color(
+        spec.text
+            .as_deref()
+            .or(spec.text_strong.as_deref())
+            .unwrap_or("#c0caf5"),
+    )?;
+    let muted = parse_color(
+        spec.text_muted
+            .as_deref()
+            .or(spec.border.as_deref())
+            .unwrap_or("#565f89"),
+    )?;
+    let background = parse_color(spec.background.as_deref().unwrap_or("reset"))?;
+    let surface = parse_color(spec.surface.as_deref().unwrap_or_else(|| {
+        spec.background.as_deref().unwrap_or("reset")
+    }))?;
+    let border = parse_color(spec.border.as_deref().unwrap_or("#414868"))?;
+    let selected_fg = parse_color(
+        spec.selected_fg
+            .as_deref()
+            .or(spec.background.as_deref())
+            .unwrap_or("#1a1b26"),
+    )?;
+    let selected_bg = parse_color(spec.selected_bg.as_deref().unwrap_or_else(|| {
+        spec.primary.as_deref().unwrap_or("#7aa2f7")
+    }))?;
+
+    Ok(Theme {
+        id,
+        name,
+        foreground,
+        muted,
+        accent: primary,
+        unread: success,
+        selected_fg,
+        selected_bg,
+        border,
+        error,
+        popup_bg: surface,
+        status_bg: background,
+    })
+}
+
+fn parse_color(value: &str) -> Result<Color> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("reset") || value.eq_ignore_ascii_case("none") {
+        return Ok(Color::Reset);
+    }
+    let hex = value
+        .strip_prefix('#')
+        .ok_or_else(|| anyhow::anyhow!("theme color must be #RRGGBB or reset: {value}"))?;
+    if hex.len() != 6 {
+        return Err(anyhow::anyhow!("theme color must be six hex digits: {value}"));
+    }
+    let red = u8::from_str_radix(&hex[0..2], 16).context("parsing red theme component")?;
+    let green = u8::from_str_radix(&hex[2..4], 16).context("parsing green theme component")?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).context("parsing blue theme component")?;
+    Ok(Color::Rgb(red, green, blue))
+}
+
+fn fallback_theme() -> Theme {
     Theme {
-        name: "default",
+        id: "default".to_owned(),
+        name: "Default".to_owned(),
         foreground: Color::Reset,
         muted: Color::DarkGray,
         accent: Color::Cyan,
@@ -80,81 +220,18 @@ pub const THEMES: [Theme; 6] = [
         selected_bg: Color::Cyan,
         border: Color::DarkGray,
         error: Color::LightRed,
-        popup_bg: Color::Black,
+        popup_bg: Color::Reset,
         status_bg: Color::Reset,
-    },
-    Theme {
-        name: "nord",
-        foreground: Color::Rgb(216, 222, 233),
-        muted: Color::Rgb(76, 86, 106),
-        accent: Color::Rgb(136, 192, 208),
-        unread: Color::Rgb(235, 203, 139),
-        selected_fg: Color::Rgb(46, 52, 64),
-        selected_bg: Color::Rgb(136, 192, 208),
-        border: Color::Rgb(76, 86, 106),
-        error: Color::Rgb(191, 97, 106),
-        popup_bg: Color::Rgb(46, 52, 64),
-        status_bg: Color::Rgb(59, 66, 82),
-    },
-    Theme {
-        name: "gruvbox",
-        foreground: Color::Rgb(235, 219, 178),
-        muted: Color::Rgb(146, 131, 116),
-        accent: Color::Rgb(250, 189, 47),
-        unread: Color::Rgb(184, 187, 38),
-        selected_fg: Color::Rgb(40, 40, 40),
-        selected_bg: Color::Rgb(250, 189, 47),
-        border: Color::Rgb(102, 92, 84),
-        error: Color::Rgb(251, 73, 52),
-        popup_bg: Color::Rgb(40, 40, 40),
-        status_bg: Color::Rgb(60, 56, 54),
-    },
-    Theme {
-        name: "catppuccin",
-        foreground: Color::Rgb(205, 214, 244),
-        muted: Color::Rgb(108, 112, 134),
-        accent: Color::Rgb(137, 180, 250),
-        unread: Color::Rgb(166, 227, 161),
-        selected_fg: Color::Rgb(30, 30, 46),
-        selected_bg: Color::Rgb(137, 180, 250),
-        border: Color::Rgb(88, 91, 112),
-        error: Color::Rgb(243, 139, 168),
-        popup_bg: Color::Rgb(30, 30, 46),
-        status_bg: Color::Rgb(49, 50, 68),
-    },
-    Theme {
-        name: "tokyo-night",
-        foreground: Color::Rgb(192, 202, 245),
-        muted: Color::Rgb(86, 95, 137),
-        accent: Color::Rgb(125, 207, 255),
-        unread: Color::Rgb(158, 206, 106),
-        selected_fg: Color::Rgb(26, 27, 38),
-        selected_bg: Color::Rgb(125, 207, 255),
-        border: Color::Rgb(65, 72, 104),
-        error: Color::Rgb(247, 118, 142),
-        popup_bg: Color::Rgb(26, 27, 38),
-        status_bg: Color::Rgb(36, 40, 59),
-    },
-    Theme {
-        name: "monochrome",
-        foreground: Color::White,
-        muted: Color::DarkGray,
-        accent: Color::White,
-        unread: Color::White,
-        selected_fg: Color::Black,
-        selected_bg: Color::White,
-        border: Color::DarkGray,
-        error: Color::White,
-        popup_bg: Color::Black,
-        status_bg: Color::Reset,
-    },
-];
+    }
+}
 
 #[must_use]
-pub fn theme_index(name: &str) -> usize {
-    THEMES
+pub fn theme_index(themes: &[Theme], name: &str) -> usize {
+    themes
         .iter()
-        .position(|theme| theme.name.eq_ignore_ascii_case(name.trim()))
+        .position(|theme| {
+            theme.id.eq_ignore_ascii_case(name.trim()) || theme.name.eq_ignore_ascii_case(name.trim())
+        })
         .unwrap_or(0)
 }
 
@@ -184,21 +261,42 @@ pub fn theme_state_path() -> PathBuf {
         .join("theme")
 }
 
+#[must_use]
+pub fn theme_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("aerc-rs")
+        .join("themes")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::{THEMES, theme_index};
+    use super::{load_themes, parse_theme, theme_index};
 
     #[test]
     fn built_in_theme_names_are_unique() {
-        let names: HashSet<_> = THEMES.iter().map(|theme| theme.name).collect();
-        assert_eq!(names.len(), THEMES.len());
+        let themes = load_themes();
+        let names: HashSet<_> = themes.iter().map(|theme| theme.id.as_str()).collect();
+        assert_eq!(names.len(), themes.len());
     }
 
     #[test]
     fn theme_lookup_is_case_insensitive_and_safe() {
-        assert_eq!(THEMES[theme_index("NORD")].name, "nord");
-        assert_eq!(THEMES[theme_index("does-not-exist")].name, "default");
+        let themes = load_themes();
+        assert_eq!(themes[theme_index(&themes, "NORD")].id, "nord");
+        assert_eq!(themes[theme_index(&themes, "does-not-exist")].id, "default");
+    }
+
+    #[test]
+    fn lazygitrs_style_flat_json_is_supported() {
+        let theme = parse_theme(
+            r##"{"id":"mine","name":"Mine","primary":"#ff6600","success":"#00ff88","error":"#ff3333","warning":"#ffcc00","text_strong":"#ffffff","background":"#1a1a2e"}"##,
+            "fallback",
+        )
+        .unwrap();
+        assert_eq!(theme.id, "mine");
+        assert_eq!(theme.name, "Mine");
     }
 }

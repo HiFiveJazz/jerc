@@ -1,0 +1,16 @@
+{
+  "id": "tokyo-night",
+  "name": "Tokyo Night",
+  "primary": "#7aa2f7",
+  "success": "#9ece6a",
+  "error": "#f7768e",
+  "warning": "#e0af68",
+  "text": "#c0caf5",
+  "text_strong": "#c0caf5",
+  "text_muted": "#565f89",
+  "background": "#1a1b26",
+  "surface": "#24283b",
+  "border": "#414868",
+  "selected_fg": "#1a1b26",
+  "selected_bg": "#7aa2f7"
+}

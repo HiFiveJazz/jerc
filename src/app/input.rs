@@ -13,10 +13,7 @@ impl Focus {
         if message_open {
             return Self::Preview;
         }
-        match self {
-            Self::Mailboxes => Self::Messages,
-            Self::Messages | Self::Preview => Self::Mailboxes,
-        }
+        Self::Messages
     }
 
     #[must_use]
@@ -36,24 +33,30 @@ pub struct HelpEntry {
 /// Count prefixes are intentionally not listed: `20j` is a Vim motion composed
 /// from a count plus `j`, not a separate keybinding.
 pub const HELP_ENTRIES: &[HelpEntry] = &[
-    HelpEntry { category: "Browse", key: "j / k, ↑ / ↓", description: "move in the focused list" },
-    HelpEntry { category: "Browse", key: "J / K", description: "move the message list regardless of focus" },
-    HelpEntry { category: "Browse", key: "Ctrl-j / Ctrl-k", description: "smooth 22-row scroll" },
+    HelpEntry { category: "Browse", key: "j / k, ↑ / ↓", description: "move through visible messages" },
+    HelpEntry { category: "Browse", key: "J / K", description: "next / previous mailbox" },
+    HelpEntry { category: "Browse", key: "Ctrl-j / Ctrl-k", description: "smooth message scrolling" },
+    HelpEntry { category: "Browse", key: "Ctrl-Shift-j / Ctrl-Shift-k", description: "smooth mailbox scrolling" },
     HelpEntry { category: "Browse", key: "g / G", description: "top / bottom" },
     HelpEntry { category: "Browse", key: "Ctrl-d / Ctrl-u", description: "page down / up" },
-    HelpEntry { category: "Browse", key: "Tab / Shift-Tab", description: "switch mailbox/message focus" },
-    HelpEntry { category: "Browse", key: "Enter / l", description: "open mailbox or message" },
-    HelpEntry { category: "Mail", key: "r / R", description: "reply" },
+    HelpEntry { category: "Browse", key: "/", description: "filter/search current mailbox" },
+    HelpEntry { category: "Browse", key: "b", description: "toggle mailbox sidebar" },
+    HelpEntry { category: "Browse", key: "P", description: "toggle vertical message preview" },
+    HelpEntry { category: "Browse", key: "Enter / l", description: "open selected message" },
+    HelpEntry { category: "Browse", key: "v", description: "visual range selection" },
+    HelpEntry { category: "Mail", key: "r / R", description: "reply without / with quoted text" },
     HelpEntry { category: "Mail", key: "f", description: "forward" },
     HelpEntry { category: "Mail", key: "c", description: "compose new message" },
-    HelpEntry { category: "Mail", key: "d", description: "move to Trash; delete permanently from Trash" },
-    HelpEntry { category: "Mail", key: "a", description: "archive selected message" },
+    HelpEntry { category: "Mail", key: "d / D", description: "delete with confirmation / immediately" },
+    HelpEntry { category: "Mail", key: "a", description: "archive selected message(s)" },
     HelpEntry { category: "Mail", key: "u", description: "toggle read / unread" },
-    HelpEntry { category: "Message", key: "Esc", description: "return to message list" },
+    HelpEntry { category: "Message", key: "Esc", description: "exit visual mode / return to message list" },
     HelpEntry { category: "Message", key: "h", description: "toggle plain / rendered HTML" },
+    HelpEntry { category: "Message", key: "Tab / Shift-Tab", description: "select next / previous rendered HTML link" },
+    HelpEntry { category: "Message", key: "o", description: "open selected rendered HTML link" },
     HelpEntry { category: "Message", key: "e", description: "export raw RFC 5322 message" },
     HelpEntry { category: "General", key: "t", description: "open searchable theme picker" },
-    HelpEntry { category: "General", key: "Ctrl-r", description: "refresh current account" },
+    HelpEntry { category: "General", key: "Ctrl-r", description: "refresh current mailbox" },
     HelpEntry { category: "General", key: "[ / ]", description: "previous / next account" },
     HelpEntry { category: "General", key: "?", description: "search keybindings" },
     HelpEntry { category: "General", key: "q / Ctrl-c", description: "quit" },
@@ -64,20 +67,25 @@ pub enum Command {
     Quit,
     Down,
     Up,
-    MessageDown,
-    MessageUp,
+    MailboxDown,
+    MailboxUp,
+    SmoothMailboxDown,
+    SmoothMailboxUp,
     SmoothDown,
     SmoothUp,
     PageDown,
     PageUp,
     Top,
     Bottom,
-    FocusNext,
-    FocusPrevious,
     Open,
+    ToggleVisual,
     ToggleSeen,
     Delete,
+    DeleteImmediate,
     Archive,
+    Search,
+    ToggleSidebar,
+    TogglePreviewSplit,
     Refresh,
     NextAccount,
     PreviousAccount,
@@ -87,6 +95,7 @@ pub enum Command {
     ToggleHtml,
     Compose,
     Reply,
+    ReplyQuoted,
     Forward,
     Escape,
     Digit(u8),
@@ -95,6 +104,14 @@ pub enum Command {
 
 #[must_use]
 pub fn command_for_key(key: KeyEvent) -> Command {
+    if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Char('J') => Command::SmoothMailboxDown,
+            KeyCode::Char('k') | KeyCode::Char('K') => Command::SmoothMailboxUp,
+            _ => Command::None,
+        };
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Command::Quit,
@@ -113,19 +130,23 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('q') => Command::Quit,
         KeyCode::Char('j') | KeyCode::Down => Command::Down,
         KeyCode::Char('k') | KeyCode::Up => Command::Up,
-        KeyCode::Char('J') => Command::MessageDown,
-        KeyCode::Char('K') => Command::MessageUp,
+        KeyCode::Char('J') => Command::MailboxDown,
+        KeyCode::Char('K') => Command::MailboxUp,
         KeyCode::Char('g') | KeyCode::Home => Command::Top,
         KeyCode::Char('G') | KeyCode::End => Command::Bottom,
         KeyCode::Char(' ') | KeyCode::PageDown => Command::PageDown,
         KeyCode::PageUp => Command::PageUp,
-        KeyCode::Tab => Command::FocusNext,
-        KeyCode::BackTab => Command::FocusPrevious,
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Command::Open,
+        KeyCode::Char('v') => Command::ToggleVisual,
         KeyCode::Char('u') => Command::ToggleSeen,
         KeyCode::Char('d') => Command::Delete,
+        KeyCode::Char('D') => Command::DeleteImmediate,
         KeyCode::Char('a') => Command::Archive,
-        KeyCode::Char('r') | KeyCode::Char('R') => Command::Reply,
+        KeyCode::Char('/') => Command::Search,
+        KeyCode::Char('b') => Command::ToggleSidebar,
+        KeyCode::Char('P') => Command::TogglePreviewSplit,
+        KeyCode::Char('r') => Command::Reply,
+        KeyCode::Char('R') => Command::ReplyQuoted,
         KeyCode::Char('f') => Command::Forward,
         KeyCode::Char(']') => Command::NextAccount,
         KeyCode::Char('[') => Command::PreviousAccount,
@@ -148,34 +169,34 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
-    fn browser_focus_never_enters_message_reader() {
+    fn browser_focus_stays_on_messages() {
         assert_eq!(Focus::Mailboxes.next(false), Focus::Messages);
-        assert_eq!(Focus::Messages.next(false), Focus::Mailboxes);
-        assert_eq!(Focus::Preview.next(false), Focus::Mailboxes);
+        assert_eq!(Focus::Messages.next(false), Focus::Messages);
+        assert_eq!(Focus::Preview.next(false), Focus::Messages);
         assert_eq!(Focus::Messages.next(true), Focus::Preview);
     }
 
     #[test]
-    fn vim_navigation_is_first_class() {
+    fn lowercase_jk_move_messages() {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             Command::Down
         );
         assert_eq!(
-            command_for_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
-            Command::Bottom
+            command_for_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            Command::Up
         );
     }
 
     #[test]
-    fn uppercase_jk_always_target_message_list() {
+    fn uppercase_jk_move_mailboxes() {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT)),
-            Command::MessageDown
+            Command::MailboxDown
         );
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT)),
-            Command::MessageUp
+            Command::MailboxUp
         );
     }
 
@@ -192,6 +213,26 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_shift_jk_scroll_mailboxes() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)),
+            Command::SmoothMailboxDown
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)),
+            Command::SmoothMailboxUp
+        );
+    }
+
+    #[test]
+    fn visual_mode_has_a_direct_key() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
+            Command::ToggleVisual
+        );
+    }
+
+    #[test]
     fn mail_actions_have_direct_keys() {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
@@ -200,6 +241,14 @@ mod tests {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
             Command::Reply
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            Command::ReplyQuoted
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)),
+            Command::DeleteImmediate
         );
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),

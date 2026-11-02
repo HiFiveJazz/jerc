@@ -1,0 +1,15 @@
+{
+  "id": "default",
+  "name": "Default",
+  "primary": "#5fd7ff",
+  "success": "#ffffff",
+  "error": "#ff5f5f",
+  "warning": "#ffd75f",
+  "text": "reset",
+  "text_muted": "#808080",
+  "background": "reset",
+  "surface": "reset",
+  "border": "#808080",
+  "selected_fg": "#000000",
+  "selected_bg": "#5fd7ff"
+}

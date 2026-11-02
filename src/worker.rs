@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::backend::MailBackend;
-use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessageSummary, OutgoingMessage};
+use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingMessage};
 use crate::outgoing::MailSender;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -17,12 +17,14 @@ pub enum ActionKind {
     Connect,
     ListMailboxes,
     MailboxStatus(String),
-    OpenMailbox(String),
+    OpenMailbox { name: String, offset: usize, limit: usize },
     FetchBody { mailbox: String, id: MessageId },
     ExportRaw { mailbox: String, id: MessageId, path: PathBuf },
     SetSeen { mailbox: String, id: MessageId, seen: bool },
     Delete { mailbox: String, id: MessageId },
+    DeleteMany { mailbox: String, ids: Vec<MessageId> },
     Move { source: String, destination: String, id: MessageId },
+    MoveMany { source: String, destination: String, ids: Vec<MessageId> },
     Send(OutgoingMessage),
     Shutdown,
 }
@@ -54,7 +56,7 @@ pub enum WorkerEventKind {
     },
     MailboxOpened {
         name: String,
-        messages: Vec<MessageSummary>,
+        page: MessagePage,
         elapsed_micros: u128,
     },
     BodyLoaded(MessageBody),
@@ -159,13 +161,25 @@ fn run_worker(
         }
 
         // Body loads are the expensive operation users most often make stale by
-        // moving rapidly through a list. Collapse queued FetchBody requests to
-        // the newest selection while preserving all non-body work for later.
-        if matches!(&action.kind, ActionKind::FetchBody { .. }) {
+        // moving rapidly through a list. Keep only the newest queued body load.
+        // A mailbox/page open has higher priority and invalidates every queued
+        // body load: otherwise an old preview can SELECT the mailbox we just left
+        // immediately after the new folder opens. The UI requests the current
+        // preview again after MailboxOpened, so dropping those stale fetches is
+        // both faster and correct.
+        if matches!(&action.kind, ActionKind::FetchBody { .. } | ActionKind::OpenMailbox { .. }) {
+            let mut opening_mailbox = matches!(&action.kind, ActionKind::OpenMailbox { .. });
             loop {
                 match receiver.try_recv() {
-                    Ok(next) if matches!(&next.kind, ActionKind::FetchBody { .. }) => {
+                    Ok(next) if matches!(&next.kind, ActionKind::OpenMailbox { .. }) => {
                         action = next;
+                        opening_mailbox = true;
+                        pending.retain(|queued| !matches!(&queued.kind, ActionKind::FetchBody { .. }));
+                    }
+                    Ok(next) if matches!(&next.kind, ActionKind::FetchBody { .. }) => {
+                        if !opening_mailbox {
+                            action = next;
+                        }
                     }
                     Ok(next) => pending.push_back(next),
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -188,13 +202,15 @@ fn run_worker(
                     unread,
                 }
             }),
-            ActionKind::OpenMailbox(name) => {
+            ActionKind::OpenMailbox { name, offset, limit } => {
                 let start = Instant::now();
-                backend.open_mailbox(&name).map(|messages| WorkerEventKind::MailboxOpened {
-                    name,
-                    messages,
-                    elapsed_micros: start.elapsed().as_micros(),
-                })
+                backend
+                    .open_mailbox(&name, offset, limit)
+                    .map(|page| WorkerEventKind::MailboxOpened {
+                        name,
+                        page,
+                        elapsed_micros: start.elapsed().as_micros(),
+                    })
             }
             ActionKind::FetchBody { mailbox, id } => backend
                 .fetch_body(&mailbox, &id)
@@ -209,8 +225,14 @@ fn run_worker(
             ActionKind::Delete { mailbox, id } => backend
                 .delete(&mailbox, &id)
                 .map(|()| WorkerEventKind::MutationComplete),
+            ActionKind::DeleteMany { mailbox, ids } => backend
+                .delete_many(&mailbox, &ids)
+                .map(|()| WorkerEventKind::MutationComplete),
             ActionKind::Move { source, destination, id } => backend
                 .move_to(&source, &destination, &id)
+                .map(|()| WorkerEventKind::MutationComplete),
+            ActionKind::MoveMany { source, destination, ids } => backend
+                .move_many(&source, &destination, &ids)
                 .map(|()| WorkerEventKind::MutationComplete),
             ActionKind::Send(message) => match outgoing.as_deref_mut() {
                 Some(sender) => sender.send(&message).map(|()| WorkerEventKind::MessageSent),
