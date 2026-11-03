@@ -17,6 +17,7 @@ use io_imap::rfc6851::r#move::ImapMessageMoveOptions;
 use io_imap::rfc7628::auth_oauthbearer::ImapAuthOauthbearerOptions;
 use io_imap::sasl::auth_xoauth2::ImapAuthXoauth2Options;
 use io_imap::types::{
+    body::{BodyStructure, SpecificFields},
     fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
     flag::{Flag, FlagFetch, FlagNameAttribute, StoreType},
     mailbox::{ListMailbox, Mailbox as ImapMailbox},
@@ -482,6 +483,9 @@ impl MailBackend for ImapBackend {
             MessageDataItemName::Flags,
             MessageDataItemName::Rfc822Size,
             MessageDataItemName::Rfc822Header,
+            // BODYSTRUCTURE is metadata only: no MIME body downloaded and no
+            // \Seen flag mutation. This makes attachment chips immediate.
+            MessageDataItemName::BodyStructure,
         ]
         .into();
         let fetched = self
@@ -495,6 +499,7 @@ impl MailBackend for ImapBackend {
             let mut flags = MessageFlags::empty();
             let mut size = 0u64;
             let mut headers = None;
+            let mut attachment_names = Vec::new();
             for item in data_items.as_ref() {
                 match item {
                     MessageDataItem::Uid(value) => uid = Some(value.get()),
@@ -503,6 +508,9 @@ impl MailBackend for ImapBackend {
                     MessageDataItem::Rfc822Header(value) => {
                         headers = value.clone().into_option().map(Cow::into_owned)
                     }
+                    MessageDataItem::BodyStructure(structure) => {
+                        collect_bodystructure_attachments(structure, &mut attachment_names);
+                    }
                     _ => {}
                 }
             }
@@ -510,7 +518,9 @@ impl MailBackend for ImapBackend {
                 continue;
             };
             let id = MessageId(format!("imap-uid:{uid}"));
-            if let Ok(summary) = parse_summary(id, &headers, size, flags) {
+            if let Ok(mut summary) = parse_summary(id, &headers, size, flags) {
+                summary.has_attachment_hint |= !attachment_names.is_empty();
+                summary.attachment_names_hint = attachment_names;
                 messages.push(summary);
             }
         }
@@ -785,6 +795,56 @@ fn run_credential_command(command: &str) -> Result<String> {
         bail!("source_cred_cmd returned an empty credential");
     }
     Ok(secret)
+}
+
+/// MIME structure is available in the same header FETCH. A multipart/mixed
+/// wrapper alone is not proof of any attachment. Only parts with an attachment
+/// disposition, or a genuine filename/name parameter, count. This deliberately
+/// does not count remote <img> URLs or CID inline images with no filename.
+fn collect_bodystructure_attachments(structure: &BodyStructure<'_>, names: &mut Vec<String>) {
+    match structure {
+        BodyStructure::Multi { bodies, .. } => {
+            for part in bodies.iter() { collect_bodystructure_attachments(part, names); }
+        }
+        BodyStructure::Single { body, extension_data } => {
+            let disposition = extension_data.as_ref()
+                .and_then(|data| data.tail.as_ref())
+                .and_then(|data| data.disposition.as_ref());
+            let is_file = disposition.is_some_and(|(kind, _)| {
+                let bytes: &[u8] = kind.as_ref();
+                bytes.eq_ignore_ascii_case(b"attachment")
+            });
+            let filename = disposition.into_iter()
+                .flat_map(|(_, pairs)| pairs.iter())
+                .chain(body.basic.parameter_list.iter())
+                .find(|(key, _)| {
+                    let bytes: &[u8] = key.as_ref();
+                    bytes.eq_ignore_ascii_case(b"filename") || bytes.eq_ignore_ascii_case(b"name")
+                })
+                .map(|(_, value)| {
+                    let bytes: &[u8] = value.as_ref();
+                    String::from_utf8_lossy(bytes).to_string()
+                })
+                .filter(|name| !name.trim().is_empty());
+            // An inline image used in an HTML email is not a user-facing
+            // attachment even when the sender provided a name parameter.
+            let inline = disposition.is_some_and(|(kind, _)| {
+                let bytes: &[u8] = kind.as_ref();
+                bytes.eq_ignore_ascii_case(b"inline")
+            });
+            let inline_image = matches!(&body.specific,
+                SpecificFields::Basic { r#type, .. } if {
+                    let bytes: &[u8] = r#type.as_ref();
+                    bytes.eq_ignore_ascii_case(b"image")
+                });
+            if is_file || (filename.is_some() && !(inline && inline_image)) {
+                let name = filename.unwrap_or_else(|| format!("attachment-{}", names.len() + 1));
+                // Never treat MIME filenames as filesystem paths.
+                let safe = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(&name);
+                names.push(safe.to_owned());
+            }
+        }
+    }
 }
 
 fn flags_from_imap(flags: &[FlagFetch<'_>]) -> MessageFlags {

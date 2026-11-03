@@ -105,6 +105,12 @@ pub struct UiConfig {
     /// Optional terminal bell on an actual Inbox count increase.
     #[serde(default)]
     pub new_mail_bell: bool,
+    /// Desktop notification on a new Inbox count (after baseline is known).
+    #[serde(default = "default_true")]
+    pub new_mail_notifications: bool,
+    /// freedesktop sound theme name; COSMIC-installed themes can provide this.
+    #[serde(default = "default_mail_sound_name")]
+    pub new_mail_sound_name: String,
 }
 
 impl Default for UiConfig {
@@ -117,6 +123,8 @@ impl Default for UiConfig {
             remote_images: false,
             inbox_poll_seconds: default_inbox_poll_seconds(),
             new_mail_bell: false,
+            new_mail_notifications: true,
+            new_mail_sound_name: default_mail_sound_name(),
         }
     }
 }
@@ -187,6 +195,10 @@ const fn default_mailbox_width_percent() -> u16 {
     33
 }
 
+fn default_true() -> bool { true }
+
+fn default_mail_sound_name() -> String { "message-new-email".to_owned() }
+
 fn default_theme() -> String {
     "default".to_owned()
 }
@@ -220,6 +232,8 @@ mod tests {
         assert!(!config.ui.remote_images);
         assert_eq!(config.ui.inbox_poll_seconds, 20);
         assert!(!config.ui.new_mail_bell);
+        assert!(config.ui.new_mail_notifications);
+        assert_eq!(config.ui.new_mail_sound_name, "message-new-email");
     }
 
     #[test]

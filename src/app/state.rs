@@ -189,6 +189,30 @@ pub struct Composer {
     pub forwarded_raw: Option<Vec<u8>>,
     pub sending: bool,
     pub confirm_send: bool,
+    #[serde(skip)]
+    pub help_visible: bool,
+    #[serde(skip)]
+    pub help_query: String,
+    #[serde(skip)]
+    pub help_selected: usize,
+    #[serde(skip)]
+    pub help_scroll: usize,
+    #[serde(skip)]
+    pub visual_linewise: bool,
+    #[serde(skip)]
+    pending_g: bool,
+    #[serde(skip)]
+    pending_delete: bool,
+    #[serde(skip)]
+    pending_inner: bool,
+    #[serde(skip)]
+    pending_find: Option<bool>,
+    #[serde(skip)]
+    count: Option<usize>,
+    #[serde(skip)]
+    undo_history: Vec<(ComposeField, String, usize)>,
+    #[serde(skip)]
+    redo_history: Vec<(ComposeField, String, usize)>,
 }
 
 impl Composer {
@@ -210,6 +234,10 @@ impl Composer {
             forwarded_raw: None,
             sending: false,
             confirm_send: false,
+            help_visible: false, help_query: String::new(), help_selected: 0, help_scroll: 0,
+            visual_linewise: false, pending_g: false, pending_delete: false,
+            pending_inner: false, pending_find: None, count: None,
+            undo_history: Vec::new(), redo_history: Vec::new(),
         }
     }
 
@@ -264,6 +292,10 @@ impl Composer {
             forwarded_raw: None,
             sending: false,
             confirm_send: false,
+            help_visible: false, help_query: String::new(), help_selected: 0, help_scroll: 0,
+            visual_linewise: false, pending_g: false, pending_delete: false,
+            pending_inner: false, pending_find: None, count: None,
+            undo_history: Vec::new(), redo_history: Vec::new(),
         }
     }
 
@@ -278,6 +310,10 @@ impl Composer {
             field: ComposeField::To, mode: ComposeMode::Insert, cursor: 0,
             visual_anchor: None, in_reply_to: None, references: Vec::new(),
             forwarded_raw: Some(raw), sending: false, confirm_send: false,
+            help_visible: false, help_query: String::new(), help_selected: 0, help_scroll: 0,
+            visual_linewise: false, pending_g: false, pending_delete: false,
+            pending_inner: false, pending_find: None, count: None,
+            undo_history: Vec::new(), redo_history: Vec::new(),
         })
     }
 
@@ -317,6 +353,34 @@ impl Composer {
         if self.mode == ComposeMode::Visual {
             self.mode = ComposeMode::Normal;
         }
+        self.visual_linewise = false;
+        self.clear_pending();
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending_g = false;
+        self.pending_delete = false;
+        self.pending_inner = false;
+        self.pending_find = None;
+        self.count = None;
+    }
+
+    fn remember_edit(&mut self) {
+        if self.undo_history.len() >= 200 { self.undo_history.remove(0); }
+        self.undo_history.push((self.field, self.field_value().to_owned(), self.cursor));
+        self.redo_history.clear();
+    }
+
+    fn undo_edit(&mut self, redo: bool) {
+        let previous = if redo { self.redo_history.pop() } else { self.undo_history.pop() };
+        let Some((field, text, cursor)) = previous else { return; };
+        let current = (self.field, self.field_value().to_owned(), self.cursor);
+        if redo { self.undo_history.push(current); } else { self.redo_history.push(current); }
+        self.field = field;
+        *self.field_mut() = text;
+        self.cursor = cursor.min(self.char_count());
+        self.visual_anchor = None;
+        self.visual_linewise = false;
     }
 
     fn byte_index(text: &str, char_index: usize) -> usize {
@@ -328,6 +392,7 @@ impl Composer {
     fn insert_char(&mut self, ch: char) {
         let cursor = self.cursor.min(self.char_count());
         let byte = Self::byte_index(self.field_value(), cursor);
+        self.remember_edit();
         self.field_mut().insert(byte, ch);
         self.cursor = cursor.saturating_add(1);
     }
@@ -356,6 +421,7 @@ impl Composer {
         let text = self.field_value();
         let start_byte = Self::byte_index(text, start);
         let end_byte = Self::byte_index(text, end);
+        self.remember_edit();
         self.field_mut().replace_range(start_byte..end_byte, "");
         self.cursor = start.min(self.char_count());
         self.visual_anchor = None;
@@ -436,6 +502,7 @@ impl Composer {
         }
         let end = self.line_end();
         let byte = Self::byte_index(&self.body, end);
+        self.remember_edit();
         self.body.insert(byte, '\n');
         self.cursor = end.saturating_add(1);
         self.visual_anchor = None;
@@ -447,6 +514,7 @@ impl Composer {
         }
         let start = self.line_start();
         let byte = Self::byte_index(&self.body, start);
+        self.remember_edit();
         self.body.insert(byte, '\n');
         self.cursor = start;
         self.visual_anchor = None;
@@ -480,10 +548,166 @@ impl Composer {
         }
     }
 
-    #[must_use]
+    fn move_word_kind(&mut self, backwards: bool, whole: bool) {
+        let chars: Vec<char> = self.field_value().chars().collect();
+        let belongs = |ch: char| if whole { !ch.is_whitespace() } else { ch.is_alphanumeric() || ch == '_' };
+        if backwards {
+            let mut i = self.cursor.min(chars.len());
+            while i > 0 && !belongs(chars[i - 1]) { i -= 1; }
+            while i > 0 && belongs(chars[i - 1]) { i -= 1; }
+            self.cursor = i;
+        } else {
+            let mut i = self.cursor.min(chars.len());
+            while i < chars.len() && belongs(chars[i]) { i += 1; }
+            while i < chars.len() && !belongs(chars[i]) { i += 1; }
+            self.cursor = i;
+        }
+    }
+
+    fn move_word_end(&mut self, whole: bool) {
+        let chars: Vec<char> = self.field_value().chars().collect();
+        if chars.is_empty() { self.cursor = 0; return; }
+        let belongs = |ch: char| if whole { !ch.is_whitespace() } else { ch.is_alphanumeric() || ch == '_' };
+        let mut i = self.cursor.min(chars.len().saturating_sub(1));
+        if belongs(chars[i]) { i = (i + 1).min(chars.len().saturating_sub(1)); }
+        while i < chars.len().saturating_sub(1) && !belongs(chars[i]) { i += 1; }
+        while i < chars.len().saturating_sub(1) && belongs(chars[i + 1]) { i += 1; }
+        self.cursor = i;
+    }
+
+    fn first_nonblank(&self) -> usize {
+        let chars: Vec<char> = self.field_value().chars().collect();
+        let mut i = self.line_start();
+        while i < chars.len() && chars[i] != '\n' && matches!(chars[i], ' ' | '\t') { i += 1; }
+        i
+    }
+
+    fn move_paragraph(&mut self, forward: bool) {
+        if self.field != ComposeField::Body { return; }
+        let chars: Vec<char> = self.body.chars().collect();
+        let mut i = self.cursor.min(chars.len());
+        if forward {
+            while i < chars.len() {
+                if chars[i] == '\n' && chars.get(i + 1) == Some(&'\n') {
+                    self.cursor = (i + 2).min(chars.len());
+                    return;
+                }
+                i += 1;
+            }
+            self.cursor = chars.len();
+        } else {
+            i = i.saturating_sub(1);
+            while i > 0 {
+                if chars[i - 1] == '\n' && chars[i] == '\n' {
+                    self.cursor = i + 1;
+                    return;
+                }
+                i -= 1;
+            }
+            self.cursor = 0;
+        }
+    }
+
+    fn delete_current_lines(&mut self, count: usize) {
+        if self.field != ComposeField::Body {
+            self.delete_range(0, self.char_count());
+            return;
+        }
+        let start = self.line_start();
+        let chars: Vec<char> = self.body.chars().collect();
+        let mut end = start;
+        for _ in 0..count {
+            while end < chars.len() && chars[end] != '\n' { end += 1; }
+            if end < chars.len() { end += 1; }
+        }
+        // Last line without newline still counts as a line.
+        if start == end && start > 0 { self.delete_range(start - 1, end); }
+        else { self.delete_range(start, end); }
+        self.cursor = start.min(self.char_count());
+    }
+
+    fn delete_words(&mut self, count: usize) {
+        let start = self.cursor;
+        for _ in 0..count { self.move_word_kind(false, false); }
+        self.delete_range(start, self.cursor);
+        self.cursor = start.min(self.char_count());
+    }
+
+    fn find_char(&mut self, ch: char, forward: bool, count: usize) {
+        let chars: Vec<char> = self.field_value().chars().collect();
+        let mut position = self.cursor.min(chars.len());
+        let start = self.line_start();
+        let end = self.line_end();
+        for _ in 0..count {
+            let match_index = if forward {
+                (position.saturating_add(1)..end).find(|&index| chars[index] == ch)
+            } else {
+                (start..position).rev().find(|&index| chars[index] == ch)
+            };
+            let Some(index) = match_index else { break };
+            position = index;
+        }
+        self.cursor = position;
+    }
+
+    fn select_inner_object(&mut self, delimiter: char) {
+        // Reuse the reader's tested matching algorithm: it understands nested
+        // delimiters and paired quotes, unlike a first-open/first-close scan.
+        if let Some((start, end)) = inner_text_object_range(
+            self.field_value(), self.cursor, delimiter,
+        ) {
+            self.visual_anchor = Some(start);
+            self.cursor = end;
+            self.visual_linewise = false;
+            self.mode = ComposeMode::Visual;
+        }
+    }
+
+    fn apply_motion(&mut self, code: KeyCode, count: usize) -> bool {
+        match code {
+            KeyCode::Char('h') | KeyCode::Left => self.move_horizontal(-(count as isize)),
+            KeyCode::Char('l') | KeyCode::Right => self.move_horizontal(count as isize),
+            KeyCode::Char('j') | KeyCode::Down => for _ in 0..count { self.move_line(1); },
+            KeyCode::Char('k') | KeyCode::Up => for _ in 0..count { self.move_line(-1); },
+            KeyCode::Char('w') => for _ in 0..count { self.move_word_kind(false, false); },
+            KeyCode::Char('W') => for _ in 0..count { self.move_word_kind(false, true); },
+            KeyCode::Char('b') => for _ in 0..count { self.move_word_kind(true, false); },
+            KeyCode::Char('B') => for _ in 0..count { self.move_word_kind(true, true); },
+            KeyCode::Char('e') => for _ in 0..count { self.move_word_end(false); },
+            KeyCode::Char('E') => for _ in 0..count { self.move_word_end(true); },
+            KeyCode::Char('0') | KeyCode::Home | KeyCode::Char('H') => self.cursor = self.line_start(),
+            KeyCode::Char('^') => self.cursor = self.first_nonblank(),
+            KeyCode::Char('$') | KeyCode::End | KeyCode::Char('L') => self.cursor = self.line_end(),
+            KeyCode::Char('G') => self.cursor = self.char_count(),
+            KeyCode::Char('{') => for _ in 0..count { self.move_paragraph(false); },
+            KeyCode::Char('}') => for _ in 0..count { self.move_paragraph(true); },
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn compose_help_matches(&self) -> Vec<usize> {
+        let query = self.help_query.trim().to_lowercase();
+        super::input::COMPOSE_HELP_ENTRIES.iter().enumerate()
+            .filter_map(|(index, entry)| {
+                (query.is_empty() || format!("{} {} {}", entry.category, entry.key, entry.description)
+                    .to_lowercase().contains(&query)).then_some(index)
+            })
+            .collect()
+    }
+
     pub fn visual_range(&self) -> Option<(usize, usize)> {
         let anchor = self.visual_anchor?;
         let cursor = self.cursor.min(self.char_count());
+        if self.visual_linewise && self.field == ComposeField::Body {
+            let chars: Vec<char> = self.body.chars().collect();
+            let mut start = anchor.min(cursor);
+            while start > 0 && chars[start - 1] != '\n' { start -= 1; }
+            let mut end = anchor.max(cursor);
+            while end < chars.len() && chars[end] != '\n' { end += 1; }
+            if end < chars.len() { end += 1; }
+            return Some((start, end));
+        }
         Some(if anchor <= cursor {
             (anchor, cursor.saturating_add(1).min(self.char_count()))
         } else {
@@ -911,6 +1135,9 @@ pub struct App {
     inbox_poll_interval: Duration,
     new_mail_bell_enabled: bool,
     new_mail_bell_pending: bool,
+    new_mail_notifications_enabled: bool,
+    new_mail_sound_name: String,
+    new_mail_notices: VecDeque<(String, usize)>,
     pub mailbox_width_percent: u16,
     pub sidebar_visible: bool,
     pub preview_split: bool,
@@ -1025,6 +1252,9 @@ impl App {
             inbox_poll_interval: Duration::from_secs(config.ui.inbox_poll_seconds.clamp(10, 3600)),
             new_mail_bell_enabled: config.ui.new_mail_bell,
             new_mail_bell_pending: false,
+            new_mail_notifications_enabled: config.ui.new_mail_notifications,
+            new_mail_sound_name: config.ui.new_mail_sound_name.clone(),
+            new_mail_notices: VecDeque::new(),
             mailbox_width_percent: config.ui.mailbox_width_percent.clamp(20, 50),
             sidebar_visible: true,
             preview_split: false,
@@ -1113,6 +1343,13 @@ impl App {
     pub fn take_new_mail_bell(&mut self) -> bool {
         std::mem::take(&mut self.new_mail_bell_pending)
     }
+
+    /// Only known count increases trigger notifications; never notify on initial sync.
+    pub fn take_new_mail_notice(&mut self) -> Option<(String, usize)> {
+        self.new_mail_notices.pop_front()
+    }
+
+    pub fn new_mail_sound_name(&self) -> &str { &self.new_mail_sound_name }
 
     pub fn bootstrap(&mut self) {
         for account in &mut self.accounts {
@@ -1486,6 +1723,9 @@ impl App {
                         "{} new message(s) in {}", new_count, account.name,
                     ), Duration::from_secs(6));
                     if self.new_mail_bell_enabled { self.new_mail_bell_pending = true; }
+                    if self.new_mail_notifications_enabled {
+                        self.new_mail_notices.push_back((account.name.clone(), new_count));
+                    }
                     if account.current_mailbox.as_deref() == Some(name.as_str()) {
                         // Never replace the reader underneath someone who is
                         // in the middle of an email. Defer the page refresh
@@ -1620,9 +1860,7 @@ impl App {
                     ),
                     Duration::from_secs(4),
                 );
-                if self.preview_split {
-                    account.request_selected_body();
-                }
+                if self.preview_split { account.request_selected_body(); }
                 if account.pending_inbox_refresh && account.page_inflight.is_none()
                     && !(self.message_open && event.account == self.account_index)
                 {
@@ -2252,9 +2490,7 @@ impl App {
         if account.message_index != previous {
             account.preview_scroll = 0;
             account.keep_message_cursor_visible();
-            if preview_split {
-                account.request_selected_body();
-            }
+            if preview_split { account.request_selected_body(); }
         }
 
         let remaining = visible.len().saturating_sub(next.saturating_add(1));
@@ -3943,166 +4179,217 @@ impl App {
     }
 
     fn handle_composer_key(&mut self, key: KeyEvent) {
-        let sending = self.composer.as_ref().is_some_and(|composer| composer.sending);
-        if sending {
+        let Some(composer) = self.composer.as_ref() else { return; };
+        if composer.sending {
             if key.code == KeyCode::Esc {
-                self.status = StatusLine::temporary(
-                    "send is already in progress",
-                    Duration::from_secs(2),
-                );
+                self.status = StatusLine::temporary("send is already in progress", Duration::from_secs(2));
             }
             return;
         }
-
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
             self.postpone_composer();
             return;
         }
-
-        if self
-            .composer
-            .as_ref()
-            .is_some_and(|composer| composer.confirm_send)
-        {
+        if composer.confirm_send {
             match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.confirm_send = false;
-                    }
+                    if let Some(composer) = self.composer.as_mut() { composer.confirm_send = false; }
                     self.send_composer();
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.confirm_send = false;
-                    }
+                    if let Some(composer) = self.composer.as_mut() { composer.confirm_send = false; }
                     self.status = StatusLine::temporary("send cancelled", Duration::from_secs(1));
                 }
                 _ => {}
             }
             return;
         }
-
-        let Some(mode) = self.composer.as_ref().map(|composer| composer.mode) else {
+        if composer.help_visible {
+            let composer = self.composer.as_mut().expect("composer exists");
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') if composer.help_query.is_empty() => {
+                    composer.help_visible = false;
+                }
+                KeyCode::Esc => composer.help_visible = false,
+                KeyCode::Backspace => {
+                    composer.help_query.pop();
+                    composer.help_selected = *composer.compose_help_matches().first().unwrap_or(&0);
+                    composer.help_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) && composer.help_query.is_empty() => {
+                    let matches = composer.compose_help_matches();
+                    if let Some(position) = matches.iter().position(|&i| i == composer.help_selected) {
+                        let next = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
+                            position.saturating_sub(1)
+                        } else { (position + 1).min(matches.len().saturating_sub(1)) };
+                        composer.help_selected = matches[next];
+                        composer.help_scroll = next.saturating_sub(5);
+                    }
+                }
+                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                    composer.help_query.push(ch);
+                    composer.help_selected = *composer.compose_help_matches().first().unwrap_or(&0);
+                    composer.help_scroll = 0;
+                }
+                _ => {}
+            }
             return;
-        };
-
+        }
+        let composer = self.composer.as_mut().expect("composer exists");
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('r') => composer.undo_edit(true),
+                KeyCode::Char('j') if composer.field == ComposeField::Body => {
+                    for _ in 0..5 { composer.move_line(1); }
+                }
+                KeyCode::Char('k') if composer.field == ComposeField::Body => {
+                    for _ in 0..5 { composer.move_line(-1); }
+                }
+                _ => {}
+            }
+            return;
+        }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            let composer = self.composer.as_mut().expect("composer checked above");
-            let field = if key.code == KeyCode::Tab {
+            let next = if key.code == KeyCode::Tab {
                 composer.field.next()
-            } else {
-                composer.field.previous()
-            };
-            composer.switch_field(field);
+            } else { composer.field.previous() };
+            composer.switch_field(next);
+            return;
+        }
+        if composer.mode == ComposeMode::Insert {
+            match key.code {
+                KeyCode::Esc => {
+                    composer.mode = ComposeMode::Normal;
+                    composer.visual_anchor = None;
+                    composer.visual_linewise = false;
+                }
+                KeyCode::Enter if composer.field == ComposeField::Body => composer.insert_char('\n'),
+                KeyCode::Enter => composer.switch_field(composer.field.next()),
+                KeyCode::Backspace => composer.backspace(),
+                KeyCode::Delete => composer.delete_at_cursor(),
+                KeyCode::Left => composer.move_horizontal(-1),
+                KeyCode::Right => composer.move_horizontal(1),
+                KeyCode::Up => composer.move_line(-1),
+                KeyCode::Down => composer.move_line(1),
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::ALT) => composer.insert_char(ch),
+                _ => {}
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('?') {
+            composer.help_visible = true;
+            composer.help_query.clear();
+            composer.help_selected = 0;
+            composer.help_scroll = 0;
+            composer.clear_pending();
             return;
         }
 
-        match mode {
-            ComposeMode::Insert => {
-                let Some(composer) = self.composer.as_mut() else {
-                    return;
-                };
-                match key.code {
-                    KeyCode::Esc => {
-                        composer.mode = ComposeMode::Normal;
-                        composer.visual_anchor = None;
-                    }
-                    KeyCode::Enter if composer.field == ComposeField::Body => {
-                        composer.insert_char('\n');
-                    }
-                    KeyCode::Enter => {
-                        composer.switch_field(composer.field.next());
-                    }
-                    KeyCode::Backspace => composer.backspace(),
-                    KeyCode::Left => composer.move_horizontal(-1),
-                    KeyCode::Right => composer.move_horizontal(1),
-                    KeyCode::Up => composer.move_line(-1),
-                    KeyCode::Down => composer.move_line(1),
-                    KeyCode::Char(ch)
-                        if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        composer.insert_char(ch);
-                    }
-                    _ => {}
-                }
+        // Multi-key Vim operations take precedence over simple motions.
+        if let Some(forward) = composer.pending_find.take() {
+            if let KeyCode::Char(ch) = key.code {
+                let count = composer.count.take().unwrap_or(1);
+                composer.find_char(ch, forward, count);
             }
-            ComposeMode::Normal => {
-                if key.code == KeyCode::Esc {
-                    self.composer = None;
-                    return;
+            return;
+        }
+        if composer.pending_inner {
+            composer.pending_inner = false;
+            if let KeyCode::Char(delim) = key.code { composer.select_inner_object(delim); }
+            return;
+        }
+        if composer.pending_g {
+            composer.pending_g = false;
+            if key.code == KeyCode::Char('g') { composer.cursor = 0; composer.count = None; return; }
+        }
+        if composer.pending_delete {
+            composer.pending_delete = false;
+            let count = composer.count.take().unwrap_or(1);
+            match key.code {
+                KeyCode::Char('d') => composer.delete_current_lines(count),
+                KeyCode::Char('w') => composer.delete_words(count),
+                KeyCode::Char('$') => {
+                    let end = composer.line_end();
+                    composer.delete_range(composer.cursor, end);
                 }
-                let Some(composer) = self.composer.as_mut() else {
-                    return;
-                };
-                match key.code {
-                    KeyCode::Enter => composer.confirm_send = true,
-                    KeyCode::Char('i') => composer.mode = ComposeMode::Insert,
-                    KeyCode::Char('a') => {
-                        composer.move_horizontal(1);
-                        composer.mode = ComposeMode::Insert;
-                    }
-                    KeyCode::Char('I') => {
-                        composer.cursor = composer.line_start();
-                        composer.mode = ComposeMode::Insert;
-                    }
-                    KeyCode::Char('A') => {
-                        composer.cursor = composer.line_end();
-                        composer.mode = ComposeMode::Insert;
-                    }
-                    KeyCode::Char('v') => {
-                        composer.visual_anchor = Some(composer.cursor.min(composer.char_count()));
-                        composer.mode = ComposeMode::Visual;
-                    }
-                    KeyCode::Char('h') | KeyCode::Left => composer.move_horizontal(-1),
-                    KeyCode::Char('l') | KeyCode::Right => composer.move_horizontal(1),
-                    KeyCode::Char('j') | KeyCode::Down => composer.move_line(1),
-                    KeyCode::Char('k') | KeyCode::Up => composer.move_line(-1),
-                    KeyCode::Char('w') => composer.move_word(false),
-                    KeyCode::Char('b') => composer.move_word(true),
-                    KeyCode::Char('0') | KeyCode::Home => composer.cursor = composer.line_start(),
-                    KeyCode::Char('$') | KeyCode::End => composer.cursor = composer.line_end(),
-                    KeyCode::Char('x') | KeyCode::Delete => composer.delete_at_cursor(),
-                    KeyCode::Char('o') if composer.field == ComposeField::Body => {
-                        composer.open_line_below();
-                        composer.mode = ComposeMode::Insert;
-                    }
-                    KeyCode::Char('O') if composer.field == ComposeField::Body => {
-                        composer.open_line_above();
-                        composer.mode = ComposeMode::Insert;
-                    }
-                    _ => {}
-                }
+                _ => {}
             }
-            ComposeMode::Visual => {
-                let Some(composer) = self.composer.as_mut() else {
-                    return;
-                };
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('v') => {
-                        composer.visual_anchor = None;
-                        composer.mode = ComposeMode::Normal;
-                    }
-                    KeyCode::Char('h') | KeyCode::Left => composer.move_horizontal(-1),
-                    KeyCode::Char('l') | KeyCode::Right => composer.move_horizontal(1),
-                    KeyCode::Char('j') | KeyCode::Down => composer.move_line(1),
-                    KeyCode::Char('k') | KeyCode::Up => composer.move_line(-1),
-                    KeyCode::Char('w') => composer.move_word(false),
-                    KeyCode::Char('b') => composer.move_word(true),
-                    KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
-                        if let Some((start, end)) = composer.visual_range() {
-                            composer.delete_range(start, end);
-                        }
-                        composer.mode = ComposeMode::Normal;
-                    }
-                    KeyCode::Char('c') => {
-                        if let Some((start, end)) = composer.visual_range() {
-                            composer.delete_range(start, end);
-                        }
-                        composer.mode = ComposeMode::Insert;
-                    }
-                    _ => {}
+            return;
+        }
+        if let KeyCode::Char(digit @ '1'..='9') = key.code {
+            composer.count = Some(composer.count.unwrap_or(0)
+                .saturating_mul(10).saturating_add(digit.to_digit(10).unwrap_or(0) as usize)
+                .min(MAX_COUNT_PREFIX));
+            return;
+        }
+        if key.code == KeyCode::Char('0') && composer.count.is_some() {
+            composer.count = Some(composer.count.unwrap_or(0).saturating_mul(10).min(MAX_COUNT_PREFIX));
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('g')) { composer.pending_g = true; return; }
+        if matches!(key.code, KeyCode::Char('f' | 'F')) {
+            composer.pending_find = Some(key.code == KeyCode::Char('f'));
+            return;
+        }
+        let count = composer.count.take().unwrap_or(1);
+        if composer.apply_motion(key.code, count) { return; }
+        match composer.mode {
+            ComposeMode::Normal => match key.code {
+                KeyCode::Enter => composer.confirm_send = true,
+                KeyCode::Esc | KeyCode::Char('q') => { self.composer = None; }
+                KeyCode::Char('i') => composer.mode = ComposeMode::Insert,
+                KeyCode::Char('a') => { composer.move_horizontal(1); composer.mode = ComposeMode::Insert; }
+                KeyCode::Char('I') => { composer.cursor = composer.first_nonblank(); composer.mode = ComposeMode::Insert; }
+                KeyCode::Char('A') => { composer.cursor = composer.line_end(); composer.mode = ComposeMode::Insert; }
+                KeyCode::Char('v') => {
+                    composer.visual_anchor = Some(composer.cursor.min(composer.char_count()));
+                    composer.visual_linewise = false;
+                    composer.mode = ComposeMode::Visual;
                 }
-            }
+                KeyCode::Char('V') => {
+                    composer.visual_anchor = Some(composer.cursor.min(composer.char_count()));
+                    composer.visual_linewise = true;
+                    composer.mode = ComposeMode::Visual;
+                }
+                KeyCode::Char('u') => composer.undo_edit(false),
+                KeyCode::Char('x') | KeyCode::Delete => for _ in 0..count { composer.delete_at_cursor(); },
+                KeyCode::Char('D') => {
+                    let end = composer.line_end();
+                    composer.delete_range(composer.cursor, end);
+                }
+                KeyCode::Char('d') => { composer.pending_delete = true; composer.count = Some(count); }
+                KeyCode::Char('o') if composer.field == ComposeField::Body => {
+                    composer.open_line_below(); composer.mode = ComposeMode::Insert;
+                }
+                KeyCode::Char('O') if composer.field == ComposeField::Body => {
+                    composer.open_line_above(); composer.mode = ComposeMode::Insert;
+                }
+                _ => {}
+            },
+            ComposeMode::Visual => match key.code {
+                KeyCode::Esc | KeyCode::Char('v') => {
+                    composer.visual_anchor = None;
+                    composer.visual_linewise = false;
+                    composer.mode = ComposeMode::Normal;
+                }
+                KeyCode::Char('V') => composer.visual_linewise = !composer.visual_linewise,
+                KeyCode::Char('i') => composer.pending_inner = true,
+                KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
+                    if let Some((start, end)) = composer.visual_range() { composer.delete_range(start, end); }
+                    composer.visual_anchor = None;
+                    composer.visual_linewise = false;
+                    composer.mode = ComposeMode::Normal;
+                }
+                KeyCode::Char('c') => {
+                    if let Some((start, end)) = composer.visual_range() { composer.delete_range(start, end); }
+                    composer.visual_anchor = None;
+                    composer.visual_linewise = false;
+                    composer.mode = ComposeMode::Insert;
+                }
+                _ => {}
+            },
+            ComposeMode::Insert => {}
         }
     }
 
@@ -4729,6 +5016,73 @@ mod tests {
     }
 
     #[test]
+    fn compose_vim_word_motions_and_undo_redo_are_consistent() {
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.body = "first second".to_owned();
+        composer.cursor = 0;
+        assert!(composer.apply_motion(crossterm::event::KeyCode::Char('w'), 1));
+        assert_eq!(composer.cursor, 6);
+        composer.insert_char('X');
+        assert_eq!(composer.body, "first Xsecond");
+        composer.undo_edit(false);
+        assert_eq!(composer.body, "first second");
+        composer.undo_edit(true);
+        assert_eq!(composer.body, "first Xsecond");
+    }
+
+    #[test]
+    fn compose_inner_text_objects_choose_the_inner_enclosing_delimiter() {
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.body = "call(foo[bar])".to_owned();
+        composer.cursor = 10;
+        composer.select_inner_object('[');
+        assert_eq!(composer.mode, ComposeMode::Visual);
+        assert_eq!(composer.visual_range(), Some((9, 12)));
+        composer.mode = ComposeMode::Normal;
+        composer.cursor = 10;
+        composer.select_inner_object('(');
+        assert_eq!(composer.visual_range(), Some((5, 13)));
+    }
+
+    #[test]
+    fn compose_find_char_never_crosses_into_the_next_line() {
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.body = "first line\nsecond line x".to_owned();
+        composer.cursor = 0;
+        composer.find_char('x', true, 1);
+        assert_eq!(composer.cursor, 0);
+        composer.cursor = composer.body.chars().count();
+        composer.find_char('s', false, 1);
+        assert_eq!(composer.cursor, "first line\n".chars().count());
+    }
+
+    #[test]
+    fn compose_visual_linewise_range_covers_the_newline() {
+        let mut composer = Composer::new();
+        composer.body = "one\ntwo\nthree".to_owned();
+        composer.switch_field(ComposeField::Body);
+        composer.cursor = 5;
+        composer.visual_anchor = Some(5);
+        composer.visual_linewise = true;
+        composer.mode = ComposeMode::Visual;
+        assert_eq!(composer.visual_range(), Some((4, 8)));
+    }
+
+    #[test]
+    fn compose_help_search_uses_its_own_keymap() {
+        let mut composer = Composer::new();
+        composer.help_query = "brackets".to_owned();
+        let matches = composer.compose_help_matches();
+        assert!(!matches.is_empty());
+        assert!(matches.iter().all(|&index| {
+            super::super::input::COMPOSE_HELP_ENTRIES[index].description.contains("brackets")
+        }));
+    }
+
+    #[test]
     fn reader_inner_text_objects_support_quotes_and_brackets() {
         assert_eq!(inner_text_object_range(r#"say "hello" now"#, 6, '"'), Some((5, 9)));
         assert_eq!(inner_text_object_range("call(foo[bar])", 9, ']'), Some((9, 11)));
@@ -4839,6 +5193,7 @@ mod tests {
             size: 0,
             flags: MessageFlags::empty(),
             has_attachment_hint: false,
+            attachment_names_hint: Vec::new(),
         };
         let attribution = reply_attribution(&message);
         assert!(attribution.starts_with("On "));

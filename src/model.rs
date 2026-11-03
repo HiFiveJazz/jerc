@@ -129,6 +129,8 @@ pub struct MessageSummary {
     pub flags: MessageFlags,
     /// Header-only, conservative hint available before loading the MIME body.
     pub has_attachment_hint: bool,
+    /// MIME filenames from IMAP BODYSTRUCTURE, available before fetching body.
+    pub attachment_names_hint: Vec<String>,
 }
 
 impl MessageSummary {

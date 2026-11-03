@@ -10,7 +10,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, ComposeField, ComposeMode, HELP_ENTRIES, ReaderSelection,
+    App, ComposeField, ComposeMode, COMPOSE_HELP_ENTRIES, HELP_ENTRIES, ReaderSelection,
 };
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
 use crate::theme::Theme;
@@ -41,6 +41,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_composer(frame, app);
         if app.composer.as_ref().is_some_and(|composer| composer.confirm_send) {
             draw_send_confirmation(frame, app);
+        } else if app.composer.as_ref().is_some_and(|composer| composer.help_visible) {
+            draw_compose_help(frame, app);
         }
     }
 }
@@ -226,10 +228,31 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 
     let height = usize::from(list_area.height.max(1));
-    let start = offset.min(visible.len().saturating_sub(1));
-    let end = start.saturating_add(height).min(visible.len());
-    let shown = &visible[start..end];
     let current_position = current_position.unwrap_or(0);
+    // A message with files has two display lines, like Gmail's filename chips.
+    // Compute the viewport in terminal rows rather than assuming every email
+    // consumes one line (which clipped selected rows at the bottom).
+    let row_heights = {
+        let account = app.account().expect("account exists");
+        visible.iter().map(|&index| {
+            let message = &account.messages[index];
+            if message.has_attachment(account.bodies.get(&message.id)) { 2usize } else { 1 }
+        }).collect::<Vec<_>>()
+    };
+    let mut start = offset.min(visible.len().saturating_sub(1));
+    if current_position < start { start = current_position; }
+    while start < current_position && row_heights[start..=current_position]
+        .iter().sum::<usize>() > height
+    { start += 1; }
+    let mut end = start;
+    let mut used = 0usize;
+    while end < visible.len() && used + row_heights[end] <= height {
+        used += row_heights[end];
+        end += 1;
+    }
+    if end == start { end = (start + 1).min(visible.len()); }
+    if let Some(account) = app.account_mut() { account.message_view_offset = start; }
+    let shown = &visible[start..end];
     let number_width = relative_number_width(visible.len());
     let message_columns = [
         Constraint::Length(number_width),
@@ -247,7 +270,7 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // leave only half the glyph visible in terminals/font fallback stacks.
     let subject_width = column_areas
         .get(3)
-        .map_or(0, |area| usize::from(area.width.saturating_sub(1)));
+        .map_or(0, |area| usize::from(area.width.saturating_sub(2)));
     let rows = shown.iter().enumerate().map(|(row_position, index)| {
         let account = app.account().expect("account exists");
         let message = &account.messages[*index];
@@ -283,16 +306,28 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             theme.text()
         };
+        let mut subject_lines = vec![Line::raw(format!(
+            "{} ",
+            truncate_display_width(&subject_for_list(&message.subject), subject_width)
+        ))];
+        if attachment_mark {
+            let names: &[String] = account.bodies.get(&message.id)
+                .map_or(message.attachment_names_hint.as_slice(), |body| body.attachment_names.as_slice());
+            let subtitle = if names.is_empty() {
+                "  Attachment".to_owned()
+            } else {
+                format!("  {}", names.iter().take(2).map(String::as_str).collect::<Vec<_>>().join(" · "))
+            };
+            subject_lines.push(Line::styled(truncate_display_width(&subtitle, subject_width), theme.muted()));
+        }
         Row::new(vec![
             Cell::from(number),
             Cell::from(mark),
             Cell::from(sender.clone()),
-            Cell::from(format!(
-                "{} ",
-                truncate_display_width(&subject_for_list(&message.subject), subject_width)
-            )),
+            Cell::from(Text::from(subject_lines)),
             Cell::from(message.date_label.clone()),
         ])
+        .height(if attachment_mark { 2 } else { 1 })
         .style(style)
     });
 
@@ -417,8 +452,9 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ]));
             }
         } else if message.has_attachment_hint {
+            let names = message.attachment_names_hint.iter().take(2).cloned().collect::<Vec<_>>().join("  ·  ");
             lines.push(Line::from(vec![Span::styled("⧉  ", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
-                Span::styled("Attachments likely (z: browse)", theme.muted())]));
+                Span::styled(if names.is_empty() { "Attachments (z: browse)".to_owned() } else { names }, theme.text())]));
         }
         lines.push(Line::styled(
             "─".repeat(usize::from(content_area.width)),
@@ -1242,48 +1278,82 @@ fn draw_confirmation(frame: &mut Frame<'_>, app: &App) {
 
 fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme().clone();
-    let Some(composer) = app.composer.as_ref().filter(|composer| composer.confirm_send) else {
-        return;
-    };
-    let area = centered_rect(frame.area(), 64, 28);
+    let Some(composer) = app.composer.as_ref().filter(|c| c.confirm_send) else { return; };
+    let area = centered_rect(frame.area(), 72, 38);
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Send message? ")
-        .borders(Borders::ALL)
-        .border_style(theme.accent());
+    let block = Block::default().title(" Send this email? ")
+        .borders(Borders::ALL).border_style(theme.accent());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(inner);
+    let body = vec![
+        Line::styled("Confirm the final recipients before sending.", theme.text().add_modifier(Modifier::BOLD)),
+        Line::raw(""),
+        Line::from(vec![Span::styled("To: ", theme.accent()), Span::raw(composer.to.clone())]),
+        Line::from(vec![Span::styled("Cc: ", theme.accent()), Span::raw(composer.cc.clone())]),
+        Line::from(vec![Span::styled("Bcc: ", theme.accent()), Span::raw(composer.bcc.clone())]),
+        Line::from(vec![Span::styled("Subject: ", theme.accent()), Span::raw(composer.subject.clone())]),
+        Line::styled(if composer.subject.trim().is_empty() { "Warning: empty subject" } else { "" }, theme.error()),
+        Line::styled(if composer.body.to_ascii_lowercase().contains("attach") && composer.attachments.trim().is_empty() && composer.forwarded_raw.is_none() {
+            "Warning: body mentions an attachment but none is selected"
+        } else { "" }, theme.error()),
+    ];
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), chunks[0]);
+    let send = " Enter Send ";
+    let cancel = " Esc Cancel ";
+    let send_width = UnicodeWidthStr::width(send) as u16;
+    let cancel_width = UnicodeWidthStr::width(cancel) as u16;
+    let gap = 3;
+    let start = chunks[1].x + chunks[1].width.saturating_sub(send_width + cancel_width + gap) / 2;
+    let y = chunks[1].y + chunks[1].height.saturating_sub(1);
+    frame.render_widget(
+        Paragraph::new(send).style(Style::default().bg(theme.accent).fg(Color::Black).add_modifier(Modifier::BOLD)),
+        Rect::new(start, y, send_width.min(chunks[1].width), 1),
+    );
+    frame.render_widget(
+        Paragraph::new(cancel).style(Style::default().bg(theme.popup_bg).fg(theme.text).add_modifier(Modifier::BOLD)),
+        Rect::new(start.saturating_add(send_width).saturating_add(gap), y, cancel_width, 1),
+    );
+}
+
+fn compose_mode_colors(mode: ComposeMode) -> (Color, Color) {
+    match mode {
+        ComposeMode::Normal => (Color::Blue, Color::Black),
+        ComposeMode::Insert => (Color::LightGreen, Color::Black),
+        ComposeMode::Visual => (Color::Rgb(170, 110, 255), Color::Black),
+    }
+}
+
+fn draw_compose_help(frame: &mut Frame<'_>, app: &App) {
+    let theme = app.theme().clone();
+    let Some(composer) = app.composer.as_ref() else { return; };
+    let area = centered_rect(frame.area(), 85, 73);
+    frame.render_widget(Clear, area);
+    let block = Block::default().title(" Compose keybindings ")
+        .borders(Borders::ALL).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(1),
-    ])
-    .split(inner);
-    let body = vec![
-        Line::from(vec![Span::styled("To: ", theme.accent()), Span::raw(composer.to.clone())]),
-        Line::from(vec![Span::styled("Subject: ", theme.accent()), Span::raw(composer.subject.clone())]),
-        Line::raw(""),
-        Line::styled("Send this message now?", theme.text()),
-        Line::styled(
-            if composer.subject.trim().is_empty() { "Warning: empty subject" } else { "" },
-            theme.error(),
-        ),
-        Line::styled(
-            if composer.body.to_ascii_lowercase().contains("attach") && composer.attachments.trim().is_empty() && composer.forwarded_raw.is_none() {
-                "Warning: body mentions an attachment, but none is selected"
-            } else { "" },
-            theme.error(),
-        ),
-    ];
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), chunks[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" Enter/y ", theme.accent()),
-            Span::styled("send   ", theme.muted()),
-            Span::styled(" Esc/n ", theme.accent()),
-            Span::styled("cancel", theme.muted()),
-        ])),
-        chunks[1],
-    );
+        Constraint::Length(2), Constraint::Min(1), Constraint::Length(1),
+    ]).split(inner);
+    draw_search_header(frame, chunks[0], &composer.help_query, app);
+    let matches = composer.compose_help_matches();
+    let max_start = matches.len().saturating_sub(usize::from(chunks[1].height));
+    let start = composer.help_scroll.min(max_start);
+    let shown: Vec<usize> = matches.into_iter().skip(start)
+        .take(usize::from(chunks[1].height)).collect();
+    let rows = shown.iter().map(|&index| {
+        let entry = COMPOSE_HELP_ENTRIES[index];
+        Row::new(vec![Cell::from(entry.category), Cell::from(entry.key), Cell::from(entry.description)])
+    });
+    let table = Table::new(rows, [
+        Constraint::Length(10), Constraint::Length(22), Constraint::Min(18),
+    ]).style(theme.text()).column_spacing(1).row_highlight_style(theme.selected());
+    let selected = shown.iter().position(|&index| index == composer.help_selected);
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, chunks[1], &mut state);
+    frame.render_widget(Paragraph::new(" Type to filter   Backspace to edit   Esc to close ")
+        .style(theme.muted()), chunks[2]);
 }
 
 fn draw_composer(frame: &mut Frame<'_>, app: &App) {
@@ -1293,22 +1363,10 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
     };
     let area = centered_rect(frame.area(), 96, 82);
     frame.render_widget(Clear, area);
-    let title = if composer.sending {
-        " Compose • sending… ".to_owned()
-    } else {
-        format!(
-            " Compose • {} • Tab fields • Enter confirms send from NORMAL ",
-            composer.mode.label()
-        )
-    };
     let block = Block::default()
-        .title(title)
+        .title(if composer.sending { " Compose • sending… " } else { " Compose " })
         .borders(Borders::ALL)
-        .border_style(match composer.mode {
-            ComposeMode::Normal => theme.accent(),
-            ComposeMode::Insert => theme.unread(),
-            ComposeMode::Visual => theme.error(),
-        });
+        .border_style(theme.border());
     let inside = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1342,33 +1400,35 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
         fields[6],
     );
 
-    let body = editor_text(&composer.body, composer, body_active, &theme);
+    let mut body = editor_text(&composer.body, composer, body_active, &theme);
+    let active_line = composer.body.chars().take(composer.cursor)
+        .filter(|&ch| ch == '\n').count();
+    for (i, line) in body.lines.iter_mut().enumerate() {
+        let number = if body_active && i == active_line { (i + 1).to_string() }
+            else { i.abs_diff(active_line).to_string() };
+        line.spans.insert(0, Span::styled(format!("{number:>3} "), theme.muted()));
+    }
+    let viewport_height = usize::from(fields[7].height).max(1);
+    let scroll = if body_active { active_line.saturating_sub(viewport_height.saturating_sub(3)) } else { 0 };
     frame.render_widget(
-        Paragraph::new(body)
-            .style(theme.text())
-            .wrap(Wrap { trim: false }),
-        fields[7],
+        Paragraph::new(body).style(theme.text())
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+            .wrap(Wrap { trim: false }), fields[7],
     );
+    // Same compact, filled mode indicator as the lazygitrs commit editor.
+    // The compose keymap is searchable with `?`, not repeated in this footer.
+    let label = format!(" {} ", composer.mode.label());
+    let width = (UnicodeWidthStr::width(label.as_str()) as u16).min(fields[8].width);
+    let mode_area = Rect::new(fields[8].right().saturating_sub(width), fields[8].y, width, 1);
+    let (bg, fg) = compose_mode_colors(composer.mode);
+    frame.render_widget(Paragraph::new(label)
+        .style(Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD)), mode_area);
+    if app.status.is_error {
+        let error_width = fields[8].width.saturating_sub(width + 1);
+        frame.render_widget(Paragraph::new(app.status.text.as_str())
+            .style(theme.error()), Rect::new(fields[8].x, fields[8].y, error_width, 1));
+    }
 
-    let mode_hint = match composer.mode {
-        ComposeMode::Insert => "INSERT  Esc normal • Tab next field",
-        ComposeMode::Normal => {
-            "NORMAL  i/a/I/A insert • o/O lines • v visual • hjkl/wb move • Enter send"
-        }
-        ComposeMode::Visual => "VISUAL  hjkl select • d/x delete • c change • Esc normal",
-    };
-    let footer = if app.status.is_error {
-        vec![
-            Span::styled(" ERROR ", theme.error()),
-            Span::styled(app.status.text.clone(), theme.error()),
-        ]
-    } else {
-        vec![
-            Span::styled(format!(" {} ", composer.mode.label()), theme.accent()),
-            Span::styled(mode_hint, theme.muted()),
-        ]
-    };
-    frame.render_widget(Paragraph::new(Line::from(footer)), fields[8]);
 }
 
 fn draw_compose_field(
@@ -1403,23 +1463,26 @@ fn editor_spans(
     value: &str,
     composer: &crate::app::Composer,
     active: bool,
-    theme: &crate::theme::Theme,
+    theme: &Theme,
 ) -> Vec<Span<'static>> {
     let chars: Vec<char> = value.chars().collect();
     let cursor = composer.cursor.min(chars.len());
     let selection = active.then(|| composer.visual_range()).flatten();
     let mut spans = Vec::with_capacity(chars.len().saturating_add(1));
-    for index in 0..=chars.len() {
-        if active && index == cursor {
-            spans.push(Span::styled("▏".to_owned(), theme.accent()));
+    let block = Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD);
+    for (index, ch) in chars.iter().copied().enumerate() {
+        let at_cursor = active && index == cursor;
+        if at_cursor && composer.mode == ComposeMode::Insert {
+            spans.push(Span::styled("▏", theme.accent()));
         }
-        if let Some(ch) = chars.get(index).copied() {
-            let selected = selection.is_some_and(|(start, end)| (start..end).contains(&index));
-            spans.push(Span::styled(
-                ch.to_string(),
-                if selected { theme.selected() } else { theme.text() },
-            ));
-        }
+        let selected = selection.is_some_and(|(start, end)| (start..end).contains(&index));
+        spans.push(Span::styled(ch.to_string(),
+            if at_cursor && composer.mode != ComposeMode::Insert { block }
+            else if selected { theme.selected() } else { theme.text() }));
+    }
+    if active && cursor == chars.len() {
+        spans.push(Span::styled(if composer.mode == ComposeMode::Insert { "▏" } else { " " },
+            if composer.mode == ComposeMode::Insert { theme.accent() } else { block }));
     }
     spans
 }
@@ -1449,7 +1512,7 @@ fn editor_text(
     value: &str,
     composer: &crate::app::Composer,
     active: bool,
-    theme: &crate::theme::Theme,
+    theme: &Theme,
 ) -> Text<'static> {
     let selection = active.then(|| composer.visual_range()).flatten();
     let cursor = composer.cursor.min(value.chars().count());
@@ -1457,34 +1520,32 @@ fn editor_text(
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut global = 0usize;
-
+    let block = Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD);
     for ch in value.chars() {
-        if active && global == cursor {
-            spans.push(Span::styled("▏".to_owned(), theme.accent()));
+        let at_cursor = active && global == cursor;
+        if at_cursor && composer.mode == ComposeMode::Insert {
+            spans.push(Span::styled("▏", theme.accent()));
         }
         if ch == '\n' {
+            if at_cursor && composer.mode != ComposeMode::Insert {
+                spans.push(Span::styled(" ", block));
+            }
             lines.push(Line::from(std::mem::take(&mut spans)));
             global += 1;
             continue;
         }
         let selected = selection.is_some_and(|(start, end)| (start..end).contains(&global));
-        let quoted = quote_ranges
-            .iter()
-            .any(|&(start, end)| global >= start && global < end);
-        spans.push(Span::styled(
-            ch.to_string(),
-            if selected {
-                theme.selected()
-            } else if quoted {
-                Style::default().fg(theme.muted)
-            } else {
-                theme.text()
-            },
-        ));
+        let quoted = quote_ranges.iter().any(|&(start, end)| global >= start && global < end);
+        spans.push(Span::styled(ch.to_string(),
+            if at_cursor && composer.mode != ComposeMode::Insert { block }
+            else if selected { theme.selected() }
+            else if quoted { Style::default().fg(theme.muted) }
+            else { theme.text() }));
         global += 1;
     }
     if active && global == cursor {
-        spans.push(Span::styled("▏".to_owned(), theme.accent()));
+        spans.push(Span::styled(if composer.mode == ComposeMode::Insert { "▏" } else { " " },
+            if composer.mode == ComposeMode::Insert { theme.accent() } else { block }));
     }
     lines.push(Line::from(spans));
     Text::from(lines)
@@ -1565,33 +1626,27 @@ fn truncate_chars(text: &str, width: usize) -> String {
 }
 
 fn subject_for_list(subject: &str) -> String {
-    let mut out = String::with_capacity(subject.len());
-    let mut chars = subject.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\u{fe0f}' {
+    let mut out = String::with_capacity(subject.len() + 8);
+    let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(subject, true).collect();
+    for (index, grapheme) in graphemes.iter().enumerate() {
+        // Keep text presentation for monochrome terminal glyphs. Important:
+        // never insert a variation selector in the middle of a grapheme;
+        // doing that broke emoji+following-text shaping in some terminals.
+        for ch in grapheme.chars() {
+            if ch == '\u{fe0f}' { out.push('\u{fe0e}'); }
+            else { out.push(ch); }
+        }
+        if grapheme.chars().count() == 1 && grapheme.chars().any(is_emoji_text_candidate) {
             out.push('\u{fe0e}');
-            continue;
         }
-
-        out.push(ch);
-        if !is_emoji_text_candidate(ch) {
-            continue;
-        }
-
-        match chars.peek().copied() {
-            Some('\u{fe0e}') => {
-                out.push(chars.next().expect("peeked variation selector"));
-            }
-            Some('\u{fe0f}') => {
-                let _ = chars.next();
-                out.push('\u{fe0e}');
-            }
-            Some('\u{200d}') | Some('\u{1f3fb}'..='\u{1f3ff}') => {}
-            _ => out.push('\u{fe0e}'),
+        // A single space between an emoji and an immediately following word
+        // guards against terminal fallback glyphs painting over that word.
+        let is_emoji = grapheme.chars().any(is_emoji_text_candidate);
+        let next = graphemes.get(index + 1).copied().unwrap_or("");
+        if is_emoji && next.chars().next().is_some_and(char::is_alphanumeric) {
+            out.push(' ');
         }
     }
-
     out
 }
 
@@ -1671,6 +1726,28 @@ mod tests {
     fn browse_subjects_request_text_emoji_presentation() {
         assert_eq!(subject_for_list("🎉 Sale"), "🎉\u{fe0e} Sale");
         assert!(!subject_for_list("🎉️ Sale").contains('\u{fe0f}'));
+    }
+
+    #[test]
+    fn emoji_before_subject_text_keeps_a_safe_cell_separator() {
+        let subject = subject_for_list("🎉Sale today");
+        assert!(subject.starts_with("🎉\u{fe0e} Sale"));
+        assert!(!subject.contains('\u{fe0f}'));
+        let display = truncate_display_width(&subject, 12);
+        assert!(UnicodeWidthStr::width(display.as_str()) <= 12);
+    }
+
+    #[test]
+    fn compose_mode_badges_use_distinct_filled_colors() {
+        use crate::app::ComposeMode;
+        let normal = super::compose_mode_colors(ComposeMode::Normal);
+        let insert = super::compose_mode_colors(ComposeMode::Insert);
+        let visual = super::compose_mode_colors(ComposeMode::Visual);
+        assert_eq!(normal, (Color::Blue, Color::Black));
+        assert_eq!(insert, (Color::LightGreen, Color::Black));
+        assert_ne!(visual.0, normal.0);
+        assert_ne!(visual.0, insert.0);
+        assert_eq!(visual.1, Color::Black);
     }
 
     #[test]

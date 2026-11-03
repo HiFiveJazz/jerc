@@ -57,6 +57,11 @@ inbox_poll_seconds = 20
 # Optional audible terminal bell when a previously-known Inbox count rises.
 # The terminal's own bell settings determine whether a sound plays.
 new_mail_bell = false
+# Desktop notifications are ON by default. A sound-name hint asks the installed
+# sound theme (including COSMIC, when selected system-wide) to play its email sound.
+# Requires a freedesktop notification daemon and `notify-send` (libnotify).
+new_mail_notifications = true
+new_mail_sound_name = "message-new-email"
 
 # Legacy layout options are still accepted so existing configs keep loading.
 # sidebar_width = 24

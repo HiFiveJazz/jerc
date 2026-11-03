@@ -1,4 +1,5 @@
 use std::io::{self, Stdout, Write};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -158,6 +159,11 @@ fn event_loop(
             RuntimeEvent::InputStopped => break,
         }
 
+        // The desktop notification server owns the themed sound, not the
+        // terminal. Never invoke a shell or block the TUI on a notification.
+        while let Some((account, count)) = app.take_new_mail_notice() {
+            notify_new_mail(&account, count, app.new_mail_sound_name());
+        }
         if app.take_new_mail_bell() {
             // Terminal bell: honors the user's terminal bell settings and
             // requires no external audio process or extra dependencies.
@@ -174,6 +180,24 @@ fn event_loop(
         render(terminal, app)?;
     }
     Ok(())
+}
+
+/// Fire-and-forget freedesktop notification. `notify-send` is the Wayland/X11
+/// transport; the sound name is resolved by the user's active sound theme.
+/// Never print GTK warnings over the alternate screen.
+fn notify_new_mail(account: &str, count: usize, sound: &str) {
+    let title = if count == 1 { "New email" } else { "New emails" };
+    let body = format!("{count} new message(s) in {account}");
+    let mut command = ProcessCommand::new("notify-send");
+    command.args(["--app-name=aerc-rs", "--icon=mail-unread"])
+        .arg("--hint")
+        .arg(format!("string:sound-name:{sound}"))
+        .arg(title)
+        .arg(body)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = command.spawn();
 }
 
 fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {

@@ -164,6 +164,7 @@ pub fn parse_summary(
         size,
         flags,
         has_attachment_hint: attachment_hint(raw_headers),
+        attachment_names_hint: Vec::new(),
     })
 }
 

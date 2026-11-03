@@ -74,6 +74,29 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "General", key: "q / Ctrl-c", description: "quit" },
 ];
 
+/// Compose-specific, searchable modal shortcuts. Do not clutter the editor.
+pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
+    HelpEntry { category: "Compose", key: "Tab / Shift-Tab", description: "next / previous header or body field" },
+    HelpEntry { category: "Compose", key: "Enter (normal)", description: "review and confirm outgoing message" },
+    HelpEntry { category: "Compose", key: "?", description: "search compose shortcuts" },
+    HelpEntry { category: "Compose", key: "Ctrl-p", description: "postpone draft locally" },
+    HelpEntry { category: "Compose", key: "Esc", description: "leave insert/visual mode or close composer" },
+    HelpEntry { category: "Vim", key: "i a I A", description: "insert before/after cursor, line start/end" },
+    HelpEntry { category: "Vim", key: "h j k l", description: "left, down, up, right" },
+    HelpEntry { category: "Vim", key: "w W b B e E", description: "word and WORD navigation" },
+    HelpEntry { category: "Vim", key: "0 ^ $ H L", description: "beginning / first nonblank / end of line" },
+    HelpEntry { category: "Vim", key: "gg G", description: "first / last line in current field" },
+    HelpEntry { category: "Vim", key: "{ }", description: "previous / next paragraph" },
+    HelpEntry { category: "Vim", key: "v V", description: "character / whole-line visual selection" },
+    HelpEntry { category: "Vim", key: "vi\" vi' vi( vi[ vi{", description: "select inside quoted text / paired brackets" },
+    HelpEntry { category: "Vim", key: "f F", description: "find character forward / backward" },
+    HelpEntry { category: "Vim", key: "o O", description: "open new body line below / above" },
+    HelpEntry { category: "Vim", key: "x dd dw D", description: "delete character / line / word / to line end" },
+    HelpEntry { category: "Vim", key: "u / Ctrl-r", description: "undo / redo editing" },
+    HelpEntry { category: "Vim", key: "2j / 3w / …", description: "repeat a motion with a count" },
+    HelpEntry { category: "Vim", key: "Ctrl-j / Ctrl-k", description: "move down/up five body lines" },
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Quit,
