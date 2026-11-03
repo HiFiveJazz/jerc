@@ -2374,10 +2374,21 @@ impl App {
             .saturating_add(self.reader_line_count)
             .max(view_height);
 
+        let reader_cursor = self.reader_cursor;
         let Some(account) = self.account_mut() else {
             return;
         };
         account.smooth_preview_target = None;
+
+        // When Vim/neoscroll returns to the first body line, restore the true
+        // top of the message as well. The image sits between the headers and the
+        // body, so leaving scrolloff anchored at `body_start` kept the cursor
+        // visible while the header image remained scrolled away permanently.
+        if reader_cursor == 0 {
+            account.preview_scroll = 0;
+            return;
+        }
+
         let current_offset = usize::from(account.preview_scroll);
         let scrolloff = READER_SCROLL_OFF.min(view_height.saturating_sub(1) / 2);
         let max_offset = total_rows.saturating_sub(view_height);

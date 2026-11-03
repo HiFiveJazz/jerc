@@ -6,6 +6,8 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui_image::Image as TerminalImage;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, ComposeField, ComposeMode, HELP_ENTRIES, ReaderSelection,
@@ -222,6 +224,23 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let shown = &visible[start..end];
     let current_position = current_position.unwrap_or(0);
     let number_width = relative_number_width(visible.len());
+    let message_columns = [
+        Constraint::Length(number_width),
+        Constraint::Length(2),
+        Constraint::Percentage(28),
+        Constraint::Min(12),
+        Constraint::Length(6),
+    ];
+    let column_areas = Layout::horizontal(message_columns.clone())
+        .spacing(1)
+        .split(list_area);
+    // Keep one terminal cell clear at the right edge of the subject column.
+    // Some monochrome emoji glyphs are double-cell/wide even in text
+    // presentation; allowing the final grapheme to touch the clipping edge can
+    // leave only half the glyph visible in terminals/font fallback stacks.
+    let subject_width = column_areas
+        .get(3)
+        .map_or(0, |area| usize::from(area.width.saturating_sub(1)));
     let rows = shown.iter().enumerate().map(|(row_position, index)| {
         let account = app.account().expect("account exists");
         let message = &account.messages[*index];
@@ -252,22 +271,16 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Cell::from(number),
             Cell::from(mark),
             Cell::from(sender.clone()),
-            Cell::from(subject_for_list(&message.subject)),
+            Cell::from(format!(
+                "{} ",
+                truncate_display_width(&subject_for_list(&message.subject), subject_width)
+            )),
             Cell::from(message.date_label.clone()),
         ])
         .style(style)
     });
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(number_width),
-            Constraint::Length(2),
-            Constraint::Percentage(28),
-            Constraint::Min(12),
-            Constraint::Length(6),
-        ],
-    )
+    let table = Table::new(rows, message_columns)
     .style(theme.text())
     .column_spacing(1);
     frame.render_widget(table, list_area);
@@ -710,7 +723,10 @@ fn reader_fragments(
             .iter()
             .any(|&(match_start, match_end)| start >= match_start && start < match_end)
         {
-            fragment_style = fragment_style.bg(illuminate_background());
+            // Match vim-illuminate's default IlluminatedWord* groups: keep the
+            // existing syntax/rich-text colour and mark references with an
+            // underline instead of painting them with an accent-derived fill.
+            fragment_style = fragment_style.add_modifier(Modifier::UNDERLINED);
         }
         if selected_columns.is_some_and(|(selected_start, selected_end)| {
             start >= selected_start && start <= selected_end
@@ -777,13 +793,6 @@ fn word_match_ranges(text: &str, word: &str) -> Vec<(usize, usize)> {
 
 fn is_reader_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
-}
-
-fn illuminate_background() -> Color {
-    // Illuminate should read as a neutral reference highlight, not as another
-    // selection/accent colour. Keep it deliberately achromatic so blue themes
-    // such as Tokyo Night do not turn every matching word blue.
-    Color::Rgb(96, 96, 96)
 }
 
 fn reader_cursor_style() -> Style {
@@ -1317,6 +1326,32 @@ fn mailbox_row_text(name: &str, count: &str, width: usize) -> String {
     format!("{name:<name_width$} {count:>count_width$}")
 }
 
+fn truncate_display_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+
+    let budget = width.saturating_sub(1);
+    let mut used = 0usize;
+    let mut out = String::new();
+    for grapheme in UnicodeSegmentation::graphemes(text, true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if used.saturating_add(grapheme_width) > budget {
+            break;
+        }
+        out.push_str(grapheme);
+        used = used.saturating_add(grapheme_width);
+    }
+    out.push('…');
+    out
+}
+
 fn truncate_chars(text: &str, width: usize) -> String {
     let len = text.chars().count();
     if len <= width {
@@ -1390,12 +1425,13 @@ fn relative_number_width(len: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        illuminate_background, mailbox_row_text, pad_reader_line, reader_word_at, relative_number,
-        rich_html_style, subject_for_list, word_match_ranges,
+        mailbox_row_text, pad_reader_line, reader_word_at, relative_number, rich_html_style,
+        subject_for_list, truncate_display_width, word_match_ranges,
     };
     use crate::model::HtmlSpanStyle;
     use crate::theme::load_themes;
     use ratatui::style::Color;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn relative_numbers_match_vim_style() {
@@ -1428,6 +1464,16 @@ mod tests {
     }
 
     #[test]
+    fn browse_subject_truncation_never_splits_emoji_graphemes() {
+        let subject = subject_for_list("Status 👨\u{200d}💻 complete");
+        let truncated = truncate_display_width(&subject, 10);
+        assert!(!truncated.ends_with('\u{200d}'));
+        assert!(!truncated.ends_with('\u{fe0e}'));
+        assert!(truncated.ends_with('…'));
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 10);
+    }
+
+    #[test]
     fn reader_illuminate_finds_word_under_cursor() {
         assert_eq!(
             reader_word_at("alpha beta\nnext", 0, 7),
@@ -1445,13 +1491,27 @@ mod tests {
     }
 
     #[test]
-    fn reader_illuminate_uses_neutral_grey() {
-        let Color::Rgb(red, green, blue) = illuminate_background() else {
-            panic!("illuminate background should be RGB");
-        };
-        assert_eq!(red, green);
-        assert_eq!(green, blue);
-        assert!(red >= 80);
+    fn reader_illuminate_uses_vim_illuminate_default_underline() {
+        let theme = load_themes().into_iter().next().expect("theme");
+        let fragments = super::reader_fragments(
+            "word",
+            theme.text(),
+            0,
+            4,
+            1,
+            0,
+            0,
+            None,
+            true,
+            &theme,
+            &[(0, 4)],
+        );
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0]
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::UNDERLINED));
+        assert_eq!(fragments[0].style.bg, None);
     }
 
     #[test]

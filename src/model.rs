@@ -256,6 +256,19 @@ impl MessageBody {
 
     #[must_use]
     pub fn html_image_candidates(&self) -> Vec<HtmlImageCandidate> {
+        // Prefer the original HTML source order over html2text image annotations.
+        // html2text intentionally drops many <img> tags whose alt text is empty,
+        // which made us skip real header/avatar images and then pick a footer badge
+        // or social icon farther down the message instead. Browsers still render
+        // those alt-less images, so use the source document as the authority.
+        if let Some(html) = self.html_source.as_deref() {
+            let images = html_source_image_candidates(html);
+            if !images.is_empty() {
+                return images;
+            }
+        }
+
+        // Fallback for synthetic/test bodies where only rich annotations exist.
         let mut images = Vec::new();
         if let Some(lines) = &self.html_lines {
             for line in lines {
@@ -263,25 +276,18 @@ impl MessageBody {
                     let Some(source) = span.style.image.as_deref() else {
                         continue;
                     };
-                    if !matches!(
-                        source.split_once(':').map(|(scheme, _)| scheme),
-                        Some("http" | "https")
-                    ) || looks_like_tracking_image(source)
+                    if !is_remote_image_source(source)
+                        || looks_like_tracking_image(source)
                         || images
                             .iter()
                             .any(|existing: &HtmlImageCandidate| existing.source == source)
                     {
                         continue;
                     }
-                    let (width_px, height_px) = self
-                        .html_source
-                        .as_deref()
-                        .and_then(|html| html_image_size_hint(html, source))
-                        .unwrap_or((None, None));
                     images.push(HtmlImageCandidate {
                         source: source.to_owned(),
-                        width_px,
-                        height_px,
+                        width_px: None,
+                        height_px: None,
                     });
                 }
             }
@@ -306,7 +312,9 @@ impl MessageBody {
     }
 }
 
-fn html_image_size_hint(html: &str, source: &str) -> Option<(Option<u32>, Option<u32>)> {
+fn html_source_image_candidates(html: &str) -> Vec<HtmlImageCandidate> {
+    let mut images = Vec::new();
+    let mut image_alts: Vec<Option<String>> = Vec::new();
     let mut cursor = 0usize;
     while let Some(relative) = html[cursor..].find('<') {
         let start = cursor + relative;
@@ -330,10 +338,21 @@ fn html_image_size_hint(html: &str, source: &str) -> Option<(Option<u32>, Option
             continue;
         }
 
-        let Some(src) = html_tag_attribute(tag, "src") else {
+        let Some(raw_source) = html_tag_attribute(tag, "src") else {
             continue;
         };
-        if decode_html_attribute(&src) != source {
+        let source = decode_html_attribute(&raw_source);
+        if !is_remote_image_source(&source)
+            || looks_like_tracking_image(&source)
+            || images
+                .iter()
+                .any(|existing: &HtmlImageCandidate| existing.source == source)
+        {
+            continue;
+        }
+
+        let style = html_tag_attribute(tag, "style");
+        if style.as_deref().is_some_and(html_image_style_is_hidden) {
             continue;
         }
 
@@ -343,21 +362,95 @@ fn html_image_size_hint(html: &str, source: &str) -> Option<(Option<u32>, Option
         let attribute_height = html_tag_attribute(tag, "height")
             .as_deref()
             .and_then(parse_css_pixel_value);
-        let style = html_tag_attribute(tag, "style");
-        // Inline CSS wins over legacy width/height attributes in browsers. Use
-        // the same precedence for our layout hint, while retaining the attribute
-        // as a fallback when CSS uses percentages/auto rather than pixel values.
-        let width = style
+        let width_px = style
             .as_deref()
             .and_then(|style| css_property_pixels(style, "width"))
             .or(attribute_width);
-        let height = style
+        let height_px = style
             .as_deref()
             .and_then(|style| css_property_pixels(style, "height"))
             .or(attribute_height);
-        return Some((width, height));
+
+        // Zero-sized/1px resources are almost always open trackers or layout
+        // shims even when the URL itself does not contain a tracker keyword.
+        if width_px.is_some_and(|width| width <= 1) || height_px.is_some_and(|height| height <= 1) {
+            continue;
+        }
+
+        let alt = html_tag_attribute(tag, "alt")
+            .map(|alt| decode_html_attribute(&alt).trim().to_owned())
+            .filter(|alt| !alt.is_empty());
+        images.push(HtmlImageCandidate {
+            source,
+            width_px,
+            height_px,
+        });
+        image_alts.push(alt);
     }
-    None
+
+    // Some marketing headers are assembled from several adjacent image slices
+    // carrying the same descriptive alt text. Picking the first source-order
+    // image can therefore select a decorative left/right fragment instead of
+    // the actual central logo. Within a contiguous run of the same non-empty
+    // alt text, move the largest declared image to the front while preserving
+    // the order of everything else. Empty-alt runs deliberately stay untouched
+    // because those are often meaningful avatar/hero sequences (for example
+    // Ko-fi mail) where source order is the best signal we have.
+    let mut run_start = 0usize;
+    while run_start < images.len() {
+        let Some(run_alt) = image_alts[run_start].as_deref() else {
+            run_start += 1;
+            continue;
+        };
+        let mut run_end = run_start + 1;
+        while run_end < images.len()
+            && image_alts[run_end]
+                .as_deref()
+                .is_some_and(|alt| alt.eq_ignore_ascii_case(run_alt))
+        {
+            run_end += 1;
+        }
+        if run_end - run_start > 1 {
+            let best = (run_start..run_end)
+                .max_by_key(|&index| image_candidate_declared_area(&images[index]))
+                .unwrap_or(run_start);
+            if best != run_start {
+                images[run_start..=best].rotate_right(1);
+                image_alts[run_start..=best].rotate_right(1);
+            }
+        }
+        run_start = run_end;
+    }
+
+    images
+}
+
+fn image_candidate_declared_area(image: &HtmlImageCandidate) -> u64 {
+    match (image.width_px, image.height_px) {
+        (Some(width), Some(height)) => u64::from(width) * u64::from(height),
+        (Some(width), None) => u64::from(width),
+        (None, Some(height)) => u64::from(height),
+        (None, None) => 0,
+    }
+}
+
+fn is_remote_image_source(source: &str) -> bool {
+    matches!(
+        source.split_once(':').map(|(scheme, _)| scheme),
+        Some("http" | "https")
+    )
+}
+
+fn html_image_style_is_hidden(style: &str) -> bool {
+    style.split(';').any(|declaration| {
+        let Some((name, value)) = declaration.split_once(':') else {
+            return false;
+        };
+        let name = name.trim();
+        let value = value.trim().to_ascii_lowercase();
+        (name.eq_ignore_ascii_case("display") && value.starts_with("none"))
+            || (name.eq_ignore_ascii_case("visibility") && value.starts_with("hidden"))
+    })
 }
 
 fn html_tag_attribute(tag: &str, wanted: &str) -> Option<String> {
@@ -557,6 +650,135 @@ mod tests {
             attachment_count: 0,
         };
         assert_eq!(body.html_images(), vec!["https://example.com/hero.png".to_owned()]);
+    }
+
+    #[test]
+    fn html_image_candidates_follow_source_order_even_when_alt_is_empty() {
+        let body = MessageBody {
+            id: MessageId("source-order-images".into()),
+            plain_text: None,
+            plain_fallback: None,
+            html_source: Some(
+                r#"<img src="https://example.com/avatar.png" width="45" height="45" alt="">
+                    <p>message</p>
+                    <img src="https://example.com/footer-badge.png" width="120" height="40" alt="App Store">"#
+                    .to_owned(),
+            ),
+            html_text: Some("message App Store".into()),
+            // Simulate html2text exposing only the footer image because the
+            // real header/avatar had empty alt text.
+            html_lines: Some(vec![HtmlLine {
+                spans: vec![HtmlSpan {
+                    text: "App Store".into(),
+                    style: HtmlSpanStyle {
+                        image: Some("https://example.com/footer-badge.png".into()),
+                        ..HtmlSpanStyle::default()
+                    },
+                }],
+            }]),
+            html_renderer: Some("test".into()),
+            html_render_width: 80,
+            attachment_count: 0,
+        };
+
+        assert_eq!(
+            body.html_image_candidates(),
+            vec![
+                HtmlImageCandidate {
+                    source: "https://example.com/avatar.png".into(),
+                    width_px: Some(45),
+                    height_px: Some(45),
+                },
+                HtmlImageCandidate {
+                    source: "https://example.com/footer-badge.png".into(),
+                    width_px: Some(120),
+                    height_px: Some(40),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn html_image_candidates_prefer_largest_slice_in_same_alt_header_group() {
+        let body = MessageBody {
+            id: MessageId("composite-header".into()),
+            plain_text: None,
+            plain_fallback: None,
+            html_source: Some(
+                r#"<img src="https://example.com/left.png" width="60" alt="Walmart Plus Home page">
+                    <img src="https://example.com/logo.png" width="150" alt="Walmart Plus Home page">
+                    <img src="https://example.com/right.png" width="60" alt="Walmart Plus Home page">
+                    <img src="https://example.com/body.png" width="300" alt="Body image">"#
+                    .to_owned(),
+            ),
+            html_text: Some("message".into()),
+            html_lines: None,
+            html_renderer: Some("test".into()),
+            html_render_width: 80,
+            attachment_count: 0,
+        };
+
+        assert_eq!(
+            body.html_images(),
+            vec![
+                "https://example.com/logo.png".to_owned(),
+                "https://example.com/left.png".to_owned(),
+                "https://example.com/right.png".to_owned(),
+                "https://example.com/body.png".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn html_image_candidates_keep_empty_alt_source_order() {
+        let body = MessageBody {
+            id: MessageId("empty-alt-order".into()),
+            plain_text: None,
+            plain_fallback: None,
+            html_source: Some(
+                r#"<img src="https://example.com/avatar.png" width="45" height="45" alt="">
+                    <img src="https://example.com/hero.png" width="500" height="300" alt="">"#
+                    .to_owned(),
+            ),
+            html_text: Some("message".into()),
+            html_lines: None,
+            html_renderer: Some("test".into()),
+            html_render_width: 80,
+            attachment_count: 0,
+        };
+
+        assert_eq!(
+            body.html_images(),
+            vec![
+                "https://example.com/avatar.png".to_owned(),
+                "https://example.com/hero.png".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn html_image_candidates_skip_hidden_and_tiny_source_images() {
+        let body = MessageBody {
+            id: MessageId("filtered-source-images".into()),
+            plain_text: None,
+            plain_fallback: None,
+            html_source: Some(
+                r#"<img src="https://example.com/hidden.png" style="display:none" width="90" height="60">
+                    <img src="https://example.com/shim.png" width="1" height="1">
+                    <img src="https://example.com/hero.png" width="90" height="60">"#
+                    .to_owned(),
+            ),
+            html_text: Some("hero".into()),
+            html_lines: None,
+            html_renderer: Some("test".into()),
+            html_render_width: 80,
+            attachment_count: 0,
+        };
+
+        assert_eq!(
+            body.html_images(),
+            vec!["https://example.com/hero.png".to_owned()]
+        );
     }
 
     #[test]
