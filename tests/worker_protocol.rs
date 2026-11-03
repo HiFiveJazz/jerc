@@ -188,6 +188,7 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
                 body: "body".to_owned(),
                 in_reply_to: None,
                 references: Vec::new(),
+                forwarded_raw: None,
             },
             sent_mailbox: Some("Sent".to_owned()),
         })

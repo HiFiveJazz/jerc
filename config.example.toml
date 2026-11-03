@@ -11,6 +11,7 @@ source = "maildir://~/Mail/kernel"
 default_mailbox = "INBOX"
 
 # Gmail / normal IMAPS with an app password + SMTP submission.
+# Add as many [[accounts]] blocks as needed; use [ / ] in the TUI to rotate them.
 # [[accounts]]
 # name = "Personal"
 # source = "imaps://you%40gmail.com@imap.gmail.com:993"

@@ -4,6 +4,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Size;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
@@ -162,6 +163,9 @@ pub struct Composer {
     pub visual_anchor: Option<usize>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// Exact original RFC 5322 message bytes when forwarding. These are sent
+    /// as a message/rfc822 attachment rather than the terminal-rendered body.
+    pub forwarded_raw: Option<Vec<u8>>,
     pub sending: bool,
     pub confirm_send: bool,
 }
@@ -179,17 +183,13 @@ impl Composer {
             visual_anchor: None,
             in_reply_to: None,
             references: Vec::new(),
+            forwarded_raw: None,
             sending: false,
             confirm_send: false,
         }
     }
 
-    fn reply(
-        message: &MessageSummary,
-        body: Option<&MessageBody>,
-        prefer_html: bool,
-        quote: bool,
-    ) -> Self {
+    fn reply(message: &MessageSummary, body: Option<&MessageBody>, quote: bool) -> Self {
         let subject = if message.subject.to_ascii_lowercase().starts_with("re:") {
             message.subject.clone()
         } else {
@@ -203,7 +203,11 @@ impl Composer {
         }
         let quoted = quote.then(|| {
             body.map_or_else(String::new, |body| {
-                body.display_text(prefer_html)
+                // aerc-style replies quote the message's textual representation,
+                // not the rich reader projection. HTML-only messages already
+                // have a generated plain fallback, so this stays readable while
+                // avoiding table chrome/image placeholders in mailing-list replies.
+                body.display_text(false)
                     .lines()
                     .map(|line| format!("> {line}"))
                     .collect::<Vec<_>>()
@@ -213,7 +217,7 @@ impl Composer {
         let body = if quoted.is_empty() {
             "\n\n".to_owned()
         } else {
-            format!("\n\nOn the previous message, {} wrote:\n{quoted}\n", display_sender(message))
+            format!("\n\n{}\n{quoted}\n", reply_attribution(message))
         };
         // Replies are composed above any quoted history, matching normal mail
         // clients and aerc's reply workflow rather than dropping the cursor below
@@ -234,30 +238,24 @@ impl Composer {
             visual_anchor: None,
             in_reply_to: message.message_id.clone(),
             references,
+            forwarded_raw: None,
             sending: false,
             confirm_send: false,
         }
     }
 
-    fn forward(message: &MessageSummary, body: Option<&MessageBody>, prefer_html: bool) -> Self {
+    fn forward(message: &MessageSummary, raw: Vec<u8>) -> Self {
         let subject = if message.subject.to_ascii_lowercase().starts_with("fwd:") {
             message.subject.clone()
         } else {
             format!("Fwd: {}", message.subject)
         };
-        let forwarded = body.map_or_else(String::new, |body| {
-            body.display_text(prefer_html).to_owned()
-        });
-        let body = if forwarded.trim().is_empty() {
-            "\n\n---------- Forwarded message ----------\n".to_owned()
-        } else {
-            format!(
-                "\n\n---------- Forwarded message ----------\nFrom: {}\nSubject: {}\n\n{}\n",
-                display_sender(message),
-                message.subject,
-                forwarded
-            )
-        };
+        let body = format!(
+            "\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\n\n[Original message attached as message/rfc822]\n",
+            display_sender(message),
+            reply_date_label(message),
+            message.subject,
+        );
         Self {
             to: String::new(),
             cc: String::new(),
@@ -269,6 +267,7 @@ impl Composer {
             visual_anchor: None,
             in_reply_to: None,
             references: Vec::new(),
+            forwarded_raw: Some(raw),
             sending: false,
             confirm_send: false,
         }
@@ -774,12 +773,12 @@ impl AccountState {
         }
     }
 
-    fn request_seen(&mut self, id: MessageId, seen: bool) {
+    fn request_seen(&mut self, id: MessageId, seen: bool) -> bool {
         let Some(mailbox) = self.current_mailbox.clone() else {
-            return;
+            return false;
         };
         if self.pending_seen.contains(&id) {
-            return;
+            return false;
         }
         if self
             .worker
@@ -791,6 +790,9 @@ impl AccountState {
             .is_ok()
         {
             self.pending_seen.insert(id);
+            true
+        } else {
+            false
         }
     }
 }
@@ -891,7 +893,6 @@ pub struct App {
     pub sidebar_visible: bool,
     pub preview_split: bool,
     pub message_open: bool,
-    pub reader_link_index: usize,
     pub reader_cursor: usize,
     pub reader_column: usize,
     pub reader_visual_anchor: Option<ReaderPosition>,
@@ -993,7 +994,6 @@ impl App {
             sidebar_visible: true,
             preview_split: false,
             message_open: false,
-            reader_link_index: 0,
             reader_cursor: 0,
             reader_column: 0,
             reader_visual_anchor: None,
@@ -1080,14 +1080,6 @@ impl App {
         }
         if self.preview_split {
             match key.code {
-                KeyCode::Tab if key.modifiers.is_empty() => {
-                    self.cycle_reader_link(1);
-                    return;
-                }
-                KeyCode::BackTab => {
-                    self.cycle_reader_link(-1);
-                    return;
-                }
                 KeyCode::Char('o') if key.modifiers.is_empty() => {
                     self.open_reader_link();
                     return;
@@ -1170,14 +1162,6 @@ impl App {
 
         match key.code {
             KeyCode::Esc => false,
-            KeyCode::Tab => {
-                self.cycle_reader_link(1);
-                true
-            }
-            KeyCode::BackTab => {
-                self.cycle_reader_link(-1);
-                true
-            }
             KeyCode::Char('o') => {
                 self.open_reader_link();
                 true
@@ -1540,14 +1524,12 @@ impl App {
                         .iter()
                         .find(|message| message.id == pending.message_id)?;
                     let body = account.bodies.get(&pending.message_id);
-                    Some(match pending.intent {
+                    match pending.intent {
                         ComposeIntent::Reply { quote } => {
-                            Composer::reply(message, body, account.prefer_html, quote)
+                            Some(Composer::reply(message, body, quote))
                         }
-                        ComposeIntent::Forward => {
-                            Composer::forward(message, body, account.prefer_html)
-                        }
-                    })
+                        ComposeIntent::Forward => None,
+                    }
                 });
 
                 if (self.message_open || self.preview_split)
@@ -1563,6 +1545,25 @@ impl App {
                     self.pending_compose = None;
                     self.composer = Some(composer);
                     self.status = StatusLine::info("ready to compose");
+                }
+            }
+            WorkerEventKind::RawLoaded { id, raw } => {
+                let pending = self.pending_compose.as_ref().filter(|pending| {
+                    pending.account == event.account
+                        && pending.message_id == id
+                        && pending.intent == ComposeIntent::Forward
+                });
+                let composer = pending.and_then(|pending| {
+                    account
+                        .messages
+                        .iter()
+                        .find(|message| message.id == pending.message_id)
+                        .map(|message| Composer::forward(message, raw))
+                });
+                if let Some(composer) = composer {
+                    self.pending_compose = None;
+                    self.composer = Some(composer);
+                    self.status = StatusLine::info("ready to forward original message");
                 }
             }
             WorkerEventKind::MessageExported { path } => {
@@ -1667,6 +1668,7 @@ impl App {
             }
             WorkerEventKind::Error(error) => {
                 let mutation_failed = account.pending_mutations > 0;
+                let seen_failed = !account.pending_seen.is_empty();
                 account.pending_mutations = 0;
                 account.connecting = false;
                 account.mailboxes_loading = false;
@@ -1689,7 +1691,7 @@ impl App {
                         composer.sending = false;
                     }
                 }
-                if mutation_failed
+                if (mutation_failed || seen_failed)
                     && let Some(name) = account.current_mailbox.clone()
                 {
                     account.invalidate_current_cache();
@@ -2035,6 +2037,12 @@ impl App {
         self.confirmation = None;
         self.focus = Focus::Messages;
         self.account_index = offset_index(self.account_index, self.accounts.len(), delta);
+        if let Some(account) = self.account() {
+            self.status = StatusLine::temporary(
+                format!("account: {}", account.name),
+                Duration::from_secs(2),
+            );
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -2524,7 +2532,6 @@ impl App {
                     return;
                 }
                 self.visual_anchor = None;
-                self.reader_link_index = 0;
                 self.reader_cursor = 0;
                 self.reader_column = 0;
                 self.reader_preferred_column = None;
@@ -2552,7 +2559,6 @@ impl App {
     }
 
     fn close_message(&mut self) {
-        self.reader_link_index = 0;
         self.reader_cursor = 0;
         self.reader_column = 0;
         self.reader_preferred_column = None;
@@ -2585,31 +2591,12 @@ impl App {
         account.request_seen(id, true);
     }
 
-    fn current_message_links(&self) -> Vec<String> {
-        self.account()
-            .and_then(AccountState::selected_body)
-            .map(MessageBody::html_links)
-            .unwrap_or_default()
-    }
-
-    fn cycle_reader_link(&mut self, delta: isize) {
-        let links = self.current_message_links();
-        if links.is_empty() {
-            self.reader_link_index = 0;
-            self.status = StatusLine::temporary("message has no rendered links", Duration::from_secs(1));
-            return;
-        }
-        self.reader_link_index = offset_index(self.reader_link_index.min(links.len() - 1), links.len(), delta);
-        self.status = StatusLine::temporary(
-            format!("link {}/{}: {}", self.reader_link_index + 1, links.len(), links[self.reader_link_index]),
-            Duration::from_secs(4),
-        );
-    }
-
     fn open_reader_link(&mut self) {
-        let links = self.current_message_links();
-        let Some(url) = links.get(self.reader_link_index.min(links.len().saturating_sub(1))).cloned() else {
-            self.status = StatusLine::temporary("message has no rendered links", Duration::from_secs(1));
+        let Some(url) = self.link_under_reader_cursor() else {
+            self.status = StatusLine::temporary(
+                "reader cursor is not on a link",
+                Duration::from_secs(1),
+            );
             return;
         };
         let result = open_url(&url);
@@ -2617,6 +2604,22 @@ impl App {
             Ok(()) => StatusLine::temporary(format!("opened {url}"), Duration::from_secs(3)),
             Err(error) => StatusLine::error(format!("could not open link: {error}")),
         };
+    }
+
+    fn link_under_reader_cursor(&self) -> Option<String> {
+        let account = self.account()?;
+        let body = account.selected_body()?;
+        let showing_html = body.has_html_alternative() && account.prefer_html;
+        if showing_html
+            && let Some(url) = body.html_link_at(self.reader_cursor, self.reader_column)
+        {
+            return Some(url.to_owned());
+        }
+        let line = body
+            .display_text(showing_html)
+            .lines()
+            .nth(self.reader_cursor)?;
+        url_at_cursor(line, self.reader_column)
     }
 
     fn yank_reader_selection(&mut self) {
@@ -2658,7 +2661,32 @@ impl App {
         else {
             return;
         };
-        account.request_seen(id, seen);
+        if !account.request_seen(id.clone(), seen) {
+            return;
+        }
+
+        // Optimistic UI: reflect the flag immediately instead of waiting for an
+        // IMAP round trip. The SeenChanged event later confirms the same value,
+        // so its unread delta naturally becomes zero.
+        let mut unread_delta = 0isize;
+        if let Some(message) = account.messages.iter_mut().find(|message| message.id == id) {
+            let was_unread = message.unread();
+            message.flags.set(MessageFlags::SEEN, seen);
+            unread_delta = match (was_unread, message.unread()) {
+                (true, false) => -1,
+                (false, true) => 1,
+                _ => 0,
+            };
+        }
+        if unread_delta != 0
+            && let Some(current) = account.current_mailbox.as_deref()
+            && let Some(mailbox) = account
+                .mailboxes
+                .iter_mut()
+                .find(|mailbox| mailbox.name == current && mailbox.counts_known)
+        {
+            mailbox.unread = mailbox.unread.saturating_add_signed(unread_delta);
+        }
     }
 
     fn toggle_visual(&mut self) {
@@ -3370,7 +3398,6 @@ impl App {
         self.reader_smooth_target = None;
         self.reader_pending_g = false;
         self.reader_pending_inner_object = false;
-        self.reader_link_index = 0;
         self.reader_image = None;
         self.reader_image_pending = None;
         self.reader_image_size_hint = None;
@@ -3548,29 +3575,58 @@ impl App {
 
     fn begin_compose_from_selected(&mut self, intent: ComposeIntent) {
         let account_index = self.account_index;
-        let prepared = self.account().and_then(|account| {
-            if !account.outgoing_configured {
-                return None;
-            }
-            let message = account.selected_message()?;
-            let body = account.selected_body();
-            let composer = body.map(|body| match intent {
-                ComposeIntent::Reply { quote } => {
-                    Composer::reply(message, Some(body), account.prefer_html, quote)
-                }
-                ComposeIntent::Forward => {
-                    Composer::forward(message, Some(body), account.prefer_html)
-                }
-            });
-            Some((message.id.clone(), composer))
-        });
-
         if !self.account().is_some_and(|account| account.outgoing_configured) {
             self.status = StatusLine::error(
                 "no outgoing SMTP transport configured; add `outgoing = ...` to this account",
             );
             return;
         }
+
+        // Forwarding must preserve the original message, not the TUI's rendered
+        // HTML/plain projection. Fetch the exact RFC 5322 bytes and attach them
+        // as message/rfc822 when the composer is sent.
+        if intent == ComposeIntent::Forward {
+            let Some((message_id, mailbox)) = self.account().and_then(|account| {
+                Some((
+                    account.selected_message()?.id.clone(),
+                    account.current_mailbox.clone()?,
+                ))
+            }) else {
+                return;
+            };
+            let queued = self.account().is_some_and(|account| {
+                account
+                    .worker
+                    .post(ActionKind::FetchRawForCompose {
+                        mailbox,
+                        id: message_id.clone(),
+                    })
+                    .is_ok()
+            });
+            if queued {
+                self.pending_compose = Some(PendingCompose {
+                    account: account_index,
+                    message_id,
+                    intent,
+                });
+                self.status = StatusLine::info("loading original message for forward…");
+            } else {
+                self.status = StatusLine::error("mail worker queue is busy; forward was not opened");
+            }
+            return;
+        }
+
+        let prepared = self.account().and_then(|account| {
+            let message = account.selected_message()?;
+            let body = account.selected_body();
+            let composer = body.map(|body| match intent {
+                ComposeIntent::Reply { quote } => {
+                    Composer::reply(message, Some(body), quote)
+                }
+                ComposeIntent::Forward => unreachable!("forward handled above"),
+            });
+            Some((message.id.clone(), composer))
+        });
 
         let Some((message_id, composer)) = prepared else {
             return;
@@ -3593,7 +3649,7 @@ impl App {
             self.status = StatusLine::info(match intent {
                 ComposeIntent::Reply { quote: true } => "loading message for quoted reply…",
                 ComposeIntent::Reply { quote: false } => "loading message for reply…",
-                ComposeIntent::Forward => "loading message for forward…",
+                ComposeIntent::Forward => unreachable!("forward handled above"),
             });
         } else {
             self.status = StatusLine::error("message body could not be queued for loading");
@@ -3781,6 +3837,7 @@ impl App {
             body: composer.body.clone(),
             in_reply_to: composer.in_reply_to.clone(),
             references: composer.references.clone(),
+            forwarded_raw: composer.forwarded_raw.clone(),
         };
         let sent_mailbox = account
             .mailboxes
@@ -3905,6 +3962,10 @@ fn open_url(url: &str) -> std::io::Result<()> {
         "opening URLs is unsupported on this platform",
     ));
 
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     command.spawn().map(|_| ())
 }
 
@@ -4092,6 +4153,49 @@ fn reader_selection_text(text: &str, selection: ReaderSelection) -> String {
     out
 }
 
+fn url_at_cursor(line: &str, column: usize) -> Option<String> {
+    let chars = line.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return None;
+    }
+    let cursor = column.min(chars.len().saturating_sub(1));
+    let mut start = cursor;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = cursor.saturating_add(1);
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+    let token = chars[start..end].iter().collect::<String>();
+    let token = token.trim_matches(|ch: char| {
+        matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\'' | '"' | ',' | ';')
+    });
+    let token = token.trim_end_matches(|ch: char| matches!(ch, '.' | ':' | '!' | '?'));
+    (token.starts_with("https://") || token.starts_with("http://")).then(|| token.to_owned())
+}
+
+fn reply_date_label(message: &MessageSummary) -> String {
+    if message.timestamp <= 0 {
+        return "the previous message".to_owned();
+    }
+    DateTime::<Utc>::from_timestamp(message.timestamp, 0)
+        .map(|utc| utc.with_timezone(&Local))
+        .map_or_else(
+            || "the previous message".to_owned(),
+            |local| local.format("%a %b %-d, %Y at %-I:%M %p %Z").to_string(),
+        )
+}
+
+fn reply_attribution(message: &MessageSummary) -> String {
+    let author = if message.from_name.trim().is_empty() {
+        message.from_address.trim()
+    } else {
+        message.from_name.trim()
+    };
+    format!("On {}, {} wrote:", reply_date_label(message), author)
+}
+
 fn display_sender(message: &MessageSummary) -> String {
     if message.from_name.is_empty() {
         message.from_address.clone()
@@ -4120,8 +4224,10 @@ mod tests {
     use super::{
         ComposeField, ComposeMode, Composer, ReaderPosition, ReaderSelection, ReaderWordMotion,
         bounded_index, inner_text_object_range, message_view_offset, offset_index,
-        reader_image_target_size, reader_selection_text, reader_word_target,
+        reader_image_target_size, reader_selection_text, reader_word_target, reply_attribution,
+        url_at_cursor,
     };
+    use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
 
     #[test]
@@ -4264,6 +4370,41 @@ mod tests {
             reader_image_target_size(2400, 1600, None, None, 8, 16, 90, 30),
             Size::new(90, 30)
         );
+    }
+
+    #[test]
+    fn reader_url_lookup_uses_the_token_under_the_cursor() {
+        let line = "first https://example.com/a then https://example.net/b.";
+        assert_eq!(
+            url_at_cursor(line, 9).as_deref(),
+            Some("https://example.com/a")
+        );
+        assert_eq!(
+            url_at_cursor(line, 40).as_deref(),
+            Some("https://example.net/b")
+        );
+        assert_eq!(url_at_cursor(line, 0), None);
+    }
+
+    #[test]
+    fn quoted_reply_attribution_matches_aerc_shape() {
+        let message = MessageSummary {
+            id: MessageId("reply".into()),
+            message_id: Some("message@example.com".into()),
+            in_reply_to: None,
+            references: Vec::new(),
+            from_name: "Takashi Iwai".into(),
+            from_address: "tiwai@suse.de".into(),
+            subject: "Re: test".into(),
+            timestamp: 1_792_662_534,
+            date_label: String::new(),
+            size: 0,
+            flags: MessageFlags::empty(),
+        };
+        let attribution = reply_attribution(&message);
+        assert!(attribution.starts_with("On "));
+        assert!(attribution.contains(", Takashi Iwai wrote:"));
+        assert!(!attribution.contains("previous message"));
     }
 
     #[test]

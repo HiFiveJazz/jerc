@@ -246,6 +246,24 @@ impl MessageBody {
         links
     }
 
+    /// Return the rendered HTML link that actually occupies the reader cursor
+    /// position. This intentionally follows the visible rich-text spans instead
+    /// of a separate global link index, so `o` behaves like Vim's gf-style
+    /// context action: move the cursor onto a link and open that exact target.
+    #[must_use]
+    pub fn html_link_at(&self, line_index: usize, column: usize) -> Option<&str> {
+        let line = self.html_lines.as_ref()?.get(line_index)?;
+        let mut start = 0usize;
+        for span in &line.spans {
+            let end = start.saturating_add(span.text.chars().count());
+            if start <= column && column < end {
+                return span.style.link.as_deref();
+            }
+            start = end;
+        }
+        None
+    }
+
     #[must_use]
     pub fn html_images(&self) -> Vec<String> {
         self.html_image_candidates()
@@ -564,6 +582,10 @@ pub struct OutgoingMessage {
     pub body: String,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// Exact RFC 5322 bytes of a message being forwarded. When present, the
+    /// SMTP builder attaches them as `message/rfc822` instead of sending the
+    /// terminal-rendered HTML/plain projection to the recipient.
+    pub forwarded_raw: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,6 +642,39 @@ mod tests {
         let a = MessageId("cur/123:2,S".into());
         let b = MessageId("cur/123:2,S".into());
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn html_link_at_tracks_the_visible_span_under_the_cursor() {
+        let body = MessageBody {
+            id: MessageId("links".into()),
+            plain_text: None,
+            plain_fallback: None,
+            html_source: Some("<a href=\"https://example.com/one\">first</a> second".into()),
+            html_text: Some("first second".into()),
+            html_lines: Some(vec![HtmlLine {
+                spans: vec![
+                    HtmlSpan {
+                        text: "first".into(),
+                        style: HtmlSpanStyle {
+                            link: Some("https://example.com/one".into()),
+                            ..HtmlSpanStyle::default()
+                        },
+                    },
+                    HtmlSpan {
+                        text: " second".into(),
+                        style: HtmlSpanStyle::default(),
+                    },
+                ],
+            }]),
+            html_renderer: Some("test".into()),
+            html_render_width: 80,
+            attachment_count: 0,
+        };
+        assert_eq!(body.html_link_at(0, 0), Some("https://example.com/one"));
+        assert_eq!(body.html_link_at(0, 4), Some("https://example.com/one"));
+        assert_eq!(body.html_link_at(0, 5), None);
+        assert_eq!(body.html_link_at(1, 0), None);
     }
 
     #[test]

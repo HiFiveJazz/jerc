@@ -9,12 +9,12 @@ A Rust terminal email client inspired by aerc's backend/worker model and lazygit
 - **Fast mailbox switching:** `J/K` changes folders, while `Ctrl-Shift-j/Ctrl-Shift-k` smoothly moves the folder cursor without loading every intermediate folder.
 - **Neovim-style message scrolling:** `j/k`, counts, `Ctrl-j/Ctrl-k`, `Ctrl-d/Ctrl-u`, `g/G`, and a four-row scrolloff. The renderer owns the visible slice, avoiding Ratatui offset artifacts and stale gutter contents.
 - **Visual selection:** `v` starts an inclusive message range; `Esc` exits visual mode. Bulk archive/delete operates on the selected range.
-- **Mail actions:** `d` confirms delete/trash, `D` performs the same action immediately, and `a` archives. Successful mutations update the current cache locally rather than reloading the mailbox tree or jumping back to INBOX.
+- **Mail actions:** `d` confirms delete/trash, `D` performs the same action immediately, and `a` archives. Read/unread toggles update optimistically in the UI while IMAP confirms them in the background. Successful mutations update the current cache locally rather than reloading the mailbox tree or jumping back to INBOX.
 - **Search/filter:** `/` edits a case-insensitive filter over the current mailbox. If the loaded cache does not contain enough matches, older pages continue loading progressively.
 - **Layout controls:** `b` hides/shows the mailbox sidebar; `P` toggles a vertical message preview. `Enter` still opens the full-screen reader.
 - **Rich HTML mail by default:** the HTML renderer is now the primary view whenever a real HTML part exists; `T` always switches to a plain view (including a generated fallback for HTML-only mail). Layout-table noise, literal Markdown-style heading markers, generic image labels and broken open table edges are normalized while semantic receipt/data tables remain boxed. Sender CSS colours never override the terminal theme.
 - **Terminal images:** `ratatui-image` supports Kitty, Sixel and iTerm2 graphics with a half-block fallback. The first meaningful remote image is shown in the reader when remote images are enabled. Tracking pixels are filtered, downloads are bounded and happen on a background worker. Remote images default off for privacy; press `I` to toggle them for the session or set `ui.remote_images = true`.
-- **Modal compose/reply/forward:** the composer has NORMAL, INSERT, and VISUAL modes. `Tab`/`Shift-Tab` cycles To → Cc → Subject → Body without hiding field labels. `Enter` from NORMAL asks for send confirmation; Ctrl-S is not used. `r` replies without quoted text, `R` replies with a quote, and `f` forwards.
+- **Modal compose/reply/forward:** the composer has NORMAL, INSERT, and VISUAL modes. `Tab`/`Shift-Tab` cycles To → Cc → Subject → Body without hiding field labels. `Enter` from NORMAL opens a centered send-confirmation popup; Ctrl-S is not used. `r` replies without quoted text, `R` uses an aerc-style dated attribution plus gray quoted text, and `f` forwards the exact original RFC 5322 message as a `message/rfc822` attachment rather than forwarding the terminal-rendered body.
 - Empty folders render an explicit empty-state message instead of a blank pane.
 - Searchable help and JSON themes; custom themes in `~/.config/aerc-rs/themes/*.json` can override built-ins by id.
 
@@ -37,7 +37,7 @@ page_size = 100
 remote_images = false # privacy-safe default; press I to toggle in-session
 ```
 
-`page_size` controls interactive pagination. Existing `max_messages` settings are retained for compatibility/headless checks and no longer make the TUI wait for one giant initial fetch.
+`page_size` controls interactive pagination. Existing `max_messages` settings are retained for compatibility/headless checks and no longer make the TUI wait for one giant initial fetch. Add more `[[accounts]]` blocks to the same config to use multiple accounts; `[ / ]` rotates accounts and the top tab bar shows the active one.
 
 ## Main controls
 
@@ -48,8 +48,8 @@ Press `?` for the searchable complete map. Common controls:
 - `d` confirmed trash/delete; `D` immediate trash/delete; `a` archive.
 - `/` filter current mailbox; `b` sidebar; `P` vertical preview; `Enter` full reader.
 - `r` reply without quote; `R` reply with quote; `f` forward; `c` compose.
-- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `Tab`/`Shift-Tab` selects links, and `o` opens the selected link.
-- `Ctrl-r` refreshes the current mailbox.
+- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser.
+- `[ / ]` previous/next account; `Ctrl-r` refreshes the current mailbox.
 
 ## Themes
 
@@ -76,6 +76,8 @@ Put the file in `~/.config/aerc-rs/themes/my-theme.json`, then press `t`.
 ./scripts/validate.sh
 cargo run --release -- --headless-check
 ```
+
+The TUI paints its shell before terminal-image capability probing, so a slow graphics query no longer delays first paint. `--headless-check` reports backend connect/list/header/body timings independently; use those numbers before reaching for `strace`.
 
 For a repeatable local workload:
 

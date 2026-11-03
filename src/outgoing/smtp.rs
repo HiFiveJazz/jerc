@@ -2,7 +2,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use lettre::message::{Mailbox, Mailboxes};
+use lettre::message::{Attachment, Mailbox, Mailboxes, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{Message, SmtpTransport, Transport};
 use percent_encoding::percent_decode_str;
@@ -285,9 +285,23 @@ impl MailSender for SmtpSender {
             builder = builder.references(format!("<{id}>"));
         }
 
-        let email = builder
-            .body(message.body.clone())
-            .context("building outgoing message")?;
+        let email = if let Some(raw) = message.forwarded_raw.as_ref() {
+            let content_type = ContentType::parse("message/rfc822")
+                .context("building forwarded message/rfc822 content type")?;
+            let attachment = Attachment::new("forwarded.eml".to_owned())
+                .body(raw.clone(), content_type);
+            builder
+                .multipart(
+                    MultiPart::mixed()
+                        .singlepart(SinglePart::plain(message.body.clone()))
+                        .singlepart(attachment),
+                )
+                .context("building forwarded outgoing message")?
+        } else {
+            builder
+                .body(message.body.clone())
+                .context("building outgoing message")?
+        };
         let raw_message = email.formatted();
         let response = self
             .transport()?

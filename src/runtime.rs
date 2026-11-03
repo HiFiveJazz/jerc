@@ -33,6 +33,14 @@ pub fn run_tui(config: Config) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+
+    // Paint the application shell immediately. Terminal image capability
+    // detection is one of the few startup operations that must synchronously
+    // read stdio before our input thread starts, and some terminals take a few
+    // hundred milliseconds to answer. First paint should not be held hostage by
+    // that query; worker results can queue safely while it completes.
+    render(&mut terminal, &mut app)?;
+
     // ratatui-image must query terminal graphics capabilities after entering
     // the alternate screen but before the input thread starts consuming escape
     // sequence responses. Fall back to portable half-block rendering when the
@@ -41,6 +49,7 @@ pub fn run_tui(config: Config) -> Result<()> {
     app.configure_mail_images(picker, runtime_tx.clone());
     spawn_input_thread(runtime_tx);
 
+    // Redraw once with the resolved image protocol before entering the event loop.
     render(&mut terminal, &mut app)?;
     event_loop(&mut terminal, &mut app, runtime_rx)?;
     Ok(())

@@ -13,6 +13,7 @@ use crate::app::{
     App, ComposeField, ComposeMode, HELP_ENTRIES, ReaderSelection,
 };
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
+use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let outer = Layout::default()
@@ -35,6 +36,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.composer.is_some() {
         draw_composer(frame, app);
+        if app.composer.as_ref().is_some_and(|composer| composer.confirm_send) {
+            draw_send_confirmation(frame, app);
+        }
     }
 }
 
@@ -151,7 +155,7 @@ fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 String::new()
             };
             let style = if absolute_index == account.mailbox_index {
-                theme.selected()
+                theme.current_line()
             } else {
                 theme.text()
             };
@@ -260,8 +264,12 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             &message.from_name
         };
-        let style = if current || visual_selected {
+        let style = if visual_selected {
             theme.selected()
+        } else if current && message.unread() {
+            theme.unread().bg(theme.popup_bg)
+        } else if current {
+            theme.current_line()
         } else if message.unread() {
             theme.unread()
         } else {
@@ -330,13 +338,6 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
     let reader_image_size = app.reader_image_protocol().map(|image| image.size());
 
-    let selected_link = app.account().and_then(|account| {
-        let body = account.selected_body()?;
-        let links = body.html_links();
-        links
-            .get(app.reader_link_index.min(links.len().saturating_sub(1)))
-            .cloned()
-    });
     let reader_cursor = app.reader_cursor;
     let reader_column = app.reader_column;
     let reader_visual = app.reader_visual_range();
@@ -402,7 +403,6 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             reader_visual,
                             reader_active,
                             &theme,
-                            selected_link.as_deref(),
                             reader_illuminate.as_deref(),
                         )
                     }));
@@ -441,23 +441,6 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         reader_illuminate.as_deref(),
                     )
                 }));
-            }
-            if body.has_html_alternative() {
-                let mode = if showing_html {
-                    format!(
-                        "HTML via {}",
-                        body.html_renderer.as_deref().unwrap_or("rich renderer")
-                    )
-                } else {
-                    "plain text".to_owned()
-                };
-                lines.push(Line::raw(""));
-                lines.push(Line::styled(
-                    format!(
-                        "[{mode}; T rich/plain; Tab/Shift-Tab links; o opens link; O opens original in browser; I images]"
-                    ),
-                    theme.muted(),
-                ));
             }
             if body.attachment_count > 0 {
                 lines.push(Line::styled(
@@ -525,7 +508,11 @@ fn plain_reader_line(
     theme: &crate::theme::Theme,
     illuminate_word: Option<&str>,
 ) -> Line<'static> {
-    let base = theme.text();
+    let base = if is_quoted_line(text) {
+        Style::default().fg(theme.muted)
+    } else {
+        theme.text()
+    };
     let illuminate_ranges = illuminate_word
         .map(|word| word_match_ranges(text, word))
         .unwrap_or_default();
@@ -573,7 +560,6 @@ fn rich_html_line(
     reader_visual: Option<ReaderSelection>,
     reader_active: bool,
     theme: &crate::theme::Theme,
-    selected_link: Option<&str>,
     illuminate_word: Option<&str>,
 ) -> Line<'static> {
     let mut spans = reader_gutter(
@@ -596,18 +582,12 @@ fn rich_html_line(
     let illuminate_ranges = illuminate_word
         .map(|word| word_match_ranges(&line_text, word))
         .unwrap_or_default();
+    let quoted = is_quoted_line(&line_text);
     let mut column = 0usize;
     for span in &line.spans {
         let mut style = rich_html_style(&span.style, &span.text, theme);
-        if span
-            .style
-            .link
-            .as_deref()
-            .is_some_and(|url| Some(url) == selected_link)
-        {
-            style = style
-                .fg(theme.accent)
-                .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
+        if quoted {
+            style = style.fg(theme.muted);
         }
         spans.extend(reader_fragments(
             &span.text,
@@ -723,10 +703,13 @@ fn reader_fragments(
             .iter()
             .any(|&(match_start, match_end)| start >= match_start && start < match_end)
         {
-            // Match vim-illuminate's default IlluminatedWord* groups: keep the
-            // existing syntax/rich-text colour and mark references with an
-            // underline instead of painting them with an accent-derived fill.
-            fragment_style = fragment_style.add_modifier(Modifier::UNDERLINED);
+            // vim-illuminate delegates the actual reference appearance to the
+            // active Neovim colorscheme. Mirror that here by deriving a cool,
+            // low-contrast reference background from the mail theme's surface
+            // and border colours instead of using accent/muted colours. This
+            // matches the #3b4261-style reference highlight used by TokyoNight
+            // without adding an underline that the user's Neovim view does not.
+            fragment_style = fragment_style.bg(reader_illuminate_bg(theme));
         }
         if selected_columns.is_some_and(|(selected_start, selected_end)| {
             start >= selected_start && start <= selected_end
@@ -793,6 +776,26 @@ fn word_match_ranges(text: &str, word: &str) -> Vec<(usize, usize)> {
 
 fn is_reader_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
+}
+
+fn reader_illuminate_bg(theme: &Theme) -> Color {
+    match (theme.popup_bg, theme.border) {
+        (Color::Rgb(sr, sg, sb), Color::Rgb(br, bg, bb)) => Color::Rgb(
+            mix_channel(sr, br, 82),
+            mix_channel(sg, bg, 82),
+            mix_channel(sb, bb, 82),
+        ),
+        _ => Color::Rgb(59, 66, 97),
+    }
+}
+
+fn mix_channel(from: u8, to: u8, toward_to_percent: u16) -> u8 {
+    let toward_to_percent = toward_to_percent.min(100);
+    let toward_from_percent = 100 - toward_to_percent;
+    ((u16::from(from) * toward_from_percent
+        + u16::from(to) * toward_to_percent
+        + 50)
+        / 100) as u8
 }
 
 fn reader_cursor_style() -> Style {
@@ -953,11 +956,19 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             spans.push(Span::raw(" "));
         }
         if account.search_editing {
-            spans.push(Span::styled(format!("/{}▏  ", account.search_query), theme.accent()));
+            let matches = account.visible_message_indices().len();
+            spans.push(Span::styled(" SEARCH ", theme.accent()));
+            spans.push(Span::styled(
+                format!("{matches} match{}  ", if matches == 1 { "" } else { "es" }),
+                theme.muted(),
+            ));
         } else if !account.search_query.is_empty() {
             spans.push(Span::styled(format!("filter:/{}  ", account.search_query), theme.accent()));
         }
-        if account.connecting {
+        if account.search_editing {
+            // The editable query is already rendered in the message-list search
+            // header. Avoid echoing the status text below it a second time.
+        } else if account.connecting {
             spans.push(Span::raw("Connecting…"));
         } else if account.mailboxes_loading {
             spans.push(Span::raw("Loading mailboxes…"));
@@ -1128,6 +1139,42 @@ fn draw_confirmation(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
+fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
+    let theme = app.theme().clone();
+    let Some(composer) = app.composer.as_ref().filter(|composer| composer.confirm_send) else {
+        return;
+    };
+    let area = centered_rect(frame.area(), 64, 28);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Send message? ")
+        .borders(Borders::ALL)
+        .border_style(theme.accent());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    let body = vec![
+        Line::from(vec![Span::styled("To: ", theme.accent()), Span::raw(composer.to.clone())]),
+        Line::from(vec![Span::styled("Subject: ", theme.accent()), Span::raw(composer.subject.clone())]),
+        Line::raw(""),
+        Line::styled("Send this message now?", theme.text()),
+    ];
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Enter/y ", theme.accent()),
+            Span::styled("send   ", theme.muted()),
+            Span::styled(" Esc/n ", theme.accent()),
+            Span::styled("cancel", theme.muted()),
+        ])),
+        chunks[1],
+    );
+}
+
 fn draw_composer(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme().clone();
     let Some(composer) = app.composer.as_ref() else {
@@ -1137,8 +1184,6 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Clear, area);
     let title = if composer.sending {
         " Compose • sending… ".to_owned()
-    } else if composer.confirm_send {
-        " Send message? • Enter/y send • Esc/n cancel ".to_owned()
     } else {
         format!(
             " Compose • {} • Tab fields • Enter confirms send from NORMAL ",
@@ -1259,6 +1304,27 @@ fn editor_spans(
     spans
 }
 
+fn is_quoted_line(text: &str) -> bool {
+    text.trim_start().starts_with('>')
+}
+
+fn quoted_line_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut global = 0usize;
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content_len = content.chars().count();
+        if is_quoted_line(content) {
+            ranges.push((global, global.saturating_add(content_len)));
+        }
+        global = global.saturating_add(line.chars().count());
+    }
+    if !text.is_empty() && !text.ends_with('\n') && ranges.is_empty() && is_quoted_line(text) {
+        ranges.push((0, text.chars().count()));
+    }
+    ranges
+}
+
 fn editor_text(
     value: &str,
     composer: &crate::app::Composer,
@@ -1267,6 +1333,7 @@ fn editor_text(
 ) -> Text<'static> {
     let selection = active.then(|| composer.visual_range()).flatten();
     let cursor = composer.cursor.min(value.chars().count());
+    let quote_ranges = quoted_line_ranges(value);
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut global = 0usize;
@@ -1281,9 +1348,18 @@ fn editor_text(
             continue;
         }
         let selected = selection.is_some_and(|(start, end)| (start..end).contains(&global));
+        let quoted = quote_ranges
+            .iter()
+            .any(|&(start, end)| global >= start && global < end);
         spans.push(Span::styled(
             ch.to_string(),
-            if selected { theme.selected() } else { theme.text() },
+            if selected {
+                theme.selected()
+            } else if quoted {
+                Style::default().fg(theme.muted)
+            } else {
+                theme.text()
+            },
         ));
         global += 1;
     }
@@ -1491,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_illuminate_uses_vim_illuminate_default_underline() {
+    fn reader_illuminate_uses_colorscheme_style_reference_highlight() {
         let theme = load_themes().into_iter().next().expect("theme");
         let fragments = super::reader_fragments(
             "word",
@@ -1507,11 +1583,42 @@ mod tests {
             &[(0, 4)],
         );
         assert_eq!(fragments.len(), 1);
-        assert!(fragments[0]
+        assert!(!fragments[0]
             .style
             .add_modifier
             .contains(ratatui::style::Modifier::UNDERLINED));
-        assert_eq!(fragments[0].style.bg, None);
+        assert_eq!(fragments[0].style.bg, Some(super::reader_illuminate_bg(&theme)));
+        assert_eq!(fragments[0].style.fg, theme.text().fg);
+    }
+
+    #[test]
+    fn reader_illuminate_matches_tokyonight_reference_tone() {
+        let mut theme = load_themes().into_iter().next().expect("theme");
+        theme.popup_bg = Color::Rgb(36, 40, 59);
+        theme.border = Color::Rgb(65, 72, 104);
+        assert_eq!(super::reader_illuminate_bg(&theme), Color::Rgb(60, 66, 96));
+    }
+
+    #[test]
+    fn reader_cursor_stays_white_over_illuminated_word() {
+        let theme = load_themes().into_iter().next().expect("theme");
+        let fragments = super::reader_fragments(
+            "word",
+            theme.text(),
+            0,
+            4,
+            0,
+            0,
+            0,
+            None,
+            true,
+            &theme,
+            &[(0, 4)],
+        );
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].style.bg, Some(Color::White));
+        assert_eq!(fragments[0].style.fg, Some(Color::Black));
+        assert_eq!(fragments[1].style.bg, Some(super::reader_illuminate_bg(&theme)));
     }
 
     #[test]

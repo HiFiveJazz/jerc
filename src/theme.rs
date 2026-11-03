@@ -50,6 +50,13 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// Subtle current-row/current-line style shared by mailbox, message list,
+    /// and the Vim reader cursor line. Visual selections keep using `selected()`.
+    #[must_use]
+    pub fn current_line(&self) -> Style {
+        Style::default().fg(self.foreground).bg(self.popup_bg)
+    }
+
     #[must_use]
     pub fn border(&self) -> Style {
         Style::default().fg(self.border)

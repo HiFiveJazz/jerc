@@ -20,6 +20,7 @@ pub enum ActionKind {
     MailboxStatus(String),
     OpenMailbox { name: String, offset: usize, limit: usize },
     FetchBody { mailbox: String, id: MessageId },
+    FetchRawForCompose { mailbox: String, id: MessageId },
     ExportRaw { mailbox: String, id: MessageId, path: PathBuf },
     SetSeen { mailbox: String, id: MessageId, seen: bool },
     Delete { mailbox: String, id: MessageId },
@@ -64,6 +65,7 @@ pub enum WorkerEventKind {
         elapsed_micros: u128,
     },
     BodyLoaded(MessageBody),
+    RawLoaded { id: MessageId, raw: Vec<u8> },
     MessageExported { path: PathBuf },
     SeenChanged { id: MessageId, seen: bool },
     MutationComplete,
@@ -225,6 +227,9 @@ fn run_worker(
             ActionKind::FetchBody { mailbox, id } => backend
                 .fetch_body(&mailbox, &id)
                 .map(WorkerEventKind::BodyLoaded),
+            ActionKind::FetchRawForCompose { mailbox, id } => backend
+                .fetch_raw(&mailbox, &id)
+                .map(|raw| WorkerEventKind::RawLoaded { id, raw }),
             ActionKind::ExportRaw { mailbox, id, path } => backend
                 .fetch_raw(&mailbox, &id)
                 .and_then(|raw| write_export(&path, &raw).map(|()| path))
