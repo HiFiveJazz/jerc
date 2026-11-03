@@ -1,22 +1,70 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::process::Command as ProcessCommand;
+use std::io::Write;
+use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Size;
+use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
 use crate::app::{Command, Focus, HELP_ENTRIES, command_for_key};
 use crate::config::Config;
+use crate::mail::render_html_for_terminal;
+use crate::mail_image::{MailImageEvent, MailImageLoader};
 use crate::model::{
     Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessageSummary,
     OutgoingMessage,
 };
 use crate::theme::{Theme, load_themes, persist_theme, persisted_theme, theme_index};
-use crate::worker::{ActionKind, WorkerEvent, WorkerEventKind, WorkerHandle};
+use crate::worker::{ActionKind, RuntimeEvent, WorkerEvent, WorkerEventKind, WorkerHandle};
 
 const SMOOTH_SCROLL_ROWS: isize = 22;
 const SMOOTH_MAILBOX_ROWS: isize = 5;
 const MAX_COUNT_PREFIX: usize = 99_999;
 const MESSAGE_SCROLL_OFF: usize = 4;
+const READER_SCROLL_OFF: usize = 3;
+const PAGE_PREFETCH_MIN: usize = 48;
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReaderPosition {
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderSelection {
+    pub start: ReaderPosition,
+    pub end: ReaderPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderWordMotion {
+    NextStart,
+    PreviousStart,
+}
+
+impl ReaderSelection {
+    #[must_use]
+    pub fn columns_for_line(self, line: usize, line_len: usize) -> Option<(usize, usize)> {
+        if line < self.start.line || line > self.end.line {
+            return None;
+        }
+        let last = line_len.saturating_sub(1);
+        let start = if line == self.start.line {
+            self.start.column.min(last)
+        } else {
+            0
+        };
+        let end = if line == self.end.line {
+            self.end.column.min(last)
+        } else {
+            last
+        };
+        (line_len > 0 && start <= end).then_some((start, end))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StatusLine {
@@ -486,7 +534,7 @@ pub struct AccountState {
     pub pending_bodies: HashSet<MessageId>,
     pub pending_seen: HashSet<MessageId>,
     pub mailbox_status_queue: VecDeque<String>,
-    pub mailbox_status_inflight: bool,
+    pub mailbox_status_inflight: Option<u64>,
     pub connecting: bool,
     pub mailboxes_loading: bool,
     pub messages_loading: bool,
@@ -637,6 +685,31 @@ impl AccountState {
         }
     }
 
+    fn queue_unknown_mailbox_statuses(&mut self, priority: Option<&str>) {
+        let unknown = self
+            .mailboxes
+            .iter()
+            .filter(|mailbox| !mailbox.counts_known)
+            .map(|mailbox| mailbox.name.clone())
+            .collect::<Vec<_>>();
+
+        self.mailbox_status_queue
+            .retain(|name| unknown.iter().any(|candidate| candidate == name));
+
+        if let Some(priority) = priority
+            && unknown.iter().any(|name| name == priority)
+        {
+            self.mailbox_status_queue.retain(|name| name != priority);
+            self.mailbox_status_queue.push_front(priority.to_owned());
+        }
+
+        for name in unknown {
+            if !self.mailbox_status_queue.iter().any(|queued| queued == &name) {
+                self.mailbox_status_queue.push_back(name);
+            }
+        }
+    }
+
     fn request_mailbox_page(&mut self, name: String, offset: usize) -> bool {
         if self
             .page_inflight
@@ -736,6 +809,35 @@ pub struct MutationConfirmation {
     kind: MutationKind,
 }
 
+struct ReaderImage {
+    source: String,
+    protocol: Protocol,
+}
+
+fn reader_image_pixel_size(
+    native_width: u32,
+    native_height: u32,
+    html_width: Option<u32>,
+    html_height: Option<u32>,
+    max_width: u32,
+    max_height: u32,
+) -> (u32, u32) {
+    let native_width = native_width.max(1);
+    let native_height = native_height.max(1);
+    let width_limit = html_width.unwrap_or(native_width).min(max_width.max(1));
+    let height_limit = html_height.unwrap_or(native_height).min(max_height.max(1));
+
+    // Fit the original pixel data into both the sender's requested CSS box and
+    // the terminal viewport. The scale is deliberately capped at 1.0: email
+    // logos and icons should never be enlarged beyond their decoded source.
+    let scale = 1.0_f64
+        .min(f64::from(width_limit) / f64::from(native_width))
+        .min(f64::from(height_limit) / f64::from(native_height));
+    let width = (f64::from(native_width) * scale).round().max(1.0) as u32;
+    let height = (f64::from(native_height) * scale).round().max(1.0) as u32;
+    (width, height)
+}
+
 pub struct App {
     pub accounts: Vec<AccountState>,
     pub account_index: usize,
@@ -747,6 +849,24 @@ pub struct App {
     pub preview_split: bool,
     pub message_open: bool,
     pub reader_link_index: usize,
+    pub reader_cursor: usize,
+    pub reader_column: usize,
+    pub reader_visual_anchor: Option<ReaderPosition>,
+    reader_visual_linewise: bool,
+    reader_smooth_target: Option<usize>,
+    reader_preferred_column: Option<usize>,
+    reader_pending_g: bool,
+    reader_pending_inner_object: bool,
+    reader_body_start: usize,
+    reader_line_count: usize,
+    reader_view_height: usize,
+    image_picker: Option<Picker>,
+    image_loader: Option<MailImageLoader>,
+    reader_image: Option<ReaderImage>,
+    reader_image_pending: Option<String>,
+    reader_image_size_hint: Option<(Option<u32>, Option<u32>)>,
+    reader_image_target_width: u16,
+    pub reader_images_enabled: bool,
     pub help_visible: bool,
     pub help_query: String,
     pub help_selected: usize,
@@ -791,7 +911,7 @@ impl App {
                 smooth_mailbox_target: None,
                 smooth_preview_target: None,
                 preview_max_scroll: 0,
-                prefer_html: false,
+                prefer_html: true,
                 // Interactive pagination has its own small page size, so an old
                 // `max_messages = 500` config no longer makes All Mail block on
                 // five hundred headers before first paint.
@@ -806,7 +926,7 @@ impl App {
                 pending_bodies: HashSet::new(),
                 pending_seen: HashSet::new(),
                 mailbox_status_queue: VecDeque::new(),
-                mailbox_status_inflight: false,
+                mailbox_status_inflight: None,
                 connecting: false,
                 mailboxes_loading: false,
                 messages_loading: false,
@@ -830,6 +950,24 @@ impl App {
             preview_split: false,
             message_open: false,
             reader_link_index: 0,
+            reader_cursor: 0,
+            reader_column: 0,
+            reader_visual_anchor: None,
+            reader_visual_linewise: false,
+            reader_smooth_target: None,
+            reader_preferred_column: None,
+            reader_pending_g: false,
+            reader_pending_inner_object: false,
+            reader_body_start: 0,
+            reader_line_count: 0,
+            reader_view_height: 1,
+            image_picker: None,
+            image_loader: None,
+            reader_image: None,
+            reader_image_pending: None,
+            reader_image_size_hint: None,
+            reader_image_target_width: 48,
+            reader_images_enabled: config.ui.remote_images,
             help_visible: false,
             help_query: String::new(),
             help_selected: 0,
@@ -892,7 +1030,10 @@ impl App {
             self.handle_search_key(key);
             return;
         }
-        if self.message_open || self.preview_split {
+        if self.message_open && self.handle_reader_key(key) {
+            return;
+        }
+        if self.preview_split {
             match key.code {
                 KeyCode::Tab if key.modifiers.is_empty() => {
                     self.cycle_reader_link(1);
@@ -906,10 +1047,242 @@ impl App {
                     self.open_reader_link();
                     return;
                 }
+                KeyCode::Char('O') if key.modifiers.is_empty() => {
+                    self.open_original_html();
+                    return;
+                }
                 _ => {}
             }
         }
         self.handle_command(command_for_key(key));
+    }
+
+    fn handle_reader_key(&mut self, key: KeyEvent) -> bool {
+        if self.focus != Focus::Preview || !self.message_open {
+            return false;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            return match key.code {
+                KeyCode::Char('j') => {
+                    self.count_prefix = None;
+                    self.start_smooth_scroll(SMOOTH_SCROLL_ROWS);
+                    true
+                }
+                KeyCode::Char('k') => {
+                    self.count_prefix = None;
+                    self.start_smooth_scroll(-SMOOTH_SCROLL_ROWS);
+                    true
+                }
+                KeyCode::Char('d') | KeyCode::Char('u') => {
+                    let distance = isize::try_from(
+                        self.reader_view_height
+                            .saturating_div(2)
+                            .max(1)
+                            .saturating_mul(self.take_count(1)),
+                    )
+                    .unwrap_or(isize::MAX);
+                    self.move_reader_cursor(if key.code == KeyCode::Char('d') {
+                        distance
+                    } else {
+                        -distance
+                    });
+                    true
+                }
+                _ => false,
+            };
+        }
+
+        // Any ordinary reader motion/action interrupts a pending neoscroll.
+        // The next key should always operate from the cursor line currently on
+        // screen rather than allowing an old smooth target to keep advancing.
+        self.reader_smooth_target = None;
+
+        if self.reader_pending_inner_object {
+            self.reader_pending_inner_object = false;
+            if let KeyCode::Char(delimiter) = key.code {
+                if self.select_reader_inner_object(delimiter) {
+                    return true;
+                }
+            }
+            self.status = StatusLine::temporary(
+                "no enclosing quote/bracket at reader cursor",
+                Duration::from_secs(2),
+            );
+            return true;
+        }
+
+        if self.reader_pending_g {
+            self.reader_pending_g = false;
+            if matches!(key.code, KeyCode::Char('g')) {
+                let target = self.take_count(1).saturating_sub(1);
+                self.jump_reader_to_line(target);
+                return true;
+            }
+        }
+
+        match key.code {
+            KeyCode::Esc => false,
+            KeyCode::Tab => {
+                self.cycle_reader_link(1);
+                true
+            }
+            KeyCode::BackTab => {
+                self.cycle_reader_link(-1);
+                true
+            }
+            KeyCode::Char('o') => {
+                self.open_reader_link();
+                true
+            }
+            KeyCode::Char('O') => {
+                self.open_original_html();
+                true
+            }
+            KeyCode::Char('0') if self.count_prefix.is_none() => {
+                self.reader_column = 0;
+                self.reader_preferred_column = None;
+                true
+            }
+            KeyCode::Char(ch) if ch.is_ascii_digit() => {
+                self.push_count_digit(ch.to_digit(10).unwrap_or_default() as u8);
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = isize::try_from(self.take_count(1)).unwrap_or(isize::MAX);
+                self.move_reader_cursor(count);
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let count = isize::try_from(self.take_count(1)).unwrap_or(isize::MAX);
+                self.move_reader_cursor(-count);
+                true
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                let count = isize::try_from(self.take_count(1)).unwrap_or(isize::MAX);
+                self.move_reader_horizontal(-count);
+                true
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                let count = isize::try_from(self.take_count(1)).unwrap_or(isize::MAX);
+                self.move_reader_horizontal(count);
+                true
+            }
+            KeyCode::Char('w') => {
+                let count = self.take_count(1);
+                for _ in 0..count {
+                    self.move_reader_word(ReaderWordMotion::NextStart);
+                }
+                true
+            }
+            KeyCode::Char('b') => {
+                let count = self.take_count(1);
+                for _ in 0..count {
+                    self.move_reader_word(ReaderWordMotion::PreviousStart);
+                }
+                true
+            }
+            KeyCode::Char('e') => {
+                self.count_prefix = None;
+                self.export_selected_raw();
+                true
+            }
+            KeyCode::Char('^') => {
+                self.reader_column = self.reader_first_non_blank();
+                self.reader_preferred_column = None;
+                true
+            }
+            KeyCode::Char('$') | KeyCode::End => {
+                self.reader_column = self.reader_line_len(self.reader_cursor).saturating_sub(1);
+                self.reader_preferred_column = None;
+                true
+            }
+            KeyCode::Home => {
+                self.reader_column = 0;
+                self.reader_preferred_column = None;
+                true
+            }
+            KeyCode::Char('H') => {
+                self.reader_column = 0;
+                self.reader_preferred_column = None;
+                true
+            }
+            KeyCode::Char('L') => {
+                self.reader_column = self.reader_line_len(self.reader_cursor).saturating_sub(1);
+                self.reader_preferred_column = None;
+                true
+            }
+            KeyCode::Char('g') => {
+                self.reader_pending_g = true;
+                true
+            }
+            KeyCode::Char('G') => {
+                if let Some(count) = self.count_prefix.take() {
+                    self.jump_reader_to_line(count.saturating_sub(1));
+                } else {
+                    self.jump_reader_to_line(self.reader_line_count.saturating_sub(1));
+                }
+                true
+            }
+            KeyCode::Char('{') => {
+                let count = self.take_count(1);
+                for _ in 0..count {
+                    self.move_reader_paragraph(false);
+                }
+                true
+            }
+            KeyCode::Char('}') => {
+                let count = self.take_count(1);
+                for _ in 0..count {
+                    self.move_reader_paragraph(true);
+                }
+                true
+            }
+            KeyCode::Char('v') => {
+                self.count_prefix = None;
+                self.toggle_visual();
+                true
+            }
+            KeyCode::Char('V') => {
+                self.count_prefix = None;
+                self.toggle_reader_linewise_visual();
+                true
+            }
+            KeyCode::Char('i') if self.reader_visual_anchor.is_some() => {
+                self.reader_visual_linewise = false;
+                self.reader_pending_inner_object = true;
+                self.status = StatusLine::temporary(
+                    "inner text object: quote or bracket",
+                    Duration::from_secs(2),
+                );
+                true
+            }
+            KeyCode::Char('y') if self.reader_visual_anchor.is_some() => {
+                self.count_prefix = None;
+                self.yank_reader_selection();
+                true
+            }
+            KeyCode::Char('d' | 'c' | 'x' | 'a') if self.reader_visual_anchor.is_some() => {
+                self.status = StatusLine::temporary(
+                    "reader is read-only; press y to copy the visual selection",
+                    Duration::from_secs(2),
+                );
+                true
+            }
+            KeyCode::Char('T') => {
+                self.count_prefix = None;
+                self.toggle_html();
+                true
+            }
+            KeyCode::Char('I') => {
+                self.count_prefix = None;
+                self.toggle_remote_images();
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn handle_worker_event(&mut self, event: WorkerEvent) {
@@ -944,14 +1317,11 @@ impl App {
                     })
                     .unwrap_or(0);
                 account.clamp_selection();
-                account.mailbox_status_queue.clear();
-                if let Some((name, counts_known)) = account
+                if let Some(name) = account
                     .selected_mailbox()
-                    .map(|mailbox| (mailbox.name.clone(), mailbox.counts_known))
+                    .map(|mailbox| mailbox.name.clone())
                 {
-                    if !counts_known {
-                        account.mailbox_status_queue.push_back(name.clone());
-                    }
+                    account.queue_unknown_mailbox_statuses(Some(&name));
                     if account.current_mailbox.as_deref() != Some(name.as_str()) {
                         if !account.restore_cached_mailbox(&name) {
                             account.current_mailbox = Some(name.clone());
@@ -974,7 +1344,9 @@ impl App {
                 total,
                 unread,
             } => {
-                account.mailbox_status_inflight = false;
+                if account.mailbox_status_inflight == Some(event.request_id) {
+                    account.mailbox_status_inflight = None;
+                }
                 if let Some(mailbox) = account.mailboxes.iter_mut().find(|m| m.name == name) {
                     mailbox.total = total;
                     mailbox.unread = unread;
@@ -1062,11 +1434,28 @@ impl App {
                 account.last_scan_micros = Some(elapsed_micros);
                 account.clamp_selection();
                 account.normalize_search_selection();
+                let visible = account.visible_message_indices();
                 let search_needs_more = !account.search_query.is_empty()
-                    && account.visible_message_indices().len() < account.message_view_height
+                    && visible.len() < account.message_view_height
                     && account.has_more
                     && account.page_inflight.is_none();
-                if search_needs_more {
+                let current_position = visible
+                    .iter()
+                    .position(|index| *index == account.message_index)
+                    .unwrap_or(0);
+                let remaining = visible
+                    .len()
+                    .saturating_sub(current_position.saturating_add(1));
+                let prefetch_distance = account
+                    .message_view_height
+                    .saturating_mul(4)
+                    .max(account.page_size)
+                    .max(PAGE_PREFETCH_MIN);
+                let browse_needs_more = account.search_query.is_empty()
+                    && account.has_more
+                    && account.page_inflight.is_none()
+                    && remaining <= prefetch_distance;
+                if search_needs_more || browse_needs_more {
                     let _ = account.request_next_page();
                 }
                 if first_page {
@@ -1075,25 +1464,21 @@ impl App {
                 }
                 self.status = StatusLine::temporary(
                     format!(
-                        "{}: {} messages loaded from {} in {:.2} ms{}",
+                        "{}: {} messages loaded from {} in {:.2} ms",
                         account.name,
                         account.messages.len(),
                         name,
-                        elapsed_micros as f64 / 1000.0,
-                        if account.has_more { " • older mail available" } else { "" }
+                        elapsed_micros as f64 / 1000.0
                     ),
                     Duration::from_secs(4),
                 );
                 if self.preview_split {
                     account.request_selected_body();
                 }
-                account.mailbox_status_queue.clear();
-                if let Some((name, false)) = account
+                let selected_mailbox = account
                     .selected_mailbox()
-                    .map(|mailbox| (mailbox.name.clone(), mailbox.counts_known))
-                {
-                    account.mailbox_status_queue.push_back(name);
-                }
+                    .map(|mailbox| mailbox.name.clone());
+                account.queue_unknown_mailbox_statuses(selected_mailbox.as_deref());
                 Self::pump_mailbox_status(account);
             }
             WorkerEventKind::BodyLoaded(body) => {
@@ -1170,11 +1555,70 @@ impl App {
                 account.pending_mutations = account.pending_mutations.saturating_sub(1);
                 self.status = StatusLine::temporary("mail updated", Duration::from_secs(2));
             }
-            WorkerEventKind::MessageSent => {
+            WorkerEventKind::MessageSent {
+                smtp_status,
+                sent_mailbox,
+                sent_copy_saved,
+                sent_copy_warning,
+            } => {
+                // A successful SMTP submission makes our mailbox snapshots stale even
+                // when the provider files Sent itself (Gmail), and especially when the
+                // message was addressed back to this account. Force the next visit to
+                // INBOX/Sent to come from the server rather than the in-memory cache.
+                let mut refresh_current = None;
+                let affected = account
+                    .mailboxes
+                    .iter()
+                    .filter(|mailbox| {
+                        matches!(mailbox.role, MailboxRole::Inbox | MailboxRole::Sent)
+                            || sent_mailbox
+                                .as_deref()
+                                .is_some_and(|name| name == mailbox.name)
+                    })
+                    .map(|mailbox| mailbox.name.clone())
+                    .collect::<Vec<_>>();
+                for name in &affected {
+                    account.mailbox_cache.remove(name);
+                    if let Some(mailbox) = account
+                        .mailboxes
+                        .iter_mut()
+                        .find(|mailbox| mailbox.name == *name)
+                    {
+                        mailbox.counts_known = false;
+                    }
+                }
+                account.queue_unknown_mailbox_statuses(sent_mailbox.as_deref());
+                if account
+                    .current_mailbox
+                    .as_ref()
+                    .is_some_and(|name| affected.iter().any(|affected| affected == name))
+                {
+                    refresh_current = account.current_mailbox.clone();
+                }
+                if let Some(name) = refresh_current {
+                    let _ = account.request_mailbox_page(name, 0);
+                }
+                Self::pump_mailbox_status(account);
+
                 if event.account == self.account_index {
                     self.composer = None;
                 }
-                self.status = StatusLine::temporary("message sent", Duration::from_secs(4));
+                self.status = if let Some(warning) = sent_copy_warning {
+                    StatusLine::temporary(
+                        format!("SMTP accepted ({smtp_status}); {warning}"),
+                        Duration::from_secs(8),
+                    )
+                } else if sent_copy_saved {
+                    StatusLine::temporary(
+                        format!("SMTP accepted ({smtp_status}); saved to Sent"),
+                        Duration::from_secs(5),
+                    )
+                } else {
+                    StatusLine::temporary(
+                        format!("SMTP accepted ({smtp_status}); provider handles Sent copy"),
+                        Duration::from_secs(5),
+                    )
+                };
             }
             WorkerEventKind::Error(error) => {
                 let mutation_failed = account.pending_mutations > 0;
@@ -1183,7 +1627,9 @@ impl App {
                 account.mailboxes_loading = false;
                 account.messages_loading = false;
                 account.page_inflight = None;
-                account.mailbox_status_inflight = false;
+                if account.mailbox_status_inflight == Some(event.request_id) {
+                    account.mailbox_status_inflight = None;
+                }
                 account.pending_bodies.clear();
                 account.pending_seen.clear();
                 if self
@@ -1204,6 +1650,10 @@ impl App {
                     account.invalidate_current_cache();
                     let _ = account.request_mailbox_page(name, 0);
                 }
+                // STATUS failures are mailbox-local. Do not leave every other
+                // folder stuck on an unknown count just because one provider
+                // rejects STATUS for a special mailbox.
+                Self::pump_mailbox_status(account);
                 self.status = StatusLine::error(format!("{}: {error}", account.name));
             }
             WorkerEventKind::Stopped => {}
@@ -1328,6 +1778,18 @@ impl App {
                 self.count_prefix = None;
                 self.toggle_html();
             }
+            Command::ToggleImages => {
+                self.count_prefix = None;
+                self.toggle_remote_images();
+            }
+            Command::OpenOriginal => {
+                self.count_prefix = None;
+                self.open_original_html();
+            }
+            Command::Yank => {
+                self.count_prefix = None;
+                self.yank_reader_selection();
+            }
             Command::Compose => {
                 self.count_prefix = None;
                 self.begin_compose();
@@ -1346,8 +1808,17 @@ impl App {
             }
             Command::Escape => {
                 self.count_prefix = None;
-                if self.visual_anchor.take().is_some() {
-                    self.status = StatusLine::temporary("visual selection cleared", Duration::from_secs(1));
+                if self.reader_visual_anchor.take().is_some() {
+                    self.reader_visual_linewise = false;
+                    self.status = StatusLine::temporary(
+                        "reader visual selection cleared",
+                        Duration::from_secs(1),
+                    );
+                } else if self.visual_anchor.take().is_some() {
+                    self.status = StatusLine::temporary(
+                        "visual selection cleared",
+                        Duration::from_secs(1),
+                    );
                 } else if self.message_open {
                     self.close_message();
                 } else {
@@ -1368,7 +1839,7 @@ impl App {
 
     #[must_use]
     pub fn animation_active(&self) -> bool {
-        self.account().is_some_and(|account| {
+        self.reader_smooth_target.is_some() || self.account().is_some_and(|account| {
             account.smooth_message_target.is_some()
                 || account.smooth_mailbox_target.is_some()
                 || account.smooth_preview_target.is_some()
@@ -1380,6 +1851,35 @@ impl App {
     /// not open intermediate folders, so Ctrl-Shift-j/k stays responsive.
     pub fn advance_animation(&mut self) {
         let focus = self.focus;
+        if focus == Focus::Preview {
+            let Some(target) = self.reader_smooth_target else {
+                return;
+            };
+            if self.reader_line_count == 0 {
+                self.reader_smooth_target = None;
+                return;
+            }
+
+            let preferred = self.reader_preferred_column.unwrap_or(self.reader_column);
+            if self.reader_cursor < target {
+                self.reader_cursor = self.reader_cursor.saturating_add(1);
+            } else if self.reader_cursor > target {
+                self.reader_cursor = self.reader_cursor.saturating_sub(1);
+            }
+            let line_len = self.reader_line_len(self.reader_cursor);
+            self.reader_column = if line_len == 0 {
+                0
+            } else {
+                preferred.min(line_len.saturating_sub(1))
+            };
+            self.reader_preferred_column = Some(preferred);
+            if self.reader_cursor == target {
+                self.reader_smooth_target = None;
+            }
+            self.keep_reader_cursor_visible();
+            return;
+        }
+
         let preview_split = self.preview_split;
         let mut mailbox_finished = false;
         let Some(account) = self.account_mut() else {
@@ -1422,6 +1922,14 @@ impl App {
                     account.message_index = visible[next.min(visible.len() - 1)];
                     account.preview_scroll = 0;
                     account.keep_message_cursor_visible();
+                    let remaining = visible.len().saturating_sub(next.saturating_add(1));
+                    let prefetch_distance = account
+                        .message_view_height
+                        .saturating_mul(4)
+                        .max(account.page_size);
+                    if remaining <= prefetch_distance {
+                        let _ = account.request_next_page();
+                    }
                     if next == target_position {
                         account.smooth_message_target = None;
                         if preview_split {
@@ -1430,17 +1938,7 @@ impl App {
                     }
                 }
                 Focus::Preview => {
-                    let Some(target) = account.smooth_preview_target else {
-                        return;
-                    };
-                    if account.preview_scroll < target {
-                        account.preview_scroll = account.preview_scroll.saturating_add(1);
-                    } else if account.preview_scroll > target {
-                        account.preview_scroll = account.preview_scroll.saturating_sub(1);
-                    }
-                    if account.preview_scroll == target {
-                        account.smooth_preview_target = None;
-                    }
+                    unreachable!("reader animation is handled before borrowing account state")
                 }
             }
         }
@@ -1451,7 +1949,7 @@ impl App {
     }
 
     fn pump_mailbox_status(account: &mut AccountState) {
-        if account.mailbox_status_inflight
+        if account.mailbox_status_inflight.is_some()
             || account.messages_loading
             || !account.pending_bodies.is_empty()
         {
@@ -1466,12 +1964,11 @@ impl App {
             {
                 continue;
             }
-            if account
+            if let Ok(request_id) = account
                 .worker
                 .post(ActionKind::MailboxStatus(name.clone()))
-                .is_ok()
             {
-                account.mailbox_status_inflight = true;
+                account.mailbox_status_inflight = Some(request_id);
             }
             break;
         }
@@ -1486,6 +1983,8 @@ impl App {
         }
         self.count_prefix = None;
         self.message_open = false;
+        self.reader_smooth_target = None;
+        self.reader_visual_linewise = false;
         self.pending_compose = None;
         self.visual_anchor = None;
         self.confirmation = None;
@@ -1495,40 +1994,51 @@ impl App {
 
     fn move_selection(&mut self, delta: isize) {
         let focus = self.focus;
+        if focus == Focus::Preview {
+            self.move_reader_cursor(delta);
+            return;
+        }
+
+        self.reader_cursor = 0;
+        self.reader_column = 0;
+        self.reader_preferred_column = None;
+        self.reader_visual_anchor = None;
+        self.reader_pending_g = false;
+        self.reader_pending_inner_object = false;
         let preview_split = self.preview_split;
         let Some(account) = self.account_mut() else {
             return;
         };
         account.smooth_message_target = None;
         account.smooth_preview_target = None;
-        match focus {
-            Focus::Messages | Focus::Mailboxes => {
-                let visible = account.visible_message_indices();
-                if visible.is_empty() {
-                    return;
-                }
-                let current = visible
-                    .iter()
-                    .position(|index| *index == account.message_index)
-                    .unwrap_or(0);
-                let next = bounded_index(current, visible.len(), delta);
-                let previous = account.message_index;
-                account.message_index = visible[next];
-                if account.message_index != previous {
-                    account.preview_scroll = 0;
-                    account.keep_message_cursor_visible();
-                    if preview_split {
-                        account.request_selected_body();
-                    }
-                }
-                if delta > 0 && next.saturating_add(5) >= visible.len() {
-                    let _ = account.request_next_page();
-                }
+
+        let visible = account.visible_message_indices();
+        if visible.is_empty() {
+            return;
+        }
+        let current = visible
+            .iter()
+            .position(|index| *index == account.message_index)
+            .unwrap_or(0);
+        let next = bounded_index(current, visible.len(), delta);
+        let previous = account.message_index;
+        account.message_index = visible[next];
+        if account.message_index != previous {
+            account.preview_scroll = 0;
+            account.keep_message_cursor_visible();
+            if preview_split {
+                account.request_selected_body();
             }
-            Focus::Preview => {
-                account.preview_scroll =
-                    bounded_scroll_to(account.preview_scroll, delta, account.preview_max_scroll);
-            }
+        }
+
+        let remaining = visible.len().saturating_sub(next.saturating_add(1));
+        let prefetch_distance = account
+            .message_view_height
+            .saturating_mul(4)
+            .max(account.page_size)
+            .max(PAGE_PREFETCH_MIN);
+        if delta > 0 && remaining <= prefetch_distance {
+            let _ = account.request_next_page();
         }
     }
 
@@ -1562,13 +2072,7 @@ impl App {
         account.message_index = 0;
         account.search_query.clear();
         account.search_editing = false;
-        account.mailbox_status_queue.clear();
-        if let Some((status_name, false)) = account
-            .selected_mailbox()
-            .map(|mailbox| (mailbox.name.clone(), mailbox.counts_known))
-        {
-            account.mailbox_status_queue.push_back(status_name);
-        }
+        account.queue_unknown_mailbox_statuses(Some(&name));
         if account.restore_cached_mailbox(&name) {
             if preview_split {
                 account.request_selected_body();
@@ -1602,9 +2106,79 @@ impl App {
         account.keep_message_cursor_visible();
     }
 
-    /// Called by the renderer after wrapping the current message. Keeping the
-    /// exact visual bound in state prevents invisible overscroll.
-    pub fn set_preview_max_scroll(&mut self, max_scroll: u16) {
+    /// Called by the renderer after laying out the current message. Keeping the
+    /// reader cursor and scroll bounds together makes normal/visual reader
+    /// motions deterministic even when the message body is shorter than the
+    /// viewport.
+    pub fn ensure_reader_html_layout(&mut self, width: usize) {
+        let width = width.max(20);
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        let Some(message_id) = account.selected_message().map(|message| message.id.clone()) else {
+            return;
+        };
+        let prefer_html = account.prefer_html;
+        let Some(body) = account.bodies.get_mut(&message_id) else {
+            return;
+        };
+        if !body.has_html_alternative()
+            || !prefer_html
+            || body.html_render_width == width
+        {
+            return;
+        }
+        let Some(source) = body.html_source.clone() else {
+            return;
+        };
+        let (html_text, html_lines, html_renderer) = render_html_for_terminal(&source, width);
+        body.html_text = Some(html_text);
+        body.html_lines = Some(html_lines);
+        body.html_renderer = Some(html_renderer);
+        body.html_render_width = width;
+    }
+
+    /// Called by the renderer after laying out the current message. Keeping the
+    /// reader cursor and scroll bounds together makes normal/visual reader
+    /// motions deterministic even when the message body is shorter than the
+    /// viewport.
+    pub fn set_reader_layout(
+        &mut self,
+        body_start: usize,
+        line_count: usize,
+        view_height: usize,
+        max_scroll: u16,
+    ) {
+        self.reader_body_start = body_start;
+        self.reader_line_count = line_count;
+        self.reader_view_height = view_height.max(1);
+        if line_count == 0 {
+            self.reader_cursor = 0;
+            self.reader_column = 0;
+            self.reader_visual_anchor = None;
+            self.reader_visual_linewise = false;
+            self.reader_smooth_target = None;
+        } else {
+            self.reader_cursor = self.reader_cursor.min(line_count.saturating_sub(1));
+            self.reader_smooth_target = self
+                .reader_smooth_target
+                .map(|target| target.min(line_count.saturating_sub(1)))
+                .filter(|target| *target != self.reader_cursor);
+            if let Some(anchor) = self.reader_visual_anchor {
+                let line = anchor.line.min(line_count.saturating_sub(1));
+                let line_len = self.reader_line_len(line);
+                self.reader_visual_anchor = Some(ReaderPosition {
+                    line,
+                    column: if line_len == 0 {
+                        0
+                    } else {
+                        anchor.column.min(line_len.saturating_sub(1))
+                    },
+                });
+            }
+            self.clamp_reader_column();
+        }
+
         let Some(account) = self.account_mut() else {
             return;
         };
@@ -1616,8 +2190,186 @@ impl App {
             .filter(|target| *target != account.preview_scroll);
     }
 
+    fn reader_display_text(&self) -> Option<&str> {
+        let account = self.account()?;
+        let body = account.selected_body()?;
+        let show_html = body.has_html_alternative() && account.prefer_html;
+        Some(body.display_text(show_html))
+    }
+
+    fn reader_line_text(&self, line: usize) -> Option<&str> {
+        self.reader_display_text()?.lines().nth(line)
+    }
+
+    fn reader_line_len(&self, line: usize) -> usize {
+        self.reader_line_text(line).map_or(0, |text| text.chars().count())
+    }
+
+    fn clamp_reader_column(&mut self) {
+        let line_len = self.reader_line_len(self.reader_cursor);
+        self.reader_column = if line_len == 0 {
+            0
+        } else {
+            self.reader_column.min(line_len.saturating_sub(1))
+        };
+    }
+
+    fn reader_first_non_blank(&self) -> usize {
+        self.reader_line_text(self.reader_cursor)
+            .and_then(|line| line.chars().position(|ch| !ch.is_whitespace()))
+            .unwrap_or(0)
+    }
+
+    fn move_reader_cursor(&mut self, delta: isize) {
+        if self.reader_line_count == 0 {
+            return;
+        }
+
+        let preferred = self.reader_preferred_column.unwrap_or(self.reader_column);
+        self.reader_cursor = bounded_index(self.reader_cursor, self.reader_line_count, delta);
+        let line_len = self.reader_line_len(self.reader_cursor);
+        self.reader_column = if line_len == 0 {
+            0
+        } else {
+            preferred.min(line_len.saturating_sub(1))
+        };
+        self.reader_preferred_column = Some(preferred);
+        self.keep_reader_cursor_visible();
+    }
+
+    fn move_reader_horizontal(&mut self, delta: isize) {
+        let line_len = self.reader_line_len(self.reader_cursor);
+        if line_len == 0 {
+            self.reader_column = 0;
+        } else {
+            self.reader_column = bounded_index(self.reader_column, line_len, delta);
+        }
+        self.reader_preferred_column = None;
+    }
+
+    fn jump_reader_to_line(&mut self, line: usize) {
+        if self.reader_line_count == 0 {
+            return;
+        }
+        self.reader_cursor = line.min(self.reader_line_count.saturating_sub(1));
+        self.clamp_reader_column();
+        self.reader_preferred_column = None;
+        self.keep_reader_cursor_visible();
+    }
+
+    fn move_reader_word(&mut self, motion: ReaderWordMotion) {
+        let Some(text) = self.reader_display_text() else {
+            return;
+        };
+        let Some(target) = reader_word_target(text, self.reader_cursor, self.reader_column, motion)
+        else {
+            return;
+        };
+        self.reader_cursor = target.line.min(self.reader_line_count.saturating_sub(1));
+        self.reader_column = target.column;
+        self.reader_preferred_column = None;
+        self.keep_reader_cursor_visible();
+    }
+
+    fn move_reader_paragraph(&mut self, forward: bool) {
+        let Some(text) = self.reader_display_text() else {
+            return;
+        };
+        let lines = text.lines().collect::<Vec<_>>();
+        if lines.is_empty() {
+            return;
+        }
+        let current = self.reader_cursor.min(lines.len().saturating_sub(1));
+        let target = if forward {
+            (current + 1..lines.len())
+                .find(|index| lines[*index].trim().is_empty())
+                .and_then(|blank| {
+                    (blank + 1..lines.len()).find(|index| !lines[*index].trim().is_empty())
+                })
+                .unwrap_or(lines.len().saturating_sub(1))
+        } else {
+            (0..current)
+                .rev()
+                .find(|index| lines[*index].trim().is_empty())
+                .and_then(|blank| {
+                    (0..blank).rev().find(|index| !lines[*index].trim().is_empty())
+                })
+                .unwrap_or(0)
+        };
+        self.reader_cursor = target;
+        self.reader_column = self.reader_first_non_blank();
+        self.reader_preferred_column = None;
+        self.keep_reader_cursor_visible();
+    }
+
+    fn select_reader_inner_object(&mut self, delimiter: char) -> bool {
+        if self.reader_visual_anchor.is_none() {
+            return false;
+        }
+        let Some(line) = self.reader_line_text(self.reader_cursor).map(ToOwned::to_owned) else {
+            return false;
+        };
+        let Some((start, end)) = inner_text_object_range(&line, self.reader_column, delimiter) else {
+            return false;
+        };
+        self.reader_visual_anchor = Some(ReaderPosition {
+            line: self.reader_cursor,
+            column: start,
+        });
+        self.reader_column = end;
+        self.reader_preferred_column = None;
+        true
+    }
+
+    fn keep_reader_cursor_visible(&mut self) {
+        let body_start = self.reader_body_start;
+        let cursor_row = body_start.saturating_add(self.reader_cursor);
+        let view_height = self.reader_view_height.max(1);
+        let total_rows = body_start
+            .saturating_add(self.reader_line_count)
+            .max(view_height);
+
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        account.smooth_preview_target = None;
+        let current_offset = usize::from(account.preview_scroll);
+        let scrolloff = READER_SCROLL_OFF.min(view_height.saturating_sub(1) / 2);
+        let max_offset = total_rows.saturating_sub(view_height);
+        let upper_guard = current_offset.saturating_add(scrolloff);
+        let lower_guard = current_offset
+            .saturating_add(view_height.saturating_sub(scrolloff + 1));
+        let mut next_offset = current_offset.min(max_offset);
+
+        if cursor_row < upper_guard {
+            next_offset = cursor_row.saturating_sub(scrolloff);
+        } else if cursor_row > lower_guard {
+            next_offset = cursor_row
+                .saturating_add(scrolloff + 1)
+                .saturating_sub(view_height)
+                .min(max_offset);
+        }
+
+        account.preview_scroll = u16::try_from(next_offset)
+            .unwrap_or(u16::MAX)
+            .min(account.preview_max_scroll);
+    }
+
     fn start_smooth_scroll(&mut self, delta: isize) {
         let focus = self.focus;
+        if focus == Focus::Preview {
+            if self.reader_line_count == 0 {
+                return;
+            }
+            let base = self.reader_smooth_target.unwrap_or(self.reader_cursor);
+            let target = bounded_index(base, self.reader_line_count, delta);
+            self.reader_smooth_target = (target != self.reader_cursor).then_some(target);
+            if let Some(account) = self.account_mut() {
+                account.smooth_preview_target = None;
+            }
+            return;
+        }
+
         let Some(account) = self.account_mut() else {
             return;
         };
@@ -1635,12 +2387,7 @@ impl App {
                 account.smooth_message_target = Some(bounded_index(base, visible.len(), delta));
             }
             Focus::Preview => {
-                let base = account
-                    .smooth_preview_target
-                    .unwrap_or(account.preview_scroll)
-                    .min(account.preview_max_scroll);
-                let target = bounded_scroll_to(base, delta, account.preview_max_scroll);
-                account.smooth_preview_target = (target != account.preview_scroll).then_some(target);
+                unreachable!("reader smooth scrolling is handled before borrowing account state")
             }
         }
     }
@@ -1665,35 +2412,52 @@ impl App {
 
     fn jump(&mut self, bottom: bool) {
         let focus = self.focus;
+        if focus == Focus::Preview {
+            self.reader_cursor = if bottom {
+                self.reader_line_count.saturating_sub(1)
+            } else {
+                0
+            };
+            self.reader_column = 0;
+            self.reader_preferred_column = None;
+            self.reader_visual_anchor = None;
+            self.reader_pending_g = false;
+            self.reader_pending_inner_object = false;
+            if let Some(account) = self.account_mut() {
+                account.smooth_preview_target = None;
+                account.preview_scroll = if bottom { account.preview_max_scroll } else { 0 };
+            }
+            return;
+        }
+
+        self.reader_cursor = 0;
+        self.reader_column = 0;
+        self.reader_preferred_column = None;
+        self.reader_visual_anchor = None;
+        self.reader_pending_g = false;
+        self.reader_pending_inner_object = false;
         let preview_split = self.preview_split;
         let Some(account) = self.account_mut() else {
             return;
         };
         account.smooth_message_target = None;
         account.smooth_preview_target = None;
-        match focus {
-            Focus::Mailboxes | Focus::Messages => {
-                let visible = account.visible_message_indices();
-                if visible.is_empty() {
-                    return;
-                }
-                account.message_index = if bottom {
-                    *visible.last().unwrap_or(&visible[0])
-                } else {
-                    visible[0]
-                };
-                account.preview_scroll = 0;
-                account.keep_message_cursor_visible();
-                if bottom {
-                    let _ = account.request_next_page();
-                }
-                if preview_split {
-                    account.request_selected_body();
-                }
-            }
-            Focus::Preview => {
-                account.preview_scroll = if bottom { account.preview_max_scroll } else { 0 };
-            }
+        let visible = account.visible_message_indices();
+        if visible.is_empty() {
+            return;
+        }
+        account.message_index = if bottom {
+            *visible.last().unwrap_or(&visible[0])
+        } else {
+            visible[0]
+        };
+        account.preview_scroll = 0;
+        account.keep_message_cursor_visible();
+        if bottom {
+            let _ = account.request_next_page();
+        }
+        if preview_split {
+            account.request_selected_body();
         }
     }
 
@@ -1705,11 +2469,23 @@ impl App {
                 }
                 self.visual_anchor = None;
                 self.reader_link_index = 0;
+                self.reader_cursor = 0;
+                self.reader_column = 0;
+                self.reader_preferred_column = None;
+                self.reader_visual_anchor = None;
+                self.reader_visual_linewise = false;
+                self.reader_smooth_target = None;
+                self.reader_pending_g = false;
+                self.reader_pending_inner_object = false;
+                self.reader_body_start = 0;
+                self.reader_line_count = 0;
+                self.reader_image = None;
+                self.reader_image_pending = None;
+                self.reader_image_size_hint = None;
                 self.message_open = true;
                 if let Some(account) = self.account_mut() {
                     account.preview_scroll = 0;
                     account.preview_max_scroll = 0;
-                    account.prefer_html = false;
                     account.request_selected_body();
                     Self::mark_cached_selected_seen(account);
                 }
@@ -1721,6 +2497,19 @@ impl App {
 
     fn close_message(&mut self) {
         self.reader_link_index = 0;
+        self.reader_cursor = 0;
+        self.reader_column = 0;
+        self.reader_preferred_column = None;
+        self.reader_visual_anchor = None;
+        self.reader_visual_linewise = false;
+        self.reader_smooth_target = None;
+        self.reader_pending_g = false;
+        self.reader_pending_inner_object = false;
+        self.reader_body_start = 0;
+        self.reader_line_count = 0;
+        self.reader_image = None;
+        self.reader_image_pending = None;
+        self.reader_image_size_hint = None;
         self.message_open = false;
         self.focus = Focus::Messages;
         if let Some(account) = self.account_mut() {
@@ -1774,6 +2563,35 @@ impl App {
         };
     }
 
+    fn yank_reader_selection(&mut self) {
+        if self.focus != Focus::Preview || !self.message_open {
+            return;
+        }
+        let Some(selection) = self.reader_visual_range() else {
+            self.status = StatusLine::temporary(
+                "press v and select reader text before yanking",
+                Duration::from_secs(2),
+            );
+            return;
+        };
+        let Some(text) = self.reader_display_text() else {
+            return;
+        };
+        let selected = reader_selection_text(text, selection);
+        if selected.is_empty() && selection.start == selection.end {
+            return;
+        }
+
+        self.status = match copy_text_to_clipboard(&selected) {
+            Ok(()) => {
+                self.reader_visual_anchor = None;
+                self.reader_visual_linewise = false;
+                StatusLine::temporary("copied reader selection", Duration::from_secs(2))
+            }
+            Err(error) => StatusLine::error(format!("could not copy selection: {error}")),
+        };
+    }
+
     fn toggle_seen(&mut self) {
         let Some(account) = self.account_mut() else {
             return;
@@ -1788,6 +2606,24 @@ impl App {
     }
 
     fn toggle_visual(&mut self) {
+        if self.focus == Focus::Preview && self.message_open {
+            if self.reader_line_count == 0 {
+                return;
+            }
+            if self.reader_visual_anchor.is_some() {
+                self.reader_visual_anchor = None;
+                self.reader_visual_linewise = false;
+            } else {
+                self.reader_visual_linewise = false;
+                self.reader_visual_anchor = Some(ReaderPosition {
+                    line: self.reader_cursor,
+                    column: self.reader_column,
+                });
+            }
+            self.reader_pending_inner_object = false;
+            return;
+        }
+
         if self.message_open || self.account().is_none_or(|account| account.messages.is_empty()) {
             return;
         }
@@ -1796,6 +2632,59 @@ impl App {
         } else {
             self.account().map(|account| account.message_index)
         };
+    }
+
+    fn toggle_reader_linewise_visual(&mut self) {
+        if self.focus != Focus::Preview || !self.message_open || self.reader_line_count == 0 {
+            return;
+        }
+
+        if self.reader_visual_anchor.is_some() && self.reader_visual_linewise {
+            self.reader_visual_anchor = None;
+            self.reader_visual_linewise = false;
+        } else {
+            let anchor_line = self
+                .reader_visual_anchor
+                .map_or(self.reader_cursor, |anchor| anchor.line);
+            self.reader_visual_anchor = Some(ReaderPosition {
+                line: anchor_line,
+                column: 0,
+            });
+            self.reader_visual_linewise = true;
+        }
+        self.reader_pending_inner_object = false;
+    }
+
+    #[must_use]
+    pub fn reader_visual_range(&self) -> Option<ReaderSelection> {
+        let anchor = self.reader_visual_anchor?;
+        if self.reader_visual_linewise {
+            let (start_line, end_line) = if anchor.line <= self.reader_cursor {
+                (anchor.line, self.reader_cursor)
+            } else {
+                (self.reader_cursor, anchor.line)
+            };
+            return Some(ReaderSelection {
+                start: ReaderPosition {
+                    line: start_line,
+                    column: 0,
+                },
+                end: ReaderPosition {
+                    line: end_line,
+                    column: usize::MAX,
+                },
+            });
+        }
+        let cursor = ReaderPosition {
+            line: self.reader_cursor,
+            column: self.reader_column,
+        };
+        let (start, end) = if anchor <= cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        Some(ReaderSelection { start, end })
     }
 
     #[must_use]
@@ -2348,15 +3237,62 @@ impl App {
         }
     }
 
+    fn open_original_html(&mut self) {
+        let Some(html) = self
+            .account()
+            .and_then(AccountState::selected_body)
+            .and_then(|body| body.html_source.as_deref())
+            .filter(|html| !html.trim().is_empty())
+            .map(str::to_owned)
+        else {
+            self.status = StatusLine::temporary(
+                "selected message does not have an HTML original",
+                Duration::from_secs(2),
+            );
+            return;
+        };
+
+        let directory = dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("aerc-rs")
+            .join("browser");
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            self.status = StatusLine::error(format!(
+                "could not create browser preview directory: {error}"
+            ));
+            return;
+        }
+        let path = directory.join("message.html");
+        if let Err(error) = std::fs::write(&path, html.as_bytes()) {
+            self.status = StatusLine::error(format!(
+                "could not write browser preview: {error}"
+            ));
+            return;
+        }
+
+        match open_url(path.to_string_lossy().as_ref()) {
+            Ok(()) => {
+                self.status = StatusLine::temporary(
+                    "opened original HTML email in browser",
+                    Duration::from_secs(3),
+                );
+            }
+            Err(error) => {
+                self.status = StatusLine::error(format!(
+                    "could not open original HTML email: {error}"
+                ));
+            }
+        }
+    }
+
     fn toggle_html(&mut self) {
         let mode = {
             let Some(account) = self.account_mut() else {
                 return;
             };
-            if !account
-                .selected_body()
-                .is_some_and(MessageBody::has_html_alternative)
-            {
+            if !account.selected_body().is_some_and(|body| {
+                body.has_html_alternative() && body.has_plain_view()
+            }) {
                 None
             } else {
                 account.prefer_html = !account.prefer_html;
@@ -2365,11 +3301,27 @@ impl App {
         };
         let Some(prefer_html) = mode else {
             self.status = StatusLine::temporary(
-                "selected message has no HTML alternative",
+                "selected message does not have both rich and plain views",
                 Duration::from_secs(2),
             );
             return;
         };
+        self.reader_cursor = 0;
+        self.reader_column = 0;
+        self.reader_preferred_column = None;
+        self.reader_visual_anchor = None;
+        self.reader_visual_linewise = false;
+        self.reader_smooth_target = None;
+        self.reader_pending_g = false;
+        self.reader_pending_inner_object = false;
+        self.reader_link_index = 0;
+        self.reader_image = None;
+        self.reader_image_pending = None;
+        self.reader_image_size_hint = None;
+        if let Some(account) = self.account_mut() {
+            account.preview_scroll = 0;
+            account.smooth_preview_target = None;
+        }
         self.status = StatusLine::temporary(
             if prefer_html {
                 "HTML mail rendering enabled"
@@ -2377,6 +3329,143 @@ impl App {
                 "plain-text mail rendering enabled"
             },
             Duration::from_secs(2),
+        );
+    }
+
+    pub fn configure_mail_images(
+        &mut self,
+        picker: Picker,
+        runtime_tx: SyncSender<RuntimeEvent>,
+    ) {
+        self.image_picker = Some(picker);
+        self.image_loader = Some(MailImageLoader::spawn(runtime_tx));
+    }
+
+    pub fn ensure_reader_image(&mut self, width: u16) {
+        if !self.reader_images_enabled || !self.message_open {
+            return;
+        }
+        let Some(account) = self.account() else {
+            return;
+        };
+        if !account.prefer_html {
+            return;
+        }
+        let Some(candidate) = account
+            .selected_body()
+            .and_then(|body| body.html_image_candidates().into_iter().next())
+        else {
+            return;
+        };
+        let source = candidate.source;
+        if self
+            .reader_image
+            .as_ref()
+            .is_some_and(|image| image.source == source)
+            || self.reader_image_pending.as_deref() == Some(source.as_str())
+        {
+            return;
+        }
+        self.reader_image = None;
+        self.reader_image_target_width = width.saturating_sub(2).clamp(1, 64);
+        self.reader_image_size_hint = Some((candidate.width_px, candidate.height_px));
+        if let Some(loader) = &self.image_loader
+            && loader.request(source.clone()).is_ok()
+        {
+            self.reader_image_pending = Some(source);
+            self.status = StatusLine::info("loading remote email image…");
+        } else {
+            self.reader_image_size_hint = None;
+        }
+    }
+
+    pub fn handle_mail_image_event(&mut self, event: MailImageEvent) {
+        if self.reader_image_pending.as_deref() != Some(event.source.as_str()) {
+            return;
+        }
+        self.reader_image_pending = None;
+        let size_hint = self.reader_image_size_hint.take().unwrap_or((None, None));
+        let Some(picker) = &self.image_picker else {
+            return;
+        };
+        match event.result {
+            Ok(mut image) => {
+                let font_size = picker.font_size();
+                let max_width_px = u32::from(self.reader_image_target_width.max(1))
+                    .saturating_mul(u32::from(font_size.width.max(1)));
+                let max_height_px = 12_u32.saturating_mul(u32::from(font_size.height.max(1)));
+                let (target_width_px, target_height_px) = reader_image_pixel_size(
+                    image.width(),
+                    image.height(),
+                    size_hint.0,
+                    size_hint.1,
+                    max_width_px,
+                    max_height_px,
+                );
+                if target_width_px < image.width() || target_height_px < image.height() {
+                    image = image.resize_exact(
+                        target_width_px,
+                        target_height_px,
+                        image::imageops::FilterType::Lanczos3,
+                    );
+                }
+                let target = Size::new(
+                    u16::try_from(target_width_px.div_ceil(u32::from(font_size.width.max(1))))
+                        .unwrap_or(u16::MAX)
+                        .max(1),
+                    u16::try_from(target_height_px.div_ceil(u32::from(font_size.height.max(1))))
+                        .unwrap_or(u16::MAX)
+                        .max(1),
+                );
+                match picker.new_protocol(
+                    image,
+                    target,
+                    Resize::Fit(Some(image::imageops::FilterType::Lanczos3)),
+                ) {
+                    Ok(protocol) => {
+                        self.reader_image = Some(ReaderImage {
+                            source: event.source,
+                            protocol,
+                        });
+                        self.status = StatusLine::info("remote email image loaded");
+                    }
+                    Err(error) => {
+                        self.status = StatusLine::temporary(
+                            format!("image render failed: {error}"),
+                            Duration::from_secs(3),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                if error != "tracking pixel ignored" {
+                    self.status = StatusLine::temporary(error, Duration::from_secs(3));
+                }
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn reader_image_protocol(&self) -> Option<&Protocol> {
+        if self.reader_images_enabled {
+            self.reader_image.as_ref().map(|image| &image.protocol)
+        } else {
+            None
+        }
+    }
+
+    fn toggle_remote_images(&mut self) {
+        self.reader_images_enabled = !self.reader_images_enabled;
+        self.reader_image = None;
+        self.reader_image_pending = None;
+        self.reader_image_size_hint = None;
+        self.status = StatusLine::temporary(
+            if self.reader_images_enabled {
+                "remote images enabled for this session; senders may observe image requests"
+            } else {
+                "remote images disabled"
+            },
+            Duration::from_secs(4),
         );
     }
 
@@ -2652,7 +3741,19 @@ impl App {
             in_reply_to: composer.in_reply_to.clone(),
             references: composer.references.clone(),
         };
-        if account.worker.post(ActionKind::Send(message)).is_ok() {
+        let sent_mailbox = account
+            .mailboxes
+            .iter()
+            .find(|mailbox| mailbox.role == MailboxRole::Sent)
+            .map(|mailbox| mailbox.name.clone());
+        if account
+            .worker
+            .post(ActionKind::Send {
+                message,
+                sent_mailbox,
+            })
+            .is_ok()
+        {
             if let Some(composer) = self.composer.as_mut() {
                 composer.sending = true;
             }
@@ -2680,6 +3781,63 @@ impl App {
     }
 }
 
+
+fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
+    let mut child = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "{program} exited with status {status}"
+        )))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn copy_text_to_clipboard(text: &str) -> std::io::Result<()> {
+    run_clipboard_command("clip.exe", &[], text)
+}
+
+#[cfg(target_os = "macos")]
+fn copy_text_to_clipboard(text: &str) -> std::io::Result<()> {
+    run_clipboard_command("pbcopy", &[], text)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn copy_text_to_clipboard(text: &str) -> std::io::Result<()> {
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    let mut last_error = None;
+    for (program, args) in candidates {
+        match run_clipboard_command(program, args, text) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no clipboard helper found")
+    }))
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn copy_text_to_clipboard(_text: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "clipboard copy is unsupported on this platform",
+    ))
+}
 
 fn open_url(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
@@ -2732,6 +3890,167 @@ fn message_view_offset(current_offset: usize, index: usize, len: usize, height: 
     offset.min(max_offset)
 }
 
+fn is_reader_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn reader_word_target(
+    text: &str,
+    line: usize,
+    column: usize,
+    motion: ReaderWordMotion,
+) -> Option<ReaderPosition> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let current_line = lines.get(line)?;
+    let chars = current_line.chars().collect::<Vec<_>>();
+
+    match motion {
+        ReaderWordMotion::NextStart => {
+            let mut index = column.min(chars.len());
+            if index < chars.len() && is_reader_word_char(chars[index]) {
+                while index < chars.len() && is_reader_word_char(chars[index]) {
+                    index += 1;
+                }
+            } else {
+                index = index.saturating_add(1).min(chars.len());
+            }
+            while index < chars.len() && !is_reader_word_char(chars[index]) {
+                index += 1;
+            }
+            if index < chars.len() {
+                return Some(ReaderPosition { line, column: index });
+            }
+            for (next_line, text) in lines.iter().enumerate().skip(line + 1) {
+                if let Some(column) = text.chars().position(is_reader_word_char) {
+                    return Some(ReaderPosition {
+                        line: next_line,
+                        column,
+                    });
+                }
+            }
+        }
+        ReaderWordMotion::PreviousStart => {
+            if column > 0 && !chars.is_empty() {
+                let mut index = column.saturating_sub(1).min(chars.len().saturating_sub(1));
+                while index > 0 && !is_reader_word_char(chars[index]) {
+                    index -= 1;
+                }
+                if is_reader_word_char(chars[index]) {
+                    while index > 0 && is_reader_word_char(chars[index - 1]) {
+                        index -= 1;
+                    }
+                    return Some(ReaderPosition { line, column: index });
+                }
+            }
+            for previous_line in (0..line).rev() {
+                let previous = lines[previous_line].chars().collect::<Vec<_>>();
+                if let Some(mut index) = previous.iter().rposition(|ch| is_reader_word_char(*ch)) {
+                    while index > 0 && is_reader_word_char(previous[index - 1]) {
+                        index -= 1;
+                    }
+                    return Some(ReaderPosition {
+                        line: previous_line,
+                        column: index,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+fn delimiter_pair(delimiter: char) -> Option<(char, char)> {
+    match delimiter {
+        '"' => Some(('"', '"')),
+        '\'' => Some(('\'', '\'')),
+        '`' => Some(('`', '`')),
+        '(' | ')' => Some(('(', ')')),
+        '[' | ']' => Some(('[', ']')),
+        '{' | '}' => Some(('{', '}')),
+        '<' | '>' => Some(('<', '>')),
+        _ => None,
+    }
+}
+
+fn inner_text_object_range(text: &str, column: usize, delimiter: char) -> Option<(usize, usize)> {
+    let (open, close) = delimiter_pair(delimiter)?;
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return None;
+    }
+    let cursor = column.min(chars.len().saturating_sub(1));
+
+    let (opening, closing) = if open == close {
+        let positions = chars
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ch)| (*ch == open).then_some(index))
+            .collect::<Vec<_>>();
+        positions
+            .chunks_exact(2)
+            .filter_map(|pair| {
+                let start = pair[0];
+                let end = pair[1];
+                (start <= cursor && cursor <= end).then_some((start, end))
+            })
+            .min_by_key(|(start, end)| end.saturating_sub(*start))?
+    } else {
+        let mut stack = Vec::new();
+        let mut enclosing = Vec::new();
+        for (index, ch) in chars.iter().copied().enumerate() {
+            if ch == open {
+                stack.push(index);
+            } else if ch == close
+                && let Some(start) = stack.pop()
+                && start <= cursor
+                && cursor <= index
+            {
+                enclosing.push((start, index));
+            }
+        }
+        enclosing
+            .into_iter()
+            .min_by_key(|(start, end)| end.saturating_sub(*start))?
+    };
+
+    if closing <= opening.saturating_add(1) {
+        return None;
+    }
+    Some((opening + 1, closing - 1))
+}
+
+fn reader_selection_text(text: &str, selection: ReaderSelection) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() || selection.start.line >= lines.len() {
+        return String::new();
+    }
+    let end_line = selection.end.line.min(lines.len().saturating_sub(1));
+    let mut out = String::new();
+    for line_index in selection.start.line..=end_line {
+        if line_index > selection.start.line {
+            out.push('\n');
+        }
+        let chars = lines[line_index].chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            continue;
+        }
+        let start = if line_index == selection.start.line {
+            selection.start.column.min(chars.len().saturating_sub(1))
+        } else {
+            0
+        };
+        let end = if line_index == end_line {
+            selection.end.column.min(chars.len().saturating_sub(1))
+        } else {
+            chars.len().saturating_sub(1)
+        };
+        if start <= end {
+            out.extend(chars[start..=end].iter().copied());
+        }
+    }
+    out
+}
+
 fn display_sender(message: &MessageSummary) -> String {
     if message.from_name.is_empty() {
         message.from_address.clone()
@@ -2747,18 +4066,6 @@ fn bounded_index(current: usize, len: usize, delta: isize) -> usize {
     current.saturating_add_signed(delta).min(len - 1)
 }
 
-fn bounded_scroll(current: u16, delta: isize) -> u16 {
-    if delta >= 0 {
-        current.saturating_add(u16::try_from(delta).unwrap_or(u16::MAX))
-    } else {
-        current.saturating_sub(u16::try_from(delta.unsigned_abs()).unwrap_or(u16::MAX))
-    }
-}
-
-fn bounded_scroll_to(current: u16, delta: isize, max: u16) -> u16 {
-    bounded_scroll(current.min(max), delta).min(max)
-}
-
 fn offset_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -2770,8 +4077,9 @@ fn offset_index(current: usize, len: usize, delta: isize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposeField, ComposeMode, Composer, bounded_index, bounded_scroll, bounded_scroll_to,
-        message_view_offset, offset_index,
+        ComposeField, ComposeMode, Composer, ReaderPosition, ReaderSelection, ReaderWordMotion,
+        bounded_index, inner_text_object_range, message_view_offset, offset_index,
+        reader_image_pixel_size, reader_selection_text, reader_word_target,
     };
 
     #[test]
@@ -2779,20 +4087,6 @@ mod tests {
         assert_eq!(bounded_index(0, 5, -1), 0);
         assert_eq!(bounded_index(3, 5, 10), 4);
         assert_eq!(bounded_index(0, 0, 1), 0);
-    }
-
-    #[test]
-    fn preview_scroll_saturates() {
-        assert_eq!(bounded_scroll(0, -1), 0);
-        assert_eq!(bounded_scroll(10, 5), 15);
-        assert_eq!(bounded_scroll(u16::MAX - 1, 10), u16::MAX);
-    }
-
-    #[test]
-    fn preview_scroll_never_moves_beyond_rendered_bottom() {
-        assert_eq!(bounded_scroll_to(90, 22, 100), 100);
-        assert_eq!(bounded_scroll_to(u16::MAX, -1, 100), 99);
-        assert_eq!(bounded_scroll_to(0, -22, 100), 0);
     }
 
     #[test]
@@ -2849,6 +4143,81 @@ mod tests {
         assert_eq!(composer.visual_range(), Some((1, 5)));
         composer.delete_range(1, 5);
         assert_eq!(composer.body, "h");
+    }
+
+    #[test]
+    fn reader_inner_text_objects_support_quotes_and_brackets() {
+        assert_eq!(inner_text_object_range(r#"say "hello" now"#, 6, '"'), Some((5, 9)));
+        assert_eq!(inner_text_object_range("call(foo[bar])", 9, ']'), Some((9, 11)));
+        assert_eq!(inner_text_object_range("call(foo[bar])", 9, ')'), Some((5, 12)));
+        assert_eq!(inner_text_object_range("'{value}'", 4, '\''), Some((1, 7)));
+    }
+
+    #[test]
+    fn reader_selection_yanks_exact_character_range() {
+        let selection = ReaderSelection {
+            start: ReaderPosition { line: 0, column: 2 },
+            end: ReaderPosition { line: 1, column: 2 },
+        };
+        assert_eq!(reader_selection_text("abcdef\nghijkl", selection), "cdef\nghi");
+    }
+
+    #[test]
+    fn reader_linewise_selection_yanks_complete_lines() {
+        let selection = ReaderSelection {
+            start: ReaderPosition { line: 0, column: 0 },
+            end: ReaderPosition {
+                line: 1,
+                column: usize::MAX,
+            },
+        };
+        assert_eq!(
+            reader_selection_text("abcdef\nghijkl\nmnop", selection),
+            "abcdef\nghijkl"
+        );
+        assert_eq!(selection.columns_for_line(0, 6), Some((0, 5)));
+        assert_eq!(selection.columns_for_line(1, 6), Some((0, 5)));
+    }
+
+    #[test]
+    fn reader_word_motions_cross_lines() {
+        let text = "one two\n\nthree";
+        assert_eq!(
+            reader_word_target(text, 0, 0, ReaderWordMotion::NextStart),
+            Some(ReaderPosition { line: 0, column: 4 })
+        );
+        assert_eq!(
+            reader_word_target(text, 0, 4, ReaderWordMotion::NextStart),
+            Some(ReaderPosition { line: 2, column: 0 })
+        );
+        assert_eq!(
+            reader_word_target(text, 2, 2, ReaderWordMotion::PreviousStart),
+            Some(ReaderPosition { line: 2, column: 0 })
+        );
+    }
+
+    #[test]
+    fn reader_images_never_upscale_small_assets() {
+        assert_eq!(
+            reader_image_pixel_size(74, 24, None, None, 640, 240),
+            (74, 24)
+        );
+        assert_eq!(
+            reader_image_pixel_size(74, 24, Some(300), Some(100), 640, 240),
+            (74, 24)
+        );
+    }
+
+    #[test]
+    fn reader_images_respect_html_size_and_preserve_aspect_ratio() {
+        assert_eq!(
+            reader_image_pixel_size(148, 48, Some(74), Some(24), 640, 240),
+            (74, 24)
+        );
+        assert_eq!(
+            reader_image_pixel_size(1200, 600, None, None, 600, 240),
+            (480, 240)
+        );
     }
 
     #[test]

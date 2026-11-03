@@ -11,6 +11,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui_image::picker::Picker;
 
 use crate::app::App;
 use crate::backend;
@@ -32,6 +33,12 @@ pub fn run_tui(config: Config) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    // ratatui-image must query terminal graphics capabilities after entering
+    // the alternate screen but before the input thread starts consuming escape
+    // sequence responses. Fall back to portable half-block rendering when the
+    // terminal does not answer the protocol query.
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    app.configure_mail_images(picker, runtime_tx.clone());
     spawn_input_thread(runtime_tx);
 
     render(&mut terminal, &mut app)?;
@@ -130,6 +137,7 @@ fn event_loop(
             RuntimeEvent::Input(event::Event::Resize(_, _)) => {}
             RuntimeEvent::Input(_) => continue,
             RuntimeEvent::Worker(event) => app.handle_worker_event(event),
+            RuntimeEvent::MailImage(event) => app.handle_mail_image_event(event),
             RuntimeEvent::InputStopped => break,
         }
 

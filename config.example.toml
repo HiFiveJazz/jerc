@@ -48,6 +48,8 @@ mailbox_width_percent = 33
 # Initial theme. Press `t` in the TUI to preview/switch themes live; the chosen
 # theme is persisted in the aerc-rs config directory and overrides this value.
 theme = "default"
+# Remote images can disclose your IP/read time to senders. Press I to toggle in-session.
+remote_images = false
 
 # Legacy layout options are still accepted so existing configs keep loading.
 # sidebar_width = 24

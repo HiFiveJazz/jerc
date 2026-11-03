@@ -5,8 +5,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap,
 };
+use ratatui_image::Image as TerminalImage;
 
-use crate::app::{App, ComposeField, ComposeMode, HELP_ENTRIES};
+use crate::app::{
+    App, ComposeField, ComposeMode, HELP_ENTRIES, ReaderSelection,
+};
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
@@ -111,27 +114,29 @@ fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let account = app.account().expect("account exists");
     frame.render_widget(Clear, area);
 
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(theme.border());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     if account.mailboxes.is_empty() {
         let text = if account.connecting || account.mailboxes_loading {
-            " Loading mailboxes…"
+            "Loading mailboxes…"
         } else {
-            " No mailboxes"
+            "No mailboxes"
         };
-        frame.render_widget(
-            Paragraph::new(text)
-                .style(theme.muted())
-                .block(Block::default().borders(Borders::RIGHT).border_style(theme.border())),
-            area,
-        );
+        frame.render_widget(Paragraph::new(text).style(theme.muted()), inner);
         return;
     }
 
-    let height = usize::from(area.height.max(1));
+    let height = usize::from(inner.height.max(1));
     let start = account
         .mailbox_view_offset
         .min(account.mailboxes.len().saturating_sub(1));
     let end = start.saturating_add(height).min(account.mailboxes.len());
-    let rows = account.mailboxes[start..end]
+    let width = usize::from(inner.width);
+    let lines = account.mailboxes[start..end]
         .iter()
         .enumerate()
         .map(|(visible_index, mailbox)| {
@@ -143,23 +148,16 @@ fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } else {
                 String::new()
             };
-            Row::new(vec![Cell::from(mailbox.name.clone()), Cell::from(count)]).style(
-                if absolute_index == account.mailbox_index {
-                    theme.selected()
-                } else {
-                    theme.text()
-                },
-            )
-        });
+            let style = if absolute_index == account.mailbox_index {
+                theme.selected()
+            } else {
+                theme.text()
+            };
+            Line::styled(mailbox_row_text(&mailbox.name, &count, width), style)
+        })
+        .collect::<Vec<_>>();
 
-    let table = Table::new(rows, [Constraint::Min(4), Constraint::Length(6)])
-        .style(theme.text())
-        .block(
-            Block::default()
-                .borders(Borders::RIGHT)
-                .border_style(theme.border()),
-        );
-    frame.render_widget(table, area);
+    frame.render_widget(Paragraph::new(Text::from(lines)).style(theme.text()), inner);
 }
 
 fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -181,12 +179,12 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         None
     };
-    let mut list_area = search_split.as_ref().map_or(area, |chunks| chunks[1]);
+    let list_area = search_split.as_ref().map_or(area, |chunks| chunks[1]);
     if let Some(chunks) = &search_split {
         draw_search_header(frame, chunks[0], &search_query, app);
     }
 
-    let (visible, current_position, offset, loading, has_more, current_mailbox) = {
+    let (visible, current_position, offset, loading, current_mailbox) = {
         let account = app.account().expect("account exists");
         let visible = account.visible_message_indices();
         let current_position = visible
@@ -197,7 +195,6 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             current_position,
             account.message_view_offset,
             account.messages_loading,
-            account.has_more,
             account
                 .current_mailbox
                 .clone()
@@ -205,19 +202,6 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         )
     };
 
-    // Reserve the final line for the pagination hint instead of painting over
-    // the last message row. Besides being clearer, this avoids clipping wide
-    // glyphs/emoji on the bottom row when older mail is available.
-    let hint_area = if has_more && list_area.height > 1 {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(list_area);
-        list_area = chunks[0];
-        Some(chunks[1])
-    } else {
-        None
-    };
     app.set_message_view_height(usize::from(list_area.height.max(1)));
 
     if visible.is_empty() {
@@ -268,7 +252,7 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Cell::from(number),
             Cell::from(mark),
             Cell::from(sender.clone()),
-            Cell::from(message.subject.clone()),
+            Cell::from(subject_for_list(&message.subject)),
             Cell::from(message.date_label.clone()),
         ])
         .style(style)
@@ -288,13 +272,6 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     .column_spacing(1);
     frame.render_widget(table, list_area);
 
-    if let Some(hint_area) = hint_area {
-        frame.render_widget(
-            Paragraph::new(" older mail loads automatically near the bottom…")
-                .style(theme.muted()),
-            hint_area,
-        );
-    }
 }
 
 fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -316,9 +293,26 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Paragraph::new("No message selected").style(theme.muted()),
             content_area,
         );
-        app.set_preview_max_scroll(0);
+        app.set_reader_layout(0, 0, usize::from(content_area.height.max(1)), 0);
         return;
     }
+
+    // html2text performs real table/centering decisions while it renders. Reflow
+    // the original HTML to the actual reader width rather than freezing every
+    // message at the worker's fallback width and wrapping that output later.
+    let reader_active = app.message_open;
+    let gutter_width = if reader_active { 5usize } else { 0 };
+    let body_width = usize::from(content_area.width)
+        .saturating_sub(gutter_width)
+        .max(20);
+    app.ensure_reader_html_layout(body_width);
+    app.ensure_reader_image(
+        content_area
+            .width
+            .saturating_sub(u16::try_from(gutter_width).unwrap_or(0)),
+    );
+    let reader_image_size = app.reader_image_protocol().map(|image| image.size());
+
     let selected_link = app.account().and_then(|account| {
         let body = account.selected_body()?;
         let links = body.html_links();
@@ -326,7 +320,19 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .get(app.reader_link_index.min(links.len().saturating_sub(1)))
             .cloned()
     });
-    let lines = {
+    let reader_cursor = app.reader_cursor;
+    let reader_column = app.reader_column;
+    let reader_visual = app.reader_visual_range();
+    let reader_illuminate = (reader_active && reader_visual.is_none())
+        .then(|| {
+            let account = app.account()?;
+            let body = account.selected_body()?;
+            let showing_html = body.has_html_alternative() && account.prefer_html;
+            reader_word_at(body.display_text(showing_html), reader_cursor, reader_column)
+        })
+        .flatten();
+
+    let (lines, body_start, body_line_count, image_start) = {
         let account = app.account().expect("account exists");
         let message = account.selected_message().expect("message checked above");
 
@@ -356,23 +362,68 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ));
         lines.push(Line::raw(""));
 
+        let image_start = reader_image_size.map(|_| lines.len());
+        if let Some(size) = reader_image_size {
+            lines.extend((0..usize::from(size.height.saturating_add(1))).map(|_| Line::raw("")));
+        }
+        let body_start = lines.len();
+        let mut body_line_count = 0usize;
+
         if let Some(body) = account.selected_body() {
-            let showing_html = body.has_html_alternative()
-                && (account.prefer_html || body.plain_is_empty());
+            let showing_html = body.has_html_alternative() && account.prefer_html;
             if showing_html {
                 if let Some(html_lines) = &body.html_lines {
-                    lines.extend(html_lines.iter().map(|line| {
-                        rich_html_line(line, &theme, selected_link.as_deref())
+                    body_line_count = html_lines.len();
+                    lines.extend(html_lines.iter().enumerate().map(|(line_index, line)| {
+                        rich_html_line(
+                            line,
+                            line_index,
+                            body_line_count,
+                            body_width,
+                            reader_cursor,
+                            reader_column,
+                            reader_visual,
+                            reader_active,
+                            &theme,
+                            selected_link.as_deref(),
+                            reader_illuminate.as_deref(),
+                        )
                     }));
                 } else {
-                    lines.extend(
-                        body.display_text(true)
-                            .lines()
-                            .map(|line| Line::styled(line.to_owned(), theme.text())),
-                    );
+                    let rendered = body.display_text(true).lines().collect::<Vec<_>>();
+                    body_line_count = rendered.len();
+                    lines.extend(rendered.into_iter().enumerate().map(|(line_index, line)| {
+                        plain_reader_line(
+                            line,
+                            line_index,
+                            body_line_count,
+                            body_width,
+                            reader_cursor,
+                            reader_column,
+                            reader_visual,
+                            reader_active,
+                            &theme,
+                            reader_illuminate.as_deref(),
+                        )
+                    }));
                 }
             } else {
-                lines.extend(Text::from(body.display_text(false).to_owned()).lines);
+                let rendered = body.display_text(false).lines().collect::<Vec<_>>();
+                body_line_count = rendered.len();
+                lines.extend(rendered.into_iter().enumerate().map(|(line_index, line)| {
+                    plain_reader_line(
+                        line,
+                        line_index,
+                        body_line_count,
+                        body_width,
+                        reader_cursor,
+                        reader_column,
+                        reader_visual,
+                        reader_active,
+                        &theme,
+                        reader_illuminate.as_deref(),
+                    )
+                }));
             }
             if body.has_html_alternative() {
                 let mode = if showing_html {
@@ -385,7 +436,9 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 };
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    format!("[{mode}; h toggles alternative; Tab/Shift-Tab selects links; o opens]"),
+                    format!(
+                        "[{mode}; T rich/plain; Tab/Shift-Tab links; o opens link; O opens original in browser; I images]"
+                    ),
                     theme.muted(),
                 ));
             }
@@ -400,9 +453,15 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             lines.push(Line::styled("Message body not loaded", theme.muted()));
         }
-        lines
+
+        (lines, body_start, body_line_count, image_start)
     };
 
+    let image_visual_start = image_start.map(|start| {
+        Paragraph::new(Text::from(lines[..start].to_vec()))
+            .wrap(Wrap { trim: false })
+            .line_count(content_area.width.max(1))
+    });
     let paragraph = Paragraph::new(Text::from(lines))
         .style(theme.text())
         .wrap(Wrap { trim: false });
@@ -410,33 +469,391 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let viewport_height = usize::from(content_area.height.max(1));
     let max_scroll =
         u16::try_from(visual_lines.saturating_sub(viewport_height)).unwrap_or(u16::MAX);
-    app.set_preview_max_scroll(max_scroll);
+    app.set_reader_layout(body_start, body_line_count, viewport_height, max_scroll);
     let scroll = app.account().map_or(0, |account| account.preview_scroll);
     frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
+
+    if let (Some(protocol), Some(start)) = (app.reader_image_protocol(), image_visual_start)
+        && start >= usize::from(scroll)
+    {
+        let size = protocol.size();
+        let gutter = u16::try_from(gutter_width).unwrap_or(0);
+        let available = content_area.width.saturating_sub(gutter);
+        let x = content_area
+            .x
+            .saturating_add(gutter)
+            .saturating_add(available.saturating_sub(size.width) / 2);
+        let visible_start = start.saturating_sub(usize::from(scroll));
+        let y = content_area
+            .y
+            .saturating_add(u16::try_from(visible_start).unwrap_or(u16::MAX));
+        if y.saturating_add(size.height) <= content_area.bottom() {
+            frame.render_widget(
+                TerminalImage::new(protocol),
+                Rect::new(x, y, size.width.min(available), size.height),
+            );
+        }
+    }
+}
+
+fn plain_reader_line(
+    text: &str,
+    line_index: usize,
+    line_count: usize,
+    content_width: usize,
+    reader_cursor: usize,
+    reader_column: usize,
+    reader_visual: Option<ReaderSelection>,
+    reader_active: bool,
+    theme: &crate::theme::Theme,
+    illuminate_word: Option<&str>,
+) -> Line<'static> {
+    let base = theme.text();
+    let illuminate_ranges = illuminate_word
+        .map(|word| word_match_ranges(text, word))
+        .unwrap_or_default();
+    let mut spans = reader_gutter(
+        line_index,
+        line_count,
+        reader_cursor,
+        reader_active,
+        theme,
+    );
+    spans.extend(reader_fragments(
+        text,
+        base,
+        0,
+        text.chars().count(),
+        line_index,
+        reader_cursor,
+        reader_column,
+        reader_visual,
+        reader_active,
+        theme,
+        &illuminate_ranges,
+    ));
+    pad_reader_line(
+        &mut spans,
+        text.chars().count(),
+        content_width,
+        line_index,
+        reader_cursor,
+        reader_column,
+        reader_visual,
+        reader_active,
+        theme,
+    );
+    Line::from(spans)
 }
 
 fn rich_html_line(
     line: &HtmlLine,
+    line_index: usize,
+    line_count: usize,
+    content_width: usize,
+    reader_cursor: usize,
+    reader_column: usize,
+    reader_visual: Option<ReaderSelection>,
+    reader_active: bool,
     theme: &crate::theme::Theme,
     selected_link: Option<&str>,
+    illuminate_word: Option<&str>,
 ) -> Line<'static> {
-    let spans = line
+    let mut spans = reader_gutter(
+        line_index,
+        line_count,
+        reader_cursor,
+        reader_active,
+        theme,
+    );
+    let line_len = line
         .spans
         .iter()
-        .map(|span| {
-            let mut style = rich_html_style(&span.style, &span.text, theme);
-            if span
-                .style
-                .link
-                .as_deref()
-                .is_some_and(|url| Some(url) == selected_link)
-            {
-                style = theme.selected().add_modifier(Modifier::UNDERLINED);
-            }
-            Span::styled(span.text.clone(), style)
-        })
-        .collect::<Vec<_>>();
+        .map(|span| span.text.chars().count())
+        .sum::<usize>();
+    let line_text = line
+        .spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    let illuminate_ranges = illuminate_word
+        .map(|word| word_match_ranges(&line_text, word))
+        .unwrap_or_default();
+    let mut column = 0usize;
+    for span in &line.spans {
+        let mut style = rich_html_style(&span.style, &span.text, theme);
+        if span
+            .style
+            .link
+            .as_deref()
+            .is_some_and(|url| Some(url) == selected_link)
+        {
+            style = style
+                .fg(theme.accent)
+                .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
+        }
+        spans.extend(reader_fragments(
+            &span.text,
+            style,
+            column,
+            line_len,
+            line_index,
+            reader_cursor,
+            reader_column,
+            reader_visual,
+            reader_active,
+            theme,
+            &illuminate_ranges,
+        ));
+        column = column.saturating_add(span.text.chars().count());
+    }
+    pad_reader_line(
+        &mut spans,
+        column,
+        content_width,
+        line_index,
+        reader_cursor,
+        reader_column,
+        reader_visual,
+        reader_active,
+        theme,
+    );
     Line::from(spans)
+}
+
+fn reader_gutter(
+    line_index: usize,
+    line_count: usize,
+    reader_cursor: usize,
+    reader_active: bool,
+    theme: &crate::theme::Theme,
+) -> Vec<Span<'static>> {
+    if !reader_active {
+        return Vec::new();
+    }
+    let digits = line_count.max(1).to_string().len().max(4);
+    let number = if line_index == reader_cursor {
+        line_index.saturating_add(1)
+    } else {
+        line_index.abs_diff(reader_cursor)
+    };
+    let style = if line_index == reader_cursor {
+        theme.accent()
+    } else {
+        theme.muted()
+    };
+    vec![Span::styled(format!("{number:>digits$} "), style)]
+}
+
+fn reader_fragments(
+    text: &str,
+    style: Style,
+    global_start: usize,
+    line_len: usize,
+    line_index: usize,
+    reader_cursor: usize,
+    reader_column: usize,
+    reader_visual: Option<ReaderSelection>,
+    reader_active: bool,
+    theme: &crate::theme::Theme,
+    illuminate_ranges: &[(usize, usize)],
+) -> Vec<Span<'static>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let len = text.chars().count();
+    let global_end = global_start.saturating_add(len);
+    let mut boundaries = vec![global_start, global_end];
+
+    let selected_columns = reader_visual
+        .and_then(|selection| selection.columns_for_line(line_index, line_len));
+    if let Some((start, end)) = selected_columns {
+        boundaries.push(start.max(global_start).min(global_end));
+        boundaries.push(end.saturating_add(1).max(global_start).min(global_end));
+    }
+    if reader_active && line_index == reader_cursor {
+        boundaries.push(reader_column.max(global_start).min(global_end));
+        boundaries.push(
+            reader_column
+                .saturating_add(1)
+                .max(global_start)
+                .min(global_end),
+        );
+    }
+    for &(start, end) in illuminate_ranges {
+        if start < global_end && end > global_start {
+            boundaries.push(start.max(global_start).min(global_end));
+            boundaries.push(end.max(global_start).min(global_end));
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut out = Vec::new();
+    for pair in boundaries.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        if start >= end || start < global_start || end > global_end {
+            continue;
+        }
+        let mut fragment_style = style;
+        if reader_active && line_index == reader_cursor {
+            fragment_style = fragment_style
+                .bg(theme.popup_bg)
+                .add_modifier(Modifier::BOLD);
+        }
+        if illuminate_ranges
+            .iter()
+            .any(|&(match_start, match_end)| start >= match_start && start < match_end)
+        {
+            fragment_style = fragment_style.bg(illuminate_background());
+        }
+        if selected_columns.is_some_and(|(selected_start, selected_end)| {
+            start >= selected_start && start <= selected_end
+        }) {
+            fragment_style = fragment_style
+                .fg(theme.selected_fg)
+                .bg(theme.selected_bg)
+                .add_modifier(Modifier::BOLD);
+        }
+        // Keep the Vim block cursor visually independent from theme selection
+        // colours. A white block mirrors the reader/editor cursor users expect
+        // and remains obvious even when the current line or Visual selection
+        // uses a blue/purple background.
+        if reader_active && line_index == reader_cursor && start == reader_column {
+            fragment_style = reader_cursor_style();
+        }
+        out.push(Span::styled(
+            char_slice(text, start - global_start, end - global_start),
+            fragment_style,
+        ));
+    }
+    out
+}
+
+fn reader_word_at(text: &str, line_index: usize, column: usize) -> Option<String> {
+    let line = text.lines().nth(line_index)?;
+    let chars = line.chars().collect::<Vec<_>>();
+    let current = *chars.get(column)?;
+    if !is_reader_word_char(current) {
+        return None;
+    }
+
+    let mut start = column;
+    while start > 0 && is_reader_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = column + 1;
+    while end < chars.len() && is_reader_word_char(chars[end]) {
+        end += 1;
+    }
+    Some(chars[start..end].iter().collect())
+}
+
+fn word_match_ranges(text: &str, word: &str) -> Vec<(usize, usize)> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let needle = word.chars().collect::<Vec<_>>();
+    if needle.is_empty() || chars.len() < needle.len() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    for start in 0..=chars.len() - needle.len() {
+        let end = start + needle.len();
+        if chars[start..end] != needle[..]
+            || start > 0 && is_reader_word_char(chars[start - 1])
+            || end < chars.len() && is_reader_word_char(chars[end])
+        {
+            continue;
+        }
+        matches.push((start, end));
+    }
+    matches
+}
+
+fn is_reader_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn illuminate_background() -> Color {
+    // Illuminate should read as a neutral reference highlight, not as another
+    // selection/accent colour. Keep it deliberately achromatic so blue themes
+    // such as Tokyo Night do not turn every matching word blue.
+    Color::Rgb(96, 96, 96)
+}
+
+fn reader_cursor_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::White)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn pad_reader_line(
+    spans: &mut Vec<Span<'static>>,
+    content_len: usize,
+    content_width: usize,
+    line_index: usize,
+    reader_cursor: usize,
+    reader_column: usize,
+    reader_visual: Option<ReaderSelection>,
+    reader_active: bool,
+    theme: &crate::theme::Theme,
+) {
+    if !reader_active {
+        return;
+    }
+    let visual_line_selected = reader_visual.is_some_and(|selection| {
+        selection.start.line <= line_index && line_index <= selection.end.line
+    });
+    let linewise_visual = reader_visual.is_some_and(|selection| {
+        selection.start.column == 0 && selection.end.column == usize::MAX
+    });
+    if line_index != reader_cursor && !visual_line_selected {
+        return;
+    }
+    let mut style = theme.text().add_modifier(Modifier::BOLD);
+    if line_index == reader_cursor {
+        style = style.bg(theme.popup_bg);
+    }
+    if visual_line_selected && (linewise_visual || content_len == 0) {
+        style = theme.selected();
+    }
+    let padding = content_width
+        .saturating_sub(content_len)
+        .max(usize::from(content_len == 0));
+    if padding == 0 {
+        return;
+    }
+
+    // Empty lines (and any future cursor position in trailing padding) have no
+    // text fragment in which to draw the block cursor. Split the padding around
+    // the cursor cell so the cursor remains visible instead of disappearing.
+    let cursor_in_padding = reader_active
+        && line_index == reader_cursor
+        && reader_column >= content_len
+        && reader_column < content_len.saturating_add(padding);
+    if !cursor_in_padding {
+        spans.push(Span::styled(" ".repeat(padding), style));
+        return;
+    }
+
+    let before = reader_column.saturating_sub(content_len);
+    if before > 0 {
+        spans.push(Span::styled(" ".repeat(before), style));
+    }
+    spans.push(Span::styled(" ", reader_cursor_style()));
+    let after = padding.saturating_sub(before.saturating_add(1));
+    if after > 0 {
+        spans.push(Span::styled(" ".repeat(after), style));
+    }
+}
+
+fn char_slice(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
 }
 
 fn rich_html_style(
@@ -444,33 +861,34 @@ fn rich_html_style(
     text: &str,
     theme: &crate::theme::Theme,
 ) -> Style {
-    // w3m is easy to scan because structure and interactive elements do not all
-    // collapse into the same colour. Keep that idea while staying inside
-    // Ratatui: table chrome follows the theme border, links/buttons use accent,
-    // emphasis is distinct, and images/placeholders stay deliberately subdued.
+    // Sender CSS is designed for a graphical page whose light/dark surface we
+    // do not control. Importing literal foreground colours into a themed TUI
+    // causes exactly the failure seen in dark-mode mail (white table text on a
+    // light selected/current-line background). Keep the sender's *semantics*
+    // -- strong, emphasis, links, code, images -- but let the terminal theme
+    // own foreground/background colours.
     let mut rendered = if is_box_drawing_span(text) {
         theme.border()
     } else {
         theme.text()
     };
-    if let Some((red, green, blue)) = style.foreground {
-        rendered = rendered.fg(Color::Rgb(red, green, blue));
-    }
-    if let Some((red, green, blue)) = style.background {
-        rendered = rendered.bg(Color::Rgb(red, green, blue));
-    }
     if style.link.is_some() {
-        // Links remain unmistakably interactive. Author CSS can still provide
-        // backgrounds, but foreground follows the active terminal theme so a
-        // low-contrast marketing colour cannot make the URL disappear.
         rendered = rendered
             .fg(theme.accent)
             .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
-    } else if style.bold && style.foreground.is_none() {
-        rendered = rendered.fg(theme.unread);
+    } else if style.bold {
+        rendered = rendered
+            .fg(theme.unread)
+            .add_modifier(Modifier::BOLD);
     }
     if style.image.is_some() {
-        rendered = theme.muted().add_modifier(Modifier::ITALIC);
+        rendered = if style.link.is_some() {
+            theme
+                .accent()
+                .add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
+        } else {
+            theme.muted().add_modifier(Modifier::ITALIC)
+        };
     }
     if style.italic {
         rendered = rendered.add_modifier(Modifier::ITALIC);
@@ -509,7 +927,15 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let mut spans = Vec::new();
     if let Some(account) = app.account() {
         spans.push(Span::styled(format!("[{}] ", account.name), theme.accent()));
-        if app.visual_anchor.is_some() {
+        if app.message_open {
+            let (label, style) = if app.reader_visual_anchor.is_some() {
+                (" VISUAL ", theme.selected())
+            } else {
+                (" NORMAL ", theme.accent())
+            };
+            spans.push(Span::styled(label, style));
+            spans.push(Span::raw(" "));
+        } else if app.visual_anchor.is_some() {
             spans.push(Span::styled(" VISUAL ", theme.selected()));
             spans.push(Span::raw(" "));
         }
@@ -524,19 +950,11 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             spans.push(Span::raw("Loading mailboxes…"));
         } else if account.messages_loading {
             spans.push(Span::raw("Loading messages…"));
-        } else if account.page_inflight.is_some() {
-            spans.push(Span::raw("Loading older mail…"));
         } else if account.is_loading_body() {
             spans.push(Span::raw("Loading message…"));
         } else {
             let style = if app.status.is_error { theme.error() } else { theme.text() };
             spans.push(Span::styled(app.status.text.as_str(), style));
-        }
-        if account.has_more {
-            spans.push(Span::styled(
-                format!("    {} loaded • more", account.messages.len()),
-                theme.muted(),
-            ));
         }
         if app.preview_split {
             spans.push(Span::styled("    SPLIT", theme.muted()));
@@ -759,16 +1177,23 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
 
     let mode_hint = match composer.mode {
         ComposeMode::Insert => "INSERT  Esc normal • Tab next field",
-        ComposeMode::Normal => "NORMAL  i/a/I/A insert • o/O lines • v visual • hjkl/wb move • Enter send",
+        ComposeMode::Normal => {
+            "NORMAL  i/a/I/A insert • o/O lines • v visual • hjkl/wb move • Enter send"
+        }
         ComposeMode::Visual => "VISUAL  hjkl select • d/x delete • c change • Esc normal",
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
+    let footer = if app.status.is_error {
+        vec![
+            Span::styled(" ERROR ", theme.error()),
+            Span::styled(app.status.text.clone(), theme.error()),
+        ]
+    } else {
+        vec![
             Span::styled(format!(" {} ", composer.mode.label()), theme.accent()),
             Span::styled(mode_hint, theme.muted()),
-        ])),
-        fields[5],
-    );
+        ]
+    };
+    frame.render_widget(Paragraph::new(Line::from(footer)), fields[5]);
 }
 
 fn draw_compose_field(
@@ -869,6 +1294,82 @@ fn centered_rect(area: Rect, max_width: u16, percent_height: u16) -> Rect {
     }
 }
 
+fn mailbox_row_text(name: &str, count: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let count_width = count.chars().count();
+    if count.is_empty() {
+        let name = truncate_chars(name, width);
+        return format!("{name:<width$}");
+    }
+    if count_width >= width {
+        return truncate_chars(count, width);
+    }
+
+    let name_width = width.saturating_sub(count_width + 1);
+    let name = truncate_chars(name, name_width);
+    format!("{name:<name_width$} {count:>count_width$}")
+}
+
+fn truncate_chars(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let mut out = text.chars().take(width - 1).collect::<String>();
+    out.push('…');
+    out
+}
+
+fn subject_for_list(subject: &str) -> String {
+    let mut out = String::with_capacity(subject.len());
+    let mut chars = subject.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{fe0f}' {
+            out.push('\u{fe0e}');
+            continue;
+        }
+
+        out.push(ch);
+        if !is_emoji_text_candidate(ch) {
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('\u{fe0e}') => {
+                out.push(chars.next().expect("peeked variation selector"));
+            }
+            Some('\u{fe0f}') => {
+                let _ = chars.next();
+                out.push('\u{fe0e}');
+            }
+            Some('\u{200d}') | Some('\u{1f3fb}'..='\u{1f3ff}') => {}
+            _ => out.push('\u{fe0e}'),
+        }
+    }
+
+    out
+}
+
+fn is_emoji_text_candidate(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2600}'..='\u{26ff}'
+            | '\u{2700}'..='\u{27bf}'
+            | '\u{1f300}'..='\u{1f3fa}'
+            | '\u{1f400}'..='\u{1faff}'
+    )
+}
+
 fn relative_number(index: usize, current: usize) -> String {
     if index == current {
         (index + 1).to_string()
@@ -884,7 +1385,13 @@ fn relative_number_width(len: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::relative_number;
+    use super::{
+        illuminate_background, mailbox_row_text, pad_reader_line, reader_word_at, relative_number,
+        rich_html_style, subject_for_list, word_match_ranges,
+    };
+    use crate::model::HtmlSpanStyle;
+    use crate::theme::load_themes;
+    use ratatui::style::Color;
 
     #[test]
     fn relative_numbers_match_vim_style() {
@@ -892,4 +1399,67 @@ mod tests {
         assert_eq!(relative_number(2, 7), "5");
         assert_eq!(relative_number(11, 7), "4");
     }
+
+    #[test]
+    fn mailbox_rows_keep_counts_at_the_right_edge() {
+        assert_eq!(mailbox_row_text("[Gmail]/Trash", "5", 20), "[Gmail]/Trash      5");
+        assert_eq!(mailbox_row_text("INBOX", "", 10), "INBOX     ");
+    }
+
+    #[test]
+    fn sender_foreground_does_not_override_terminal_theme() {
+        let theme = load_themes().into_iter().next().expect("built-in theme");
+        let style = HtmlSpanStyle {
+            foreground: Some((255, 255, 255)),
+            ..HtmlSpanStyle::default()
+        };
+        let rendered = rich_html_style(&style, "body text", &theme);
+        assert_eq!(rendered, theme.text());
+    }
+
+    #[test]
+    fn browse_subjects_request_text_emoji_presentation() {
+        assert_eq!(subject_for_list("🎉 Sale"), "🎉\u{fe0e} Sale");
+        assert!(!subject_for_list("🎉️ Sale").contains('\u{fe0f}'));
+    }
+
+    #[test]
+    fn reader_illuminate_finds_word_under_cursor() {
+        assert_eq!(
+            reader_word_at("alpha beta\nnext", 0, 7),
+            Some("beta".to_owned())
+        );
+        assert_eq!(reader_word_at("alpha beta", 0, 5), None);
+    }
+
+    #[test]
+    fn reader_illuminate_matches_whole_words_only() {
+        assert_eq!(
+            word_match_ranges("word wordy word word_word", "word"),
+            vec![(0, 4), (11, 15)]
+        );
+    }
+
+    #[test]
+    fn reader_illuminate_uses_neutral_grey() {
+        let Color::Rgb(red, green, blue) = illuminate_background() else {
+            panic!("illuminate background should be RGB");
+        };
+        assert_eq!(red, green);
+        assert_eq!(green, blue);
+        assert!(red >= 80);
+    }
+
+    #[test]
+    fn reader_cursor_remains_visible_on_blank_lines() {
+        let theme = load_themes().into_iter().next().expect("theme");
+        let mut spans = Vec::new();
+        pad_reader_line(&mut spans, 0, 8, 2, 2, 0, None, true, &theme);
+
+        assert!(!spans.is_empty());
+        assert_eq!(spans[0].content.as_ref(), " ");
+        assert_eq!(spans[0].style.bg, Some(Color::White));
+        assert_eq!(spans[0].style.fg, Some(Color::Black));
+    }
+
 }

@@ -50,11 +50,18 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Mail", key: "d / D", description: "delete with confirmation / immediately" },
     HelpEntry { category: "Mail", key: "a", description: "archive selected message(s)" },
     HelpEntry { category: "Mail", key: "u", description: "toggle read / unread" },
-    HelpEntry { category: "Message", key: "Esc", description: "exit visual mode / return to message list" },
-    HelpEntry { category: "Message", key: "h", description: "toggle plain / rendered HTML" },
+    HelpEntry { category: "Message", key: "Esc", description: "leave visual mode / close reader" },
+    HelpEntry { category: "Message", key: "h/j/k/l", description: "move reader cursor" },
+    HelpEntry { category: "Message", key: "w/b, 0/^/$, H/L", description: "word / line motions" },
+    HelpEntry { category: "Message", key: "gg / G, { / }", description: "document / paragraph motions" },
+    HelpEntry { category: "Message", key: "v / V, vi\" / vi' / vi() / vi[] / vi{}", description: "character / line visual selection and inner text objects" },
+    HelpEntry { category: "Message", key: "T", description: "toggle rich HTML / plain fallback" },
+    HelpEntry { category: "Message", key: "I", description: "toggle remote images for this session" },
     HelpEntry { category: "Message", key: "Tab / Shift-Tab", description: "select next / previous rendered HTML link" },
     HelpEntry { category: "Message", key: "o", description: "open selected rendered HTML link" },
-    HelpEntry { category: "Message", key: "e", description: "export raw RFC 5322 message" },
+    HelpEntry { category: "Message", key: "O", description: "open original HTML email in the browser" },
+    HelpEntry { category: "Message", key: "y", description: "copy visual selection to clipboard" },
+    HelpEntry { category: "Message", key: "e / E", description: "export raw RFC 5322 debug message" },
     HelpEntry { category: "General", key: "t", description: "open searchable theme picker" },
     HelpEntry { category: "General", key: "Ctrl-r", description: "refresh current mailbox" },
     HelpEntry { category: "General", key: "[ / ]", description: "previous / next account" },
@@ -93,6 +100,9 @@ pub enum Command {
     ExportRaw,
     ToggleHelp,
     ToggleHtml,
+    ToggleImages,
+    OpenOriginal,
+    Yank,
     Compose,
     Reply,
     ReplyQuoted,
@@ -151,9 +161,12 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char(']') => Command::NextAccount,
         KeyCode::Char('[') => Command::PreviousAccount,
         KeyCode::Char('t') => Command::ToggleThemePicker,
-        KeyCode::Char('e') => Command::ExportRaw,
+        KeyCode::Char('e') | KeyCode::Char('E') => Command::ExportRaw,
         KeyCode::Char('?') => Command::ToggleHelp,
-        KeyCode::Char('h') => Command::ToggleHtml,
+        KeyCode::Char('T') => Command::ToggleHtml,
+        KeyCode::Char('I') => Command::ToggleImages,
+        KeyCode::Char('O') => Command::OpenOriginal,
+        KeyCode::Char('y') => Command::Yank,
         KeyCode::Char('c') => Command::Compose,
         KeyCode::Esc => Command::Escape,
         KeyCode::Char(ch) if ch.is_ascii_digit() => {
@@ -229,6 +242,34 @@ mod tests {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
             Command::ToggleVisual
+        );
+    }
+
+    #[test]
+    fn reader_yank_has_a_direct_key() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Command::Yank
+        );
+    }
+
+    #[test]
+    fn reader_debug_export_and_html_toggle_have_non_motion_keys() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            Command::ExportRaw
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
+            Command::ToggleHtml
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT)),
+            Command::ToggleImages
+        );
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT)),
+            Command::OpenOriginal
         );
     }
 

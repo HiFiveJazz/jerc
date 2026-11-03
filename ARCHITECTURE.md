@@ -7,6 +7,7 @@ Crossterm input thread ───────────────────
                                                   │ bounded RuntimeEvent queue
 Account worker 0 ── Maildir/IMAP + SMTP sender ──┤
 Account worker 1 ── Maildir/IMAP + SMTP sender ──┤
+Remote image worker ── bounded fetch/decode ─────┤
                                                   ▼
                                            UI/state loop
                                                   │
@@ -43,9 +44,11 @@ Bulk IMAP mutations build one UID sequence for the whole selection. Successful m
 
 ## HTML mail
 
-MIME parsing remains in `mail-parser`. HTML uses `html2text`'s rich line API, which preserves table box drawing and annotations such as links, images, emphasis, strong text, strikeout and code. Those annotations are converted into model-level spans and styled by Ratatui using the active aerc-rs theme. This produces text-browser-like visual structure without spawning an external process for every preview.
+MIME parsing remains in `mail-parser`. A real HTML part is the default reader view and `html2text`'s rich line API preserves table structure plus annotations such as links, images, emphasis, strong text, strikeout and code. Those annotations are converted into model-level spans, but sender foreground/background CSS is deliberately not painted into the TUI: semantic emphasis survives while the active theme owns readability. `T` switches to the supplied text/plain part or, for HTML-only mail, a generated plain fallback.
 
-The parser also strips common zero-width preheader padding and collapses useless blank runs. The reader can select rendered links with Tab/Shift-Tab and launch one with `o`.
+Before rich conversion, HTML tables explicitly marked `role="presentation"` are linearized so newsletter/grid scaffolding does not become data-table chrome. Post-processing then removes zero-width/preheader padding, Markdown-like heading markers emitted by the conversion layer, generic image labels and repeated layout-table chrome. Dense nested layout blocks are flattened as a fallback; remaining semantic tables have their outer edges closed instead of ending in dangling junctions.
+
+`ratatui-image` provides Kitty/Sixel/iTerm2 rendering with a half-block fallback. Remote image HTTP/decode work runs on its own bounded worker, has an 8 MiB body cap and a global timeout, and filters obvious/decoded tracking pixels. Remote loading defaults off because direct image requests can disclose IP address and read time; `I` toggles it for the session and `ui.remote_images` can opt in at startup.
 
 ## Modal composer
 
@@ -55,7 +58,7 @@ Esc follows modal semantics: VISUAL → NORMAL, INSERT → NORMAL, and only Esc 
 
 ## Performance invariants
 
-1. Rendering performs no filesystem/network I/O.
+1. Rendering performs no filesystem/network I/O; remote image fetch/decode runs on its own worker.
 2. Idle UI has no redraw polling.
 3. Ordinary UI→worker enqueue never blocks the terminal thread.
 4. Browser navigation never fetches bodies unless split preview is enabled.

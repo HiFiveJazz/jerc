@@ -17,7 +17,8 @@ The source includes tests for:
 - pagination metadata and page merging for Maildir/worker protocol paths;
 - Neovim-style viewport scrolloff and modal compose line/visual editing helpers;
 - modal compose field/mode editing helpers;
-- HTML rich rendering with preserved table box characters, annotated links, and zero-width preheader cleanup;
+- HTML rich rendering with theme-owned colours, cleaned heading markers, closed semantic tables, presentation-table compaction, annotated links, and zero-width preheader cleanup;
+- rich-HTML-default/plain-fallback behavior and remote-image key/config plumbing;
 - existing IMAP source/auth parsing, Maildir behavior, themes, outgoing mail, and worker protocol behavior.
 
 ## Validation performed in the patch build environment

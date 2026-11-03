@@ -10,7 +10,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::model::OutgoingMessage;
-use crate::outgoing::MailSender;
+use crate::outgoing::{MailSender, SendReceipt};
 
 const SMTP_TIMEOUT: Duration = Duration::from_secs(60);
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -245,7 +245,7 @@ impl SmtpSender {
 }
 
 impl MailSender for SmtpSender {
-    fn send(&mut self, message: &OutgoingMessage) -> Result<()> {
+    fn send(&mut self, message: &OutgoingMessage) -> Result<SendReceipt> {
         let from_value = if message.from.trim().is_empty() {
             self.source.username.as_str()
         } else {
@@ -288,10 +288,21 @@ impl MailSender for SmtpSender {
         let email = builder
             .body(message.body.clone())
             .context("building outgoing message")?;
-        self.transport()?
-            .send(&email)
+        let raw_message = email.formatted();
+        let response = self
+            .transport()?
+            .send_raw(email.envelope(), &raw_message)
             .context("sending message through SMTP")?;
-        Ok(())
+        if !response.is_positive() {
+            bail!("SMTP relay returned a non-success response");
+        }
+        Ok(SendReceipt {
+            raw_message,
+            smtp_status: response.first_word().unwrap_or("accepted").to_owned(),
+            // Gmail files authenticated SMTP submissions in Sent itself. APPENDing
+            // the same RFC 5322 bytes would therefore create a duplicate.
+            server_files_sent_copy: self.source.host.eq_ignore_ascii_case("smtp.gmail.com"),
+        })
     }
 }
 

@@ -90,6 +90,12 @@ pub trait MailBackend: Send {
     fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage>;
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody>;
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>>;
+    /// Append an already-built RFC 5322 message to a mailbox. Outgoing mail uses
+    /// this for a Sent copy after the SMTP relay accepts the exact same bytes.
+    fn append_message(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
+        let _ = (mailbox, raw, seen);
+        Err(anyhow!("backend does not support appending messages"))
+    }
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()>;
     fn delete(&mut self, mailbox: &str, id: &MessageId) -> Result<()>;
     fn delete_many(&mut self, mailbox: &str, ids: &[MessageId]) -> Result<()> {

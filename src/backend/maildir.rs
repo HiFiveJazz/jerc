@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -234,6 +235,34 @@ impl MailBackend for MaildirBackend {
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
         let path = self.locate(mailbox, id)?;
         read_all(File::open(&path)?).with_context(|| format!("reading message from {}", path.display()))
+    }
+
+    fn append_message(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
+        let maildir = self.mailbox_path(mailbox)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let unique = format!(
+            "{}.M{}P{}.aerc-rs",
+            now.as_secs(),
+            now.subsec_nanos(),
+            std::process::id()
+        );
+        let tmp = maildir.join("tmp").join(&unique);
+        fs::write(&tmp, raw).with_context(|| format!("writing {}", tmp.display()))?;
+        let filename = if seen {
+            format!("{unique}{}2,S", maildir_info_separator())
+        } else {
+            unique
+        };
+        let target_dir = if seen { "cur" } else { "new" };
+        let target = maildir.join(target_dir).join(filename);
+        if let Err(error) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error)
+                .with_context(|| format!("filing sent message in {}", target.display()));
+        }
+        Ok(())
     }
 
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()> {

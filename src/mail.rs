@@ -155,18 +155,32 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
     // mail-parser's RFC 8621 body lists intentionally include synthesized
     // alternatives: an HTML part may stand in for missing text/plain, and a
     // text part may stand in for missing text/html. Inspect PartKind so the UI
-    // only exposes `h` when the sender actually supplied both alternatives.
+    // only exposes the rich/plain toggle when the sender actually supplied HTML.
     let plain_text = message.text_body().find_map(|part| match part.kind() {
         PartKind::Text => part.text().map(|text| text.into_owned()),
         _ => None,
     });
 
-    let rendered_html = message.html_body().find_map(|part| match part.kind() {
-        PartKind::Html => part
-            .text()
-            .map(|html| render_html_for_terminal(html.as_ref())),
+    let html_source = message.html_body().find_map(|part| match part.kind() {
+        PartKind::Html => part.text().map(|html| html.into_owned()),
         _ => None,
     });
+    let plain_fallback = if plain_text
+        .as_deref()
+        .is_none_or(|text| text.trim().is_empty())
+    {
+        html_source
+            .as_deref()
+            .map(mail_parser::html_to_text)
+            .map(|text| clean_reader_text(&text))
+            .filter(|text| !text.trim().is_empty())
+    } else {
+        None
+    };
+    let rendered_html = html_source
+        .as_deref()
+        .map(|html| render_html_for_terminal(html, 100));
+    let html_render_width = if rendered_html.is_some() { 100 } else { 0 };
     let (html_text, html_lines, html_renderer) = rendered_html
         .map(|(text, lines, renderer)| (Some(text), Some(lines), Some(renderer)))
         .unwrap_or((None, None, None));
@@ -174,26 +188,30 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
     Ok(MessageBody {
         id,
         plain_text,
+        plain_fallback,
+        html_source,
         html_text,
         html_lines,
         html_renderer,
+        html_render_width,
         attachment_count: message.attachments().count(),
     })
 }
 
-fn render_html_for_terminal(html: &str) -> (String, Vec<HtmlLine>, String) {
+pub fn render_html_for_terminal(html: &str, width: usize) -> (String, Vec<HtmlLine>, String) {
     // html2text's rich renderer is intentionally closer to a text browser than
     // its String-only API: tables keep their box drawing and semantic markup
     // such as links/strong/emphasis remains tagged. Ratatui maps those tags to
     // the active aerc-rs theme, which gives HTML mail the same useful visual
     // landmarks as a terminal browser without spawning an external process for
-    // every message. Rendering happens once on the account worker, never in the
-    // draw loop, so rich mail cannot make scrolling stutter.
+    // every message. The worker produces a fallback layout; reader mode can
+    // reflow the preserved HTML when its actual viewport width changes.
+    let normalized_html = flatten_presentation_tables_html(html);
     let rich = html2text::config::rich()
         .use_doc_css()
         .link_footnotes(false)
         .no_link_wrapping()
-        .lines_from_read(html.as_bytes(), 100);
+        .lines_from_read(normalized_html.as_bytes(), width.max(20));
 
     if let Ok(lines) = rich {
         let mut converted = Vec::with_capacity(lines.len());
@@ -208,6 +226,13 @@ fn render_html_for_terminal(html: &str) -> (String, Vec<HtmlLine>, String) {
             converted.push(HtmlLine { spans });
         }
         let converted = clean_rich_lines(converted);
+        let converted = compact_prose_whitespace(converted);
+        let converted = compact_generic_image_alt_lines(converted);
+        let converted = compact_bare_list_markers(converted);
+        let converted = clean_heading_markers(converted);
+        let converted = simplify_layout_table_blocks(converted);
+        let converted = compact_decorative_horizontal_rules(converted);
+        let converted = compact_social_link_chrome(converted);
         let text = rich_lines_to_text(&converted);
         if !text.trim().is_empty() {
             return (text, converted, "html2text-rich".to_owned());
@@ -228,6 +253,388 @@ fn render_html_for_terminal(html: &str) -> (String, Vec<HtmlLine>, String) {
         })
         .collect();
     (text, lines, "mail-parser fallback".to_owned())
+}
+
+fn flatten_presentation_tables_html(html: &str) -> String {
+    // Marketing mail routinely uses deeply nested tables as a CSS layout
+    // primitive. When a sender explicitly marks one as role=presentation,
+    // treating it as a data table produces pages of box-drawing chrome.
+    // Linearize that subtree before html2text sees it while leaving genuine
+    // unmarked receipt/data tables intact.
+    let mut out = String::with_capacity(html.len());
+    let mut table_stack = Vec::<bool>::new();
+    let mut presentation_depth = 0usize;
+    let mut cursor = 0usize;
+
+    while let Some(relative_start) = html[cursor..].find('<') {
+        let start = cursor + relative_start;
+        out.push_str(&html[cursor..start]);
+        let Some(end) = find_html_tag_end(html, start) else {
+            out.push_str(&html[start..]);
+            cursor = html.len();
+            break;
+        };
+        let tag = &html[start..=end];
+        let (closing, name) = html_tag_name(tag);
+
+        match (closing, name.as_deref()) {
+            (false, Some("table")) => {
+                let flatten = presentation_depth > 0 || tag_has_presentation_role(tag);
+                table_stack.push(flatten);
+                if flatten {
+                    presentation_depth += 1;
+                    out.push_str("<div>");
+                } else {
+                    out.push_str(tag);
+                }
+            }
+            (true, Some("table")) => {
+                if let Some(flatten) = table_stack.pop() {
+                    if flatten {
+                        presentation_depth = presentation_depth.saturating_sub(1);
+                        out.push_str("</div>");
+                    } else {
+                        out.push_str(tag);
+                    }
+                } else {
+                    out.push_str(tag);
+                }
+            }
+            (_, Some("tbody" | "thead" | "tfoot")) if presentation_depth > 0 => {}
+            (false, Some("tr" | "td" | "th")) if presentation_depth > 0 => {
+                out.push_str("<div>");
+            }
+            (true, Some("tr" | "td" | "th")) if presentation_depth > 0 => {
+                out.push_str("</div>");
+            }
+            _ => out.push_str(tag),
+        }
+        cursor = end + 1;
+    }
+
+    if cursor < html.len() {
+        out.push_str(&html[cursor..]);
+    }
+    out
+}
+
+fn find_html_tag_end(html: &str, start: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut quote = None::<u8>;
+    for (offset, &byte) in bytes.get(start + 1..)?.iter().enumerate() {
+        match (quote, byte) {
+            (Some(active), current) if active == current => quote = None,
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, b'>') => return Some(start + 1 + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn html_tag_name(tag: &str) -> (bool, Option<String>) {
+    let inner = tag
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim_start();
+    if inner.starts_with('!') || inner.starts_with('?') {
+        return (false, None);
+    }
+    let closing = inner.starts_with('/');
+    let inner = inner.trim_start_matches('/').trim_start();
+    let name = inner
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    (closing, (!name.is_empty()).then_some(name))
+}
+
+fn tag_has_presentation_role(tag: &str) -> bool {
+    let lower = tag.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut offset = 0usize;
+    while let Some(relative) = lower[offset..].find("role") {
+        let start = offset + relative;
+        let before_ok = start == 0
+            || !matches!(bytes[start - 1], b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
+        let mut cursor = start + 4;
+        let after_ok = cursor >= bytes.len()
+            || !matches!(bytes[cursor], b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
+        if !before_ok || !after_ok {
+            offset = cursor;
+            continue;
+        }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            offset = cursor;
+            continue;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let quote = bytes.get(cursor).copied().filter(|byte| matches!(*byte, b'\'' | b'"'));
+        if quote.is_some() {
+            cursor += 1;
+        }
+        let value_start = cursor;
+        while let Some(&byte) = bytes.get(cursor) {
+            if quote.is_some_and(|quote| byte == quote)
+                || (quote.is_none() && (byte.is_ascii_whitespace() || byte == b'>'))
+            {
+                break;
+            }
+            cursor += 1;
+        }
+        if &lower[value_start..cursor] == "presentation" {
+            return true;
+        }
+        offset = cursor.max(start + 4);
+    }
+    false
+}
+
+fn compact_prose_whitespace(mut lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
+    // HTML mail frequently uses combinations such as `&nbsp;  ` to tune a
+    // graphical layout. Once NBSP has been converted to a normal space that
+    // can leave distracting multi-space gaps in otherwise ordinary prose.
+    // Do not touch box-drawn table rows or preformatted/code content: their
+    // spacing is structural rather than decorative.
+    for line in &mut lines {
+        let text = html_line_text(line);
+        if line_has_table_chrome(&text) || line.spans.iter().any(|span| span.style.code) {
+            continue;
+        }
+
+        let mut previous_space = false;
+        for span in &mut line.spans {
+            let mut compacted = String::with_capacity(span.text.len());
+            for ch in span.text.chars() {
+                if matches!(ch, ' ' | '\t') {
+                    if !previous_space {
+                        compacted.push(' ');
+                    }
+                    previous_space = true;
+                } else {
+                    compacted.push(ch);
+                    previous_space = false;
+                }
+            }
+            span.text = compacted;
+        }
+    }
+    lines
+}
+
+fn compact_generic_image_alt_lines(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
+    // Useful image alt text is one of the best things a terminal renderer can
+    // preserve (product names, event banners, brand names). Generic template
+    // placeholders are different: labels such as "Dynamic Banner" and "item
+    // image" add noise without conveying anything the user can act on. Drop a
+    // line only when every visible span is an image annotation with a known
+    // generic label, so descriptive alt text remains untouched.
+    clean_rich_lines(
+        lines
+            .into_iter()
+            .filter(|line| !line_is_generic_image_alt(line))
+            .collect(),
+    )
+}
+
+fn compact_bare_list_markers(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
+    // Some newsletter HTML puts <br> elements between <li> elements. The rich
+    // html2text renderer can turn those separators into marker-only rows (for
+    // example a line containing just `*`) between otherwise correct bullets.
+    // A single marker could be intentional; a repeated cluster is layout
+    // fallout and can be removed safely.
+    let bare_markers = lines
+        .iter()
+        .filter(|line| line_is_bare_list_marker(line))
+        .count();
+    if bare_markers < 2 {
+        return lines;
+    }
+
+    clean_rich_lines(
+        lines
+            .into_iter()
+            .filter(|line| !line_is_bare_list_marker(line))
+            .collect(),
+    )
+}
+
+fn compact_decorative_horizontal_rules(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
+    // Layout-table-heavy marketing mail can turn every cell boundary into a
+    // full-width horizontal rule. A real data table has corners/junctions and
+    // vertical structure, while this chrome is usually just repeated runs of
+    // horizontal glyphs. Leave occasional <hr>-style rules alone, but when a
+    // message contains a cluster of them, strip only the pure horizontal rows.
+    let rule_count = lines
+        .iter()
+        .filter(|line| line_is_pure_horizontal_rule(line))
+        .count();
+    if rule_count < 4 {
+        return lines;
+    }
+
+    clean_rich_lines(
+        lines
+            .into_iter()
+            .filter(|line| !line_is_pure_horizontal_rule(line))
+            .collect(),
+    )
+}
+
+fn clean_heading_markers(mut lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
+    for line in &mut lines {
+        let text = html_line_text(line);
+        let trimmed = text.trim_start();
+        let marker_len = trimmed.chars().take_while(|ch| *ch == '#').count();
+        if !(1..=6).contains(&marker_len)
+            || !trimmed.chars().nth(marker_len).is_some_and(char::is_whitespace)
+        {
+            continue;
+        }
+
+        let leading = text
+            .chars()
+            .count()
+            .saturating_sub(trimmed.chars().count());
+        remove_visible_prefix(line, leading + marker_len + 1);
+        for span in &mut line.spans {
+            if !span.text.trim().is_empty() {
+                span.style.bold = true;
+            }
+        }
+    }
+    clean_rich_lines(lines)
+}
+
+fn remove_visible_prefix(line: &mut HtmlLine, mut count: usize) {
+    for span in &mut line.spans {
+        if count == 0 {
+            break;
+        }
+        let span_len = span.text.chars().count();
+        if span_len <= count {
+            span.text.clear();
+            count -= span_len;
+        } else {
+            span.text = span.text.chars().skip(count).collect();
+            count = 0;
+        }
+    }
+    line.spans.retain(|span| !span.text.is_empty());
+}
+
+fn simplify_layout_table_blocks(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
+    let mut output = Vec::with_capacity(lines.len());
+    let mut start = 0usize;
+    while start < lines.len() {
+        if html_line_text(&lines[start]).trim().is_empty() {
+            output.push(lines[start].clone());
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < lines.len() && !html_line_text(&lines[end]).trim().is_empty() {
+            end += 1;
+        }
+        let block = &lines[start..end];
+        let separator_rows = block
+            .iter()
+            .filter(|line| line_is_separator_or_blank(line) && !html_line_text(line).trim().is_empty())
+            .count();
+        let empty_cell_rows = block
+            .iter()
+            .filter(|line| {
+                let text = html_line_text(line);
+                line_has_table_chrome(&text)
+                    && !text.trim().is_empty()
+                    && text.chars().filter(|ch| !ch.is_whitespace() && !is_table_chrome_char(*ch)).count() == 0
+                    && text.chars().any(|ch| matches!(ch, '│' | '║'))
+            })
+            .count();
+        let nested_rows = block
+            .iter()
+            .filter(|line| {
+                html_line_text(line)
+                    .chars()
+                    .filter(|ch| matches!(ch, '┬' | '┴' | '┼' | '│'))
+                    .count()
+                    >= 5
+            })
+            .count();
+
+        if block.len() >= 5
+            && separator_rows >= 3
+            && (empty_cell_rows >= 2 || nested_rows >= 2)
+        {
+            for line in block {
+                let flattened = flatten_layout_line(line);
+                if !html_line_text(&flattened).trim().is_empty() {
+                    output.push(flattened);
+                }
+            }
+            output.push(HtmlLine::default());
+        } else {
+            output.extend_from_slice(block);
+        }
+        start = end;
+    }
+    clean_rich_lines(output)
+}
+
+fn flatten_layout_line(line: &HtmlLine) -> HtmlLine {
+    if line_is_separator_or_blank(line) {
+        return HtmlLine::default();
+    }
+    let mut spans = line.spans.clone();
+    for span in &mut spans {
+        let mut out = String::with_capacity(span.text.len());
+        let mut previous_space = false;
+        for ch in span.text.chars() {
+            if is_table_chrome_char(ch) {
+                if !previous_space {
+                    out.push(' ');
+                    previous_space = true;
+                }
+            } else {
+                out.push(ch);
+                previous_space = ch.is_whitespace();
+            }
+        }
+        span.text = out;
+    }
+    let mut flattened = HtmlLine { spans };
+    trim_rich_line(&mut flattened);
+    flattened
+}
+
+fn trim_rich_line(line: &mut HtmlLine) {
+    while line
+        .spans
+        .first()
+        .is_some_and(|span| span.text.trim().is_empty())
+    {
+        line.spans.remove(0);
+    }
+    while line
+        .spans
+        .last()
+        .is_some_and(|span| span.text.trim().is_empty())
+    {
+        line.spans.pop();
+    }
+    if let Some(first) = line.spans.first_mut() {
+        first.text = first.text.trim_start().to_owned();
+    }
+    if let Some(last) = line.spans.last_mut() {
+        last.text = last.text.trim_end().to_owned();
+    }
 }
 
 fn rich_style(annotations: &[html2text::render::RichAnnotation]) -> HtmlSpanStyle {
@@ -290,6 +697,237 @@ fn clean_rich_lines(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
     cleaned
 }
 
+fn compact_social_link_chrome(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
+    let lines = compact_inline_social_rows(lines);
+    let social = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let label = html_line_text(line).trim().to_owned();
+            if !is_social_link_label(&label)
+                || !line.spans.iter().any(|span| span.style.link.is_some())
+            {
+                return None;
+            }
+            let style = line
+                .spans
+                .iter()
+                .find(|span| span.style.link.is_some())
+                .map(|span| span.style.clone())
+                .unwrap_or_default();
+            Some((index, label, style))
+        })
+        .collect::<Vec<_>>();
+
+    // A lone "Website" or "X" can be meaningful content. Only compact when the
+    // message contains an obvious social-footer cluster.
+    if social.len() < 3 {
+        return lines;
+    }
+
+    let mut remove = vec![false; lines.len()];
+    for (index, _, _) in &social {
+        remove[*index] = true;
+        if *index > 0 && line_is_separator_or_blank(&lines[*index - 1]) {
+            remove[*index - 1] = true;
+        }
+        if *index + 1 < lines.len() && line_is_separator_or_blank(&lines[*index + 1]) {
+            remove[*index + 1] = true;
+        }
+    }
+
+    let insert_at = social[0].0;
+    let social_links = social
+        .iter()
+        .map(|(_, label, style)| (label.clone(), style.clone()))
+        .collect::<Vec<_>>();
+    let compact_line = social_link_line(&social_links);
+
+    let mut output = Vec::with_capacity(lines.len());
+    for (index, line) in lines.into_iter().enumerate() {
+        if index == insert_at {
+            output.push(compact_line.clone());
+        }
+        if !remove[index] {
+            output.push(line);
+        }
+    }
+    clean_rich_lines(output)
+}
+
+fn compact_inline_social_rows(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
+    let mut replacements = Vec::<(usize, HtmlLine)>::new();
+    let mut remove = vec![false; lines.len()];
+
+    for (index, line) in lines.iter().enumerate() {
+        let Some(social) = social_links_from_chrome_row(line) else {
+            continue;
+        };
+        replacements.push((index, social_link_line(&social)));
+        remove[index] = true;
+        if index > 0 && line_is_separator_or_blank(&lines[index - 1]) {
+            remove[index - 1] = true;
+        }
+        if index + 1 < lines.len() && line_is_separator_or_blank(&lines[index + 1]) {
+            remove[index + 1] = true;
+        }
+    }
+
+    if replacements.is_empty() {
+        return lines;
+    }
+
+    let mut output = Vec::with_capacity(lines.len());
+    for (index, line) in lines.into_iter().enumerate() {
+        if let Some((_, replacement)) = replacements.iter().find(|(at, _)| *at == index) {
+            output.push(replacement.clone());
+        }
+        if !remove[index] {
+            output.push(line);
+        }
+    }
+    clean_rich_lines(output)
+}
+
+fn social_links_from_chrome_row(line: &HtmlLine) -> Option<Vec<(String, HtmlSpanStyle)>> {
+    let mut social = Vec::new();
+    for span in &line.spans {
+        let label = span.text.trim();
+        if label.is_empty() || label.chars().all(is_table_chrome_char) {
+            continue;
+        }
+        if span.style.link.is_some() && is_social_link_label(label) {
+            social.push((label.to_owned(), span.style.clone()));
+            continue;
+        }
+        return None;
+    }
+    (social.len() >= 3).then_some(social)
+}
+
+fn social_link_line(social: &[(String, HtmlSpanStyle)]) -> HtmlLine {
+    let mut spans = vec![HtmlSpan {
+        text: "[links: ".to_owned(),
+        style: HtmlSpanStyle::default(),
+    }];
+    for (position, (label, style)) in social.iter().enumerate() {
+        if position > 0 {
+            spans.push(HtmlSpan {
+                text: " · ".to_owned(),
+                style: HtmlSpanStyle::default(),
+            });
+        }
+        spans.push(HtmlSpan {
+            text: label.clone(),
+            style: style.clone(),
+        });
+    }
+    spans.push(HtmlSpan {
+        text: "]".to_owned(),
+        style: HtmlSpanStyle::default(),
+    });
+    HtmlLine { spans }
+}
+
+fn html_line_text(line: &HtmlLine) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<String>()
+}
+
+fn line_is_separator_or_blank(line: &HtmlLine) -> bool {
+    let text = html_line_text(line);
+    let trimmed = text.trim();
+    trimmed.is_empty()
+        || trimmed.chars().all(|ch| {
+            matches!(
+                ch,
+                '-' | '─' | '━' | '│' | '┌' | '┐' | '└' | '┘' | '├' | '┤'
+                    | '┬' | '┴' | '┼' | '═' | '║' | '╔' | '╗' | '╚' | '╝'
+                    | '╠' | '╣' | '╦' | '╩' | '╬'
+            )
+        })
+}
+
+fn line_has_table_chrome(text: &str) -> bool {
+    text.chars().any(is_table_chrome_char)
+}
+
+fn is_table_chrome_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '─' | '━' | '│' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴'
+            | '┼' | '═' | '║' | '╔' | '╗' | '╚' | '╝' | '╠' | '╣' | '╦'
+            | '╩' | '╬' | '╌' | '╍'
+    )
+}
+
+fn line_is_generic_image_alt(line: &HtmlLine) -> bool {
+    let mut saw_visible_image = false;
+    for span in &line.spans {
+        let label = span.text.trim();
+        if label.is_empty() {
+            continue;
+        }
+        if span.style.image.is_none() || !is_generic_image_alt(label) {
+            return false;
+        }
+        saw_visible_image = true;
+    }
+    saw_visible_image
+}
+
+fn is_generic_image_alt(label: &str) -> bool {
+    let label = label
+        .trim()
+        .trim_matches(|ch| matches!(ch, '[' | ']' | '(' | ')'))
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        label.as_str(),
+        "image"
+            | "item image"
+            | "dynamic banner"
+            | "banner image"
+            | "spacer"
+            | "spacer image"
+            | "tracking pixel"
+            | "pixel"
+            | "blank image"
+    )
+}
+
+fn line_is_bare_list_marker(line: &HtmlLine) -> bool {
+    matches!(html_line_text(line).trim(), "*" | "•" | "◦" | "▪" | "‣")
+}
+
+fn line_is_pure_horizontal_rule(line: &HtmlLine) -> bool {
+    let text = html_line_text(line);
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| matches!(ch, '-' | '─' | '━' | '═' | '╌' | '╍'))
+}
+
+fn is_social_link_label(label: &str) -> bool {
+    matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "facebook"
+            | "x"
+            | "twitter"
+            | "instagram"
+            | "youtube"
+            | "tiktok"
+            | "linkedin"
+            | "pinterest"
+            | "threads"
+            | "discord"
+            | "website"
+    )
+}
+
 fn rich_lines_to_text(lines: &[HtmlLine]) -> String {
     let mut out = String::new();
     for (line_index, line) in lines.iter().enumerate() {
@@ -347,8 +985,13 @@ pub fn read_all(mut reader: impl Read) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_thread_headers, parse_body, parse_summary, read_header_block};
-    use crate::model::{MessageFlags, MessageId};
+    use super::{
+        compact_bare_list_markers, compact_decorative_horizontal_rules,
+        compact_generic_image_alt_lines, compact_prose_whitespace, compact_social_link_chrome,
+        extract_thread_headers, parse_body, parse_summary, read_header_block,
+        render_html_for_terminal, simplify_layout_table_blocks,
+    };
+    use crate::model::{HtmlLine, HtmlSpan, HtmlSpanStyle, MessageFlags, MessageId};
     use std::io::Cursor;
 
     const MAIL: &[u8] = b"From: Example Person <person@example.com>\r\n\
@@ -441,6 +1084,255 @@ Hello from the body.\r\n";
         let body = parse_body(MessageId("html-space".into()), raw).unwrap();
         let rendered = body.html_text.unwrap();
         assert!(!rendered.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn html_reader_removes_repeated_layout_table_rules_but_keeps_real_table_chrome() {
+        let line = |text: &str| HtmlLine {
+            spans: vec![HtmlSpan {
+                text: text.to_owned(),
+                style: HtmlSpanStyle::default(),
+            }],
+        };
+        let compacted = compact_decorative_horizontal_rules(vec![
+            line("────────────────"),
+            line("Hello"),
+            line("────────────────"),
+            line("World"),
+            line("────────────────"),
+            line("┌────┬────┐"),
+            line("│ A  │ B  │"),
+            line("────────────────"),
+        ]);
+        let text = compacted
+            .iter()
+            .map(super::html_line_text)
+            .collect::<Vec<_>>();
+        assert!(!text.iter().any(|line| line == "────────────────"));
+        assert!(text.iter().any(|line| line == "┌────┬────┐"));
+        assert!(text.iter().any(|line| line == "│ A  │ B  │"));
+    }
+
+    #[test]
+    fn social_footer_links_compact_without_losing_targets() {
+        let social = ["Facebook", "Instagram", "YouTube"]
+            .into_iter()
+            .map(|label| HtmlLine {
+                spans: vec![HtmlSpan {
+                    text: label.to_owned(),
+                    style: HtmlSpanStyle {
+                        link: Some(format!("https://example.com/{label}")),
+                        ..HtmlSpanStyle::default()
+                    },
+                }],
+            })
+            .collect::<Vec<_>>();
+        let compacted = compact_social_link_chrome(social);
+        assert_eq!(compacted.len(), 1);
+        let text = compacted[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert_eq!(text, "[links: Facebook · Instagram · YouTube]");
+        assert_eq!(
+            compacted[0]
+                .spans
+                .iter()
+                .filter(|span| span.style.link.is_some())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn horizontal_social_footer_table_compacts_without_losing_targets() {
+        let separator = |text: &str| HtmlSpan {
+            text: text.to_owned(),
+            style: HtmlSpanStyle::default(),
+        };
+        let social = |label: &str| HtmlSpan {
+            text: label.to_owned(),
+            style: HtmlSpanStyle {
+                link: Some(format!("https://example.com/{label}")),
+                image: Some(format!("https://example.com/{label}.png")),
+                ..HtmlSpanStyle::default()
+            },
+        };
+        let lines = vec![
+            HtmlLine {
+                spans: vec![separator("────────┬───────┬────────")],
+            },
+            HtmlLine {
+                spans: vec![
+                    social("Facebook"),
+                    separator(" │ "),
+                    social("X"),
+                    separator(" │ "),
+                    social("Instagram"),
+                ],
+            },
+            HtmlLine {
+                spans: vec![separator("────────┴───────┴────────")],
+            },
+        ];
+
+        let compacted = compact_social_link_chrome(lines);
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(
+            compacted[0]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "[links: Facebook · X · Instagram]"
+        );
+        assert_eq!(
+            compacted[0]
+                .spans
+                .iter()
+                .filter(|span| span.style.link.is_some())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn generic_image_alt_placeholders_are_removed_but_descriptive_images_survive() {
+        let image_line = |label: &str| HtmlLine {
+            spans: vec![HtmlSpan {
+                text: label.to_owned(),
+                style: HtmlSpanStyle {
+                    image: Some("https://example.com/image.png".to_owned()),
+                    ..HtmlSpanStyle::default()
+                },
+            }],
+        };
+        let compacted = compact_generic_image_alt_lines(vec![
+            image_line("Dynamic Banner"),
+            image_line("item image"),
+            image_line("June Bluefin Tuna Cutting Ceremony"),
+        ]);
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(
+            compacted[0]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "June Bluefin Tuna Cutting Ceremony"
+        );
+    }
+
+    #[test]
+    fn repeated_bare_list_markers_are_removed() {
+        let line = |text: &str| HtmlLine {
+            spans: vec![HtmlSpan {
+                text: text.to_owned(),
+                style: HtmlSpanStyle::default(),
+            }],
+        };
+        let compacted = compact_bare_list_markers(vec![
+            line("* First item"),
+            line("*"),
+            line("* Second item"),
+            line("*"),
+            line("* Third item"),
+        ]);
+        let text = compacted
+            .iter()
+            .map(super::html_line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(text, ["* First item", "* Second item", "* Third item"]);
+    }
+
+    #[test]
+    fn prose_spaces_compact_without_changing_table_alignment() {
+        let line = |text: &str| HtmlLine {
+            spans: vec![HtmlSpan {
+                text: text.to_owned(),
+                style: HtmlSpanStyle::default(),
+            }],
+        };
+        let table = "│ A    │ B  │";
+        let compacted = compact_prose_whitespace(vec![
+            line("Please don't miss the   first cut!"),
+            line(table),
+        ]);
+        assert_eq!(super::html_line_text(&compacted[0]), "Please don't miss the first cut!");
+        assert_eq!(super::html_line_text(&compacted[1]), table);
+    }
+
+    #[test]
+    fn html_headings_keep_emphasis_without_literal_markdown_markers() {
+        let (text, lines, _) = render_html_for_terminal(
+            "<h1>Your Services Agreement made clearer</h1><p>Hello</p>",
+            80,
+        );
+        assert!(text.contains("Your Services Agreement made clearer"));
+        assert!(!text.contains("# Your Services Agreement"));
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.text.contains("Your Services Agreement") && span.style.bold
+        }));
+    }
+
+
+    #[test]
+    fn explicit_presentation_tables_are_linearized_before_rich_rendering() {
+        let html = r#"
+            <table role = 'presentation'><tr>
+              <td><strong>Logo</strong></td><td>Order #580<br>$10.38</td>
+            </tr></table>
+            <table><tr><td>Ticket</td><td>$85.00</td></tr></table>
+        "#;
+        let (text, _, _) = render_html_for_terminal(html, 80);
+        assert!(text.contains("Logo"));
+        assert!(text.contains("Order #580"));
+        // The role=presentation table is layout, not data, so it should not
+        // contribute box-drawing separators. The unmarked receipt table still
+        // should.
+        assert_eq!(text.matches('┬').count(), 1);
+        assert!(text.contains("Ticket"));
+    }
+
+    #[test]
+    fn presentation_table_blocks_flatten_without_touching_small_data_tables() {
+        let line = |text: &str| HtmlLine {
+            spans: vec![HtmlSpan {
+                text: text.to_owned(),
+                style: HtmlSpanStyle::default(),
+            }],
+        };
+        let flattened = simplify_layout_table_blocks(vec![
+            line("─┬────────────────┬─"),
+            line(" │Share Your Thoughts│ "),
+            line(" │────────────────│ "),
+            line(" │                │ "),
+            line(" │────────────────│ "),
+            line(" │Take Survey     │ "),
+            line("─┴────────────────┴─"),
+        ]);
+        let text = flattened.iter().map(super::html_line_text).collect::<Vec<_>>();
+        assert!(text.iter().any(|line| line.contains("Share Your Thoughts")));
+        assert!(text.iter().any(|line| line.contains("Take Survey")));
+        assert!(!text.iter().any(|line| line.contains('┬') || line.contains('┴')));
+
+        let data = simplify_layout_table_blocks(vec![
+            line("──────┬────────"),
+            line("Ticket│$85.00"),
+            line("──────┴────────"),
+        ]);
+        assert!(data.iter().any(|line| super::html_line_text(line).contains('┬')));
+    }
+
+    #[test]
+    fn html_only_mail_gets_a_plain_toggle_fallback() {
+        let raw = b"From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<h1>Hello</h1><p>Fallback body</p>";
+        let body = parse_body(MessageId("html-fallback".into()), raw).unwrap();
+        assert!(body.has_html_alternative());
+        assert!(body.has_plain_view());
+        assert!(body.display_text(false).contains("Fallback body"));
+        assert!(body.display_text(true).contains("Fallback body"));
     }
 
     #[test]

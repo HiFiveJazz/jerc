@@ -9,6 +9,7 @@ use std::time::Instant;
 use crate::backend::MailBackend;
 use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingMessage};
 use crate::outgoing::MailSender;
+use crate::mail_image::MailImageEvent;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -25,7 +26,10 @@ pub enum ActionKind {
     DeleteMany { mailbox: String, ids: Vec<MessageId> },
     Move { source: String, destination: String, id: MessageId },
     MoveMany { source: String, destination: String, ids: Vec<MessageId> },
-    Send(OutgoingMessage),
+    Send {
+        message: OutgoingMessage,
+        sent_mailbox: Option<String>,
+    },
     Shutdown,
 }
 
@@ -63,7 +67,12 @@ pub enum WorkerEventKind {
     MessageExported { path: PathBuf },
     SeenChanged { id: MessageId, seen: bool },
     MutationComplete,
-    MessageSent,
+    MessageSent {
+        smtp_status: String,
+        sent_mailbox: Option<String>,
+        sent_copy_saved: bool,
+        sent_copy_warning: Option<String>,
+    },
     Error(String),
     Stopped,
 }
@@ -79,6 +88,7 @@ pub struct WorkerEvent {
 pub enum RuntimeEvent {
     Input(crossterm::event::Event),
     Worker(WorkerEvent),
+    MailImage(MailImageEvent),
     InputStopped,
 }
 
@@ -234,8 +244,37 @@ fn run_worker(
             ActionKind::MoveMany { source, destination, ids } => backend
                 .move_many(&source, &destination, &ids)
                 .map(|()| WorkerEventKind::MutationComplete),
-            ActionKind::Send(message) => match outgoing.as_deref_mut() {
-                Some(sender) => sender.send(&message).map(|()| WorkerEventKind::MessageSent),
+            ActionKind::Send {
+                message,
+                sent_mailbox,
+            } => match outgoing.as_deref_mut() {
+                Some(sender) => sender.send(&message).map(|receipt| {
+                    let mut sent_copy_saved = false;
+                    let mut sent_copy_warning = None;
+                    if !receipt.server_files_sent_copy {
+                        if let Some(mailbox) = sent_mailbox.as_deref() {
+                            match backend.append_message(mailbox, &receipt.raw_message, true) {
+                                Ok(()) => sent_copy_saved = true,
+                                Err(error) => {
+                                    sent_copy_warning = Some(format!(
+                                        "SMTP accepted the message, but saving a Sent copy to {mailbox:?} failed: {error:#}"
+                                    ));
+                                }
+                            }
+                        } else {
+                            sent_copy_warning = Some(
+                                "SMTP accepted the message, but the account advertises no Sent mailbox"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    WorkerEventKind::MessageSent {
+                        smtp_status: receipt.smtp_status,
+                        sent_mailbox,
+                        sent_copy_saved,
+                        sent_copy_warning,
+                    }
+                }),
                 None => Err(anyhow::anyhow!(
                     "no outgoing transport configured for this account"
                 )),

@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use io_imap::client::{ImapClient, ImapClientStd, ImapClientStdConnectOptions};
 use io_imap::rfc3501::{
+    append::ImapMessageAppendOptions,
     copy::ImapMessageCopyOptions,
     fetch::ImapMessageFetchOptions,
     login::ImapLoginOptions,
@@ -29,7 +30,7 @@ use url::Url;
 use crate::backend::MailBackend;
 use crate::mail::{parse_body, parse_summary};
 use crate::model::{
-    Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage, MessageSummary,
+    Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage,
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(90);
@@ -545,6 +546,24 @@ impl MailBackend for ImapBackend {
             bail!("IMAP server did not return requested UID {uid}");
         }
         Ok(raw)
+    }
+
+    fn append_message(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
+        let mailbox_name = mailbox_from_name(mailbox)?;
+        let options = ImapMessageAppendOptions {
+            flags: if seen { vec![Flag::Seen] } else { Vec::new() },
+            ..Default::default()
+        };
+        let (exists, _) = self
+            .session()?
+            .append(mailbox_name, raw, options)
+            .with_context(|| format!("appending message to IMAP mailbox {mailbox:?}"))?;
+        if self.selected_mailbox.as_deref() == Some(mailbox)
+            && let Some(exists) = exists
+        {
+            self.selected_exists = Some(exists);
+        }
+        Ok(())
     }
 
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()> {

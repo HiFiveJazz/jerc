@@ -12,7 +12,8 @@ A Rust terminal email client inspired by aerc's backend/worker model and lazygit
 - **Mail actions:** `d` confirms delete/trash, `D` performs the same action immediately, and `a` archives. Successful mutations update the current cache locally rather than reloading the mailbox tree or jumping back to INBOX.
 - **Search/filter:** `/` edits a case-insensitive filter over the current mailbox. If the loaded cache does not contain enough matches, older pages continue loading progressively.
 - **Layout controls:** `b` hides/shows the mailbox sidebar; `P` toggles a vertical message preview. `Enter` still opens the full-screen reader.
-- **Rich HTML mail:** `html2text`'s rich renderer preserves table box drawing and semantic link/image/emphasis annotations. Ratatui then applies theme-aware colors, underline, emphasis and selected-link highlighting. Zero-width preheader padding is stripped. `Tab`/`Shift-Tab` chooses links and `o` opens the selected link.
+- **Rich HTML mail by default:** the HTML renderer is now the primary view whenever a real HTML part exists; `T` always switches to a plain view (including a generated fallback for HTML-only mail). Layout-table noise, literal Markdown-style heading markers, generic image labels and broken open table edges are normalized while semantic receipt/data tables remain boxed. Sender CSS colours never override the terminal theme.
+- **Terminal images:** `ratatui-image` supports Kitty, Sixel and iTerm2 graphics with a half-block fallback. The first meaningful remote image is shown in the reader when remote images are enabled. Tracking pixels are filtered, downloads are bounded and happen on a background worker. Remote images default off for privacy; press `I` to toggle them for the session or set `ui.remote_images = true`.
 - **Modal compose/reply/forward:** the composer has NORMAL, INSERT, and VISUAL modes. `Tab`/`Shift-Tab` cycles To → Cc → Subject → Body without hiding field labels. `Enter` from NORMAL asks for send confirmation; Ctrl-S is not used. `r` replies without quoted text, `R` replies with a quote, and `f` forwards.
 - Empty folders render an explicit empty-state message instead of a blank pane.
 - Searchable help and JSON themes; custom themes in `~/.config/aerc-rs/themes/*.json` can override built-ins by id.
@@ -31,6 +32,9 @@ outgoing = "smtps://you%40gmail.com@smtp.gmail.com:465"
 outgoing_cred_cmd = "pass show mail/personal-app-password"
 default_mailbox = "INBOX"
 page_size = 100
+
+[ui]
+remote_images = false # privacy-safe default; press I to toggle in-session
 ```
 
 `page_size` controls interactive pagination. Existing `max_messages` settings are retained for compatibility/headless checks and no longer make the TUI wait for one giant initial fetch.
@@ -44,7 +48,7 @@ Press `?` for the searchable complete map. Common controls:
 - `d` confirmed trash/delete; `D` immediate trash/delete; `a` archive.
 - `/` filter current mailbox; `b` sidebar; `P` vertical preview; `Enter` full reader.
 - `r` reply without quote; `R` reply with quote; `f` forward; `c` compose.
-- HTML reader/preview: `h` plain/rendered HTML, `Tab`/`Shift-Tab` links, `o` open selected link.
+- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `Tab`/`Shift-Tab` selects links, and `o` opens the selected link.
 - `Ctrl-r` refreshes the current mailbox.
 
 ## Themes

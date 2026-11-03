@@ -131,6 +131,13 @@ impl MessageSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlImageCandidate {
+    pub source: String,
+    pub width_px: Option<u32>,
+    pub height_px: Option<u32>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HtmlSpanStyle {
     pub foreground: Option<(u8, u8, u8)>,
@@ -159,15 +166,25 @@ pub struct MessageBody {
     pub id: MessageId,
     /// The MIME text/plain representation when one exists.
     pub plain_text: Option<String>,
+    /// A generated readable plain-text view for HTML-only messages. This keeps
+    /// the rich/plain toggle useful even when the sender omitted text/plain.
+    pub plain_fallback: Option<String>,
+    /// Original HTML alternative. Keeping it lets the UI reflow the document
+    /// to the actual reader width instead of freezing every message at the
+    /// worker's fallback width.
+    pub html_source: Option<String>,
     /// Plain-string projection of the rich HTML rendering. This is also used
     /// when quoting HTML-only mail in a reply.
     pub html_text: Option<String>,
-    /// Rich terminal representation produced once on the worker thread. Table
-    /// borders plus semantic links/emphasis survive into Ratatui, where they are
-    /// coloured using the active terminal theme.
+    /// Rich terminal representation produced by the worker at a fallback width
+    /// and reflowed by reader mode when the actual viewport width changes. Table
+    /// borders plus semantic links/emphasis survive into Ratatui.
     pub html_lines: Option<Vec<HtmlLine>>,
     /// Human-readable renderer label shown in reader mode.
     pub html_renderer: Option<String>,
+    /// Width used to produce html_text/html_lines. A zero value means no rich
+    /// layout has been produced yet.
+    pub html_render_width: usize,
     pub attachment_count: usize,
 }
 
@@ -190,6 +207,13 @@ impl MessageBody {
             }
         }
         if let Some(plain) = self.plain_text.as_deref().filter(|text| !text.trim().is_empty()) {
+            return plain;
+        }
+        if let Some(plain) = self
+            .plain_fallback
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
             return plain;
         }
         if let Some(html) = self.html_text.as_deref().filter(|text| !text.trim().is_empty()) {
@@ -223,11 +247,213 @@ impl MessageBody {
     }
 
     #[must_use]
-    pub fn plain_is_empty(&self) -> bool {
+    pub fn html_images(&self) -> Vec<String> {
+        self.html_image_candidates()
+            .into_iter()
+            .map(|image| image.source)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn html_image_candidates(&self) -> Vec<HtmlImageCandidate> {
+        let mut images = Vec::new();
+        if let Some(lines) = &self.html_lines {
+            for line in lines {
+                for span in &line.spans {
+                    let Some(source) = span.style.image.as_deref() else {
+                        continue;
+                    };
+                    if !matches!(
+                        source.split_once(':').map(|(scheme, _)| scheme),
+                        Some("http" | "https")
+                    ) || looks_like_tracking_image(source)
+                        || images
+                            .iter()
+                            .any(|existing: &HtmlImageCandidate| existing.source == source)
+                    {
+                        continue;
+                    }
+                    let (width_px, height_px) = self
+                        .html_source
+                        .as_deref()
+                        .and_then(|html| html_image_size_hint(html, source))
+                        .unwrap_or((None, None));
+                    images.push(HtmlImageCandidate {
+                        source: source.to_owned(),
+                        width_px,
+                        height_px,
+                    });
+                }
+            }
+        }
+        images
+    }
+
+    #[must_use]
+    pub fn has_plain_view(&self) -> bool {
         self.plain_text
             .as_deref()
-            .is_none_or(|text| text.trim().is_empty())
+            .is_some_and(|text| !text.trim().is_empty())
+            || self
+                .plain_fallback
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
     }
+
+    #[must_use]
+    pub fn plain_is_empty(&self) -> bool {
+        !self.has_plain_view()
+    }
+}
+
+fn html_image_size_hint(html: &str, source: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let mut cursor = 0usize;
+    while let Some(relative) = html[cursor..].find('<') {
+        let start = cursor + relative;
+        let Some(relative_end) = html[start..].find('>') else {
+            break;
+        };
+        let end = start + relative_end;
+        let tag = &html[start..=end];
+        cursor = end.saturating_add(1);
+
+        let trimmed = tag
+            .trim_start_matches('<')
+            .trim_start()
+            .to_ascii_lowercase();
+        if !trimmed.starts_with("img")
+            || trimmed
+                .chars()
+                .nth(3)
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':'))
+        {
+            continue;
+        }
+
+        let Some(src) = html_tag_attribute(tag, "src") else {
+            continue;
+        };
+        if decode_html_attribute(&src) != source {
+            continue;
+        }
+
+        let mut width = html_tag_attribute(tag, "width")
+            .as_deref()
+            .and_then(parse_css_pixel_value);
+        let mut height = html_tag_attribute(tag, "height")
+            .as_deref()
+            .and_then(parse_css_pixel_value);
+        if (width.is_none() || height.is_none())
+            && let Some(style) = html_tag_attribute(tag, "style")
+        {
+            width = width.or_else(|| css_property_pixels(&style, "width"));
+            height = height.or_else(|| css_property_pixels(&style, "height"));
+        }
+        return Some((width, height));
+    }
+    None
+}
+
+fn html_tag_attribute(tag: &str, wanted: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        while i < bytes.len()
+            && (bytes[i].is_ascii_whitespace() || matches!(bytes[i], b'<' | b'/' | b'>'))
+        {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'-' | b'_' | b':'))
+        {
+            i += 1;
+        }
+        if name_start == i {
+            i += 1;
+            continue;
+        }
+        let name = &tag[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let (value_start, value_end) = if matches!(bytes[i], b'"' | b'\'') {
+            let quote = bytes[i];
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            let end = i;
+            i = i.saturating_add(1);
+            (start, end)
+        } else {
+            let start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                i += 1;
+            }
+            (start, i)
+        };
+        if name.eq_ignore_ascii_case(wanted) {
+            return Some(tag[value_start..value_end].to_owned());
+        }
+    }
+    None
+}
+
+fn decode_html_attribute(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+        .replace("&#x26;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn parse_css_pixel_value(value: &str) -> Option<u32> {
+    let trimmed = value.trim().trim_end_matches("px").trim();
+    if trimmed.is_empty() || trimmed.contains('%') || trimmed.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    let value = trimmed.parse::<f64>().ok()?;
+    (value.is_finite() && value > 0.0).then(|| value.round() as u32)
+}
+
+fn css_property_pixels(style: &str, property: &str) -> Option<u32> {
+    style.split(';').find_map(|declaration| {
+        let (name, value) = declaration.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(property)
+            .then(|| parse_css_pixel_value(value))
+            .flatten()
+    })
+}
+
+fn looks_like_tracking_image(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    [
+        "/open/",
+        "opentracker",
+        "tracking/open",
+        "pixel",
+        "beacon",
+        "transparent.gif",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,7 +502,9 @@ impl Capabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageBody, MessageFlags, MessageId};
+    use super::{
+        HtmlImageCandidate, HtmlLine, HtmlSpan, HtmlSpanStyle, MessageBody, MessageFlags, MessageId,
+    };
 
     #[test]
     fn maildir_flags_round_trip() {
@@ -296,13 +524,82 @@ mod tests {
     }
 
     #[test]
+    fn html_images_skip_tracking_pixels_and_duplicate_sources() {
+        let image_span = |source: &str| HtmlSpan {
+            text: "image".into(),
+            style: HtmlSpanStyle {
+                image: Some(source.into()),
+                ..HtmlSpanStyle::default()
+            },
+        };
+        let body = MessageBody {
+            id: MessageId("images".into()),
+            plain_text: None,
+            plain_fallback: None,
+            html_source: Some("<img>".into()),
+            html_text: Some("image".into()),
+            html_lines: Some(vec![HtmlLine {
+                spans: vec![
+                    image_span("https://example.com/hero.png"),
+                    image_span("https://example.com/hero.png"),
+                    image_span("https://tracker.example/open/pixel.gif"),
+                    image_span("cid:embedded-logo"),
+                ],
+            }]),
+            html_renderer: Some("test".into()),
+            html_render_width: 80,
+            attachment_count: 0,
+        };
+        assert_eq!(body.html_images(), vec!["https://example.com/hero.png".to_owned()]);
+    }
+
+    #[test]
+    fn html_image_candidates_preserve_sender_pixel_size_hints() {
+        let source = "https://example.com/logo@2x.png?a=1&b=2";
+        let body = MessageBody {
+            id: MessageId("sized-image".into()),
+            plain_text: None,
+            plain_fallback: None,
+            html_source: Some(
+                r#"<img src="https://example.com/logo@2x.png?a=1&amp;b=2" width="74" height="24" style="width: 148px; height: 48px">"#
+                    .to_owned(),
+            ),
+            html_text: Some("logo".into()),
+            html_lines: Some(vec![HtmlLine {
+                spans: vec![HtmlSpan {
+                    text: "logo".into(),
+                    style: HtmlSpanStyle {
+                        image: Some(source.into()),
+                        ..HtmlSpanStyle::default()
+                    },
+                }],
+            }]),
+            html_renderer: Some("test".into()),
+            html_render_width: 80,
+            attachment_count: 0,
+        };
+
+        assert_eq!(
+            body.html_image_candidates(),
+            vec![HtmlImageCandidate {
+                source: source.into(),
+                width_px: Some(74),
+                height_px: Some(24),
+            }]
+        );
+    }
+
+    #[test]
     fn body_falls_back_to_html_when_plain_is_empty() {
         let body = MessageBody {
             id: MessageId("1".into()),
             plain_text: Some("   ".into()),
+            plain_fallback: None,
+            html_source: Some("<b>HTML version</b>".into()),
             html_text: Some("HTML version".into()),
             html_lines: None,
             html_renderer: Some("test".into()),
+            html_render_width: 80,
             attachment_count: 0,
         };
         assert_eq!(body.display_text(false), "HTML version");

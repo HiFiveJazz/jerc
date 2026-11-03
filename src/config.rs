@@ -93,6 +93,11 @@ pub struct UiConfig {
     /// takes precedence on the next launch.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Fetch remote HTML images automatically. Disabled by default because a
+    /// direct image request can disclose the user's IP address and read time.
+    /// Press `I` in the reader to opt in/out for the current session.
+    #[serde(default)]
+    pub remote_images: bool,
 }
 
 impl Default for UiConfig {
@@ -102,6 +107,7 @@ impl Default for UiConfig {
             message_width_percent: default_message_width_percent(),
             mailbox_width_percent: default_mailbox_width_percent(),
             theme: default_theme(),
+            remote_images: false,
         }
     }
 }
@@ -200,6 +206,7 @@ mod tests {
         assert_eq!(config.ui.sidebar_width, 27);
         assert_eq!(config.ui.mailbox_width_percent, 35);
         assert_eq!(config.ui.theme, "nord");
+        assert!(!config.ui.remote_images);
     }
 
     #[test]

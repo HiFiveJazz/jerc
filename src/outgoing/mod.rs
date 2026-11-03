@@ -7,8 +7,20 @@ use crate::model::OutgoingMessage;
 
 pub use smtp::{SmtpAuth, SmtpSender, SmtpSource};
 
+#[derive(Debug, Clone)]
+pub struct SendReceipt {
+    /// Exact RFC 5322 bytes accepted by the SMTP relay. Reuse these bytes for
+    /// the Sent copy so the server-side copy has the same Message-ID and body.
+    pub raw_message: Vec<u8>,
+    /// Short status token returned by the relay (for example `2.0.0`).
+    pub smtp_status: String,
+    /// Gmail stores SMTP-submitted messages in Sent itself; most generic SMTP
+    /// relays do not. This lets the worker avoid creating a duplicate there.
+    pub server_files_sent_copy: bool,
+}
+
 pub trait MailSender: Send {
-    fn send(&mut self, message: &OutgoingMessage) -> Result<()>;
+    fn send(&mut self, message: &OutgoingMessage) -> Result<SendReceipt>;
 }
 
 pub fn from_account(account: &AccountConfig) -> Result<Option<Box<dyn MailSender>>> {
