@@ -44,6 +44,7 @@ impl MailBackend for FakeBackend {
             html_renderer: None,
             html_render_width: 0,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         })
     }
     fn fetch_raw(&mut self, _mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
@@ -100,6 +101,7 @@ fn worker_preserves_pagination_metadata() {
 
 struct AppendingBackend {
     appended: Arc<Mutex<Vec<(String, Vec<u8>, bool)>>>,
+    fail_append: bool,
 }
 
 impl MailBackend for AppendingBackend {
@@ -134,12 +136,14 @@ impl MailBackend for AppendingBackend {
             html_renderer: None,
             html_render_width: 0,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         })
     }
     fn fetch_raw(&mut self, _mailbox: &str, _id: &MessageId) -> Result<Vec<u8>> {
         Ok(vec![])
     }
     fn append_message(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
+        if self.fail_append { anyhow::bail!("simulated Sent append failure"); }
         self.appended
             .lock()
             .unwrap()
@@ -175,6 +179,7 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
     let appended = Arc::new(Mutex::new(Vec::new()));
     let backend = AppendingBackend {
         appended: Arc::clone(&appended),
+        fail_append: false,
     };
     let (tx, rx) = sync_channel(8);
     let mut worker = WorkerHandle::spawn(0, Box::new(backend), Some(Box::new(FakeSender)), tx);
@@ -184,6 +189,10 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
                 from: "sender@example.com".to_owned(),
                 to: "receiver@example.com".to_owned(),
                 cc: String::new(),
+                bcc: String::new(),
+                html_body: None,
+                attachments: Vec::new(),
+                custom_headers: Vec::new(),
                 subject: "hello".to_owned(),
                 body: "body".to_owned(),
                 in_reply_to: None,
@@ -216,5 +225,33 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
     assert_eq!(appended[0].0, "Sent");
     assert!(appended[0].2);
     assert!(appended[0].1.windows(5).any(|window| window == b"hello"));
+    worker.shutdown();
+}
+
+
+#[test]
+fn sent_append_failure_is_reported_and_not_retried_as_smtp_send() {
+    let appended = Arc::new(Mutex::new(Vec::new()));
+    let backend = AppendingBackend { appended: Arc::clone(&appended), fail_append: true };
+    let (tx, rx) = sync_channel(8);
+    let mut worker = WorkerHandle::spawn(0, Box::new(backend), Some(Box::new(FakeSender)), tx);
+    worker.post(ActionKind::Send {
+        message: OutgoingMessage {
+            from: "sender@example.com".into(), to: "receiver@example.com".into(),
+            cc: String::new(), bcc: String::new(), subject: "failure test".into(),
+            body: "test".into(), html_body: None, attachments: vec![], custom_headers: vec![],
+            in_reply_to: None, references: vec![], forwarded_raw: None,
+        },
+        sent_mailbox: Some("Sent".into()),
+    }).unwrap();
+    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+        panic!("worker event expected");
+    };
+    let WorkerEventKind::MessageSent { sent_copy_saved, sent_copy_warning, .. } = event.kind else {
+        panic!("SMTP accepted message but worker returned error");
+    };
+    assert!(!sent_copy_saved);
+    assert!(sent_copy_warning.unwrap().contains("SMTP accepted"));
+    assert!(appended.lock().unwrap().is_empty());
     worker.shutdown();
 }

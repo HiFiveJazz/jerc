@@ -11,11 +11,12 @@ use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
 use crate::app::{Command, Focus, HELP_ENTRIES, command_for_key};
 use crate::config::Config;
-use crate::mail::render_html_for_terminal;
+use crate::mail::{parse_body, render_html_for_terminal};
+use crate::outgoing::{ReplyAudience, reply_recipients, reply_subject, forward_subject, inline_forward_parts, forward_html, forward_attribution, FORWARD_SEPARATOR};
 use crate::mail_image::{MailImageEvent, MailImageLoader};
 use crate::model::{
     Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessageSummary,
-    OutgoingMessage,
+    OutgoingAttachment, OutgoingMessage,
 };
 use crate::theme::{Theme, load_themes, persist_theme, persisted_theme, theme_index};
 use crate::worker::{ActionKind, RuntimeEvent, WorkerEvent, WorkerEventKind, WorkerHandle};
@@ -26,6 +27,13 @@ const MAX_COUNT_PREFIX: usize = 99_999;
 const MESSAGE_SCROLL_OFF: usize = 4;
 const READER_SCROLL_OFF: usize = 3;
 const PAGE_PREFETCH_MIN: usize = 48;
+
+/// Only a completed background poll against a known Inbox baseline can
+/// trigger a new-message alert. STATUS counts are not message identities;
+/// an equal count with concurrent arrival/deletion needs future UID tracking.
+fn inbox_new_mail_count(from_poll: bool, known: bool, previous: usize, now: usize) -> usize {
+    if from_poll && known { now.saturating_sub(previous) } else { 0 }
+}
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -105,11 +113,14 @@ impl StatusLine {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComposeField {
     To,
     Cc,
+    Bcc,
     Subject,
+    Attachments,
+    Headers,
     Body,
 }
 
@@ -117,8 +128,11 @@ impl ComposeField {
     const fn next(self) -> Self {
         match self {
             Self::To => Self::Cc,
-            Self::Cc => Self::Subject,
-            Self::Subject => Self::Body,
+            Self::Cc => Self::Bcc,
+            Self::Bcc => Self::Subject,
+            Self::Subject => Self::Attachments,
+            Self::Attachments => Self::Headers,
+            Self::Headers => Self::Body,
             Self::Body => Self::To,
         }
     }
@@ -127,13 +141,16 @@ impl ComposeField {
         match self {
             Self::To => Self::Body,
             Self::Cc => Self::To,
-            Self::Subject => Self::Cc,
-            Self::Body => Self::Subject,
+            Self::Bcc => Self::Cc,
+            Self::Subject => Self::Bcc,
+            Self::Attachments => Self::Subject,
+            Self::Headers => Self::Attachments,
+            Self::Body => Self::Headers,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComposeMode {
     Normal,
     Insert,
@@ -151,10 +168,13 @@ impl ComposeMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Composer {
     pub to: String,
     pub cc: String,
+    pub bcc: String,
+    pub attachments: String,
+    pub headers: String,
     pub subject: String,
     pub body: String,
     pub field: ComposeField,
@@ -163,18 +183,22 @@ pub struct Composer {
     pub visual_anchor: Option<usize>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
-    /// Exact original RFC 5322 message bytes when forwarding. These are sent
-    /// as a message/rfc822 attachment rather than the terminal-rendered body.
+    /// Original RFC 5322 message retained to reconstruct HTML/attachments
+    /// for inline forwarding, including postponed drafts. Never serialized as
+    /// a .eml attachment in the default forwarding workflow.
     pub forwarded_raw: Option<Vec<u8>>,
     pub sending: bool,
     pub confirm_send: bool,
 }
 
 impl Composer {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             to: String::new(),
             cc: String::new(),
+            bcc: String::new(),
+            attachments: String::new(),
+            headers: String::new(),
             subject: String::new(),
             body: String::new(),
             field: ComposeField::To,
@@ -190,11 +214,7 @@ impl Composer {
     }
 
     fn reply(message: &MessageSummary, body: Option<&MessageBody>, quote: bool) -> Self {
-        let subject = if message.subject.to_ascii_lowercase().starts_with("re:") {
-            message.subject.clone()
-        } else {
-            format!("Re: {}", message.subject)
-        };
+        let subject = reply_subject(&message.subject);
         let mut references = message.references.clone();
         if let Some(id) = &message.message_id {
             if references.last() != Some(id) {
@@ -230,6 +250,9 @@ impl Composer {
                 format!("{} <{}>", message.from_name, message.from_address)
             },
             cc: String::new(),
+            bcc: String::new(),
+            attachments: String::new(),
+            headers: String::new(),
             subject,
             body,
             field: ComposeField::Body,
@@ -244,33 +267,18 @@ impl Composer {
         }
     }
 
-    fn forward(message: &MessageSummary, raw: Vec<u8>) -> Self {
-        let subject = if message.subject.to_ascii_lowercase().starts_with("fwd:") {
-            message.subject.clone()
-        } else {
-            format!("Fwd: {}", message.subject)
-        };
-        let body = format!(
-            "\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\n\n[Original message attached as message/rfc822]\n",
-            display_sender(message),
-            reply_date_label(message),
-            message.subject,
-        );
-        Self {
-            to: String::new(),
-            cc: String::new(),
-            subject,
-            body,
-            field: ComposeField::To,
-            mode: ComposeMode::Insert,
-            cursor: 0,
-            visual_anchor: None,
-            in_reply_to: None,
-            references: Vec::new(),
-            forwarded_raw: Some(raw),
-            sending: false,
-            confirm_send: false,
-        }
+    fn forward(message: &MessageSummary, raw: Vec<u8>) -> anyhow::Result<Self> {
+        let parts = inline_forward_parts(&raw)?;
+        let subject = forward_subject(&message.subject);
+        let attribution = forward_attribution(&raw)?;
+        let body = format!("\n\n{attribution}\n{}\n", parts.plain);
+        Ok(Self {
+            to: String::new(), cc: String::new(), bcc: String::new(),
+            attachments: String::new(), headers: String::new(), subject, body,
+            field: ComposeField::To, mode: ComposeMode::Insert, cursor: 0,
+            visual_anchor: None, in_reply_to: None, references: Vec::new(),
+            forwarded_raw: Some(raw), sending: false, confirm_send: false,
+        })
     }
 
     #[must_use]
@@ -278,7 +286,10 @@ impl Composer {
         match self.field {
             ComposeField::To => &self.to,
             ComposeField::Cc => &self.cc,
+            ComposeField::Bcc => &self.bcc,
             ComposeField::Subject => &self.subject,
+            ComposeField::Attachments => &self.attachments,
+            ComposeField::Headers => &self.headers,
             ComposeField::Body => &self.body,
         }
     }
@@ -287,7 +298,10 @@ impl Composer {
         match self.field {
             ComposeField::To => &mut self.to,
             ComposeField::Cc => &mut self.cc,
+            ComposeField::Bcc => &mut self.bcc,
             ComposeField::Subject => &mut self.subject,
+            ComposeField::Attachments => &mut self.attachments,
+            ComposeField::Headers => &mut self.headers,
             ComposeField::Body => &mut self.body,
         }
     }
@@ -480,7 +494,7 @@ impl Composer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposeIntent {
-    Reply { quote: bool },
+    Reply { quote: bool, audience: ReplyAudience },
     Forward,
 }
 
@@ -534,6 +548,9 @@ pub struct AccountState {
     pub pending_seen: HashSet<MessageId>,
     pub mailbox_status_queue: VecDeque<String>,
     pub mailbox_status_inflight: Option<u64>,
+    inbox_poll_inflight: Option<u64>,
+    pending_inbox_refresh: bool,
+    pending_mutation_labels: HashMap<u64, &'static str>,
     pub connecting: bool,
     pub mailboxes_loading: bool,
     pub messages_loading: bool,
@@ -801,6 +818,8 @@ impl AccountState {
 enum MutationKind {
     Delete,
     Move { destination: String },
+    Archive { destination: String },
+    Unarchive { destination: String },
 }
 
 #[derive(Debug, Clone)]
@@ -889,6 +908,9 @@ pub struct App {
     pub focus: Focus,
     pub status: StatusLine,
     pub should_quit: bool,
+    inbox_poll_interval: Duration,
+    new_mail_bell_enabled: bool,
+    new_mail_bell_pending: bool,
     pub mailbox_width_percent: u16,
     pub sidebar_visible: bool,
     pub preview_split: bool,
@@ -912,6 +934,12 @@ pub struct App {
     reader_image_target_width: u16,
     reader_image_target_height: u16,
     pub reader_images_enabled: bool,
+    pub show_message_ids: bool,
+    pub attachment_picker_visible: bool,
+    pub attachment_selection: usize,
+    pub attachment_files: Vec<OutgoingAttachment>,
+    attachment_pending: Option<MessageId>,
+    attachment_preview: Option<Protocol>,
     pub help_visible: bool,
     pub help_query: String,
     pub help_selected: usize,
@@ -928,6 +956,7 @@ pub struct App {
     pub confirmation: Option<MutationConfirmation>,
     pub composer: Option<Composer>,
     pending_compose: Option<PendingCompose>,
+    resumed_draft_account: Option<usize>,
 }
 
 impl App {
@@ -972,6 +1001,9 @@ impl App {
                 pending_seen: HashSet::new(),
                 mailbox_status_queue: VecDeque::new(),
                 mailbox_status_inflight: None,
+                inbox_poll_inflight: None,
+                pending_inbox_refresh: false,
+                pending_mutation_labels: HashMap::new(),
                 connecting: false,
                 mailboxes_loading: false,
                 messages_loading: false,
@@ -990,6 +1022,9 @@ impl App {
             focus: Focus::Messages,
             status: StatusLine::info("starting workers…"),
             should_quit: false,
+            inbox_poll_interval: Duration::from_secs(config.ui.inbox_poll_seconds.clamp(10, 3600)),
+            new_mail_bell_enabled: config.ui.new_mail_bell,
+            new_mail_bell_pending: false,
             mailbox_width_percent: config.ui.mailbox_width_percent.clamp(20, 50),
             sidebar_visible: true,
             preview_split: false,
@@ -1013,6 +1048,12 @@ impl App {
             reader_image_target_width: 48,
             reader_image_target_height: 18,
             reader_images_enabled: config.ui.remote_images,
+            show_message_ids: false,
+            attachment_picker_visible: false,
+            attachment_selection: 0,
+            attachment_files: Vec::new(),
+            attachment_pending: None,
+            attachment_preview: None,
             help_visible: false,
             help_query: String::new(),
             help_selected: 0,
@@ -1029,6 +1070,7 @@ impl App {
             confirmation: None,
             composer: None,
             pending_compose: None,
+            resumed_draft_account: None,
         }
     }
 
@@ -1046,6 +1088,32 @@ impl App {
         &self.themes[self.theme_index.min(self.themes.len().saturating_sub(1))]
     }
 
+    #[must_use]
+    pub fn inbox_poll_interval(&self) -> Duration { self.inbox_poll_interval }
+
+    /// Poll only Inbox counts, not every message body or folder. IMAP servers
+    /// without IDLE can still report new mail with one inexpensive STATUS.
+    pub fn poll_inboxes(&mut self) {
+        for account in &mut self.accounts {
+            if account.capabilities.is_none() || account.mailboxes_loading
+                || account.inbox_poll_inflight.is_some()
+                || account.mailbox_status_inflight.is_some()
+                || account.pending_mutations > 0
+            { continue; }
+            let Some(inbox) = account.mailboxes.iter()
+                .find(|mailbox| mailbox.role == MailboxRole::Inbox)
+                .map(|mailbox| mailbox.name.clone()) else { continue; };
+            if let Ok(request) = account.worker.post(ActionKind::MailboxStatus(inbox)) {
+                account.inbox_poll_inflight = Some(request);
+            }
+        }
+    }
+
+    /// Terminal BEL is emitted in the main runtime, never from a worker.
+    pub fn take_new_mail_bell(&mut self) -> bool {
+        std::mem::take(&mut self.new_mail_bell_pending)
+    }
+
     pub fn bootstrap(&mut self) {
         for account in &mut self.accounts {
             if account.worker.post(ActionKind::Connect).is_ok() {
@@ -1055,6 +1123,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.attachment_picker_visible {
+            self.handle_attachment_picker_key(key);
+            return;
+        }
         if self.confirmation.is_some() {
             self.handle_confirmation_key(key);
             return;
@@ -1073,6 +1145,10 @@ impl App {
         }
         if self.account().is_some_and(|account| account.search_editing) {
             self.handle_search_key(key);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+            self.restore_postponed_composer();
             return;
         }
         if self.message_open && self.handle_reader_key(key) {
@@ -1168,6 +1244,14 @@ impl App {
             }
             KeyCode::Char('O') => {
                 self.open_original_html();
+                true
+            }
+            KeyCode::Char('m') => {
+                self.toggle_message_ids();
+                true
+            }
+            KeyCode::Char('z') => {
+                self.open_attachment_picker();
                 true
             }
             KeyCode::Char('0') if self.count_prefix.is_none() => {
@@ -1315,6 +1399,10 @@ impl App {
     }
 
     pub fn handle_worker_event(&mut self, event: WorkerEvent) {
+        let own_addresses = self.accounts.iter()
+            .filter_map(|a| a.from.parse::<lettre::message::Mailbox>().ok())
+            .map(|a| a.email.to_string())
+            .collect::<Vec<_>>();
         let Some(account) = self.accounts.get_mut(event.account) else {
             return;
         };
@@ -1376,10 +1464,41 @@ impl App {
                 if account.mailbox_status_inflight == Some(event.request_id) {
                     account.mailbox_status_inflight = None;
                 }
+                let from_poll = account.inbox_poll_inflight == Some(event.request_id);
+                if from_poll { account.inbox_poll_inflight = None; }
+                let mut new_count = 0usize;
                 if let Some(mailbox) = account.mailboxes.iter_mut().find(|m| m.name == name) {
+                    new_count = inbox_new_mail_count(
+                        from_poll && mailbox.role == MailboxRole::Inbox,
+                        mailbox.counts_known,
+                        mailbox.total,
+                        total,
+                    );
                     mailbox.total = total;
                     mailbox.unread = unread;
                     mailbox.counts_known = true;
+                }
+                if new_count > 0 {
+                    // A cached Inbox from another tab is now stale even if the
+                    // user is browsing a different mailbox/account.
+                    account.mailbox_cache.remove(&name);
+                    self.status = StatusLine::temporary(format!(
+                        "{} new message(s) in {}", new_count, account.name,
+                    ), Duration::from_secs(6));
+                    if self.new_mail_bell_enabled { self.new_mail_bell_pending = true; }
+                    if account.current_mailbox.as_deref() == Some(name.as_str()) {
+                        // Never replace the reader underneath someone who is
+                        // in the middle of an email. Defer the page refresh
+                        // until the reader closes; the count still updates.
+                        if self.message_open && event.account == self.account_index
+                            || account.page_inflight.is_some()
+                        {
+                            account.pending_inbox_refresh = true;
+                        } else {
+                            account.restore_message_index = Some(account.message_index);
+                            let _ = account.request_mailbox_page(name, 0);
+                        }
+                    }
                 }
                 Self::pump_mailbox_status(account);
             }
@@ -1487,7 +1606,7 @@ impl App {
                 if search_needs_more || browse_needs_more {
                     let _ = account.request_next_page();
                 }
-                if first_page {
+                if first_page && event.account == self.account_index && !self.message_open {
                     self.visual_anchor = None;
                     self.focus = Focus::Messages;
                 }
@@ -1504,6 +1623,12 @@ impl App {
                 if self.preview_split {
                     account.request_selected_body();
                 }
+                if account.pending_inbox_refresh && account.page_inflight.is_none()
+                    && !(self.message_open && event.account == self.account_index)
+                {
+                    account.pending_inbox_refresh = false;
+                    let _ = account.request_mailbox_page(name.clone(), 0);
+                }
                 let selected_mailbox = account
                     .selected_mailbox()
                     .map(|mailbox| mailbox.name.clone());
@@ -1515,23 +1640,6 @@ impl App {
                 account.pending_bodies.remove(&id);
                 account.bodies.insert(id.clone(), body);
 
-                let pending = self.pending_compose.as_ref().filter(|pending| {
-                    pending.account == event.account && pending.message_id == id
-                });
-                let composer = pending.and_then(|pending| {
-                    let message = account
-                        .messages
-                        .iter()
-                        .find(|message| message.id == pending.message_id)?;
-                    let body = account.bodies.get(&pending.message_id);
-                    match pending.intent {
-                        ComposeIntent::Reply { quote } => {
-                            Some(Composer::reply(message, body, quote))
-                        }
-                        ComposeIntent::Forward => None,
-                    }
-                });
-
                 if (self.message_open || self.preview_split)
                     && account
                         .selected_message()
@@ -1541,29 +1649,48 @@ impl App {
                 }
                 Self::pump_mailbox_status(account);
 
-                if let Some(composer) = composer {
-                    self.pending_compose = None;
-                    self.composer = Some(composer);
-                    self.status = StatusLine::info("ready to compose");
+            }
+            WorkerEventKind::AttachmentsLoaded { id, attachments } => {
+                if self.attachment_pending.as_ref() == Some(&id) && self.attachment_picker_visible {
+                    self.attachment_files = attachments;
+                    self.attachment_selection = 0;
+                    self.attachment_pending = None;
+                    self.status = StatusLine::info(format!("{} attachment(s) loaded", self.attachment_files.len()));
                 }
             }
             WorkerEventKind::RawLoaded { id, raw } => {
                 let pending = self.pending_compose.as_ref().filter(|pending| {
-                    pending.account == event.account
-                        && pending.message_id == id
-                        && pending.intent == ComposeIntent::Forward
+                    pending.account == event.account && pending.message_id == id
                 });
-                let composer = pending.and_then(|pending| {
-                    account
-                        .messages
-                        .iter()
-                        .find(|message| message.id == pending.message_id)
-                        .map(|message| Composer::forward(message, raw))
+                let result = pending.and_then(|pending| {
+                    let message = account.messages.iter()
+                        .find(|message| message.id == pending.message_id)?;
+                    Some(match pending.intent {
+                        ComposeIntent::Forward => Composer::forward(message, raw),
+                        ComposeIntent::Reply { quote, audience } => {
+                            (|| -> anyhow::Result<Composer> {
+                                let targets = reply_recipients(&raw, audience, &own_addresses)?;
+                                let body = parse_body(id, &raw)?;
+                                let mut composer = Composer::reply(message, Some(&body), quote);
+                                composer.to = targets.to;
+                                composer.cc = targets.cc;
+                                Ok(composer)
+                            })()
+                        }
+                    })
                 });
-                if let Some(composer) = composer {
-                    self.pending_compose = None;
-                    self.composer = Some(composer);
-                    self.status = StatusLine::info("ready to forward original message");
+                match result {
+                    Some(Ok(composer)) => {
+                        self.pending_compose = None;
+                        self.composer = Some(composer);
+                        self.resumed_draft_account = None;
+                        self.status = StatusLine::info("ready to compose reply/forward");
+                    }
+                    Some(Err(error)) => {
+                        self.pending_compose = None;
+                        self.status = StatusLine::error(format!("cannot prepare reply: {error:#}"));
+                    }
+                    None => {}
                 }
             }
             WorkerEventKind::MessageExported { path } => {
@@ -1599,7 +1726,9 @@ impl App {
             }
             WorkerEventKind::MutationComplete => {
                 account.pending_mutations = account.pending_mutations.saturating_sub(1);
-                self.status = StatusLine::temporary("mail updated", Duration::from_secs(2));
+                let message = account.pending_mutation_labels.remove(&event.request_id)
+                    .unwrap_or("mail updated");
+                self.status = StatusLine::temporary(message, Duration::from_secs(2));
             }
             WorkerEventKind::MessageSent {
                 smtp_status,
@@ -1646,6 +1775,12 @@ impl App {
                 }
                 Self::pump_mailbox_status(account);
 
+                if self.resumed_draft_account == Some(event.account) {
+                    if let Ok(root) = Self::postponed_drafts_root() {
+                        let _ = crate::outgoing::drafts::delete_draft(&root, &account.name);
+                    }
+                    self.resumed_draft_account = None;
+                }
                 if event.account == self.account_index {
                     self.composer = None;
                 }
@@ -1667,9 +1802,22 @@ impl App {
                 };
             }
             WorkerEventKind::Error(error) => {
+                if account.inbox_poll_inflight == Some(event.request_id) {
+                    // Background STATUS is best-effort: a transient server
+                    // failure must not cancel an in-progress preview/compose
+                    // or reset the mailbox browser state.
+                    account.inbox_poll_inflight = None;
+                    self.status = StatusLine::temporary(
+                        format!("{}: Inbox check failed ({error})", account.name),
+                        Duration::from_secs(4),
+                    );
+                    return;
+                }
                 let mutation_failed = account.pending_mutations > 0;
                 let seen_failed = !account.pending_seen.is_empty();
                 account.pending_mutations = 0;
+                account.pending_mutation_labels.clear();
+                account.inbox_poll_inflight = None;
                 account.connecting = false;
                 account.mailboxes_loading = false;
                 account.messages_loading = false;
@@ -1788,6 +1936,14 @@ impl App {
                 self.count_prefix = None;
                 self.archive_selected();
             }
+            Command::Unarchive => {
+                self.count_prefix = None;
+                self.unarchive_selected();
+            }
+            Command::Attachments => {
+                self.count_prefix = None;
+                self.open_attachment_picker();
+            }
             Command::Search => {
                 self.count_prefix = None;
                 self.begin_search();
@@ -1829,6 +1985,15 @@ impl App {
                 self.count_prefix = None;
                 self.toggle_remote_images();
             }
+            Command::ToggleBell => {
+                self.count_prefix = None;
+                self.new_mail_bell_enabled = !self.new_mail_bell_enabled;
+                self.status = StatusLine::temporary(
+                    if self.new_mail_bell_enabled { "new-mail bell enabled" }
+                    else { "new-mail bell muted" },
+                    Duration::from_secs(2),
+                );
+            }
             Command::OpenOriginal => {
                 self.count_prefix = None;
                 self.open_original_html();
@@ -1852,6 +2017,14 @@ impl App {
             Command::Forward => {
                 self.count_prefix = None;
                 self.begin_forward();
+            }
+            Command::ReplyAll => {
+                self.count_prefix = None;
+                self.begin_reply_all();
+            }
+            Command::ReplyList => {
+                self.count_prefix = None;
+                self.begin_reply_list();
             }
             Command::Escape => {
                 self.count_prefix = None;
@@ -2577,6 +2750,13 @@ impl App {
         if let Some(account) = self.account_mut() {
             account.smooth_preview_target = None;
             account.preview_scroll = 0;
+            if account.pending_inbox_refresh && account.page_inflight.is_none() {
+                account.pending_inbox_refresh = false;
+                if let Some(name) = account.current_mailbox.clone() {
+                    account.restore_message_index = Some(account.message_index);
+                    let _ = account.request_mailbox_page(name, 0);
+                }
+            }
         }
     }
 
@@ -2910,6 +3090,27 @@ impl App {
         self.start_mutation(source, ids, kind);
     }
 
+    fn unarchive_selected(&mut self) {
+        let ids = self.selected_message_ids();
+        if ids.is_empty() { return; }
+        let Some(account) = self.account() else { return; };
+        let Some(source) = account.current_mailbox.clone() else { return; };
+        if !account.mailboxes.iter().any(|m| m.name == source && m.role == MailboxRole::Archive) {
+            self.status = StatusLine::temporary(
+                "open Archive / All Mail, then press U to restore to INBOX",
+                Duration::from_secs(3),
+            );
+            return;
+        }
+        let Some(inbox) = account.mailboxes.iter()
+            .find(|m| m.role == MailboxRole::Inbox && m.name != source)
+            .map(|m| m.name.clone()) else {
+                self.status = StatusLine::error("no INBOX available to restore archived mail");
+                return;
+            };
+        self.start_mutation(source, ids, MutationKind::Unarchive { destination: inbox });
+    }
+
     fn archive_selected(&mut self) {
         let ids = self.selected_message_ids();
         if ids.is_empty() {
@@ -2921,6 +3122,10 @@ impl App {
         let Some(source) = account.current_mailbox.clone() else {
             return;
         };
+        if account.mailboxes.iter().any(|mailbox| mailbox.name == source && mailbox.role == MailboxRole::Archive) {
+            self.status = StatusLine::temporary("message is already in Archive / All Mail", Duration::from_secs(2));
+            return;
+        }
         let destination = account
             .mailboxes
             .iter()
@@ -2933,7 +3138,20 @@ impl App {
             );
             return;
         };
-        self.start_mutation(source, ids, MutationKind::Move { destination });
+        // Gmail All Mail is virtual. The IMAP UID delete/expunge used to
+        // remove INBOX membership depends on the account's deletion settings,
+        // so require explicit confirmation instead of hiding the risk.
+        if source.eq_ignore_ascii_case("INBOX")
+            && (destination.to_ascii_lowercase().starts_with("[gmail]/")
+                || destination.to_ascii_lowercase().starts_with("[googlemail]/"))
+        {
+            self.confirmation = Some(MutationConfirmation {
+                prompt: format!("Archive {} Gmail message(s)? This uses IMAP expunge; check Gmail deletion settings first. [y/N]", ids.len()),
+                source, ids, kind: MutationKind::Archive { destination },
+            });
+        } else {
+            self.start_mutation(source, ids, MutationKind::Archive { destination });
+        }
     }
 
     fn handle_confirmation_key(&mut self, key: KeyEvent) {
@@ -2964,17 +3182,32 @@ impl App {
                 ids: ids.clone(),
             },
             MutationKind::Move { destination } => ActionKind::MoveMany {
-                source: source.clone(),
-                destination: destination.clone(),
-                ids: ids.clone(),
+                source: source.clone(), destination: destination.clone(), ids: ids.clone(),
+            },
+            MutationKind::Archive { destination } => ActionKind::ArchiveMany {
+                source: source.clone(), destination: destination.clone(), ids: ids.clone(),
+            },
+            MutationKind::Unarchive { destination } => ActionKind::UnarchiveMany {
+                source: source.clone(), destination: destination.clone(), ids: ids.clone(),
             },
         };
 
+        let moving_to_trash = matches!(&kind, MutationKind::Move { destination }
+            if self.account().is_some_and(|account| account.mailboxes.iter()
+                .any(|mailbox| mailbox.name == *destination && mailbox.role == MailboxRole::Trash)));
+        let (pending_label, complete_label) = match &kind {
+            MutationKind::Delete => ("permanently deleting message(s)…", "message(s) permanently deleted"),
+            MutationKind::Move { .. } if moving_to_trash => ("deleting message(s) to Trash…", "message(s) deleted to Trash"),
+            MutationKind::Move { .. } => ("moving message(s)…", "message(s) moved"),
+            MutationKind::Archive { .. } => ("archiving message(s)…", "message(s) archived"),
+            MutationKind::Unarchive { .. } => ("restoring message(s) to INBOX…", "message(s) restored to INBOX"),
+        };
         let started = self
             .account_mut()
             .is_some_and(|account| match account.worker.post(action) {
-                Ok(_) => {
+                Ok(request) => {
                     account.pending_mutations = account.pending_mutations.saturating_add(1);
+                    account.pending_mutation_labels.insert(request, complete_label);
                     true
                 }
                 Err(_) => false,
@@ -2989,10 +3222,7 @@ impl App {
         if self.message_open {
             self.close_message();
         }
-        self.status = StatusLine::info(match kind {
-            MutationKind::Delete => "deleting message(s)…",
-            MutationKind::Move { .. } => "moving message(s)…",
-        });
+        self.status = StatusLine::info(pending_label);
     }
 
     fn remove_messages_locally(&mut self, source: &str, ids: &[MessageId], kind: &MutationKind) {
@@ -3006,7 +3236,20 @@ impl App {
             .filter(|message| selected_ids.contains(&message.id))
             .cloned()
             .collect();
-        if removed.is_empty() {
+        if removed.is_empty() { return; }
+        // Gmail All Mail is a view containing both archived and INBOX messages.
+        // Unarchiving adds the INBOX label without removing that All Mail row.
+        if let MutationKind::Unarchive { destination } = kind
+            && (source.to_ascii_lowercase().starts_with("[gmail]/")
+                || source.to_ascii_lowercase().starts_with("[googlemail]/"))
+        {
+            account.mailbox_cache.remove(destination);
+            if let Some(mailbox) = account.mailboxes.iter_mut()
+                .find(|mailbox| mailbox.name == *destination && mailbox.counts_known)
+            {
+                mailbox.total = mailbox.total.saturating_add(removed.len());
+                mailbox.unread = mailbox.unread.saturating_add(removed.iter().filter(|m| m.unread()).count());
+            }
             return;
         }
         account.messages.retain(|message| !selected_ids.contains(&message.id));
@@ -3029,7 +3272,9 @@ impl App {
             mailbox.total = mailbox.total.saturating_sub(removed.len());
             mailbox.unread = mailbox.unread.saturating_sub(removed_unread);
         }
-        if let MutationKind::Move { destination } = kind {
+        if let MutationKind::Move { destination }
+            | MutationKind::Archive { destination }
+            | MutationKind::Unarchive { destination } = kind {
             // A destination cache cannot know about the moved messages without
             // a server response containing their destination UIDs. Drop only
             // that cache; the active source list stays updated locally.
@@ -3415,6 +3660,93 @@ impl App {
         );
     }
 
+    fn toggle_message_ids(&mut self) {
+        self.show_message_ids = !self.show_message_ids;
+        self.status = StatusLine::temporary(
+            if self.show_message_ids { "Message-ID shown" } else { "Message-ID hidden" },
+            Duration::from_secs(2),
+        );
+    }
+
+    fn open_attachment_picker(&mut self) {
+        let Some(account) = self.account() else { return; };
+        let Some(message) = account.selected_message() else { return; };
+        let Some(mailbox) = account.current_mailbox.clone() else { return; };
+        let id = message.id.clone();
+        if account.worker.post(ActionKind::FetchAttachments { mailbox, id: id.clone() }).is_ok() {
+            self.attachment_picker_visible = true;
+            self.attachment_selection = 0;
+            self.attachment_files.clear();
+            self.attachment_preview = None;
+            self.attachment_pending = Some(id);
+            self.status = StatusLine::info("loading attachments…");
+        } else {
+            self.status = StatusLine::error("mail worker busy; cannot load attachments");
+        }
+    }
+
+    fn handle_attachment_picker_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.attachment_picker_visible = false;
+                self.attachment_preview = None;
+                self.attachment_pending = None;
+                self.attachment_files.clear();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.attachment_files.is_empty() {
+                    self.attachment_selection = (self.attachment_selection + 1)
+                        .min(self.attachment_files.len() - 1);
+                    self.attachment_preview = None;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.attachment_selection = self.attachment_selection.saturating_sub(1);
+                self.attachment_preview = None;
+            }
+            KeyCode::Char('p') => self.preview_attachment(),
+            KeyCode::Enter | KeyCode::Char('o') => self.open_attachment(),
+            _ => {}
+        }
+    }
+
+    fn preview_attachment(&mut self) {
+        let Some(file) = self.attachment_files.get(self.attachment_selection) else { return; };
+        let Some(picker) = &self.image_picker else {
+            self.status = StatusLine::error("terminal image protocol unavailable");
+            return;
+        };
+        match image::load_from_memory(&file.data) {
+            Ok(image) => {
+                let target = reader_image_target_size(image.width(), image.height(), None, None,
+                    picker.font_size().width, picker.font_size().height, 70, 18);
+                match picker.new_protocol(image, target, Resize::Fit(Some(image::imageops::FilterType::Lanczos3))) {
+                    Ok(protocol) => self.attachment_preview = Some(protocol),
+                    Err(error) => self.status = StatusLine::error(format!("attachment preview: {error}")),
+                }
+            }
+            Err(_) => self.status = StatusLine::temporary(
+                "not an image; press Enter to open with your system viewer",
+                Duration::from_secs(3),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn attachment_preview(&self) -> Option<&Protocol> { self.attachment_preview.as_ref() }
+
+    fn open_attachment(&mut self) {
+        let Some(file) = self.attachment_files.get(self.attachment_selection) else { return; };
+        match export_attachment_for_open(file) {
+            Ok(path) => match open_url(&path.to_string_lossy()) {
+                Ok(()) => self.status = StatusLine::temporary(
+                    format!("opened {} with system viewer", file.filename), Duration::from_secs(3)),
+                Err(error) => self.status = StatusLine::error(format!("could not open attachment: {error}")),
+            },
+            Err(error) => self.status = StatusLine::error(format!("could not export attachment: {error:#}")),
+        }
+    }
+
     pub fn configure_mail_images(
         &mut self,
         picker: Picker,
@@ -3563,10 +3895,19 @@ impl App {
             return;
         }
         self.composer = Some(Composer::new());
+        self.resumed_draft_account = None;
     }
 
     fn begin_reply(&mut self, quote: bool) {
-        self.begin_compose_from_selected(ComposeIntent::Reply { quote });
+        self.begin_compose_from_selected(ComposeIntent::Reply { quote, audience: ReplyAudience::Sender });
+    }
+
+    fn begin_reply_all(&mut self) {
+        self.begin_compose_from_selected(ComposeIntent::Reply { quote: true, audience: ReplyAudience::All });
+    }
+
+    fn begin_reply_list(&mut self) {
+        self.begin_compose_from_selected(ComposeIntent::Reply { quote: true, audience: ReplyAudience::List });
     }
 
     fn begin_forward(&mut self) {
@@ -3582,77 +3923,22 @@ impl App {
             return;
         }
 
-        // Forwarding must preserve the original message, not the TUI's rendered
-        // HTML/plain projection. Fetch the exact RFC 5322 bytes and attach them
-        // as message/rfc822 when the composer is sent.
-        if intent == ComposeIntent::Forward {
-            let Some((message_id, mailbox)) = self.account().and_then(|account| {
-                Some((
-                    account.selected_message()?.id.clone(),
-                    account.current_mailbox.clone()?,
-                ))
-            }) else {
-                return;
-            };
-            let queued = self.account().is_some_and(|account| {
-                account
-                    .worker
-                    .post(ActionKind::FetchRawForCompose {
-                        mailbox,
-                        id: message_id.clone(),
-                    })
-                    .is_ok()
-            });
-            if queued {
-                self.pending_compose = Some(PendingCompose {
-                    account: account_index,
-                    message_id,
-                    intent,
-                });
-                self.status = StatusLine::info("loading original message for forward…");
-            } else {
-                self.status = StatusLine::error("mail worker queue is busy; forward was not opened");
-            }
-            return;
-        }
-
-        let prepared = self.account().and_then(|account| {
-            let message = account.selected_message()?;
-            let body = account.selected_body();
-            let composer = body.map(|body| match intent {
-                ComposeIntent::Reply { quote } => {
-                    Composer::reply(message, Some(body), quote)
-                }
-                ComposeIntent::Forward => unreachable!("forward handled above"),
-            });
-            Some((message.id.clone(), composer))
+        // Fetch the original MIME for every reply/forward. Reply targets must
+        // come from the real To/Cc/Reply-To/List-Post headers, not the reader
+        // projection or the sender summary. Forwarding preserves raw bytes.
+        let Some((message_id, mailbox)) = self.account().and_then(|account| {
+            Some((account.selected_message()?.id.clone(), account.current_mailbox.clone()?))
+        }) else { return; };
+        let queued = self.account().is_some_and(|account| {
+            account.worker.post(ActionKind::FetchRawForCompose {
+                mailbox, id: message_id.clone(),
+            }).is_ok()
         });
-
-        let Some((message_id, composer)) = prepared else {
-            return;
-        };
-        if let Some(composer) = composer {
-            self.composer = Some(composer);
-            return;
-        }
-
-        let started = self.account_mut().is_some_and(|account| {
-            account.request_selected_body();
-            account.pending_bodies.contains(&message_id)
-        });
-        if started {
-            self.pending_compose = Some(PendingCompose {
-                account: account_index,
-                message_id,
-                intent,
-            });
-            self.status = StatusLine::info(match intent {
-                ComposeIntent::Reply { quote: true } => "loading message for quoted reply…",
-                ComposeIntent::Reply { quote: false } => "loading message for reply…",
-                ComposeIntent::Forward => unreachable!("forward handled above"),
-            });
+        if queued {
+            self.pending_compose = Some(PendingCompose { account: account_index, message_id, intent });
+            self.status = StatusLine::info("loading original message headers…");
         } else {
-            self.status = StatusLine::error("message body could not be queued for loading");
+            self.status = StatusLine::error("mail worker queue is busy; reply/forward not opened");
         }
     }
 
@@ -3665,6 +3951,11 @@ impl App {
                     Duration::from_secs(2),
                 );
             }
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.postpone_composer();
             return;
         }
 
@@ -3815,6 +4106,48 @@ impl App {
         }
     }
 
+    fn postponed_drafts_root() -> anyhow::Result<std::path::PathBuf> {
+        let root = dirs::data_local_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot find local application data directory"))?;
+        Ok(root.join("aerc-rs").join("postponed"))
+    }
+
+    fn postpone_composer(&mut self) {
+        let Some(account) = self.account() else { return; };
+        let Some(composer) = self.composer.as_ref() else { return; };
+        let result = Self::postponed_drafts_root().and_then(|root| {
+            crate::outgoing::drafts::save_draft(&root, &account.name, composer)
+        });
+        match result {
+            Ok(()) => {
+                self.composer = None;
+                self.resumed_draft_account = None;
+                self.status = StatusLine::info("postponed locally; Ctrl-n resumes from this account");
+            }
+            Err(error) => self.status = StatusLine::error(format!("could not postpone: {error:#}")),
+        }
+    }
+
+    fn restore_postponed_composer(&mut self) {
+        let Some(account) = self.account() else { return; };
+        if !account.outgoing_configured {
+            self.status = StatusLine::error("configure outgoing SMTP before resuming a draft");
+            return;
+        }
+        let result = Self::postponed_drafts_root().and_then(|root| {
+            crate::outgoing::drafts::load_draft(&root, &account.name)
+        });
+        match result {
+            Ok(Some(draft)) => {
+                self.composer = Some(draft);
+                self.resumed_draft_account = Some(self.account_index);
+                self.status = StatusLine::info("resumed locally postponed draft");
+            }
+            Ok(None) => self.status = StatusLine::temporary("no postponed draft for this account", Duration::from_secs(2)),
+            Err(error) => self.status = StatusLine::error(format!("cannot resume draft: {error:#}")),
+        }
+    }
+
     fn send_composer(&mut self) {
         let Some(composer) = self.composer.as_ref() else {
             return;
@@ -3822,9 +4155,44 @@ impl App {
         if composer.sending {
             return;
         }
-        if composer.to.trim().is_empty() {
-            self.status = StatusLine::error("To cannot be empty");
+        if composer.to.trim().is_empty() && composer.cc.trim().is_empty() && composer.bcc.trim().is_empty() {
+            self.status = StatusLine::error("Add at least one To, Cc or Bcc recipient");
             return;
+        }
+        let mut attachments = match load_compose_attachments(&composer.attachments) {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                self.status = StatusLine::error(format!("attachment: {error:#}"));
+                return;
+            }
+        };
+        let custom_headers = match parse_compose_headers(&composer.headers) {
+            Ok(headers) => headers,
+            Err(error) => {
+                self.status = StatusLine::error(format!("header: {error:#}"));
+                return;
+            }
+        };
+        let mut html_body = None;
+        if let Some(raw) = composer.forwarded_raw.as_deref() {
+            let parts = match inline_forward_parts(raw) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    self.status = StatusLine::error(format!("cannot inline-forward original email: {error:#}"));
+                    return;
+                }
+            };
+            attachments.extend(parts.attachments);
+            if let Some(html) = parts.html {
+                // Personal text preceding the forwarded-message marker belongs
+                // above the original HTML. Preserve that HTML with its CSS.
+                let personal_note = composer.body.split(FORWARD_SEPARATOR)
+                    .next().unwrap_or("");
+                let original_headers = composer.body.split(FORWARD_SEPARATOR)
+                    .nth(1).and_then(|tail| tail.split("\n\n").next()).unwrap_or("");
+                let attribution = format!("{FORWARD_SEPARATOR}{original_headers}");
+                html_body = Some(forward_html(&html, &attribution, personal_note));
+            }
         }
         let Some(account) = self.account() else {
             return;
@@ -3833,11 +4201,17 @@ impl App {
             from: account.from.clone(),
             to: composer.to.clone(),
             cc: composer.cc.clone(),
+            bcc: composer.bcc.clone(),
             subject: composer.subject.clone(),
             body: composer.body.clone(),
+            html_body,
+            attachments,
+            custom_headers,
             in_reply_to: composer.in_reply_to.clone(),
             references: composer.references.clone(),
-            forwarded_raw: composer.forwarded_raw.clone(),
+            // The UI uses original bytes only to build inline alternatives and
+            // attachments. Never send a .eml attachment for ordinary Forward.
+            forwarded_raw: None,
         };
         let sent_mailbox = account
             .mailboxes
@@ -3879,6 +4253,46 @@ impl App {
     }
 }
 
+
+
+fn parse_compose_headers(raw: &str) -> anyhow::Result<Vec<(String, String)>> {
+    raw.split(';').filter(|part| !part.trim().is_empty()).map(|part| {
+        let (name, value) = part.split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("use Header-Name: value; separated by semicolons"))?;
+        Ok((name.trim().to_owned(), value.trim().to_owned()))
+    }).collect()
+}
+
+fn load_compose_attachments(value: &str) -> anyhow::Result<Vec<OutgoingAttachment>> {
+    let mut output = Vec::new();
+    for part in value.split(';').map(str::trim).filter(|part| !part.is_empty()) {
+        let path = std::path::Path::new(part);
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+            anyhow::bail!("attachments must be files under 16 MiB: {part}");
+        }
+        let filename = path.file_name().and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("attachment has no valid UTF-8 filename"))?
+            .to_owned();
+        let content_type = match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+            "txt" | "patch" | "diff" | "log" | "md" => "text/plain",
+            "html" | "htm" => "text/html",
+            "pdf" => "application/pdf",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "eml" => "message/rfc822",
+            "zip" => "application/zip",
+            _ => "application/octet-stream",
+        };
+        output.push(OutgoingAttachment {
+            filename,
+            content_type: content_type.to_owned(),
+            data: std::fs::read(path)?,
+        });
+    }
+    Ok(output)
+}
 
 fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
     let mut child = ProcessCommand::new(program)
@@ -3935,6 +4349,27 @@ fn copy_text_to_clipboard(_text: &str) -> std::io::Result<()> {
         std::io::ErrorKind::Unsupported,
         "clipboard copy is unsupported on this platform",
     ))
+}
+
+/// Keep the temporary path alive so external viewers can open it after the
+/// TUI immediately regains control. tempfile creates files with mode 0600.
+fn export_attachment_for_open(file: &OutgoingAttachment) -> anyhow::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    if file.data.len() > 32 * 1024 * 1024 {
+        anyhow::bail!("attachment is larger than the 32 MiB open limit");
+    }
+    let extension = file.filename.rsplit_once('.').map(|(_, extension)| extension)
+        .filter(|extension| !extension.is_empty() && extension.len() <= 12
+            && extension.bytes().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or("bin");
+    let mut file_out = tempfile::Builder::new()
+        .prefix("aerc-rs-attachment-")
+        .suffix(&format!(".{extension}"))
+        .tempfile()?;
+    file_out.write_all(&file.data)?;
+    file_out.flush()?;
+    let (_, path) = file_out.keep()?;
+    Ok(path)
 }
 
 fn open_url(url: &str) -> std::io::Result<()> {
@@ -4395,11 +4830,15 @@ mod tests {
             references: Vec::new(),
             from_name: "Takashi Iwai".into(),
             from_address: "tiwai@suse.de".into(),
+            to: String::new(),
+            cc: String::new(),
+            bcc: String::new(),
             subject: "Re: test".into(),
             timestamp: 1_792_662_534,
             date_label: String::new(),
             size: 0,
             flags: MessageFlags::empty(),
+            has_attachment_hint: false,
         };
         let attribution = reply_attribution(&message);
         assert!(attribution.starts_with("On "));
@@ -4408,8 +4847,35 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_message_contains_gmail_attribution_and_original_recipient() {
+        let raw = b"From: Yuzu Keycaps <contact@example.org>\r\nTo: Person <person@example.net>\r\nCc: Friend <friend@example.net>\r\nDate: Fri, 23 Oct 2026 14:02:00 -0700\r\nSubject: Ends Saturday\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nA great deal";
+        let message = crate::mail::parse_summary(
+            MessageId("forward".into()), raw, raw.len() as u64, MessageFlags::empty(),
+        ).unwrap();
+        let composer = Composer::forward(&message, raw.to_vec()).unwrap();
+        assert!(composer.body.contains("---------- Forwarded message ---------"));
+        assert!(composer.body.contains("To: Person <person@example.net>"));
+        assert!(composer.body.contains("Cc: Friend <friend@example.net>"));
+        assert!(composer.body.contains("A great deal"));
+        assert!(!composer.body.contains("Bcc:"));
+    }
+
+    #[test]
     fn account_navigation_wraps() {
         assert_eq!(offset_index(0, 3, -1), 2);
         assert_eq!(offset_index(2, 3, 1), 0);
+    }
+}
+
+#[cfg(test)]
+mod inbox_poll_tests {
+    use super::inbox_new_mail_count;
+
+    #[test]
+    fn only_a_completed_poll_against_a_known_inbox_triggers_alerts() {
+        assert_eq!(inbox_new_mail_count(true, true, 10, 12), 2);
+        assert_eq!(inbox_new_mail_count(true, true, 10, 9), 0);
+        assert_eq!(inbox_new_mail_count(true, false, 0, 12), 0);
+        assert_eq!(inbox_new_mail_count(false, true, 10, 12), 0);
     }
 }

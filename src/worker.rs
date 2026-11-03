@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::backend::MailBackend;
-use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingMessage};
+use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingMessage, OutgoingAttachment};
 use crate::outgoing::MailSender;
 use crate::mail_image::MailImageEvent;
 
@@ -21,12 +21,15 @@ pub enum ActionKind {
     OpenMailbox { name: String, offset: usize, limit: usize },
     FetchBody { mailbox: String, id: MessageId },
     FetchRawForCompose { mailbox: String, id: MessageId },
+    FetchAttachments { mailbox: String, id: MessageId },
     ExportRaw { mailbox: String, id: MessageId, path: PathBuf },
     SetSeen { mailbox: String, id: MessageId, seen: bool },
     Delete { mailbox: String, id: MessageId },
     DeleteMany { mailbox: String, ids: Vec<MessageId> },
     Move { source: String, destination: String, id: MessageId },
     MoveMany { source: String, destination: String, ids: Vec<MessageId> },
+    ArchiveMany { source: String, destination: String, ids: Vec<MessageId> },
+    UnarchiveMany { source: String, destination: String, ids: Vec<MessageId> },
     Send {
         message: OutgoingMessage,
         sent_mailbox: Option<String>,
@@ -66,6 +69,7 @@ pub enum WorkerEventKind {
     },
     BodyLoaded(MessageBody),
     RawLoaded { id: MessageId, raw: Vec<u8> },
+    AttachmentsLoaded { id: MessageId, attachments: Vec<OutgoingAttachment> },
     MessageExported { path: PathBuf },
     SeenChanged { id: MessageId, seen: bool },
     MutationComplete,
@@ -230,6 +234,10 @@ fn run_worker(
             ActionKind::FetchRawForCompose { mailbox, id } => backend
                 .fetch_raw(&mailbox, &id)
                 .map(|raw| WorkerEventKind::RawLoaded { id, raw }),
+            ActionKind::FetchAttachments { mailbox, id } => backend
+                .fetch_raw(&mailbox, &id)
+                .and_then(|raw| crate::mail::extract_attachments(&raw))
+                .map(|attachments| WorkerEventKind::AttachmentsLoaded { id, attachments }),
             ActionKind::ExportRaw { mailbox, id, path } => backend
                 .fetch_raw(&mailbox, &id)
                 .and_then(|raw| write_export(&path, &raw).map(|()| path))
@@ -248,6 +256,12 @@ fn run_worker(
                 .map(|()| WorkerEventKind::MutationComplete),
             ActionKind::MoveMany { source, destination, ids } => backend
                 .move_many(&source, &destination, &ids)
+                .map(|()| WorkerEventKind::MutationComplete),
+            ActionKind::ArchiveMany { source, destination, ids } => backend
+                .archive_many(&source, &destination, &ids)
+                .map(|()| WorkerEventKind::MutationComplete),
+            ActionKind::UnarchiveMany { source, destination, ids } => backend
+                .unarchive_many(&source, &destination, &ids)
                 .map(|()| WorkerEventKind::MutationComplete),
             ActionKind::Send {
                 message,

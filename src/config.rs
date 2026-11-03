@@ -98,6 +98,13 @@ pub struct UiConfig {
     /// Press `I` in the reader to opt in/out for the current session.
     #[serde(default)]
     pub remote_images: bool,
+    /// Periodic Inbox STATUS check in seconds (the IMAP IDLE backend is not
+    /// available yet). The UI stays responsive while checks run on workers.
+    #[serde(default = "default_inbox_poll_seconds")]
+    pub inbox_poll_seconds: u64,
+    /// Optional terminal bell on an actual Inbox count increase.
+    #[serde(default)]
+    pub new_mail_bell: bool,
 }
 
 impl Default for UiConfig {
@@ -108,6 +115,8 @@ impl Default for UiConfig {
             mailbox_width_percent: default_mailbox_width_percent(),
             theme: default_theme(),
             remote_images: false,
+            inbox_poll_seconds: default_inbox_poll_seconds(),
+            new_mail_bell: false,
         }
     }
 }
@@ -160,6 +169,8 @@ const fn default_max_messages() -> usize {
     200
 }
 
+const fn default_inbox_poll_seconds() -> u64 { 20 }
+
 const fn default_page_size() -> usize {
     100
 }
@@ -207,6 +218,8 @@ mod tests {
         assert_eq!(config.ui.mailbox_width_percent, 35);
         assert_eq!(config.ui.theme, "nord");
         assert!(!config.ui.remote_images);
+        assert_eq!(config.ui.inbox_poll_seconds, 20);
+        assert!(!config.ui.new_mail_bell);
     }
 
     #[test]

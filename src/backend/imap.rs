@@ -611,6 +611,47 @@ impl MailBackend for ImapBackend {
         Ok(())
     }
 
+    fn archive_many(&mut self, source: &str, destination: &str, ids: &[MessageId]) -> Result<()> {
+        if ids.is_empty() { return Ok(()); }
+        if is_gmail_archive(&self.source.host, source, destination) {
+            // In Gmail, All Mail is a virtual view that already contains INBOX
+            // messages. Copy/MOVE into All Mail need not remove the INBOX label.
+            // The Gmail IMAP archive operation removes messages from the INBOX
+            // by marking only their selected UIDs deleted and expunging those
+            // UIDs. This is *not* used for a generic mail server or other folder.
+            self.ensure_selected(source)?;
+            let uids = Self::uid_sequence_many(ids)?;
+            let mut options = ImapMessageStoreOptions::default();
+            options.uid = true;
+            self.session()?.store(uids.clone(), StoreType::Add,
+                vec![Flag::Deleted], options)
+                .context("marking Gmail INBOX labels for removal")?;
+            self.session()?.uid_expunge(uids)
+                .context("removing Gmail INBOX labels")?;
+            self.note_removed(source, ids.len());
+            Ok(())
+        } else {
+            self.move_many(source, destination, ids)
+        }
+    }
+
+    fn unarchive_many(&mut self, source: &str, destination: &str, ids: &[MessageId]) -> Result<()> {
+        if ids.is_empty() { return Ok(()); }
+        if is_gmail_unarchive(&self.source.host, source, destination) {
+            // Adding INBOX in Gmail must not remove the message from the All Mail
+            // view, so COPY (add label) instead of MOVE (remove source).
+            self.ensure_selected(source)?;
+            let uids = Self::uid_sequence_many(ids)?;
+            let mut options = ImapMessageCopyOptions::default();
+            options.uid = true;
+            self.session()?.copy(uids, mailbox_from_name(destination)?, options)
+                .context("restoring Gmail message to INBOX")?;
+            Ok(())
+        } else {
+            self.move_many(source, destination, ids)
+        }
+    }
+
     fn move_to(&mut self, source: &str, destination: &str, id: &MessageId) -> Result<()> {
         self.ensure_selected(source)?;
         let destination_mailbox = mailbox_from_name(destination)?;
@@ -682,6 +723,23 @@ impl MailBackend for ImapBackend {
         self.note_removed(source, ids.len());
         Ok(())
     }
+}
+
+// Gmail's All Mail is a view, not a separate message store. Do not apply
+// these label semantics to arbitrary IMAP servers or user-created Archive dirs.
+fn gmail_host(host: &str) -> bool {
+    matches!(host.to_ascii_lowercase().as_str(), "imap.gmail.com" | "imap.googlemail.com")
+}
+fn gmail_all_mail(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower.starts_with("[gmail]/") || lower.starts_with("[googlemail]/"))
+        && lower.ends_with("all mail")
+}
+fn is_gmail_archive(host: &str, source: &str, destination: &str) -> bool {
+    gmail_host(host) && source.eq_ignore_ascii_case("INBOX") && gmail_all_mail(destination)
+}
+fn is_gmail_unarchive(host: &str, source: &str, destination: &str) -> bool {
+    gmail_host(host) && gmail_all_mail(source) && destination.eq_ignore_ascii_case("INBOX")
 }
 
 fn decode_component(raw: &str) -> Result<String> {

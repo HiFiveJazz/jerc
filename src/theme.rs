@@ -17,6 +17,7 @@ pub struct Theme {
     pub selected_bg: Color,
     pub border: Color,
     pub error: Color,
+    pub warning: Color,
     pub popup_bg: Color,
     pub status_bg: Color,
 }
@@ -55,6 +56,7 @@ impl Theme {
     #[must_use]
     pub fn current_line(&self) -> Style {
         Style::default().fg(self.foreground).bg(self.popup_bg)
+            .add_modifier(Modifier::BOLD)
     }
 
     #[must_use]
@@ -154,7 +156,7 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
     let primary = parse_color(spec.primary.as_deref().unwrap_or("#7aa2f7"))?;
     let success = parse_color(spec.success.as_deref().unwrap_or("#9ece6a"))?;
     let error = parse_color(spec.error.as_deref().unwrap_or("#f7768e"))?;
-    let _ = parse_color(spec.warning.as_deref().unwrap_or("#e0af68"))?;
+    let warning = parse_color(spec.warning.as_deref().unwrap_or("#e0af68"))?;
     let foreground = parse_color(
         spec.text
             .as_deref()
@@ -193,6 +195,7 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
         selected_bg,
         border,
         error,
+        warning,
         popup_bg: surface,
         status_bg: background,
     })
@@ -227,6 +230,7 @@ fn fallback_theme() -> Theme {
         selected_bg: Color::Cyan,
         border: Color::DarkGray,
         error: Color::LightRed,
+        warning: Color::Yellow,
         popup_bg: Color::Reset,
         status_bg: Color::Reset,
     }
@@ -283,6 +287,18 @@ mod tests {
     use super::{load_themes, parse_theme, theme_index};
 
     #[test]
+    fn default_and_monochrome_highlight_current_line_and_make_it_bold() {
+        use ratatui::style::{Color, Modifier};
+        let themes = load_themes();
+        for name in ["default", "monochrome"] {
+            let theme = themes.iter().find(|theme| theme.id == name).unwrap();
+            assert_ne!(theme.popup_bg, Color::Reset);
+            assert_ne!(theme.current_line().bg, theme.status().bg);
+            assert!(theme.current_line().add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
     fn built_in_theme_names_are_unique() {
         let themes = load_themes();
         let names: HashSet<_> = themes.iter().map(|theme| theme.id.as_str()).collect();
@@ -305,5 +321,15 @@ mod tests {
         .unwrap();
         assert_eq!(theme.id, "mine");
         assert_eq!(theme.name, "Mine");
+    }
+}
+
+#[cfg(test)]
+mod attachment_indicator_tests {
+    use super::*;
+    #[test]
+    fn warning_color_from_theme_is_available_for_attachment_glyph() {
+        let theme = parse_theme(r##"{"id":"test","warning":"#e0af68"}"##, "test").unwrap();
+        assert_eq!(theme.warning, Color::Rgb(224, 175, 104));
     }
 }

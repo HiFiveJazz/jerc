@@ -51,6 +51,12 @@ mailbox_width_percent = 33
 theme = "default"
 # Remote images can disclose your IP/read time to senders. Press I to toggle in-session.
 remote_images = false
+# Check Inbox counts in the background every 20 seconds. (IMAP IDLE can
+# replace polling in a future backend milestone.) Minimum 10 seconds.
+inbox_poll_seconds = 20
+# Optional audible terminal bell when a previously-known Inbox count rises.
+# The terminal's own bell settings determine whether a sound plays.
+new_mail_bell = false
 
 # Legacy layout options are still accepted so existing configs keep loading.
 # sidebar_width = 24

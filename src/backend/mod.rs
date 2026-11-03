@@ -104,6 +104,12 @@ pub trait MailBackend: Send {
         }
         Ok(())
     }
+    fn archive_many(&mut self, source: &str, destination: &str, ids: &[MessageId]) -> Result<()> {
+        self.move_many(source, destination, ids)
+    }
+    fn unarchive_many(&mut self, source: &str, destination: &str, ids: &[MessageId]) -> Result<()> {
+        self.move_many(source, destination, ids)
+    }
     fn move_to(&mut self, source: &str, destination: &str, id: &MessageId) -> Result<()>;
     fn move_many(&mut self, source: &str, destination: &str, ids: &[MessageId]) -> Result<()> {
         for id in ids {

@@ -1,4 +1,4 @@
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -102,8 +102,14 @@ fn event_loop(
     // stream of worker events (mailbox STATUS refreshes are a common example)
     // could starve Ctrl-j/Ctrl-k for hundreds of milliseconds.
     let mut next_animation_frame = Instant::now();
+    let mut next_inbox_poll = Instant::now() + app.inbox_poll_interval();
 
     while !app.should_quit {
+        let now = Instant::now();
+        if now >= next_inbox_poll {
+            app.poll_inboxes();
+            next_inbox_poll = now + app.inbox_poll_interval();
+        }
         if app.animation_active() {
             let now = Instant::now();
             if now >= next_animation_frame {
@@ -116,17 +122,19 @@ fn event_loop(
             next_animation_frame = Instant::now();
         }
 
-        let received = if app.animation_active() {
-            let timeout = next_animation_frame.saturating_duration_since(Instant::now());
-            match runtime_rx.recv_timeout(timeout) {
-                Ok(event) => Some(event),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(anyhow::anyhow!("runtime event channel closed"));
-                }
-            }
+        let deadline = if app.animation_active() {
+            next_animation_frame.min(next_inbox_poll)
         } else {
-            Some(runtime_rx.recv().context("runtime event channel closed")?)
+            next_inbox_poll
+        };
+        let received = match runtime_rx.recv_timeout(
+            deadline.saturating_duration_since(Instant::now())
+        ) {
+            Ok(event) => Some(event),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(anyhow::anyhow!("runtime event channel closed"));
+            }
         };
 
         let Some(event) = received else {
@@ -148,6 +156,13 @@ fn event_loop(
             RuntimeEvent::Worker(event) => app.handle_worker_event(event),
             RuntimeEvent::MailImage(event) => app.handle_mail_image_event(event),
             RuntimeEvent::InputStopped => break,
+        }
+
+        if app.take_new_mail_bell() {
+            // Terminal bell: honors the user's terminal bell settings and
+            // requires no external audio process or extra dependencies.
+            io::stdout().write_all(b"\x07")?;
+            io::stdout().flush()?;
         }
 
         // A key can start or reverse an animation. Draw its state immediately,

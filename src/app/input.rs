@@ -48,7 +48,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Mail", key: "f", description: "forward" },
     HelpEntry { category: "Mail", key: "c", description: "compose new message" },
     HelpEntry { category: "Mail", key: "d / D", description: "delete with confirmation / immediately" },
-    HelpEntry { category: "Mail", key: "a", description: "archive selected message(s)" },
+    HelpEntry { category: "Mail", key: "a / U", description: "archive / restore archived message to INBOX" },
     HelpEntry { category: "Mail", key: "u", description: "toggle read / unread" },
     HelpEntry { category: "Message", key: "Esc", description: "leave visual mode / close reader" },
     HelpEntry { category: "Message", key: "h/j/k/l", description: "move reader cursor" },
@@ -57,13 +57,19 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Message", key: "v / V, vi\" / vi' / vi() / vi[] / vi{}", description: "character / line visual selection and inner text objects" },
     HelpEntry { category: "Message", key: "T", description: "toggle rich HTML / plain fallback" },
     HelpEntry { category: "Message", key: "I", description: "toggle remote images for this session" },
+    HelpEntry { category: "Message", key: "m", description: "show / hide Message-ID in reader" },
+    HelpEntry { category: "Message", key: "z", description: "attachments picker: Enter open, p image preview" },
     HelpEntry { category: "Message", key: "o", description: "open link under reader cursor" },
     HelpEntry { category: "Message", key: "O", description: "open original HTML email in the browser" },
     HelpEntry { category: "Message", key: "y", description: "copy visual selection to clipboard" },
     HelpEntry { category: "Message", key: "e / E", description: "export raw RFC 5322 debug message" },
     HelpEntry { category: "General", key: "t", description: "open searchable theme picker" },
     HelpEntry { category: "General", key: "Ctrl-r", description: "refresh current mailbox" },
+    HelpEntry { category: "General", key: "B", description: "toggle new mail bell (Inbox checked periodically)" },
     HelpEntry { category: "General", key: "[ / ]", description: "previous / next account" },
+    HelpEntry { category: "Message", key: "A / L", description: "reply all / reply to mailing list (List-Post)" },
+    HelpEntry { category: "Compose", key: "Ctrl-p / Ctrl-n", description: "postpone / resume local draft for current account" },
+    HelpEntry { category: "Compose", key: "Tab / Shift-Tab", description: "To, Cc, Bcc, Subject, Attachments, Headers, Body" },
     HelpEntry { category: "General", key: "?", description: "search keybindings" },
     HelpEntry { category: "General", key: "q / Ctrl-c", description: "quit" },
 ];
@@ -89,6 +95,8 @@ pub enum Command {
     Delete,
     DeleteImmediate,
     Archive,
+    Unarchive,
+    Attachments,
     Search,
     ToggleSidebar,
     TogglePreviewSplit,
@@ -100,11 +108,14 @@ pub enum Command {
     ToggleHelp,
     ToggleHtml,
     ToggleImages,
+    ToggleBell,
     OpenOriginal,
     Yank,
     Compose,
     Reply,
     ReplyQuoted,
+    ReplyAll,
+    ReplyList,
     Forward,
     Escape,
     Digit(u8),
@@ -151,11 +162,15 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('d') => Command::Delete,
         KeyCode::Char('D') => Command::DeleteImmediate,
         KeyCode::Char('a') => Command::Archive,
+        KeyCode::Char('U') => Command::Unarchive,
+        KeyCode::Char('z') => Command::Attachments,
         KeyCode::Char('/') => Command::Search,
         KeyCode::Char('b') => Command::ToggleSidebar,
         KeyCode::Char('P') => Command::TogglePreviewSplit,
         KeyCode::Char('r') => Command::Reply,
         KeyCode::Char('R') => Command::ReplyQuoted,
+        KeyCode::Char('A') => Command::ReplyAll,
+        KeyCode::Char('L') => Command::ReplyList,
         KeyCode::Char('f') => Command::Forward,
         KeyCode::Char(']') => Command::NextAccount,
         KeyCode::Char('[') => Command::PreviousAccount,
@@ -164,6 +179,7 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('?') => Command::ToggleHelp,
         KeyCode::Char('T') => Command::ToggleHtml,
         KeyCode::Char('I') => Command::ToggleImages,
+        KeyCode::Char('B') => Command::ToggleBell,
         KeyCode::Char('O') => Command::OpenOriginal,
         KeyCode::Char('y') => Command::Yank,
         KeyCode::Char('c') => Command::Compose,
@@ -186,6 +202,14 @@ mod tests {
         assert_eq!(Focus::Messages.next(false), Focus::Messages);
         assert_eq!(Focus::Preview.next(false), Focus::Messages);
         assert_eq!(Focus::Messages.next(true), Focus::Preview);
+    }
+
+    #[test]
+    fn bell_toggles_with_uppercase_b() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT)),
+            Command::ToggleBell
+        );
     }
 
     #[test]

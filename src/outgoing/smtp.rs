@@ -2,9 +2,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use lettre::message::{Attachment, Mailbox, Mailboxes, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::{Message, SmtpTransport, Transport};
+use lettre::{SmtpTransport, Transport};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use url::Url;
@@ -246,62 +245,7 @@ impl SmtpSender {
 
 impl MailSender for SmtpSender {
     fn send(&mut self, message: &OutgoingMessage) -> Result<SendReceipt> {
-        let from_value = if message.from.trim().is_empty() {
-            self.source.username.as_str()
-        } else {
-            message.from.as_str()
-        };
-        let from: Mailbox = from_value
-            .parse()
-            .with_context(|| format!("invalid From address {from_value:?}"))?;
-        let to: Mailboxes = message
-            .to
-            .parse()
-            .with_context(|| format!("invalid To address list {:?}", message.to))?;
-        if to.iter().next().is_none() {
-            bail!("message has no recipients");
-        }
-
-        let mut builder = Message::builder()
-            .from(from)
-            .subject(message.subject.clone())
-            .user_agent(format!("aerc-rs/{}", env!("CARGO_PKG_VERSION")));
-        for mailbox in to {
-            builder = builder.to(mailbox);
-        }
-        if !message.cc.trim().is_empty() {
-            let cc: Mailboxes = message
-                .cc
-                .parse()
-                .with_context(|| format!("invalid Cc address list {:?}", message.cc))?;
-            for mailbox in cc {
-                builder = builder.cc(mailbox);
-            }
-        }
-        if let Some(id) = &message.in_reply_to {
-            builder = builder.in_reply_to(format!("<{id}>"));
-        }
-        for id in &message.references {
-            builder = builder.references(format!("<{id}>"));
-        }
-
-        let email = if let Some(raw) = message.forwarded_raw.as_ref() {
-            let content_type = ContentType::parse("message/rfc822")
-                .context("building forwarded message/rfc822 content type")?;
-            let attachment = Attachment::new("forwarded.eml".to_owned())
-                .body(raw.clone(), content_type);
-            builder
-                .multipart(
-                    MultiPart::mixed()
-                        .singlepart(SinglePart::plain(message.body.clone()))
-                        .singlepart(attachment),
-                )
-                .context("building forwarded outgoing message")?
-        } else {
-            builder
-                .body(message.body.clone())
-                .context("building outgoing message")?
-        };
+        let email = crate::outgoing::build_outgoing(message, &self.source.username)?;
         let raw_message = email.formatted();
         let response = self
             .transport()?

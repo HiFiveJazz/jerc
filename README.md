@@ -14,7 +14,13 @@ A Rust terminal email client inspired by aerc's backend/worker model and lazygit
 - **Layout controls:** `b` hides/shows the mailbox sidebar; `P` toggles a vertical message preview. `Enter` still opens the full-screen reader.
 - **Rich HTML mail by default:** the HTML renderer is now the primary view whenever a real HTML part exists; `T` always switches to a plain view (including a generated fallback for HTML-only mail). Layout-table noise, literal Markdown-style heading markers, generic image labels and broken open table edges are normalized while semantic receipt/data tables remain boxed. Sender CSS colours never override the terminal theme.
 - **Terminal images:** `ratatui-image` supports Kitty, Sixel and iTerm2 graphics with a half-block fallback. The first meaningful remote image is shown in the reader when remote images are enabled. Tracking pixels are filtered, downloads are bounded and happen on a background worker. Remote images default off for privacy; press `I` to toggle them for the session or set `ui.remote_images = true`.
-- **Modal compose/reply/forward:** the composer has NORMAL, INSERT, and VISUAL modes. `Tab`/`Shift-Tab` cycles To → Cc → Subject → Body without hiding field labels. `Enter` from NORMAL opens a centered send-confirmation popup; Ctrl-S is not used. `r` replies without quoted text, `R` uses an aerc-style dated attribution plus gray quoted text, and `f` forwards the exact original RFC 5322 message as a `message/rfc822` attachment rather than forwarding the terminal-rendered body.
+- **Modal compose/reply/forward:** the composer has NORMAL, INSERT, and VISUAL modes. `Tab`/`Shift-Tab` cycles To → Cc → Bcc → Subject → Files → Headers → Body without hiding field labels. `Enter` from NORMAL opens a centered send-confirmation popup; Ctrl-S is not used. `r` replies without quoted text, `R` uses an aerc-style dated attribution plus gray quoted text, `A` replies to all (minus own identities), `L` replies to List-Post, and `f` forwards with a Gmail-style original From/Date/Subject/To/Cc attribution and the original plain/HTML contents inline with MIME attachments preserved instead of attaching `forwarded.eml`. The original MIME bytes remain available to the composer for drafts and extraction.
+- **Attachments:** mailbox rows show a separate theme-yellow `⧉` marker for likely/confirmed MIME attachments, not a paperclip embedded in the subject. Once the body loads, the reader shows two decoded attachment filenames under the subject; `z` opens a proper attachment list. Image preview uses the same terminal graphics picker; PDF and other files are extracted to a private temporary file and opened using the OS file handler. External opener stdout/stderr are suppressed.
+- **Mailing-list patches:** unified Git diff additions, deletions, headers and hunk ranges are styled distinctly, including `> `-quoted patches.
+- **New-mail updates:** Inbox STATUS is checked by background mail workers every 20 seconds by default, without blocking navigation. When the known Inbox count rises, its cache is invalidated and the visible Inbox is refreshed. `B` toggles an optional terminal bell (off by default); the terminal determines whether the BEL control character makes a sound. This is a lightweight polling fallback, not IMAP IDLE; if new and deleted mail cancel out in a single interval, a count-only poll may miss the arrival.
+- **Reader envelope:** displays Date, To, and any Cc/Bcc headers physically present in the mail. Bcc must not be guessed in recipient copies.
+- **Theme polish:** default and monochrome themes now have a visibly shaded, bold current line in the message reader, mailbox list, and message browser.
+- **Gmail archiving:** from INBOX, `a` removes the Inbox membership using Gmail's IMAP delete/expunge semantics; `U` from All Mail copies back to INBOX to add the Inbox membership. IMAP behavior is affected by your account's Gmail auto-expunge/deletion settings, so test this on disposable mail first.
 - Empty folders render an explicit empty-state message instead of a blank pane.
 - Searchable help and JSON themes; custom themes in `~/.config/aerc-rs/themes/*.json` can override built-ins by id.
 
@@ -35,6 +41,8 @@ page_size = 100
 
 [ui]
 remote_images = false # privacy-safe default; press I to toggle in-session
+inbox_poll_seconds = 20 # 10..3600 supported; lower values create more server traffic
+new_mail_bell = false # enable at startup or toggle with B
 ```
 
 `page_size` controls interactive pagination. Existing `max_messages` settings are retained for compatibility/headless checks and no longer make the TUI wait for one giant initial fetch. Add more `[[accounts]]` blocks to the same config to use multiple accounts; `[ / ]` rotates accounts and the top tab bar shows the active one.
@@ -45,11 +53,12 @@ Press `?` for the searchable complete map. Common controls:
 
 - `j/k` messages; `J/K` mailboxes; `Ctrl-j/Ctrl-k` smooth messages; `Ctrl-Shift-j/Ctrl-Shift-k` smooth mailboxes.
 - `v` visual selection; `Esc` exits visual mode first.
-- `d` confirmed trash/delete; `D` immediate trash/delete; `a` archive.
+- `d` confirmed trash/delete; `D` immediate trash/delete; `a` archive; `U` restore an archived message to INBOX.
 - `/` filter current mailbox; `b` sidebar; `P` vertical preview; `Enter` full reader.
-- `r` reply without quote; `R` reply with quote; `f` forward; `c` compose.
-- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser.
-- `[ / ]` previous/next account; `Ctrl-r` refreshes the current mailbox.
+- `r` reply without quote; `R` reply with quote; `A` reply all; `L` list reply; `f` inline forward; `c` compose.
+- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser. `m` toggles the Message-ID header. `z` in the reader or message list opens attachments, `p` previews decoded images in-terminal and Enter opens with `xdg-open` (on Linux).
+- In composer, Tab/Shift-Tab visits Bcc, Files (semicolon-separated paths), and Headers (`X-Header: value; ...`). `Ctrl-p` postpones locally; `Ctrl-n` resumes the active account’s postponed draft. These are local files, not IMAP Drafts synchronization.
+- `[ / ]` previous/next account; `Ctrl-r` refreshes the current mailbox; `B` toggles the audible new-mail bell.
 
 ## Themes
 
@@ -88,4 +97,4 @@ cargo run --release --example generate_fixture -- /tmp/aerc-rs-maildir 10000
 
 ## Still intentionally incomplete versus aerc
 
-Milestone 5 is much closer to the daily aerc workflow, but it does not claim full parity. Important remaining work includes IMAP IDLE/reconnect/unsolicited updates, persistent on-disk header/body cache, server-side search/sort/thread views, drafts/sent synchronization, attachments, address book/aliases, reply-all recipient policy, external-editor composition, and the developer-mail features we ultimately want: patch-series grouping, rich diffs, patch application, and direct lazygitrs integration.
+Milestone 5 is much closer to the daily aerc workflow, but it does not claim full parity. Important remaining work includes IMAP IDLE/reconnect/unsolicited updates, persistent on-disk header/body cache, server-side search/sort/thread views, IMAP Drafts synchronization, inline forward with attached MIME parts, bounce/resend, address book/aliases, external-editor composition, and the developer-mail features we ultimately want: patch-series grouping, rich diffs, patch application, and direct lazygitrs integration.

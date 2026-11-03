@@ -35,3 +35,45 @@ Run `./scripts/validate.sh` after applying it. Any compiler or API error from th
 - Start `/` search and verify the editable query appears once (in the search row), not again in the status bar.
 - Open a quoted reply with `R`; the attribution should read `On <weekday> <month> <day>, <year> at <time> <zone>, <author> wrote:` and quoted `>` lines should be gray in both reader and composer.
 - Add two `[[accounts]]` blocks and rotate with `[` / `]`; the active tab and status should change without restarting.
+
+## Mail correctness regression suite (tests-first milestone)
+
+Run `cargo test --all-targets` (and `cargo fmt` first). The new
+`tests/mail_correctness.rs`, `tests/drafts.rs`, and worker protocol regression
+cover generated/unique Message-ID, RFC 5322 thread headers, Bcc envelope versus
+serialized headers, non-ASCII subjects and attachment names, multipart nesting,
+raw `message/rfc822` forwards, Reply-To / Reply All / List-Post recipient routing,
+subject-prefix preservation, header injection rejection, postponement round trips,
+account-scoped draft isolation, and failure to append a Sent copy after successful
+SMTP acceptance. The worker must **never retry SMTP** merely because saving a
+Sent copy failed.
+
+Current local postponed drafts are per-account JSON in the user data directory
+(`~/.local/share/aerc-rs/postponed` on typical Linux systems). They are
+confidential and are written with 0600 permissions on Unix systems. They are
+not yet synchronized with server-side Drafts. No signing or encryption was added.
+
+This artifact was reconstructed from the complete local patch stack and checked
+with `git apply --check` and `git diff --check`. This build environment has no
+Rust toolchain, so the Cargo tests cannot be run until applied on the user host.
+
+## Inline forward, attachments and triage polish
+
+`tests/polish_regressions.rs` covers inline HTML/plain forwarding with MIME
+attachments, decoded PDF bytes and mailbox-list attachment hints. Rust unit
+tests cover Gmail archive route classification, current-line visibility for
+Default/Monochrome themes, and syntax colors for quoted Git diffs.
+
+Manually verify with a disposable Gmail email: `a` from INBOX, `U` from All
+Mail, and refresh both views. Gmail auto-expunge settings affect how the IMAP
+`\Deleted` flag is interpreted; do not test first on irreplaceable mail.
+
+In the reader or browser, press `z` for the MIME attachment picker, `p` to
+preview PNG/JPEG/GIF/WebP, Enter to open a PDF or other file with the system
+handler, and `m` to show or hide Message-ID. Fwd a multipart HTML email with
+a PDF and confirm the forwarded message is inline with the PDF but without
+a `forwarded.eml` MIME part. Inline CID references need future dedicated
+`multipart/related` handling to reproduce all original images exactly.
+
+This environment has no Rust compiler; `cargo fmt` and `cargo test --all-targets`
+must be run on the target machine.

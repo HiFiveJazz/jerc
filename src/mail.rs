@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read};
 use anyhow::{Context, Result, anyhow};
 use mail_parser::{MessageParser, PartKind};
 
-use crate::model::{HtmlLine, HtmlSpan, HtmlSpanStyle, MessageBody, MessageFlags, MessageId, MessageSummary};
+use crate::model::{HtmlLine, HtmlSpan, HtmlSpanStyle, MessageBody, MessageFlags, MessageId, MessageSummary, OutgoingAttachment};
 
 const MAX_HEADER_BYTES: usize = 512 * 1024;
 
@@ -123,6 +123,23 @@ pub fn parse_summary(
         })
         .unwrap_or_default();
 
+    // Only render addresses actually serialized in this copy. In particular,
+    // a recipient cannot recover who else was blind-copied via Bcc.
+    macro_rules! render_addresses {
+        ($value:expr) => {
+            $value.map(|value| value.mailboxes().filter_map(|mailbox| {
+                let address = mailbox.address()?.trim();
+                if address.is_empty() { return None; }
+                let name = mailbox.name().unwrap_or_default().trim();
+                Some(if name.is_empty() { address.to_owned() }
+                    else { format!("{name} <{address}>") })
+            }).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+        };
+    }
+    let to = render_addresses!(message.to());
+    let cc = render_addresses!(message.cc());
+    let bcc = render_addresses!(message.bcc());
+
     let subject = message.subject().unwrap_or("(no subject)").trim().to_owned();
     let (timestamp, date_label) = message.date().map_or((0, String::new()), |date| {
         let rendered = date.to_rfc3339();
@@ -138,12 +155,83 @@ pub fn parse_summary(
         references: thread.references,
         from_name,
         from_address,
+        to,
+        cc,
+        bcc,
         subject,
         timestamp,
         date_label,
         size,
         flags,
+        has_attachment_hint: attachment_hint(raw_headers),
     })
+}
+
+/// A header-only hint for an *explicitly declared* attachment.
+///
+/// `multipart/mixed` only describes a MIME container. It may hold nothing
+/// except a `multipart/related` HTML body, as in some marketing messages.
+/// The presence of a real file cannot be known without the MIME structure;
+/// prefer the parsed body's attachment count once the body is available.
+#[must_use]
+pub fn attachment_hint(headers: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(headers).to_ascii_lowercase();
+    text.lines()
+        // Some callers provide a full .eml rather than only its RFC 5322
+        // header block. Never mistake a nested MIME part's disposition for a
+        // top-level header hint.
+        .take_while(|line| !line.trim_end_matches('\r').is_empty())
+        .any(|line| {
+            let line = line.trim_start();
+            line.starts_with("content-disposition:")
+                && line["content-disposition:".len()..]
+                    .trim_start()
+                    .starts_with("attachment")
+        })
+}
+
+/// Decoded MIME attachments in display order. Never infer a file path from a
+/// sender-provided filename: names are sanitized at the UI/export boundary.
+pub fn extract_attachments(raw: &[u8]) -> Result<Vec<OutgoingAttachment>> {
+    let parsed = MessageParser::new().parse(raw)
+        .ok_or_else(|| anyhow!("unable to parse MIME attachments"))?;
+    let mut results = Vec::new();
+    for (index, part) in parsed.attachments().enumerate() {
+        let raw_name = part.attachment_name().unwrap_or("");
+        let name = raw_name.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("").trim();
+        let filename = if name.is_empty() || name == "." || name == ".." {
+            format!("attachment-{}", index + 1)
+        } else {
+            name.to_owned()
+        };
+        let data = part.decoded().into_owned();
+        results.push(OutgoingAttachment {
+            content_type: guessed_attachment_type(&filename, &data).to_owned(),
+            filename,
+            data,
+        });
+    }
+    Ok(results)
+}
+
+fn guessed_attachment_type(name: &str, bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"%PDF-") { return "application/pdf"; }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return "image/png"; }
+    if bytes.starts_with(b"\xff\xd8\xff") { return "image/jpeg"; }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") { return "image/gif"; }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) { return "image/webp"; }
+    match name.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase()).as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("txt" | "patch" | "diff" | "log" | "md") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
 }
 
 pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
@@ -195,6 +283,13 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         html_renderer,
         html_render_width,
         attachment_count: message.attachments().count(),
+        attachment_names: message.attachments().enumerate().map(|(index, part)| {
+            let raw = part.attachment_name().unwrap_or("");
+            let name = raw.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("").trim();
+            if name.is_empty() || name == "." || name == ".." {
+                format!("attachment-{}", index + 1)
+            } else { name.to_owned() }
+        }).collect(),
     })
 }
 

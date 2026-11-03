@@ -28,6 +28,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.help_visible {
         draw_help(frame, app);
     }
+    if app.attachment_picker_visible {
+        draw_attachments(frame, app);
+    }
     if app.theme_picker_visible {
         draw_theme_picker(frame, app);
     }
@@ -252,13 +255,18 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let number = relative_number(absolute_position, current_position);
         let visual_selected = app.message_is_visual_selected(*index);
         let current = absolute_position == current_position;
-        let mark = if visual_selected {
-            "✓"
-        } else if message.flags.contains(MessageFlags::SEEN) {
-            " "
-        } else {
-            "●"
-        };
+        let unread_mark = if visual_selected { "✓" } else if message.flags.contains(MessageFlags::SEEN) { " " } else { "●" };
+        let attachment_mark = message.has_attachment(account.bodies.get(&message.id));
+        // A separate box glyph in the mark column, never embedded in the
+        // subject where it could be mistaken for part of the title.
+        let mark = Line::from(vec![
+            Span::raw(unread_mark),
+            if attachment_mark {
+                Span::styled("⧉", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw(" ")
+            },
+        ]);
         let sender = if message.from_name.is_empty() {
             &message.from_address
         } else {
@@ -363,16 +371,54 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         };
         let mut lines = vec![
             Line::from(vec![Span::styled("From: ", theme.accent()), Span::raw(from)]),
+            Line::from(vec![Span::styled("Date: ", theme.accent()), Span::raw(
+                if message.timestamp > 0 {
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(message.timestamp, 0)
+                        .map(|date| date.with_timezone(&chrono::Local)
+                            .format("%a, %b %-d, %Y at %-I:%M %p %Z").to_string())
+                        .unwrap_or_else(|| "unknown".to_owned())
+                } else { "unknown".to_owned() }
+            )]),
+            Line::from(vec![Span::styled("To: ", theme.accent()), Span::raw(
+                if message.to.is_empty() { "(not supplied)".to_owned() } else { message.to.clone() }
+            )]),
             Line::from(vec![
                 Span::styled("Subject: ", theme.accent()),
                 Span::raw(message.subject.clone()),
             ]),
         ];
-        if let Some(message_id) = &message.message_id {
-            lines.push(Line::from(vec![
-                Span::styled("Message-ID: ", theme.accent()),
-                Span::raw(format!("<{message_id}>")),
-            ]));
+        if !message.cc.is_empty() {
+            lines.push(Line::from(vec![Span::styled("Cc: ", theme.accent()), Span::raw(message.cc.clone())]));
+        }
+        if !message.bcc.is_empty() {
+            lines.push(Line::from(vec![Span::styled("Bcc: ", theme.accent()), Span::raw(message.bcc.clone())]));
+        }
+        if app.show_message_ids {
+            if let Some(message_id) = &message.message_id {
+                lines.push(Line::from(vec![
+                    Span::styled("Message-ID: ", theme.accent()),
+                    Span::raw(format!("<{message_id}>")),
+                ]));
+            }
+        }
+        if let Some(body) = account.selected_body() {
+            if body.attachment_count > 0 {
+                let preview = body.attachment_names.iter().take(2).cloned().collect::<Vec<_>>().join("  ·  ");
+                let overflow = body.attachment_names.len().saturating_sub(2);
+                let label = if preview.is_empty() {
+                    format!("{} attachment(s)", body.attachment_count)
+                } else if overflow > 0 {
+                    format!("{preview}  +{overflow} more")
+                } else { preview };
+                lines.push(Line::from(vec![
+                    Span::styled("⧉  ", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
+                    Span::styled(label, theme.text()),
+                    Span::styled("   z: view", theme.muted()),
+                ]));
+            }
+        } else if message.has_attachment_hint {
+            lines.push(Line::from(vec![Span::styled("⧉  ", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
+                Span::styled("Attachments likely (z: browse)", theme.muted())]));
         }
         lines.push(Line::styled(
             "─".repeat(usize::from(content_area.width)),
@@ -442,12 +488,7 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     )
                 }));
             }
-            if body.attachment_count > 0 {
-                lines.push(Line::styled(
-                    format!("[{} attachment(s)]", body.attachment_count),
-                    theme.muted(),
-                ));
-            }
+
         } else if account.is_loading_body() {
             lines.push(Line::styled("Loading message…", theme.muted()));
         } else {
@@ -496,6 +537,27 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
+/// Git unified diff styling. Email quoting (`> `) is ignored while
+/// classifying the patch, so reviewing a mailed patch resembles lazygitrs.
+fn diff_line_style(line: &str, theme: &Theme) -> Option<Style> {
+    let mut text = line;
+    while let Some(after) = text.strip_prefix('>') {
+        text = after.strip_prefix(' ').unwrap_or(after);
+    }
+    if text.starts_with("diff --git ") || text.starts_with("index ")
+        || text.starts_with("--- ") || text.starts_with("+++ ")
+        || text.starts_with("new file mode ") || text.starts_with("deleted file mode ")
+    {
+        Some(theme.accent())
+    } else if text.starts_with("@@") || text.starts_with("\\ No newline at end of file") {
+        Some(Style::default().fg(Color::Rgb(122, 162, 247)).add_modifier(Modifier::BOLD))
+    } else if text.starts_with('+') {
+        Some(Style::default().fg(Color::Rgb(158, 206, 106)))
+    } else if text.starts_with('-') {
+        Some(Style::default().fg(Color::Rgb(247, 118, 142)))
+    } else { None }
+}
+
 fn plain_reader_line(
     text: &str,
     line_index: usize,
@@ -508,11 +570,10 @@ fn plain_reader_line(
     theme: &crate::theme::Theme,
     illuminate_word: Option<&str>,
 ) -> Line<'static> {
-    let base = if is_quoted_line(text) {
-        Style::default().fg(theme.muted)
-    } else {
-        theme.text()
-    };
+    let base = diff_line_style(text, theme).unwrap_or_else(|| {
+        if is_quoted_line(text) { Style::default().fg(theme.muted) }
+        else { theme.text() }
+    });
     let illuminate_ranges = illuminate_word
         .map(|word| word_match_ranges(text, word))
         .unwrap_or_default();
@@ -583,12 +644,12 @@ fn rich_html_line(
         .map(|word| word_match_ranges(&line_text, word))
         .unwrap_or_default();
     let quoted = is_quoted_line(&line_text);
+    let diff = diff_line_style(&line_text, theme);
     let mut column = 0usize;
     for span in &line.spans {
         let mut style = rich_html_style(&span.style, &span.text, theme);
-        if quoted {
-            style = style.fg(theme.muted);
-        }
+        if let Some(diff) = diff { style = style.fg(diff.fg.unwrap_or(theme.foreground)); }
+        else if quoted { style = style.fg(theme.muted); }
         spans.extend(reader_fragments(
             &span.text,
             style,
@@ -1118,6 +1179,46 @@ fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
+fn draw_attachments(frame: &mut Frame<'_>, app: &App) {
+    let theme = app.theme().clone();
+    let area = centered_rect(frame.area(), 82, 76);
+    frame.render_widget(Clear, area);
+    let block = Block::default().title(" Attachments ").borders(Borders::ALL)
+        .border_style(theme.accent());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([
+        Constraint::Percentage(42), Constraint::Min(4), Constraint::Length(1),
+    ]).split(inner);
+    let entries = app.attachment_files.iter().enumerate().map(|(index, item)| {
+        let label = format!(" {}  {}   ({} bytes)",
+            if item.content_type.starts_with("image/") { "▧" }
+            else if item.content_type == "application/pdf" { "▤" } else { "▫" },
+            item.filename, item.data.len());
+        Line::styled(label, if index == app.attachment_selection { theme.selected() } else { theme.text() })
+    }).collect::<Vec<_>>();
+    if entries.is_empty() {
+        frame.render_widget(Paragraph::new(" No attachments loaded (or this message has none)")
+            .style(theme.muted()), chunks[0]);
+    } else {
+        frame.render_widget(Paragraph::new(entries), chunks[0]);
+    }
+    if let Some(protocol) = app.attachment_preview() {
+        let size = protocol.size();
+        if size.width <= chunks[1].width && size.height <= chunks[1].height {
+            let rect = Rect::new(chunks[1].x + (chunks[1].width - size.width)/2,
+                chunks[1].y, size.width, size.height);
+            frame.render_widget(TerminalImage::new(protocol), rect);
+        }
+    } else {
+        frame.render_widget(Paragraph::new(" p previews PNG/JPEG/GIF/WebP in the terminal;
+ Enter opens via the system file handler (PDF, image, etc.)")
+            .style(theme.muted()), chunks[1]);
+    }
+    frame.render_widget(Paragraph::new(" j/k select   p preview image   Enter/o open   Esc/q close")
+        .style(theme.accent()), chunks[2]);
+}
+
 fn draw_confirmation(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme().clone();
     let Some(confirmation) = app.confirmation.as_ref() else {
@@ -1162,6 +1263,16 @@ fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
         Line::from(vec![Span::styled("Subject: ", theme.accent()), Span::raw(composer.subject.clone())]),
         Line::raw(""),
         Line::styled("Send this message now?", theme.text()),
+        Line::styled(
+            if composer.subject.trim().is_empty() { "Warning: empty subject" } else { "" },
+            theme.error(),
+        ),
+        Line::styled(
+            if composer.body.to_ascii_lowercase().contains("attach") && composer.attachments.trim().is_empty() && composer.forwarded_raw.is_none() {
+                "Warning: body mentions an attachment, but none is selected"
+            } else { "" },
+            theme.error(),
+        ),
     ];
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), chunks[0]);
     frame.render_widget(
@@ -1208,6 +1319,9 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
@@ -1215,14 +1329,17 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
 
     draw_compose_field(frame, fields[0], "To", ComposeField::To, composer, app);
     draw_compose_field(frame, fields[1], "Cc", ComposeField::Cc, composer, app);
-    draw_compose_field(frame, fields[2], "Subject", ComposeField::Subject, composer, app);
+    draw_compose_field(frame, fields[2], "Bcc", ComposeField::Bcc, composer, app);
+    draw_compose_field(frame, fields[3], "Subject", ComposeField::Subject, composer, app);
+    draw_compose_field(frame, fields[4], "Files (;)", ComposeField::Attachments, composer, app);
+    draw_compose_field(frame, fields[5], "Headers (;)", ComposeField::Headers, composer, app);
     let body_active = composer.field == ComposeField::Body;
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             if body_active { "▸ Body:" } else { "  Body:" },
             if body_active { theme.accent() } else { theme.muted() },
         ))),
-        fields[3],
+        fields[6],
     );
 
     let body = editor_text(&composer.body, composer, body_active, &theme);
@@ -1230,7 +1347,7 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(body)
             .style(theme.text())
             .wrap(Wrap { trim: false }),
-        fields[4],
+        fields[7],
     );
 
     let mode_hint = match composer.mode {
@@ -1251,7 +1368,7 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
             Span::styled(mode_hint, theme.muted()),
         ]
     };
-    frame.render_widget(Paragraph::new(Line::from(footer)), fields[5]);
+    frame.render_widget(Paragraph::new(Line::from(footer)), fields[8]);
 }
 
 fn draw_compose_field(
@@ -1268,7 +1385,10 @@ fn draw_compose_field(
     let value = match field {
         ComposeField::To => &composer.to,
         ComposeField::Cc => &composer.cc,
+        ComposeField::Bcc => &composer.bcc,
         ComposeField::Subject => &composer.subject,
+        ComposeField::Attachments => &composer.attachments,
+        ComposeField::Headers => &composer.headers,
         ComposeField::Body => &composer.body,
     };
     let mut spans = vec![Span::styled(
@@ -1508,6 +1628,20 @@ mod tests {
     use crate::theme::load_themes;
     use ratatui::style::Color;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn mailed_diff_add_remove_and_hunk_have_distinct_styles() {
+        use super::diff_line_style;
+        let theme = load_themes().into_iter().next().unwrap();
+        let add = diff_line_style("+new", &theme).unwrap();
+        let quoted_add = diff_line_style("> +new", &theme).unwrap();
+        let remove = diff_line_style("-old", &theme).unwrap();
+        let hunk = diff_line_style("@@ -1,2 +1,3 @@", &theme).unwrap();
+        assert_eq!(add.fg, quoted_add.fg);
+        assert_ne!(add.fg, remove.fg);
+        assert_ne!(hunk.fg, add.fg);
+        assert!(diff_line_style("normal prose", &theme).is_none());
+    }
 
     #[test]
     fn relative_numbers_match_vim_style() {

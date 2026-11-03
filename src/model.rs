@@ -117,17 +117,31 @@ pub struct MessageSummary {
     pub references: Vec<String>,
     pub from_name: String,
     pub from_address: String,
+    /// Recipients actually present in the message headers. Bcc is normally
+    /// absent in recipient copies and must never be inferred from the envelope.
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
     pub subject: String,
     pub timestamp: i64,
     pub date_label: String,
     pub size: u64,
     pub flags: MessageFlags,
+    /// Header-only, conservative hint available before loading the MIME body.
+    pub has_attachment_hint: bool,
 }
 
 impl MessageSummary {
     #[must_use]
     pub fn unread(&self) -> bool {
         !self.flags.contains(MessageFlags::SEEN)
+    }
+
+    /// Prefer the definitive MIME-part count over any header-only hint.
+    /// This also overrides stale, speculative hints in already-loaded lists.
+    #[must_use]
+    pub fn has_attachment(&self, body: Option<&MessageBody>) -> bool {
+        body.map_or(self.has_attachment_hint, |body| body.attachment_count > 0)
     }
 }
 
@@ -186,6 +200,8 @@ pub struct MessageBody {
     /// layout has been produced yet.
     pub html_render_width: usize,
     pub attachment_count: usize,
+    /// MIME attachment names for Gmail-like preview chips under the subject.
+    pub attachment_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -574,17 +590,28 @@ fn looks_like_tracking_image(source: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutgoingMessage {
     pub from: String,
     pub to: String,
     pub cc: String,
+    pub bcc: String,
     pub subject: String,
     pub body: String,
+    pub html_body: Option<String>,
+    pub attachments: Vec<OutgoingAttachment>,
+    pub custom_headers: Vec<(String, String)>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
-    /// Exact RFC 5322 bytes of a message being forwarded. When present, the
-    /// SMTP builder attaches them as `message/rfc822` instead of sending the
-    /// terminal-rendered HTML/plain projection to the recipient.
+    /// Optional explicit RFC 5322 attachment-forwarding mode at the wire API
+    /// level. Normal composer forwarding now reconstructs inline HTML/plain
+    /// alternatives and file attachments, and sends this field as None.
     pub forwarded_raw: Option<Vec<u8>>,
 }
 
@@ -670,6 +697,7 @@ mod tests {
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         };
         assert_eq!(body.html_link_at(0, 0), Some("https://example.com/one"));
         assert_eq!(body.html_link_at(0, 4), Some("https://example.com/one"));
@@ -703,6 +731,7 @@ mod tests {
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         };
         assert_eq!(body.html_images(), vec!["https://example.com/hero.png".to_owned()]);
     }
@@ -734,6 +763,7 @@ mod tests {
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         };
 
         assert_eq!(
@@ -771,6 +801,7 @@ mod tests {
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         };
 
         assert_eq!(
@@ -800,6 +831,7 @@ mod tests {
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         };
 
         assert_eq!(
@@ -828,6 +860,7 @@ mod tests {
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         };
 
         assert_eq!(
@@ -860,6 +893,7 @@ mod tests {
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         };
 
         assert_eq!(
@@ -884,6 +918,7 @@ mod tests {
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
+            attachment_names: Vec::new(),
         };
         assert_eq!(body.display_text(false), "HTML version");
         assert!(body.plain_is_empty());
