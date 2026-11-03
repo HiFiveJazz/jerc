@@ -310,6 +310,10 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         content_area
             .width
             .saturating_sub(u16::try_from(gutter_width).unwrap_or(0)),
+        // Leave the header/divider visible but otherwise let images use the real
+        // reader viewport. The old fixed 12-row cap made banners/photos much
+        // smaller than the same message in a browser.
+        content_area.height.saturating_sub(6).max(1),
     );
     let reader_image_size = app.reader_image_protocol().map(|image| image.size());
 

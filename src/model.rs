@@ -337,18 +337,24 @@ fn html_image_size_hint(html: &str, source: &str) -> Option<(Option<u32>, Option
             continue;
         }
 
-        let mut width = html_tag_attribute(tag, "width")
+        let attribute_width = html_tag_attribute(tag, "width")
             .as_deref()
             .and_then(parse_css_pixel_value);
-        let mut height = html_tag_attribute(tag, "height")
+        let attribute_height = html_tag_attribute(tag, "height")
             .as_deref()
             .and_then(parse_css_pixel_value);
-        if (width.is_none() || height.is_none())
-            && let Some(style) = html_tag_attribute(tag, "style")
-        {
-            width = width.or_else(|| css_property_pixels(&style, "width"));
-            height = height.or_else(|| css_property_pixels(&style, "height"));
-        }
+        let style = html_tag_attribute(tag, "style");
+        // Inline CSS wins over legacy width/height attributes in browsers. Use
+        // the same precedence for our layout hint, while retaining the attribute
+        // as a fallback when CSS uses percentages/auto rather than pixel values.
+        let width = style
+            .as_deref()
+            .and_then(|style| css_property_pixels(style, "width"))
+            .or(attribute_width);
+        let height = style
+            .as_deref()
+            .and_then(|style| css_property_pixels(style, "height"))
+            .or(attribute_height);
         return Some((width, height));
     }
     None
@@ -554,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn html_image_candidates_preserve_sender_pixel_size_hints() {
+    fn html_image_candidates_prefer_inline_css_pixel_size_hints() {
         let source = "https://example.com/logo@2x.png?a=1&b=2";
         let body = MessageBody {
             id: MessageId("sized-image".into()),
@@ -583,8 +589,8 @@ mod tests {
             body.html_image_candidates(),
             vec![HtmlImageCandidate {
                 source: source.into(),
-                width_px: Some(74),
-                height_px: Some(24),
+                width_px: Some(148),
+                height_px: Some(48),
             }]
         );
     }

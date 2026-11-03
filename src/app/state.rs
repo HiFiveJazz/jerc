@@ -814,28 +814,71 @@ struct ReaderImage {
     protocol: Protocol,
 }
 
-fn reader_image_pixel_size(
+fn reader_image_target_size(
     native_width: u32,
     native_height: u32,
     html_width: Option<u32>,
     html_height: Option<u32>,
-    max_width: u32,
-    max_height: u32,
-) -> (u32, u32) {
+    font_width: u16,
+    font_height: u16,
+    max_width_cells: u16,
+    max_height_cells: u16,
+) -> Size {
     let native_width = native_width.max(1);
     let native_height = native_height.max(1);
-    let width_limit = html_width.unwrap_or(native_width).min(max_width.max(1));
-    let height_limit = html_height.unwrap_or(native_height).min(max_height.max(1));
+    let font_width = u32::from(font_width.max(1));
+    let font_height = u32::from(font_height.max(1));
 
-    // Fit the original pixel data into both the sender's requested CSS box and
-    // the terminal viewport. The scale is deliberately capped at 1.0: email
-    // logos and icons should never be enlarged beyond their decoded source.
-    let scale = 1.0_f64
-        .min(f64::from(width_limit) / f64::from(native_width))
-        .min(f64::from(height_limit) / f64::from(native_height));
-    let width = (f64::from(native_width) * scale).round().max(1.0) as u32;
-    let height = (f64::from(native_height) * scale).round().max(1.0) as u32;
-    (width, height)
+    // HTML width/height are CSS pixels, while Picker::font_size() is reported
+    // in terminal/device pixels. Email templates commonly ship 2x (Retina)
+    // bitmaps and ask browsers to display them at half the backing resolution.
+    // Treat the sender's CSS box as up to 2 device pixels per CSS pixel, capped
+    // by the decoded bitmap below. This lets a 148x48 logo declared as 74x24
+    // occupy its natural 148x48 device-pixel footprint instead of looking about
+    // half-size in a HiDPI terminal, without ever inventing pixels for a 1x asset.
+    const EMAIL_CSS_DEVICE_SCALE: u32 = 2;
+    let scale_css_px = |value: u32| value.max(1).saturating_mul(EMAIL_CSS_DEVICE_SCALE);
+
+    // Keep the decoded source at full resolution and use the scaled HTML box
+    // only to choose the terminal-cell area handed to ratatui-image. The bitmap
+    // itself is still resized exactly once by the graphics protocol.
+    let (desired_width_px, desired_height_px) = match (html_width, html_height) {
+        (Some(width), Some(height)) => (scale_css_px(width), scale_css_px(height)),
+        (Some(width), None) => {
+            let width = scale_css_px(width);
+            let height = u32::try_from(
+                (u64::from(native_height) * u64::from(width)).div_ceil(u64::from(native_width)),
+            )
+            .unwrap_or(u32::MAX)
+            .max(1);
+            (width, height)
+        }
+        (None, Some(height)) => {
+            let height = scale_css_px(height);
+            let width = u32::try_from(
+                (u64::from(native_width) * u64::from(height)).div_ceil(u64::from(native_height)),
+            )
+            .unwrap_or(u32::MAX)
+            .max(1);
+            (width, height)
+        }
+        (None, None) => (native_width, native_height),
+    };
+
+    // Preserve the no-upscale rule. A high-DPI source can use its extra backing
+    // pixels, but a true 1x/tiny bitmap is never enlarged beyond native size.
+    let desired_width_px = desired_width_px.min(native_width);
+    let desired_height_px = desired_height_px.min(native_height);
+    let width_cells = u16::try_from(desired_width_px.div_ceil(font_width))
+        .unwrap_or(u16::MAX)
+        .max(1)
+        .min(max_width_cells.max(1));
+    let height_cells = u16::try_from(desired_height_px.div_ceil(font_height))
+        .unwrap_or(u16::MAX)
+        .max(1)
+        .min(max_height_cells.max(1));
+
+    Size::new(width_cells, height_cells)
 }
 
 pub struct App {
@@ -866,6 +909,7 @@ pub struct App {
     reader_image_pending: Option<String>,
     reader_image_size_hint: Option<(Option<u32>, Option<u32>)>,
     reader_image_target_width: u16,
+    reader_image_target_height: u16,
     pub reader_images_enabled: bool,
     pub help_visible: bool,
     pub help_query: String,
@@ -967,6 +1011,7 @@ impl App {
             reader_image_pending: None,
             reader_image_size_hint: None,
             reader_image_target_width: 48,
+            reader_image_target_height: 18,
             reader_images_enabled: config.ui.remote_images,
             help_visible: false,
             help_query: String::new(),
@@ -3341,7 +3386,7 @@ impl App {
         self.image_loader = Some(MailImageLoader::spawn(runtime_tx));
     }
 
-    pub fn ensure_reader_image(&mut self, width: u16) {
+    pub fn ensure_reader_image(&mut self, width: u16, height: u16) {
         if !self.reader_images_enabled || !self.message_open {
             return;
         }
@@ -3367,7 +3412,8 @@ impl App {
             return;
         }
         self.reader_image = None;
-        self.reader_image_target_width = width.saturating_sub(2).clamp(1, 64);
+        self.reader_image_target_width = width.max(1);
+        self.reader_image_target_height = height.max(1);
         self.reader_image_size_hint = Some((candidate.width_px, candidate.height_px));
         if let Some(loader) = &self.image_loader
             && loader.request(source.clone()).is_ok()
@@ -3389,33 +3435,17 @@ impl App {
             return;
         };
         match event.result {
-            Ok(mut image) => {
+            Ok(image) => {
                 let font_size = picker.font_size();
-                let max_width_px = u32::from(self.reader_image_target_width.max(1))
-                    .saturating_mul(u32::from(font_size.width.max(1)));
-                let max_height_px = 12_u32.saturating_mul(u32::from(font_size.height.max(1)));
-                let (target_width_px, target_height_px) = reader_image_pixel_size(
+                let target = reader_image_target_size(
                     image.width(),
                     image.height(),
                     size_hint.0,
                     size_hint.1,
-                    max_width_px,
-                    max_height_px,
-                );
-                if target_width_px < image.width() || target_height_px < image.height() {
-                    image = image.resize_exact(
-                        target_width_px,
-                        target_height_px,
-                        image::imageops::FilterType::Lanczos3,
-                    );
-                }
-                let target = Size::new(
-                    u16::try_from(target_width_px.div_ceil(u32::from(font_size.width.max(1))))
-                        .unwrap_or(u16::MAX)
-                        .max(1),
-                    u16::try_from(target_height_px.div_ceil(u32::from(font_size.height.max(1))))
-                        .unwrap_or(u16::MAX)
-                        .max(1),
+                    font_size.width,
+                    font_size.height,
+                    self.reader_image_target_width,
+                    self.reader_image_target_height,
                 );
                 match picker.new_protocol(
                     image,
@@ -4079,8 +4109,9 @@ mod tests {
     use super::{
         ComposeField, ComposeMode, Composer, ReaderPosition, ReaderSelection, ReaderWordMotion,
         bounded_index, inner_text_object_range, message_view_offset, offset_index,
-        reader_image_pixel_size, reader_selection_text, reader_word_target,
+        reader_image_target_size, reader_selection_text, reader_word_target,
     };
+    use ratatui::layout::Size;
 
     #[test]
     fn list_navigation_is_bounded() {
@@ -4197,26 +4228,30 @@ mod tests {
     }
 
     #[test]
-    fn reader_images_never_upscale_small_assets() {
+    fn reader_images_treat_html_dimensions_as_css_pixels_for_hidpi_assets() {
+        // A typical 2x email logo should use its full backing bitmap instead of
+        // being rendered at half-size just because HTML declares the CSS size.
         assert_eq!(
-            reader_image_pixel_size(74, 24, None, None, 640, 240),
-            (74, 24)
+            reader_image_target_size(148, 48, Some(74), Some(24), 8, 16, 120, 40),
+            Size::new(19, 3)
         );
+
+        // A genuine 1x asset is still capped at native size and never upscaled.
         assert_eq!(
-            reader_image_pixel_size(74, 24, Some(300), Some(100), 640, 240),
-            (74, 24)
+            reader_image_target_size(74, 24, Some(300), Some(100), 8, 16, 120, 40),
+            Size::new(10, 2)
         );
     }
 
     #[test]
-    fn reader_images_respect_html_size_and_preserve_aspect_ratio() {
+    fn reader_images_use_full_reader_bounds_instead_of_legacy_caps() {
         assert_eq!(
-            reader_image_pixel_size(148, 48, Some(74), Some(24), 640, 240),
-            (74, 24)
+            reader_image_target_size(1200, 600, None, None, 8, 16, 120, 40),
+            Size::new(120, 38)
         );
         assert_eq!(
-            reader_image_pixel_size(1200, 600, None, None, 600, 240),
-            (480, 240)
+            reader_image_target_size(2400, 1600, None, None, 8, 16, 90, 30),
+            Size::new(90, 30)
         );
     }
 
