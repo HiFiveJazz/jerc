@@ -122,6 +122,19 @@ new_mail_sound_name = "message-new-email"
 # client_id = "PUBLISHER_OAUTH_DESKTOP_CLIENT_ID"
 # client_secret = "OPTIONAL_GOOGLE_DESKTOP_PUBLIC_CLIENT_SECRET"
 # tenant = "common"  # Microsoft only; organizational tenant ID also supported
+# flow = "browser"      # default: aerc-rs localhost callback (own registered app)
+# flow = "nativeclient" # Microsoft: copy redirect URL back into terminal
+# flow = "devicecode"   # Microsoft: enter one-time code in browser; no redirect URI
+# callback_host = "localhost" # browser flow only, or "127.0.0.1" (default)
+# callback_path = "/"        # browser flow only; default "/oauth/callback"
+# prompt = "select_account"  # google: consent/select_account/none;
+#                            # microsoft: login/consent/select_account/none
+# login_hint = "you@example.com" # prefill account; does not change consent
+# scope = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
+#                            # advanced override; missing scopes may break IMAP/SMTP
+# Diagnose without network: aerc-rs --oauth-inspect "ACCOUNT NAME"
+# Redirect paths and consent are validated against the selected app registration.
+# These settings cannot grant unregistered redirect URIs, app identity, or admin consent.
 # After configuring, run: aerc-rs --oauth-login "ACCOUNT NAME"
 # It opens a browser and stores a private refresh token outside config.toml.
 # Apps can embed public IDs at build-time via AERC_RS_GOOGLE_CLIENT_ID,

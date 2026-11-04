@@ -350,3 +350,53 @@ must first register and, where required, verify these OAuth clients; this
 patch does not bundle an approved application identity.** Microsoft tenants may
 require administrator consent, and some disallow SMTP AUTH entirely.
 Legacy refresh-token URLs and credential commands remain supported.
+
+### Microsoft OAuth compatibility (desktop CLI)
+
+Microsoft application registrations accept specific redirect URLs. If an
+existing registered public client ID does not allow the aerc-rs loopback URI,
+`AADSTS50011` occurs before the IMAP or SMTP connection.
+
+For an app that permits the Microsoft native-client redirect used by Mutt and
+NeoMutt, configure `flow = "nativeclient"` in `[accounts.oauth]`, then run
+`aerc-rs --oauth-login "Work"`. Copy the **complete** final redirect URL from
+the browser into the terminal. This one-time code is exchanged with PKCE; it is
+not stored in config or shell history. This is an opt-in workaround, not a
+replacement for registering an aerc-rs client ID with its own loopback URI.
+
+Alternatively, set `flow = "devicecode"`: aerc-rs opens the Microsoft
+verification page and shows a short code to enter there. This avoids callback
+URLs, but requires the Microsoft OAuth application to permit device-code/public
+client authentication and your organization to allow that grant. Neither
+option bypasses organizational consent policies or permits reuse of another
+publisher's OAuth registration in distributed builds.
+
+### Testing desktop OAuth registrations
+
+Use `aerc-rs --oauth-inspect "ACCOUNT NAME"` to show the redirect pattern,
+requested permissions and consent prompt without opening a browser or reading
+refresh tokens. For a Microsoft **app you registered** with `http://localhost`
+under **Mobile and desktop applications**, set:
+
+```toml
+[accounts.oauth]
+provider = "microsoft"
+client_id = "YOUR_OWN_REGISTERED_PUBLIC_CLIENT_ID"
+flow = "browser"
+callback_host = "localhost"
+callback_path = "/"
+prompt = "select_account"
+```
+
+For an app registered with the Microsoft `nativeclient` redirect, set
+`flow = "nativeclient"` and paste the final browser URL into the terminal;
+for a registered public client permitted to use device authorization, set
+`flow = "devicecode"`. The default loopback browser callback remains
+`http://127.0.0.1:<random-port>/oauth/callback`. Google browser OAuth
+still uses PKCE and requests offline access.
+
+Changing the redirect URI or prompt does **not** make aerc-rs into Apple Mail
+or Thunderbird, grant their OAuth permissions, or bypass tenant consent. Do not
+use another application’s registration without authorization. Microsoft/Google
+provider approvals still apply. OAuth tokens remain account/client-bound and
+are stored in the private per-account token file.

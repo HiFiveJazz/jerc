@@ -28,6 +28,11 @@ struct Cli {
     #[arg(long, value_name = "ACCOUNT_NAME")]
     oauth_login: Option<String>,
 
+    /// Show the account's OAuth redirect, permissions, and consent options
+    /// without opening a browser or making a network request.
+    #[arg(long, value_name = "ACCOUNT_NAME", conflicts_with = "oauth_login")]
+    oauth_inspect: Option<String>,
+
     /// Validate accounts and benchmark folder/header scanning without opening the TUI.
     #[arg(long)]
     headless_check: bool,
@@ -38,6 +43,9 @@ fn main() -> Result<()> {
     let config = load_config(&cli)?;
     if let Some(name) = &cli.oauth_login {
         return aerc_rs::oauth::login_account(&config.accounts, name);
+    }
+    if let Some(name) = &cli.oauth_inspect {
+        return aerc_rs::oauth::inspect_account(&config.accounts, name);
     }
     if cli.headless_check {
         return headless_check(&config);

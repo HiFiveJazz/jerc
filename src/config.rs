@@ -75,7 +75,7 @@ pub struct AccountConfig {
     pub page_size: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct OAuthConfig {
     pub provider: String,
     /// Public client ID. Application publishers can instead embed one at build
@@ -89,6 +89,27 @@ pub struct OAuthConfig {
     /// Not used as a security boundary; don't put user refresh tokens here.
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// Login flow: browser (local callback), nativeclient (manual URL), or
+    /// devicecode (Microsoft sign-in code). Defaults to browser.
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// Optional browser redirect hostname. Choose only localhost or 127.0.0.1
+    /// to match the redirect URI registered for *your* OAuth application.
+    #[serde(default)]
+    pub callback_host: Option<String>,
+    /// Optional browser redirect path. Default: /oauth/callback.
+    #[serde(default)]
+    pub callback_path: Option<String>,
+    /// Provider's consent-screen choice (e.g. select_account or consent).
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Optional email hint prefilled on the provider's login page.
+    #[serde(default)]
+    pub login_hint: Option<String>,
+    /// Override requested OAuth scopes (advanced; must include IMAP/SMTP
+    /// permissions and offline access if those are needed).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl std::fmt::Debug for AccountConfig {
@@ -550,6 +571,31 @@ mod tests {
         assert_eq!(config.accounts[0].copy_to.as_deref(), Some(""));
         assert_eq!(config.accounts[1].copy_to.as_deref(), Some("Sent, Archive"));
         assert!(config.accounts[2].copy_to.is_none());
+    }
+
+    #[test]
+    fn oauth_browser_test_settings_parse_per_account() {
+        let config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Development"
+            email = "dev@example.com"
+            source = "imap"
+            outgoing = "smtp"
+            [accounts.oauth]
+            provider = "microsoft"
+            client_id = "registered-public-client"
+            callback_host = "localhost"
+            callback_path = "/"
+            prompt = "select_account"
+            login_hint = "dev@example.com"
+            scope = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
+        "#).unwrap();
+        let oauth = config.accounts[0].oauth.as_ref().unwrap();
+        assert_eq!(oauth.callback_host.as_deref(), Some("localhost"));
+        assert_eq!(oauth.callback_path.as_deref(), Some("/"));
+        assert_eq!(oauth.prompt.as_deref(), Some("select_account"));
+        assert_eq!(oauth.login_hint.as_deref(), Some("dev@example.com"));
+        assert!(!format!("{:?}", config.accounts[0]).contains("registered-public-client"));
     }
 
     #[test]
