@@ -38,10 +38,29 @@ struct Cli {
     #[arg(long, value_name = "ACCOUNT_NAME", conflicts_with_all = ["oauth_login", "oauth_inspect"])]
     oauth_probe: Option<String>,
 
+    /// Try Microsoft's documented two-step XOAUTH2 challenge/response during
+    /// the no-send SMTP probe. Does not change ordinary sending behavior.
+    #[arg(long, requires = "oauth_probe")]
+    oauth_probe_smtp_challenge: bool,
+
     /// Discover secure IMAP/SMTP settings using provider HTTPS autoconfig and Thunderbird ISPDB.
     /// Prints a proposed TOML account without modifying your config or credentials.
     #[arg(long, value_name = "EMAIL_ADDRESS", conflicts_with_all = ["maildir", "oauth_login", "oauth_inspect", "oauth_probe", "headless_check"])]
     discover_email: Option<String>,
+
+    /// Select a known provider when domain discovery is missing or ambiguous.
+    /// Does not confirm account ownership or bypass OAuth approval.
+    #[arg(long, value_parser = ["auto", "microsoft", "google"], requires = "discover_email")]
+    discover_provider: Option<String>,
+
+    /// Suggest a separate IMAP/SMTP username in the generated config (no OAuth request).
+    #[arg(long, value_name = "LOGIN_UPN", requires = "discover_email", conflicts_with = "discover_oauth_account")]
+    discover_username: Option<String>,
+
+    /// Suggest a Microsoft login from a configured account's OAuth token.
+    /// Requires a previous --oauth-login; never changes account config.
+    #[arg(long, value_name = "ACCOUNT_NAME", requires = "discover_email", conflicts_with = "discover_username")]
+    discover_oauth_account: Option<String>,
 
     /// Validate accounts and benchmark folder/header scanning without opening the TUI.
     #[arg(long)]
@@ -51,7 +70,55 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Some(email) = &cli.discover_email {
-        let proposal = aerc_rs::discovery::discover(email)?;
+        let mut provider = cli.discover_provider.as_deref().unwrap_or("auto");
+        let mut oauth_settings = None;
+        let mut configured_logins = (None, None);
+        if let Some(name) = &cli.discover_oauth_account {
+            let config = Config::load(cli.config.as_deref())?;
+            let account = config.accounts.iter().find(|account| &account.name == name)
+                .with_context(|| format!("no configured account named {name:?}"))?;
+            anyhow::ensure!(
+                account.email.as_deref().is_some_and(|address| address.eq_ignore_ascii_case(email)),
+                "--discover-oauth-account must refer to an account with the same visible email address"
+            );
+            let settings = aerc_rs::oauth::OAuthSettings::for_account(account)?
+                .with_context(|| format!("account {name:?} has no OAuth configuration"))?;
+            anyhow::ensure!(settings.provider == "microsoft",
+                "OAuth identity suggestions currently support Microsoft accounts only");
+            if provider == "auto" { provider = "microsoft"; }
+            anyhow::ensure!(provider == "microsoft",
+                "--discover-provider must be microsoft when using a Microsoft OAuth account");
+            configured_logins = (account.imap_username.clone(), account.smtp_username.clone());
+            oauth_settings = Some(settings);
+        }
+        let mut proposal = aerc_rs::discovery::discover_with_provider(email, provider)?;
+        if let Some(username) = &cli.discover_username {
+            proposal = proposal.with_login_username(username)?;
+            println!("# Login username supplied explicitly; verify before applying.");
+        }
+        if let Some(settings) = oauth_settings {
+            let (imap_login, smtp_login) = configured_logins;
+            // Explicit configuration takes precedence over unverified claims.
+            // Only refresh the OAuth token if at least one login is unknown.
+            let hint = if imap_login.is_some() && smtp_login.is_some() {
+                None
+            } else {
+                settings.suggested_login_username()?
+            };
+            proposal = proposal.with_login_usernames(
+                imap_login.as_deref().or(hint.as_deref()),
+                smtp_login.as_deref().or(hint.as_deref()),
+            )?;
+            if imap_login.is_some() || smtp_login.is_some() {
+                println!("# Existing explicitly configured IMAP/SMTP usernames preserved.");
+            }
+            if hint.is_some() {
+                println!("# Missing login username(s) suggested from Microsoft access-token claims (unverified).");
+                println!("# Confirm the UPN against your provider before applying this config.");
+            } else if imap_login.is_none() || smtp_login.is_none() {
+                println!("# Access token has no readable login hint; use --discover-username LOGIN_UPN if needed.");
+            }
+        }
         println!("{}", proposal.to_toml());
         return Ok(());
     }
@@ -63,7 +130,7 @@ fn main() -> Result<()> {
         return aerc_rs::oauth::inspect_account(&config.accounts, name);
     }
     if let Some(name) = &cli.oauth_probe {
-        return oauth_probe(&config, name);
+        return oauth_probe(&config, name, cli.oauth_probe_smtp_challenge);
     }
     if cli.headless_check {
         return headless_check(&config);
@@ -75,20 +142,39 @@ fn load_config(cli: &Cli) -> Result<Config> {
     if let Some(maildir) = &cli.maildir {
         return Ok(Config::single_maildir(cli.name.clone(), maildir.clone()));
     }
-    Config::load(cli.config.as_deref())
+    if cli.oauth_login.is_none() && cli.oauth_inspect.is_none()
+        && cli.oauth_probe.is_none() && !cli.headless_check
+    {
+        Config::load_or_empty(cli.config.as_deref())
+    } else {
+        Config::load(cli.config.as_deref())
+    }
 }
 
-fn oauth_probe(config: &Config, name: &str) -> Result<()> {
+fn oauth_probe(config: &Config, name: &str, smtp_challenge: bool) -> Result<()> {
     let account = config.accounts.iter().find(|account| account.name == name)
         .with_context(|| format!("no account named {name:?} in config"))?;
     let settings = aerc_rs::oauth::OAuthSettings::for_account(account)?
         .with_context(|| format!("account {name:?} has no [accounts.oauth] configuration"))?;
     println!("Testing OAuth for {name:?} (no email will be sent)");
 
-    // Deliberately discard the access token without displaying it. The IMAP
-    // and SMTP probes use their real, existing protocol authentication paths.
-    drop(settings.access_token().context("refreshing OAuth token")?);
+    // Refresh the token and inspect the response's scope metadata without
+    // exposing bearer tokens, refresh tokens, or the full response payload.
+    let reported_scopes = settings.reported_protocol_scopes()
+        .context("refreshing OAuth token / inspecting reported scopes")?;
     println!("  OAuth refresh: OK");
+    if settings.provider == "microsoft" {
+        match reported_scopes {
+            Some((imap, smtp)) => println!(
+                "  Token response reports IMAP permission: {} | SMTP.Send: {}",
+                if imap { "yes" } else { "no" },
+                if smtp { "yes" } else { "no" },
+            ),
+            None => println!(
+                "  Token response did not include scope metadata (inconclusive)"
+            ),
+        }
+    }
 
     let mut backend = backend::from_account(account)?;
     backend.connect().context("connecting/authenticating to IMAP using XOAUTH2")?;
@@ -102,7 +188,11 @@ fn oauth_probe(config: &Config, name: &str) -> Result<()> {
             let source = aerc_rs::outgoing::SmtpSource::parse(outgoing)?
                 .with_account_oauth(account)?;
             let sender = aerc_rs::outgoing::SmtpSender::new(source, account.outgoing_cred_cmd.clone());
-            sender.probe_oauth().context("authenticating to SMTP without sending a message")?;
+            if smtp_challenge {
+                println!("  SMTP OAuth mode: two-step XOAUTH2 challenge/response");
+            }
+            sender.probe_oauth_with_challenge(smtp_challenge)
+                .context("authenticating to SMTP without sending a message")?;
             println!("  SMTP OAuth authentication: OK (no message sent)");
         } else {
             println!("  SMTP: skipped (not an SMTP outgoing URI)");

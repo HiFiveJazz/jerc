@@ -21,6 +21,34 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
 const MICROSOFT_NATIVE_REDIRECT: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
 
+/// Application-publisher defaults embedded at compile time. The user may
+/// override them per-account, but ordinary users should not need to register
+/// OAuth clients when using an appropriately registered app build.
+/// Register your own IDs with each provider; don't copy another app's identity.
+#[must_use]
+pub fn embedded_client_id(provider: &str) -> Option<&'static str> {
+    match provider {
+        "google" => option_env!("AERC_RS_GOOGLE_CLIENT_ID"),
+        "microsoft" => option_env!("AERC_RS_MICROSOFT_CLIENT_ID"),
+        _ => None,
+    }.filter(|id| !id.trim().is_empty())
+}
+
+#[must_use]
+pub fn embedded_google_client_secret() -> Option<&'static str> {
+    option_env!("AERC_RS_GOOGLE_CLIENT_SECRET").filter(|secret| !secret.is_empty())
+}
+
+/// Google Desktop application OAuth client IDs include this suffix verbatim.
+/// The local-part is checked only for safe syntax; this does not verify that
+/// the client is registered or permitted to use this redirect URI.
+#[must_use]
+pub fn valid_google_desktop_client_id(id: &str) -> bool {
+    let Some(prefix) = id.strip_suffix(".apps.googleusercontent.com") else { return false; };
+    !prefix.is_empty() && prefix.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+}
+
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginFlow {
     Browser,
@@ -76,10 +104,106 @@ struct SavedToken {
     refresh_token: String,
 }
 
+// Avoid depending on the access token's internal format: Microsoft service
+// access tokens can be opaque or encrypted. Inspect only response metadata.
+fn protocol_scope_flags(scope: &str) -> (bool, bool) {
+    let has = |wanted: &str| scope.split_whitespace().any(|item| {
+        item.rsplit('/').next().is_some_and(|scope| scope.eq_ignore_ascii_case(wanted))
+    });
+    (has("IMAP.AccessAsUser.All"), has("SMTP.Send"))
+}
+
+
+/// A deliberately narrow, read-only summary of claims in the *actual* access
+/// token used for SMTP. Do not print access tokens, account identifiers, or
+/// arbitrary JWT payload values. JWT payloads here are NOT signature-verified:
+/// this is diagnostic metadata, not authorization logic. Some Microsoft tokens
+/// are encrypted/opaque; callers must treat those as inconclusive.
+#[must_use]
+pub fn safe_smtp_token_diagnostics(token: &str, client_id: &str, smtp_username: &str) -> String {
+    let parts: Vec<_> = token.split('.').collect();
+    if parts.len() != 3 || token.len() > 131_072 {
+        return "Access token claims: opaque or encrypted; cannot inspect (inconclusive)".into();
+    }
+    let Ok(payload) = URL_SAFE_NO_PAD.decode(parts[1]) else {
+        return "Access token claims: not a readable JWT (inconclusive)".into();
+    };
+    if payload.len() > 65_536 {
+        return "Access token claims: payload too large (inconclusive)".into();
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload) else {
+        return "Access token claims: not JSON (inconclusive)".into();
+    };
+    let field = |key| value.get(key).and_then(serde_json::Value::as_str);
+    let audience = match field("aud") {
+        Some("https://outlook.office.com" | "https://outlook.office365.com" |
+             "00000002-0000-0ff1-ce00-000000000000") => "Exchange Online",
+        Some(_) => "other (verify token audience)",
+        None => "missing",
+    };
+    let scope = field("scp");
+    let scoped = |permission: &str| scope.is_some_and(|s| s.split_whitespace()
+        .any(|candidate| candidate.eq_ignore_ascii_case(permission)));
+    let flag = |bool_value| if bool_value { "yes" } else { "no" };
+    let client_claim = field("azp").or_else(|| field("appid"));
+    let client_match = match client_claim {
+        Some(claim) => flag(claim.eq_ignore_ascii_case(client_id)),
+        None => "unavailable",
+    };
+    let principal = field("preferred_username").or_else(|| field("upn"))
+        .or_else(|| field("unique_name"));
+    let principal_match = match principal {
+        Some(username) => flag(username.eq_ignore_ascii_case(smtp_username)),
+        None => "unavailable",
+    };
+    format!(
+        "Access token JWT claims (unverified): aud={audience}; scp.IMAP={}; scp.SMTP.Send={}; client_id_matches={client_match}; login_matches_SMTP={principal_match}; tenant_present={}",
+        if scope.is_some() { flag(scoped("IMAP.AccessAsUser.All")) } else { "unavailable" },
+        if scope.is_some() { flag(scoped("SMTP.Send")) } else { "unavailable" },
+        flag(field("tid").is_some()),
+    )
+}
+
+/// Extract a *suggested* SMTP/IMAP login from a Microsoft access token.
+/// This is strictly a user-facing account-setup hint, never proof of identity
+/// or authorization: JWT claims are not signature-verified here, and Microsoft
+/// may issue opaque tokens. Do not cache, trust, or auto-apply this value.
+#[must_use]
+pub fn microsoft_login_username_hint(token: &str) -> Option<String> {
+    if token.len() > 131_072 { return None; }
+    let mut parts = token.split('.');
+    let (_, Some(payload), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else { return None; };
+    let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    if payload.len() > 65_536 { return None; }
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    for key in ["preferred_username", "upn", "unique_name"] {
+        let Some(value) = claims.get(key).and_then(serde_json::Value::as_str) else { continue; };
+        // A display name, GUID, unsafe value, or truncated claim is not a
+        // useful login suggestion. User-provided UPNs are validated separately.
+        if value.len() > 254 || value.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+            continue;
+        }
+        if let Some((local, domain)) = value.rsplit_once('@') {
+            if !local.is_empty() && !local.contains('@') && domain.contains('.')
+                && !domain.starts_with('.') && !domain.ends_with('.')
+                && domain.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+            {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Deserialize)]
 struct TokenReply {
     access_token: String,
     refresh_token: Option<String>,
+    /// Scopes in the token response, if the identity provider reports them.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -126,16 +250,14 @@ impl OAuthSettings {
 
     fn from_config(name: &str, oauth: &OAuthConfig) -> Result<Self> {
         let provider = oauth.provider.trim().to_ascii_lowercase();
-        let client_id = oauth.client_id.clone().or_else(|| match provider.as_str() {
-            "google" => option_env!("AERC_RS_GOOGLE_CLIENT_ID").map(str::to_owned),
-            "microsoft" => option_env!("AERC_RS_MICROSOFT_CLIENT_ID").map(str::to_owned),
-            _ => None,
-        }).filter(|id| !id.trim().is_empty()).ok_or_else(|| anyhow!(
+        let client_id = oauth.client_id.clone()
+            .or_else(|| embedded_client_id(&provider).map(str::to_owned))
+            .filter(|id| !id.trim().is_empty()).ok_or_else(|| anyhow!(
             "OAuth account {name:?} needs oauth.client_id or an app-publisher client ID at build time"
         ))?;
-        let client_secret = oauth.client_secret.clone().or_else(|| match provider.as_str() {
-            "google" => option_env!("AERC_RS_GOOGLE_CLIENT_SECRET").map(str::to_owned),
-            _ => None,
+        let client_secret = oauth.client_secret.clone().or_else(|| {
+            (provider == "google").then(|| embedded_google_client_secret())
+                .flatten().map(str::to_owned)
         });
         let (auth_endpoint, token_endpoint, scope) = match provider.as_str() {
             "google" => (
@@ -256,12 +378,41 @@ impl OAuthSettings {
     }
 
     pub fn access_token(&self) -> Result<String> {
+        Ok(self.refresh_access_token()?.access_token)
+    }
+
+    /// Refresh an existing Microsoft OAuth session and offer its username
+    /// claim as an unverified setup hint. Never changes account configuration.
+    /// The identity provider may rotate the cached refresh token as usual.
+    pub fn suggested_login_username(&self) -> Result<Option<String>> {
+        if self.provider != "microsoft" {
+            bail!("OAuth username suggestions currently support Microsoft accounts only");
+        }
+        Ok(microsoft_login_username_hint(&self.access_token()?))
+    }
+
+    /// Inspect only the protocol permissions reported by the token endpoint.
+    /// No access or refresh token, account ID, or raw scope string is printed.
+    /// `None` means the token endpoint did not supply a scope field.
+    pub fn reported_protocol_scopes(&self) -> Result<Option<(bool, bool)>> {
+        let reply = self.refresh_access_token()?;
+        Ok(reply.scope.as_deref().map(protocol_scope_flags))
+    }
+
+    fn refresh_access_token(&self) -> Result<TokenReply> {
         let refresh = self.refresh_token()?;
         let mut form = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh.as_str()),
             ("client_id", self.client_id.as_str()),
         ];
+        // Microsoft permits an explicit scope on a refresh grant. Request the
+        // same configured IMAP/SMTP permissions rather than depending on the
+        // original grant's default scope selection. This cannot add scopes
+        // which the user/tenant has not consented to.
+        if self.provider == "microsoft" {
+            form.push(("scope", self.scope.as_str()));
+        }
         if let Some(secret) = self.client_secret.as_deref() {
             form.push(("client_secret", secret));
         }
@@ -269,7 +420,7 @@ impl OAuthSettings {
         if let Some(rotated) = reply.refresh_token.as_deref().filter(|value| !value.is_empty()) {
             self.save_refresh_token(rotated)?;
         }
-        Ok(reply.access_token)
+        Ok(reply)
     }
 
     fn request_token(&self, form: &[(&str, &str)]) -> Result<TokenReply> {
@@ -282,7 +433,11 @@ impl OAuthSettings {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let failure: OAuthFailure = response.body_mut().read_json().unwrap_or_default();
-            bail!("{}", safe_oauth_failure(status, &failure));
+            let message = safe_oauth_failure(status, &failure);
+            if self.provider == "google" && status == 400 {
+                bail!("{message}. Verify the FULL Google desktop client ID, any matching desktop client_secret issued for that registration, and the exact localhost redirect URI. A browser callback alone does not mean the token exchange succeeded");
+            }
+            bail!("{message}");
         }
         let token: TokenReply = response.body_mut().read_json()
             .context("decoding OAuth token response")?;
@@ -331,7 +486,7 @@ impl OAuthSettings {
         Ok((authorization, verifier, state))
     }
 
-    fn exchange_code(&self, code: &str, redirect_uri: &str, verifier: &str) -> Result<()> {
+    fn exchange_code(&self, code: &str, redirect_uri: &str, verifier: &str, quiet: bool) -> Result<()> {
         let mut form = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -343,20 +498,35 @@ impl OAuthSettings {
             form.push(("client_secret", secret));
         }
         let reply = self.request_token(&form)?;
-        self.finish_login(reply)
+        self.finish_login(reply, quiet)
     }
 
-    fn finish_login(&self, reply: TokenReply) -> Result<()> {
+    fn finish_login(&self, reply: TokenReply, quiet: bool) -> Result<()> {
         if reply.access_token.is_empty() { bail!("OAuth server returned no access token"); }
         let refresh = reply.refresh_token.ok_or_else(|| anyhow!(
             "OAuth provider did not return a refresh token; revoke authorization and retry with offline access"
         ))?;
         self.save_refresh_token(&refresh)?;
-        println!("OAuth sign-in succeeded for {:?}; refresh token stored locally with private permissions.", self.account_name);
+        if !quiet {
+            println!("OAuth sign-in succeeded for {:?}; refresh token stored locally with private permissions.", self.account_name);
+        }
         Ok(())
     }
 
     pub fn browser_login(&self) -> Result<()> {
+        self.browser_login_inner(false)
+    }
+
+    /// TUI wizard uses a browser-only flow and renders its own feedback.
+    /// Never print sensitive authorization URLs into the alternate screen.
+    fn wizard_login(&self) -> Result<()> {
+        if self.flow != LoginFlow::Browser {
+            bail!("the account wizard currently requires browser OAuth");
+        }
+        self.browser_login_inner(true)
+    }
+
+    fn browser_login_inner(&self, quiet: bool) -> Result<()> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .context("binding OAuth callback to loopback")?;
         listener.set_nonblocking(true)?;
@@ -364,7 +534,11 @@ impl OAuthSettings {
         let redirect_uri = format!("http://{}:{port}{}", self.callback_host, self.callback_path);
         let (authorization, verifier, state) = self.authorization_url(&redirect_uri)?;
         if open_browser(authorization.as_str()) {
-            println!("Check your browser to finish signing in to {:?}.", self.account_name);
+            if !quiet {
+                println!("Check your browser to finish signing in to {:?}.", self.account_name);
+            }
+        } else if quiet {
+            bail!("could not open a browser; run --oauth-login for the registered account from a normal terminal");
         } else {
             println!("Could not launch your browser. Open this URL to sign in:\n{}", authorization);
         }
@@ -400,7 +574,7 @@ impl OAuthSettings {
                 Err(error) => return Err(error.into()),
             }
         };
-        self.exchange_code(&code, &redirect_uri, &verifier)
+        self.exchange_code(&code, &redirect_uri, &verifier, quiet)
     }
 
     /// Microsoft native-client redirect compatible with the authorization-code
@@ -420,7 +594,7 @@ impl OAuthSettings {
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
         let code = parse_nativeclient_callback(&answer, &state)?;
-        self.exchange_code(&code, MICROSOFT_NATIVE_REDIRECT, &verifier)
+        self.exchange_code(&code, MICROSOFT_NATIVE_REDIRECT, &verifier, false)
     }
 
     /// RFC 8628 / Microsoft device-code sign-in. This does not require any
@@ -466,7 +640,7 @@ impl OAuthSettings {
                 .context("decoding Microsoft device-code token response")?;
             if result.status().is_success() {
                 let access_token = reply.access_token.ok_or_else(|| anyhow!("Microsoft returned no access token"))?;
-                return self.finish_login(TokenReply { access_token, refresh_token: reply.refresh_token });
+                return self.finish_login(TokenReply { access_token, refresh_token: reply.refresh_token, scope: None }, false);
             }
             match reply.error.as_deref() {
                 Some("authorization_pending") => {},
@@ -561,6 +735,16 @@ pub fn inspect_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Browser-only login for the editable account wizard. This never exposes
+/// OAuth URL state, codes, or tokens in the TUI's terminal output.
+pub fn login_account_quiet(accounts: &[AccountConfig], name: &str) -> Result<()> {
+    let account = accounts.iter().find(|account| account.name == name)
+        .ok_or_else(|| anyhow!("no account named {name:?} in config"))?;
+    let settings = OAuthSettings::for_account(account)?
+        .ok_or_else(|| anyhow!("account {name:?} has no OAuth settings"))?;
+    settings.wizard_login()
+}
+
 pub fn login_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
     let account = accounts.iter().find(|account| account.name == name)
         .ok_or_else(|| anyhow!("no account named {name:?} in config"))?;
@@ -572,6 +756,37 @@ pub fn login_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn google_desktop_id_must_include_full_suffix() {
+        assert!(valid_google_desktop_client_id("123-abc.apps.googleusercontent.com"));
+        assert!(!valid_google_desktop_client_id("123-abc"));
+        assert!(!valid_google_desktop_client_id("oops\n.apps.googleusercontent.com"));
+    }
+
+    #[test]
+    fn microsoft_login_hint_prefers_human_readable_login_and_rejects_unsafe_claims() {
+        fn token(claims: serde_json::Value) -> String {
+            let data = serde_json::to_vec(&claims).unwrap();
+            format!("header.{}.signature", URL_SAFE_NO_PAD.encode(data))
+        }
+        let ok = token(serde_json::json!({
+            "preferred_username": "f00851y@dartmouth.edu",
+            "upn": "other@dartmouth.edu"
+        }));
+        assert_eq!(super::microsoft_login_username_hint(&ok).as_deref(),
+            Some("f00851y@dartmouth.edu"));
+        let fallback = token(serde_json::json!({
+            "preferred_username": "User Name",
+            "upn": "login@dartmouth.edu"
+        }));
+        assert_eq!(super::microsoft_login_username_hint(&fallback).as_deref(),
+            Some("login@dartmouth.edu"));
+        assert!(super::microsoft_login_username_hint(&token(serde_json::json!({
+            "preferred_username": "login\n@dartmouth.edu"
+        }))).is_none());
+        assert!(super::microsoft_login_username_hint("opaque-token").is_none());
+    }
+
     #[test]
     fn google_and_microsoft_use_distinct_imap_smtp_scopes() {
         let google = OAuthSettings::from_config("Personal", &OAuthConfig { provider: "google".into(), client_id: Some("public-client".into()), tenant: None, client_secret: None, flow: None, ..Default::default() }).unwrap();
@@ -688,6 +903,46 @@ mod tests {
                 credential_namespace: Some(value.into()), ..Default::default()
             }).is_err());
         }
+    }
+
+    #[test]
+    fn smtp_claim_diagnostics_do_not_expose_token_or_identifiers() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let payload = serde_json::json!({
+            "aud": "https://outlook.office.com", "scp": "IMAP.AccessAsUser.All SMTP.Send",
+            "azp": "client-identifier", "tid": "private-tenant",
+            "preferred_username": "student@example.edu", "oid": "private-object"
+        });
+        let token = format!("{}.{}.signature", URL_SAFE_NO_PAD.encode("{}"),
+            URL_SAFE_NO_PAD.encode(payload.to_string()));
+        let diagnostic = safe_smtp_token_diagnostics(&token, "client-identifier", "student@example.edu");
+        assert!(diagnostic.contains("aud=Exchange Online"));
+        assert!(diagnostic.contains("scp.SMTP.Send=yes"));
+        assert!(diagnostic.contains("client_id_matches=yes"));
+        assert!(diagnostic.contains("login_matches_SMTP=yes"));
+        for secret in ["private-tenant", "private-object", "student@example.edu", "client-identifier", &token] {
+            assert!(!diagnostic.contains(secret));
+        }
+        assert!(safe_smtp_token_diagnostics("opaque-token", "id", "u").contains("inconclusive"));
+    }
+
+    #[test]
+    fn protocol_permissions_are_read_only_from_token_response_scope_metadata() {
+        assert_eq!(protocol_scope_flags(
+            "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
+        ), (true, true));
+        assert_eq!(protocol_scope_flags(
+            "https://outlook.office.com/IMAP.AccessAsUser.All"
+        ), (true, false));
+        assert_eq!(protocol_scope_flags(
+            "https://graph.microsoft.com/Mail.Send"
+        ), (false, false));
+        let parsed: TokenReply = serde_json::from_str(
+            r#"{"access_token":"private-token","refresh_token":null,"scope":"https://outlook.office.com/SMTP.Send"}"#
+        ).unwrap();
+        assert_eq!(parsed.scope.as_deref().map(protocol_scope_flags), Some((false, true)));
+        let no_scope: TokenReply = serde_json::from_str(r#"{"access_token":"private-token","refresh_token":null}"#).unwrap();
+        assert!(no_scope.scope.is_none());
     }
 
     #[test]

@@ -25,6 +25,10 @@ default_mailbox = "INBOX"
 # For Google Workspace or Microsoft 365 custom domains, the OAuth provider
 # selects known servers. For other domains, set:
 # To discover real servers first: aerc-rs --discover-email "you@example.com"
+# For a Microsoft login UPN different from the visible email address:
+#   aerc-rs --discover-email "alias@university.edu" --discover-provider microsoft --discover-username "login@university.edu"
+# Or after OAuth sign-in to this configured account:
+#   aerc-rs --discover-email "alias@university.edu" --discover-oauth-account "University"
 # The command prints TOML for review; it does NOT alter existing accounts.
 # imap_username = "actual-login@example.com" # if IMAP login differs from `email`
 # smtp_username = "actual-login@example.com" # if SMTP login differs from `email`

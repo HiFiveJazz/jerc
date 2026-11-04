@@ -59,6 +59,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             draw_compose_advanced_options(frame, app);
         }
     }
+    if app.setup.is_some() {
+        draw_setup_wizard(frame, app);
+    }
 }
 
 fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -82,6 +85,95 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.text()), area);
+}
+
+/// Shows discovered values and manual overrides together, like a desktop
+/// account editor. No config is modified before Ctrl-S confirms this screen.
+fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
+    let Some(wizard) = app.setup.as_ref() else { return; };
+    let theme = app.theme().clone();
+    let bounds = frame.area();
+    let width = bounds.width.saturating_sub(2).min(94).max(1);
+    let height = bounds.height.saturating_sub(2).min(24).max(1);
+    let popup = Rect::new(
+        bounds.x + bounds.width.saturating_sub(width) / 2,
+        bounds.y + bounds.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(if wizard.first_run { " Welcome to aerc-rs · Set up your first account " }
+            else { " Add email account " })
+        .borders(Borders::ALL).border_style(theme.accent());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height < 4 || inner.width < 15 { return; }
+
+    let regions = Layout::default().direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ]).split(inner);
+    let source = wizard.source.as_deref().unwrap_or("Not discovered yet");
+    let summary = format!(
+        "Provider: {}    Detection: {}",
+        wizard.fields[crate::setup::PROVIDER], source
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled("Your email address and server login may be different.", theme.text()),
+            Line::styled(summary, theme.muted()),
+        ]), regions[0],
+    );
+
+    let list_height = usize::from(regions[1].height);
+    let first = wizard.selected.saturating_sub(list_height.saturating_sub(1))
+        .min(crate::setup::FIELD_COUNT.saturating_sub(list_height));
+    let rows = (first..(first + list_height).min(crate::setup::FIELD_COUNT))
+        .map(|index| {
+            let selected = index == wizard.selected;
+            let label = crate::setup::LABELS[index];
+            let value = wizard.fields[index].as_str();
+            let value = if index == crate::setup::CLIENT_ID && value.is_empty()
+                && crate::oauth::embedded_client_id(wizard.provider_hint()).is_some() {
+                "(publisher-configured)"
+            } else if index == crate::setup::GOOGLE_SECRET && value.is_empty()
+                && crate::oauth::embedded_google_client_secret().is_some() {
+                "(publisher-configured)"
+            } else if value.is_empty() { "(enter value)" } else { value };
+            // Do not show the optional client secret on-screen or in screenshots.
+            let value = if index == crate::setup::GOOGLE_SECRET &&
+                !wizard.fields[index].is_empty() {
+                "(configured)".to_owned()
+            } else { value.to_owned() };
+            let value = if index == crate::setup::PROVIDER {
+                format!("◀ {value} ▶")
+            } else if selected && !wizard.authenticating && !wizard.saved {
+                format!("{value}▏")
+            } else { value.to_string() };
+            let maximum = usize::from(regions[1].width).saturating_sub(24);
+            let visible = value.chars().take(maximum).collect::<String>();
+            let text = format!("{} {label:<20} {visible}", if selected { "›" } else { " " });
+            Line::styled(text, if selected { theme.current_line() } else { theme.text() })
+        }).collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(rows), regions[1]);
+
+    let status_style = if wizard.error { theme.error() } else { theme.muted() };
+    let message = if wizard.authenticating {
+        "OAuth browser login in progress. Return here after authenticating."
+    } else { &wizard.message };
+    let hints = if wizard.saved {
+        "Enter: load saved account  ·  OAuth errors can be retried from CLI"
+    } else {
+        "Tab/↑↓: fields · ←→: provider · F5: discover · F6: retry · Ctrl-S: sign in/save · F7: offline save after error · Esc: cancel"
+    };
+    frame.render_widget(
+        Paragraph::new(vec![Line::styled(message.to_owned(), status_style),
+            Line::styled(hints, theme.accent())]).wrap(Wrap { trim: false }),
+        regions[2],
+    );
 }
 
 fn draw_startup_warnings(frame: &mut Frame<'_>, app: &App) {

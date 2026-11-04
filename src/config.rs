@@ -238,6 +238,29 @@ impl Config {
         Ok(config)
     }
 
+    /// Only the interactive TUI may start with no account configuration.
+    /// Explicit commands such as --oauth-probe still use strict `load()`.
+    pub fn load_or_empty(path: Option<&Path>) -> Result<Self> {
+        let path = path.map_or_else(default_config_path, Path::to_path_buf);
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                let mut config: Self = if contents.trim().is_empty() {
+                    toml::from_str("[ui]\n")?
+                } else {
+                    toml::from_str(&contents)
+                        .with_context(|| format!("parsing config {}", path.display()))?
+                };
+                config.config_path = Some(path);
+                config.normalize_accounts();
+                Ok(config)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                accounts: Vec::new(), ui: UiConfig::default(), config_path: Some(path),
+            }),
+            Err(err) => Err(err).with_context(|| format!("reading config {}", path.display())),
+        }
+    }
+
     fn normalize_accounts(&mut self) {
         for account in &mut self.accounts {
             // Preserve multi-account recovery: a malformed shortcut must not

@@ -12,6 +12,7 @@ use ratatui::layout::Size;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
 use crate::app::{Command, Focus, HELP_ENTRIES, command_for_key};
+use crate::setup::{SetupWizard, WizardAction};
 use crate::cache::{self, CachedMailbox};
 use crate::backend::MailboxSyncHint;
 use crate::config::Config;
@@ -2135,6 +2136,11 @@ pub struct App {
     pub startup_warnings: Vec<String>,
     pub show_startup_warnings: bool,
     pub should_quit: bool,
+    /// In-app first-run or add-account setup, modal over normal mail UI.
+    pub setup: Option<SetupWizard>,
+    pub setup_config_path: PathBuf,
+    pub setup_reload_requested: bool,
+    setup_sender: Option<SyncSender<RuntimeEvent>>,
     inbox_poll_interval: Duration,
     new_mail_bell_enabled: bool,
     new_mail_bell_pending: bool,
@@ -2305,6 +2311,11 @@ impl App {
             startup_warnings: Vec::new(),
             show_startup_warnings: false,
             should_quit: false,
+            setup: config.accounts.is_empty().then(|| SetupWizard::new(true)),
+            setup_config_path: config.config_path.clone()
+                .unwrap_or_else(crate::config::default_config_path),
+            setup_reload_requested: false,
+            setup_sender: None,
             inbox_poll_interval: Duration::from_secs(config.ui.inbox_poll_seconds.clamp(10, 3600)),
             new_mail_bell_enabled: config.ui.new_mail_bell,
             new_mail_bell_pending: false,
@@ -2441,7 +2452,174 @@ impl App {
         }
     }
 
+    pub fn attach_setup_sender(&mut self, sender: SyncSender<RuntimeEvent>) {
+        self.setup_sender = Some(sender);
+    }
+
+    /// Keep the already-negotiated terminal graphics protocol across an
+    /// in-place account reload. Re-querying after the input thread starts
+    /// would consume terminal escape sequences as keypresses.
+    pub fn inherit_image_runtime(&mut self, previous: &mut Self) {
+        self.image_picker = previous.image_picker.take();
+        self.image_loader = previous.image_loader.take();
+    }
+
+    pub fn setup_discovered(&mut self, email: String, result: Result<crate::discovery::MailConfiguration, String>) {
+        if let Some(wizard) = self.setup.as_mut() {
+            if wizard.authenticating || wizard.saved ||
+                !wizard.fields[crate::setup::EMAIL].eq_ignore_ascii_case(&email) { return; }
+            match result {
+                Ok(config) => wizard.apply_discovery(config),
+                Err(error) => wizard.discovery_failed(&error),
+            }
+        }
+    }
+
+    pub fn setup_login_finished(&mut self, result: Result<Option<String>, String>) {
+        if let Some(wizard) = self.setup.as_mut() {
+            match result {
+                Ok(login) => wizard.suggest_login(login),
+                Err(error) => {
+                    wizard.authenticating = false;
+                    wizard.login_failed = true;
+                    wizard.error = true;
+                    wizard.message = format!(
+                        "OAuth failed: {error}. Ctrl-S/F6 retry; F7 saves offline."
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_setup_key(&mut self, key: KeyEvent) {
+        let action = if let Some(wizard) = self.setup.as_mut() {
+            if wizard.saved && !wizard.authenticating && key.code == KeyCode::Enter {
+                self.setup_reload_requested = true;
+                return;
+            }
+            wizard.key(key)
+        } else { return; };
+        match action {
+            WizardAction::Nothing => {}
+            WizardAction::Close => {
+                if self.setup.as_ref().is_some_and(|wizard| !wizard.first_run) {
+                    self.setup = None;
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            WizardAction::Discover => {
+                let Some(sender) = self.setup_sender.clone() else { return; };
+                let Some(wizard) = self.setup.as_mut() else { return; };
+                if wizard.discovering { return; }
+                let email = wizard.fields[crate::setup::EMAIL].trim().to_owned();
+                let provider = wizard.provider_hint().to_owned();
+                wizard.discovering = true;
+                wizard.error = false;
+                wizard.message = "Finding provider settings…".into();
+                std::thread::spawn(move || {
+                    let result = crate::discovery::discover_with_provider(&email, &provider)
+                        .map_err(|error| error.to_string());
+                    let _ = sender.send(RuntimeEvent::SetupDiscovered { email, result });
+                });
+            }
+            WizardAction::SaveOffline => {
+                let Some(wizard) = self.setup.as_mut() else { return; };
+                match wizard.save(&self.setup_config_path) {
+                    Ok(_) => {
+                        wizard.saved = true;
+                        wizard.error = false;
+                        wizard.message = "Account saved without OAuth. Run --oauth-login later before using mail.".into();
+                        self.setup_reload_requested = true;
+                    }
+                    Err(error) => {
+                        wizard.error = true;
+                        wizard.message = format!("Cannot save: {error:#}");
+                    }
+                }
+            }
+            WizardAction::Save => {
+                let Some(wizard) = self.setup.as_mut() else { return; };
+                if wizard.saved { return; }
+                // First Ctrl-S authorizes OAuth. The browser session can
+                // suggest a real login UPN (which may differ from an alias).
+                // The user gets another chance to review before anything is
+                // appended to their configuration file.
+                if !wizard.authenticated {
+                    match wizard.preview_account() {
+                        Ok(account) => {
+                            // Validate names before OAuth: token filenames are
+                            // keyed by account name, so a duplicate could
+                            // overwrite another account's refresh token.
+                            let duplicate = self.accounts.iter().any(|existing| existing.name == account.name)
+                                || crate::config::Config::load_or_empty(Some(&self.setup_config_path))
+                                    .is_ok_and(|config| config.accounts.iter().any(|existing| existing.name == account.name));
+                            if duplicate {
+                                wizard.error = true;
+                                wizard.message = "This account name is already in use. Choose another before signing in.".into();
+                                return;
+                            }
+                            wizard.authenticating = true;
+                            wizard.login_failed = false;
+                            wizard.error = false;
+                            wizard.message = "Opening your OAuth browser sign-in…".into();
+                            let Some(sender) = self.setup_sender.clone() else {
+                                wizard.authenticating = false;
+                                wizard.error = true;
+                                wizard.message = "OAuth runtime unavailable".into();
+                                return;
+                            };
+                            std::thread::spawn(move || {
+                                let name = account.name.clone();
+                                let result = crate::oauth::login_account_quiet(&[account.clone()], &name)
+                                    .and_then(|()| {
+                                        let settings = crate::oauth::OAuthSettings::for_account(&account)?
+                                            .ok_or_else(|| anyhow::anyhow!("OAuth is not configured"))?;
+                                        if settings.provider == "microsoft" {
+                                            settings.suggested_login_username()
+                                        } else { Ok(None) }
+                                    })
+                                    .map_err(|error| format!("{}", error.root_cause()));
+                                let _ = sender.send(RuntimeEvent::SetupLoginFinished(result));
+                            });
+                        }
+                        Err(error) => {
+                            wizard.error = true;
+                            wizard.message = format!("Check settings: {error:#}");
+                        }
+                    }
+                    return;
+                }
+                match wizard.save(&self.setup_config_path) {
+                    Ok(_) => {
+                        wizard.saved = true;
+                        wizard.error = false;
+                        wizard.message = "Account saved; opening mailbox…".into();
+                        self.setup_reload_requested = true;
+                    }
+                    Err(error) => {
+                        wizard.error = true;
+                        wizard.message = format!("Cannot save: {error:#}");
+                    }
+                }
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.setup.is_some() {
+            self.handle_setup_key(key);
+            return;
+        }
+        // Ctrl-a opens account setup outside compose and other modal contexts.
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('a')
+            && self.composer.is_none() && self.confirmation.is_none()
+            && !self.help_visible && !self.theme_picker_visible
+            && !self.attachment_picker_visible
+        {
+            self.setup = Some(SetupWizard::new(false));
+            return;
+        }
         if self.show_startup_warnings {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('!')) {
                 self.show_startup_warnings = false;
@@ -5721,6 +5899,24 @@ impl App {
     /// Drag the mailbox divider. Mouse moves over the attachment list select
     /// the hovered file, and footer clicks activate Open/Save/Mark actions.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
+        if let Some(wizard) = self.setup.as_mut() {
+            if !wizard.authenticating && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let popup_height = height.saturating_sub(2).min(24).max(1);
+                let popup_width = width.saturating_sub(2).min(94).max(1);
+                let popup_y = height.saturating_sub(popup_height) / 2;
+                let popup_x = width.saturating_sub(popup_width) / 2;
+                let list_y = popup_y.saturating_add(3);
+                let list_height = usize::from(popup_height.saturating_sub(7));
+                let first = wizard.selected.saturating_sub(list_height.saturating_sub(1))
+                    .min(crate::setup::FIELD_COUNT.saturating_sub(list_height));
+                if mouse.column > popup_x && mouse.column < popup_x.saturating_add(popup_width)
+                    && mouse.row >= list_y && usize::from(mouse.row - list_y) < list_height {
+                    wizard.selected = (first + usize::from(mouse.row - list_y))
+                        .min(crate::setup::FIELD_COUNT.saturating_sub(1));
+                }
+            }
+            return;
+        }
         if self.show_startup_warnings { return; }
         // The rightmost footer bell is an action as well as a status indicator.
         // Never steal clicks from compose, confirmation, or other open dialogs.

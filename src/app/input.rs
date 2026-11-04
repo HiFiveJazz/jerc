@@ -35,6 +35,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Accounts", key: "[ / ]", description: "previous / next account" },
     HelpEntry { category: "Accounts", key: "Alt-1 … Alt-9", description: "switch directly to an email account" },
     HelpEntry { category: "Accounts", key: "Alt-n / Alt-p", description: "next / previous email account" },
+    HelpEntry { category: "Accounts", key: "Ctrl-a", description: "add an account with editable setup wizard" },
     HelpEntry { category: "General", key: "!", description: "show account configuration warnings" },
     HelpEntry { category: "General", key: "?", description: "search command palette" },
     HelpEntry { category: "General", key: "B", description: "toggle new-mail terminal bell" },

@@ -119,6 +119,8 @@ pub enum RuntimeEvent {
     Input(crossterm::event::Event),
     Worker(WorkerEvent),
     MailImage(MailImageEvent),
+    SetupDiscovered { email: String, result: Result<crate::discovery::MailConfiguration, String> },
+    SetupLoginFinished(Result<Option<String>, String>),
     InputStopped,
 }
 

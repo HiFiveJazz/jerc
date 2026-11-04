@@ -14,3 +14,5 @@ pub mod runtime;
 pub mod theme;
 pub mod ui;
 pub mod worker;
+
+pub mod setup;

@@ -29,6 +29,7 @@ pub fn run_tui(config: Config) -> Result<()> {
     let workers = create_workers(&config, runtime_tx.clone())?;
     let mut app = App::new(&config, workers);
     app.bootstrap();
+    app.attach_setup_sender(runtime_tx.clone());
     app.startup_warnings = configuration_warnings;
     if !app.startup_warnings.is_empty() {
         app.status = crate::app::StatusLine::error(format!(
@@ -55,11 +56,11 @@ pub fn run_tui(config: Config) -> Result<()> {
     // terminal does not answer the protocol query.
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     app.configure_mail_images(picker, runtime_tx.clone());
-    spawn_input_thread(runtime_tx);
+    spawn_input_thread(runtime_tx.clone());
 
     // Redraw once with the resolved image protocol before entering the event loop.
     render(&mut terminal, &mut app)?;
-    event_loop(&mut terminal, &mut app, runtime_rx)?;
+    event_loop(&mut terminal, &mut app, runtime_rx, runtime_tx)?;
     Ok(())
 }
 
@@ -106,7 +107,7 @@ fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<Str
         }
         true
     });
-    if config.accounts.is_empty() {
+    if config.accounts.is_empty() && !warnings.is_empty() {
         return Err(anyhow!(
             "no usable incoming accounts; check [[accounts]].source in config.toml ({} account(s) invalid)",
             warnings.len(),
@@ -171,6 +172,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     runtime_rx: Receiver<RuntimeEvent>,
+    runtime_tx: SyncSender<RuntimeEvent>,
 ) -> Result<()> {
     // Animation is deadline-driven instead of timeout-driven.  The old loop only
     // advanced smooth scrolling when recv_timeout() *timed out*, so a steady
@@ -239,7 +241,41 @@ fn event_loop(
             RuntimeEvent::Input(_) => continue,
             RuntimeEvent::Worker(event) => app.handle_worker_event(event),
             RuntimeEvent::MailImage(event) => app.handle_mail_image_event(event),
+            RuntimeEvent::SetupDiscovered { email, result } => app.setup_discovered(email, result),
+            RuntimeEvent::SetupLoginFinished(result) => app.setup_login_finished(result),
             RuntimeEvent::InputStopped => break,
+        }
+
+        if std::mem::take(&mut app.setup_reload_requested) {
+            let result = Config::load(Some(&app.setup_config_path))
+                .and_then(validate_account_configuration)
+                .and_then(|(config, warnings)| {
+                    let workers = create_workers(&config, runtime_tx.clone())?;
+                    Ok((config, workers, warnings))
+                });
+            match result {
+                Ok((config, workers, warnings)) => {
+                    // Old mail workers finish before we accept events from new
+                    // account indices, preventing stale updates after reload.
+                    let mut fresh = App::new(&config, workers);
+                    fresh.attach_setup_sender(runtime_tx.clone());
+                    fresh.account_index = fresh.accounts.len().saturating_sub(1);
+                    fresh.startup_warnings = warnings;
+                    let mut old = std::mem::replace(app, fresh);
+                    app.inherit_image_runtime(&mut old);
+                    drop(old);
+                    while runtime_rx.try_recv().is_ok() {}
+                    app.bootstrap();
+                    render(terminal, app)?;
+                    continue;
+                }
+                Err(error) => {
+                    if let Some(wizard) = app.setup.as_mut() {
+                        wizard.error = true;
+                        wizard.message = format!("Saved, but could not load account: {error:#}");
+                    }
+                }
+            }
         }
 
         // The desktop notification server owns the themed sound, not the

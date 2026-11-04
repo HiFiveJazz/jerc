@@ -243,20 +243,37 @@ impl SmtpSender {
     /// sending, but quit immediately after AUTH succeeds. Never sends MAIL FROM,
     /// RCPT TO or DATA; safe to run on an existing mailbox.
     pub fn probe_oauth(&self) -> Result<()> {
+        self.probe_oauth_with_challenge(false)
+    }
+
+    /// Opt-in diagnostic: send `AUTH XOAUTH2`, wait for 334, then send the
+    /// base64 SASL response. Does not send an email or change the send path.
+    pub fn probe_oauth_with_challenge(&self, challenge: bool) -> Result<()> {
         if !matches!(self.source.auth, SmtpAuth::XOAuth2 | SmtpAuth::OAuthBearer) ||
             self.source.account_oauth.is_none() {
             bail!("SMTP OAuth probe requires an account with [accounts.oauth]");
         }
-        let mut connection = self.authenticated_oauth_connection()?;
+        let mut connection = self.authenticated_oauth_connection(challenge, true)?;
         let _ = connection.quit();
         Ok(())
     }
 
     /// Lettre's high-level transport does not expose RFC 7628 OAUTHBEARER.
     /// The low-level path is shared by actual sends and credential-only probes.
-    fn authenticated_oauth_connection(&self) -> Result<SmtpConnection> {
+    fn authenticated_oauth_connection(&self, challenge_xoauth2: bool, probe: bool) -> Result<SmtpConnection> {
         let credential = self.source.credential(self.credential_command.as_deref())?;
         let token = self.source.access_token(&credential)?;
+        if probe {
+            if let Some(oauth) = &self.source.account_oauth {
+                if oauth.provider == "microsoft" {
+                    // Claims can be unavailable/opaque. Never print the token,
+                    // decoded JSON, username, or arbitrary identity fields.
+                    println!("  {}", crate::oauth::safe_smtp_token_diagnostics(
+                        &token, &oauth.client_id, &self.source.username,
+                    ));
+                }
+            }
+        }
         let hello = ClientId::default();
         let tls = TlsParameters::new(self.source.host.clone())
             .context("configuring SMTP TLS certificate verification")?;
@@ -291,7 +308,43 @@ impl SmtpSender {
         let extensions = connection
             .command(Ehlo::new(hello))
             .context("reading SMTP authentication capabilities")?;
-        if smtp_advertises_oauthbearer(&extensions) {
+        if challenge_xoauth2 {
+            // This diagnostic deliberately tests the two-step form described
+            // in Microsoft's SMTP OAuth documentation. Do not automatically
+            // retry failed credentials or downgrade to PLAIN/LOGIN.
+            if !connection.server_info().supports_auth_mechanism(Mechanism::Xoauth2) {
+                bail!("SMTP server did not advertise XOAUTH2 after STARTTLS");
+            }
+            let auth = connection.command("AUTH XOAUTH2\r\n")
+                .context("starting two-step SMTP XOAUTH2 exchange")?;
+            if !auth.has_code(334) {
+                bail!("SMTP did not issue XOAUTH2 challenge (code {})", auth.code());
+            }
+            let initial = xoauth2_initial_response(&self.source.username, &token)?;
+            // Never log the base64 payload: it contains the access token.
+            let result = connection.command(format!("{}\r\n", BASE64.encode(initial)))
+                .map_err(|error| smtp_xoauth2_error(&self.source.host, error))?;
+            if !result.has_code(235) {
+                bail!("SMTP rejected two-step XOAUTH2 authentication (code {})", result.code());
+            }
+        } else if is_microsoft_smtp_host(&self.source.host) {
+            // Thunderbird chooses XOAUTH2 for Microsoft SMTP. The old path
+            // preferred OAUTHBEARER when advertised, unlike Thunderbird.
+            // Fail explicitly rather than silently attempting another method.
+            if !connection.server_info().supports_auth_mechanism(Mechanism::Xoauth2) {
+                bail!("Microsoft SMTP server did not advertise XOAUTH2 after STARTTLS");
+            }
+            if probe {
+                println!("  SMTP OAuth mechanism: XOAUTH2 (Microsoft / Thunderbird-compatible)");
+            }
+            let auth = connection.auth(
+                &[Mechanism::Xoauth2],
+                &Credentials::new(self.source.username.clone(), token),
+            ).map_err(|error| smtp_xoauth2_error(&self.source.host, error))?;
+            if !auth.has_code(235) {
+                bail!("Microsoft SMTP rejected XOAUTH2 authentication (code {})", auth.code());
+            }
+        } else if smtp_advertises_oauthbearer(&extensions) {
             let sasl = oauthbearer_initial_response(
                 &self.source.username, &self.source.host, self.source.port, &token,
             )?;
@@ -328,7 +381,7 @@ impl SmtpSender {
     }
 
     fn send_oauthbearer(&self, email: &lettre::Message, raw_message: &[u8]) -> Result<Response> {
-        let mut connection = self.authenticated_oauth_connection()?;
+        let mut connection = self.authenticated_oauth_connection(false, false)?;
         let result = connection
             .send(email.envelope(), raw_message)
             .context("sending message through authenticated SMTP connection")?;
@@ -400,6 +453,17 @@ impl MailSender for SmtpSender {
     }
 }
 
+/// Microsoft Exchange Online's SASL XOAUTH2 framing, matching its published
+/// `user=<username>\x01auth=Bearer <token>\x01\x01` protocol example.
+/// Never log this string or its base64 encoding: both contain the token.
+fn xoauth2_initial_response(user: &str, token: &str) -> Result<String> {
+    if user.is_empty() || token.is_empty() || user.chars().any(char::is_control)
+        || token.chars().any(char::is_control) {
+        bail!("invalid SMTP XOAUTH2 identity or token");
+    }
+    Ok(format!("user={user}\x01auth=Bearer {token}\x01\x01"))
+}
+
 /// RFC 7628's GS2 header and bearer key/value fields. Do not put tokens in
 /// log messages, Debug implementations, or anyhow error context.
 fn oauthbearer_initial_response(user: &str, host: &str, port: u16, token: &str) -> Result<String> {
@@ -424,6 +488,11 @@ fn smtp_advertises_oauthbearer(response: &Response) -> bool {
         matches!(fields.next(), Some(prefix) if prefix.eq_ignore_ascii_case("AUTH"))
             && fields.any(|mechanism| mechanism.eq_ignore_ascii_case("OAUTHBEARER"))
     })
+}
+
+fn is_microsoft_smtp_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("smtp.office365.com") ||
+        host.eq_ignore_ascii_case("smtp-mail.outlook.com")
 }
 
 /// SMTP AUTH is a separate Exchange Online policy, even when IMAP OAuth works.
@@ -478,7 +547,7 @@ fn run_credential_command(command: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SmtpAuth, SmtpSource, oauthbearer_initial_response, smtp_advertises_oauthbearer};
+    use super::{SmtpAuth, SmtpSource, oauthbearer_initial_response, smtp_advertises_oauthbearer, xoauth2_initial_response, is_microsoft_smtp_host};
     use lettre::transport::smtp::response::Response;
 
     #[test]
@@ -549,6 +618,23 @@ mod tests {
         assert_eq!(frame, "n,a=alice=2Ctest=3Done@example.org,\x01host=smtp.example.org\x01port=587\x01auth=Bearer opaque.token\x01\x01");
         assert!(oauthbearer_initial_response("alice\r\nINJECT", "smtp.example.org", 587, "token").is_err());
         assert!(oauthbearer_initial_response("alice", "smtp.example.org", 587, "token\x01INJECT").is_err());
+    }
+
+    #[test]
+    fn exchange_online_hosts_are_recognized_for_xoauth2() {
+        assert!(is_microsoft_smtp_host("smtp.office365.com"));
+        assert!(is_microsoft_smtp_host("SMTP-MAIL.OUTLOOK.COM"));
+        assert!(!is_microsoft_smtp_host("smtp.example.com"));
+    }
+
+    #[test]
+    fn microsoft_two_step_xoauth2_payload_has_required_frame() {
+        assert_eq!(
+            xoauth2_initial_response("user@example.edu", "opaque.token").unwrap(),
+            "user=user@example.edu\x01auth=Bearer opaque.token\x01\x01"
+        );
+        assert!(xoauth2_initial_response("u\r\nINJECT", "token").is_err());
+        assert!(xoauth2_initial_response("user", "token\x01INJECT").is_err());
     }
 
     #[test]

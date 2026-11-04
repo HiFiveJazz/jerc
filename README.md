@@ -90,15 +90,55 @@ encoding is needed**. `incoming = "imap"` is an alias for `source = "imap"`.
 disables sending. Gmail and Outlook.com can be detected from the email domain;
 Google Workspace and Microsoft 365 custom domains use `[accounts.oauth].provider`.
 For Thunderbird-style server discovery, run `aerc-rs --discover-email
-"you@example.com"`. This opt-in command requests the domain's HTTPS autoconfig
-files first, then Thunderbird's ISPDB, and **prints a suggested account TOML**
-without changing your configuration. It sends the full address only to the
-domain's own HTTPS autoconfig service; ISPDB receives just the domain. XML
-settings are untrusted suggestions: inspect them before using, and supply your
-own authorized OAuth registration separately. Some organizations don't publish
-IMAP/SMTP autoconfig (or use undiscoverable account IDs); the command then
-reports missing settings rather than guessing servers. MX-based discovery is
-not implemented.
+"you@example.com"`. The command tries provider-hosted HTTPS autoconfig,
+Thunderbird ISPDB, and (if those fail) MX-derived ISPDB plus a DNS provider
+hint. It prints **suggested TOML only** and does not modify an account.
+DNS fallback uses Cloudflare DNS-over-HTTPS, sending *domain names only*,
+never the local part of the email address. The provider-hosted HTTPS
+configuration may receive the full address. No HTTP redirect downgrade is
+permitted.
+
+Some universities use Google Workspace and Microsoft 365 concurrently, so
+neither an MX record nor an Exchange autodiscover CNAME proves which mailbox
+backend applies to a particular address. When discovery is missing or ambiguous,
+select the provider explicitly, e.g.:
+
+```sh
+# Uses known Microsoft 365 IMAP/SMTP endpoints without claiming discovery
+# of the university account identity:
+aerc-rs --discover-email "student@university.edu" --discover-provider microsoft
+```
+
+`--discover-provider google` likewise suggests Google's IMAP/SMTP servers.
+These hints **do not verify that the account exists at the provider**, and
+cannot infer an institutional login ID from a visible address by DNS alone.
+
+For Microsoft 365 university mailboxes where the login UPN differs from the
+visible email address, the generator can suggest separate IMAP/SMTP usernames:
+
+```sh
+# Known login from the institution or another working client; no OAuth required:
+aerc-rs --discover-email "alias@university.edu" --discover-provider microsoft \
+    --discover-username "login@university.edu"
+
+# Or, after authorizing the same account in aerc-rs, suggest from Microsoft's
+# existing OAuth session (may refresh/rotate the locally stored token):
+aerc-rs --discover-email "alias@university.edu" \
+    --discover-oauth-account "University"
+```
+
+The OAuth-assisted option reads the existing configured account and requires
+its `email` field to match the requested visible address; its Microsoft
+provider automatically selects the Microsoft 365 server preset. Existing
+explicit `imap_username` / `smtp_username` values take precedence, and a
+cached OAuth login hint is consulted only for missing values. It emits a
+**suggestion only**. `preferred_username`, `upn`, and `unique_name` in an
+access token are unverified hints and are not guaranteed to be SMTP login
+identifiers; opaque tokens may have no readable hint. Always check the
+suggested login against your provider or a working client, and test with
+`--oauth-probe` before sending. **No account config is written** and no token
+is printed. This does not change application permissions or grant OAuth
+approval. You can always edit `imap_username` and `smtp_username` manually.
 
 If your display address differs from the login ID (such as an institutional
 UPN), set `imap_username` and/or `smtp_username` under `[[accounts]]` when
@@ -509,3 +549,66 @@ scope, TLS/STARTTLS on port 587, and ask your Exchange administrator whether
 SMTP AUTH is enabled for your mailbox and organization. Aerc-rs cannot enable
 SMTP AUTH against a tenant's policy. It never silently falls back to password
 authentication.
+
+### Interactive account setup (first-run and add-account)
+
+Start `aerc-rs` with no `config.toml` (or with an empty `[[accounts]]` list)
+for an automatic setup wizard. Once mail accounts exist, press **Ctrl-a** from
+the normal mailbox screen to add another. The wizard shows every discovered
+field and lets you edit email, account label, provider, IMAP/SMTP servers and
+ports, independent IMAP/SMTP usernames, your OAuth application client ID and
+the Microsoft tenant. **Click** a row or use **Tab / Shift-Tab / arrows** to
+select it, type to edit, and use **Left/Right** on Provider to switch Auto,
+Microsoft 365, or Google. **F5** runs HTTPS/ISPDB/DNS discovery on a background
+thread; leaving the email field triggers initial discovery too. Discovery is
+only a suggestion and never silently overwrites manually edited fields.
+
+Press **Ctrl-S** to start OAuth in the system browser using *your registered*
+application. After sign-in, Microsoft can suggest a login UPN that differs from
+an alias or display email. Review the suggested usernames, then press **Ctrl-S**
+again to save the new `[[accounts]]` entry and load the mailbox without
+restarting. Failed OAuth? **F6** retries; **Ctrl-S** can still save the account
+for a later `--oauth-login` when an administrator grants consent. **Esc**
+cancels before saving (and closes the app when no account exists). No passwords,
+access tokens or refresh tokens are stored in `config.toml`.
+
+The first version supports OAuth-enabled Microsoft 365 and Google accounts
+with TLS IMAP and SMTP. Other providers still require manual configuration.
+
+### Desktop OAuth credentials in the setup wizard
+
+The interactive wizard can use client IDs embedded **by the aerc-rs publisher**
+when the binary is built. Users do not need to type an OAuth client ID if
+that publisher has registered and configured a desktop application. The wizard
+shows `(publisher-configured)` for these defaults and lets advanced users
+supply an explicit per-account override.
+
+Build with your own registered desktop OAuth applications:
+
+```sh
+AERC_RS_GOOGLE_CLIENT_ID="YOUR_FULL_GOOGLE_ID.apps.googleusercontent.com" \
+AERC_RS_GOOGLE_CLIENT_SECRET="OPTIONAL_GOOGLE_DESKTOP_CLIENT_SECRET" \
+AERC_RS_MICROSOFT_CLIENT_ID="YOUR_MICROSOFT_APPLICATION_ID" \
+cargo build --release
+```
+
+The `AERC_RS_GOOGLE_CLIENT_SECRET` is optional for registrations that do not
+require it, but some Google desktop clients issue a public client secret that
+must accompany authorization-code exchanges. If a registered Google client
+requires it, set this publisher build-time value or the wizard's optional
+`Google desktop secret` field. Unlike a confidential server secret, a desktop
+client secret embedded in a public desktop executable is not private.
+
+Google desktop client IDs must keep the complete
+`.apps.googleusercontent.com` suffix. Removing it does not create a valid
+short alias. A browser reporting "Authorization received" only confirms that
+it delivered an authorization code to the app; the subsequent token exchange
+can still fail if the client ID, public desktop secret, or redirect settings
+are incompatible.
+
+After a failed login, Ctrl-S and F6 retry the login instead of saving a broken
+account. F7 explicitly saves the account without credentials for later login.
+The provider's registered client identity must be yours or one whose publisher
+has authorized you to use it. This project does not bundle Thunderbird's OAuth
+client identities; copying an unrelated publisher's registration can fail or
+misrepresent the requesting application.
