@@ -1,6 +1,8 @@
 //! Typed outgoing MIME construction and reply address policy. This module does
 //! no network I/O, so its wire-format tests can run without a mail account.
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use lettre::message::{Attachment, Mailbox, Mailboxes, MultiPart, SinglePart, header::{ContentType, HeaderName, HeaderValue}};
@@ -10,6 +12,49 @@ use mail_parser::MessageParser;
 use crate::model::OutgoingMessage;
 
 pub const FORWARD_SEPARATOR: &str = "---------- Forwarded message ---------";
+static NEXT_OUTGOING_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Restrict interactive outgoing recipients to fully qualified public mail domains.
+/// A syntactically valid but misspelled local part cannot be detected without
+/// confirming with the recipient. Never silently rewrite an address.
+pub fn validate_recipients(to: &str, cc: &str, bcc: &str) -> Result<()> {
+    let mut count = 0;
+    for (label, value) in [("To", to), ("Cc", cc), ("Bcc", bcc)] {
+        if value.trim().is_empty() { continue; }
+        let mailboxes: Mailboxes = value.parse().with_context(|| format!("invalid {label} recipient list"))?;
+        for mailbox in mailboxes {
+            let email = mailbox.email.to_string();
+            let (_, domain) = email.rsplit_once('@')
+                .ok_or_else(|| anyhow!("invalid {label} address {email:?}"))?;
+            let labels: Vec<_> = domain.split('.').collect();
+            // A single-label host can be valid on private SMTP installations,
+            // but accepting it by default lets typos such as @gmail reach Send.
+            if labels.len() < 2 || labels.iter().any(|part| part.is_empty()
+                || part.starts_with('-') || part.ends_with('-')
+                || !part.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-'))
+                || labels.last().is_some_and(|tld| tld.len() < 2 || !tld.bytes().all(|c| c.is_ascii_alphabetic())) {
+                bail!("{label} recipient {email:?} has an incomplete or invalid domain (e.g. use gmail.com, not gmail)");
+            }
+            count += 1;
+        }
+    }
+    if count == 0 { bail!("outgoing email has no To, Cc, or Bcc recipient"); }
+    Ok(())
+}
+
+fn sender_message_id_domain(from: &Mailbox) -> String {
+    // Keep the sender's domain, not the machine's local hostname. A single
+    // generated ID must be reused for both SMTP and the Sent folder copy.
+    from.email.to_string().rsplit_once('@')
+        .map_or_else(|| "localhost".to_owned(), |(_, domain)| domain.to_ascii_lowercase())
+}
+
+fn new_outgoing_message_id(domain: &str) -> String {
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let sequence = NEXT_OUTGOING_ID.fetch_add(1, Ordering::Relaxed);
+    format!("<aerc-rs-{timestamp:x}-{:x}-{sequence:x}@{domain}>", std::process::id())
+}
+
 
 /// Gmail/aerc-style inline forward: preserve MIME alternatives and the
 /// original attachments, rather than sending the entire mail as forwarded.eml.
@@ -189,7 +234,7 @@ fn unfold_header(raw: &[u8], target: &str) -> Option<String> {
     for line in String::from_utf8_lossy(raw).lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() { break; }
-        if (line.starts_with(' ') || line.starts_with('\t')) {
+        if line.starts_with(' ') || line.starts_with('\t') {
             if let Some(value) = found.as_mut() {
                 value.push(' ');
                 value.push_str(line.trim());
@@ -222,9 +267,11 @@ pub fn send_warnings(message: &OutgoingMessage) -> Vec<&'static str> {
 pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<Message> {
     let from_value = if message.from.trim().is_empty() { default_from } else { &message.from };
     let from: Mailbox = from_value.parse().context("invalid From mailbox")?;
+    validate_recipients(&message.to, &message.cc, &message.bcc)?;
+    let message_id = new_outgoing_message_id(&sender_message_id_domain(&from));
     let mut builder = Message::builder()
         .from(from)
-        .message_id(None)
+        .message_id(Some(message_id))
         .subject(message.subject.clone())
         .user_agent(format!("aerc-rs/{}", env!("CARGO_PKG_VERSION")));
     let mut recipients = 0usize;
@@ -259,7 +306,7 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
             ["from", "to", "cc", "bcc", "subject", "date", "message-id", "in-reply-to", "references", "mime-version", "content-type", "content-transfer-encoding", "return-path"].contains(&lower.as_str()) {
             bail!("reserved or invalid custom header {name:?}");
         }
-        if (value.contains('\r') || value.contains('\n')) { bail!("newlines forbidden in custom header {name:?}"); }
+        if value.contains('\r') || value.contains('\n') { bail!("newlines forbidden in custom header {name:?}"); }
         let name = HeaderName::new_from_ascii(name.clone()).context("invalid custom header name")?;
         builder = builder.raw_header(HeaderValue::new(name, value.clone()));
     }
@@ -291,10 +338,117 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
     builder.multipart(body).context("building multipart outgoing message")
 }
 
+
+/// Construct an unsent RFC 5322 message for the user's Drafts folder.
+/// Unlike SMTP mail, a draft can have incomplete/empty recipients. Lettre
+/// requires an SMTP envelope recipient, so we use the sender ONLY in a
+/// temporary builder and remove that placeholder To header before APPEND.
+/// The original To/Cc/Bcc strings are stored exclusively in the saved draft.
+/// The returned bytes must never be submitted to SMTP directly.
+pub fn build_draft(message: &OutgoingMessage, default_from: &str) -> Result<Vec<u8>> {
+    let sender = if message.from.trim().is_empty() { default_from } else { &message.from };
+    let mailbox: Mailbox = sender.parse().context("invalid draft sender")?;
+    let mut staged = message.clone();
+    staged.to = mailbox.email.to_string();
+    staged.cc.clear();
+    staged.bcc.clear();
+    let raw = build_outgoing(&staged, default_from)?.formatted();
+    let separator = b"\r\n\r\n";
+    let split = raw.windows(separator.len()).position(|part| part == separator)
+        .ok_or_else(|| anyhow!("MIME message has no header/body boundary"))?;
+    let header = std::str::from_utf8(&raw[..split]).context("invalid MIME header text")?;
+    let mut output = Vec::with_capacity(raw.len() + 256);
+    let mut skip_to = false;
+    for line in header.split("\r\n") {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if skip_to { continue; }
+        } else {
+            skip_to = line.get(..3).is_some_and(|prefix| prefix.eq_ignore_ascii_case("to:"));
+            if skip_to { continue; }
+        }
+        output.extend_from_slice(line.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+    for (name, value) in [("To", &message.to), ("Cc", &message.cc), ("Bcc", &message.bcc)] {
+        if value.is_empty() { continue; }
+        // A partially typed address may be saved, but not a header injection.
+        if value.contains('\r') || value.contains('\n') || value.contains('\0') {
+            bail!("invalid newline/control in draft {name} field");
+        }
+        output.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    output.extend_from_slice(b"X-Unsent: 1\r\n\r\n");
+    output.extend_from_slice(&raw[split + separator.len()..]);
+    Ok(output)
+}
+
 fn normalized_message_id(id: &str) -> Result<String> {
     let id = id.trim().trim_start_matches('<').trim_end_matches('>');
     if id.is_empty() || !id.contains('@') || id.chars().any(|ch| ch.is_whitespace() || ch == '<' || ch == '>') {
         bail!("invalid message-id in outgoing thread headers");
     }
     Ok(id.to_owned())
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::build_draft;
+    use crate::model::{OutgoingAttachment, OutgoingMessage};
+
+    fn message() -> OutgoingMessage {
+        OutgoingMessage {
+            from: "sender@example.org".to_owned(),
+            to: String::new(), cc: String::new(), bcc: String::new(),
+            subject: "Unsent 🎉".to_owned(), body: "The unsent body".to_owned(),
+            html_body: None, attachments: Vec::new(), custom_headers: Vec::new(),
+            in_reply_to: None, references: Vec::new(), forwarded_raw: None,
+        }
+    }
+
+    #[test]
+    fn draft_with_no_recipients_does_not_leak_placeholder_to() {
+        let raw = build_draft(&message(), "sender@example.org").unwrap();
+        let headers = String::from_utf8_lossy(&raw);
+        let headers = headers.split("\r\n\r\n").next().unwrap();
+        assert!(headers.contains("X-Unsent: 1"));
+        assert!(!headers.lines().any(|line| line.starts_with("To:")));
+        assert!(headers.contains("Subject: "));
+    }
+
+    #[test]
+    fn draft_keeps_partially_typed_to_and_private_bcc() {
+        let mut draft = message();
+        draft.to = "someone@gmail".to_owned();
+        draft.cc = "other@example.org".to_owned();
+        draft.bcc = "hidden@example.org".to_owned();
+        let raw = build_draft(&draft, "sender@example.org").unwrap();
+        let headers = String::from_utf8_lossy(&raw);
+        let headers = headers.split("\r\n\r\n").next().unwrap();
+        assert!(headers.contains("To: someone@gmail\r\n"));
+        assert!(headers.contains("Cc: other@example.org\r\n"));
+        assert!(headers.contains("Bcc: hidden@example.org\r\n"));
+        assert!(!headers.contains("To: sender@example.org"));
+    }
+
+    #[test]
+    fn draft_preserves_actual_mime_attachments() {
+        let mut draft = message();
+        draft.attachments.push(OutgoingAttachment {
+            filename: "notes.txt".to_owned(),
+            content_type: "text/plain".to_owned(),
+            data: b"hello from attachment".to_vec(),
+        });
+        let raw = build_draft(&draft, "sender@example.org").unwrap();
+        let attachments = crate::mail::extract_attachments(&raw).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "notes.txt");
+        assert_eq!(attachments[0].data, b"hello from attachment");
+    }
+
+    #[test]
+    fn rejects_header_injection_in_unfinished_drafts() {
+        let mut draft = message();
+        draft.to = "someone@example.org\r\nBcc: attacker@example.org".to_owned();
+        assert!(build_draft(&draft, "sender@example.org").is_err());
+    }
 }

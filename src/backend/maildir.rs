@@ -265,6 +265,20 @@ impl MailBackend for MaildirBackend {
         Ok(())
     }
 
+    fn append_draft(&mut self, mailbox: &str, raw: &[u8]) -> Result<()> {
+        let maildir = self.mailbox_path(mailbox)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let unique = format!("{}.M{}P{}.aerc-rs-draft", now.as_secs(), now.subsec_nanos(), std::process::id());
+        let tmp = maildir.join("tmp").join(&unique);
+        fs::write(&tmp, raw).with_context(|| format!("writing draft {}", tmp.display()))?;
+        let target = maildir.join("cur").join(format!("{unique}{}2,DS", maildir_info_separator()));
+        if let Err(error) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("saving draft to {}", target.display()));
+        }
+        Ok(())
+    }
+
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()> {
         let old = self.locate(mailbox, id)?;
         let maildir = self.mailbox_path(mailbox)?;

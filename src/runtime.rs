@@ -4,8 +4,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{self, KeyEventKind};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -21,7 +22,6 @@ use crate::outgoing;
 use crate::ui;
 use crate::worker::{RuntimeEvent, WorkerHandle};
 
-const ANIMATION_FRAME: Duration = Duration::from_millis(10);
 
 pub fn run_tui(config: Config) -> Result<()> {
     let (runtime_tx, runtime_rx) = sync_channel::<RuntimeEvent>(4096);
@@ -115,7 +115,7 @@ fn event_loop(
             let now = Instant::now();
             if now >= next_animation_frame {
                 app.advance_animation();
-                next_animation_frame = now + ANIMATION_FRAME;
+                next_animation_frame = now + app.animation_frame_interval();
                 render(terminal, app)?;
                 continue;
             }
@@ -175,7 +175,7 @@ fn event_loop(
         // then make its first row eligible without waiting on unrelated traffic.
         if app.animation_active() && next_animation_frame <= Instant::now() {
             app.advance_animation();
-            next_animation_frame = Instant::now() + ANIMATION_FRAME;
+            next_animation_frame = Instant::now() + app.animation_frame_interval();
         }
         render(terminal, app)?;
     }
@@ -210,7 +210,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, SetCursorStyle::SteadyBar)?;
         Ok(Self)
     }
 }
@@ -218,6 +218,6 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape, LeaveAlternateScreen);
     }
 }

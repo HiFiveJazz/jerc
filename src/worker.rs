@@ -34,6 +34,7 @@ pub enum ActionKind {
         message: OutgoingMessage,
         sent_mailbox: Option<String>,
     },
+    SaveDraft { message: OutgoingMessage, mailbox: String },
     Shutdown,
 }
 
@@ -73,6 +74,8 @@ pub enum WorkerEventKind {
     MessageExported { path: PathBuf },
     SeenChanged { id: MessageId, seen: bool },
     MutationComplete,
+    DraftSaved { mailbox: String },
+    DraftSaveFailed { mailbox: String, error: String },
     MessageSent {
         smtp_status: String,
         sent_mailbox: Option<String>,
@@ -263,6 +266,17 @@ fn run_worker(
             ActionKind::UnarchiveMany { source, destination, ids } => backend
                 .unarchive_many(&source, &destination, &ids)
                 .map(|()| WorkerEventKind::MutationComplete),
+            ActionKind::SaveDraft { message, mailbox } => {
+                // Save failures must not invalidate unrelated mailbox state.
+                // A local recovery copy is already on disk at this point.
+                Ok(match crate::outgoing::build_draft(&message, &message.from)
+                    .and_then(|raw| backend.append_draft(&mailbox, &raw)) {
+                    Ok(()) => WorkerEventKind::DraftSaved { mailbox },
+                    Err(error) => WorkerEventKind::DraftSaveFailed {
+                        mailbox, error: format!("{error:#}"),
+                    },
+                })
+            }
             ActionKind::Send {
                 message,
                 sent_mailbox,

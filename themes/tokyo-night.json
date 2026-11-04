@@ -12,5 +12,6 @@
   "surface": "#24283b",
   "border": "#414868",
   "selected_fg": "#1a1b26",
-  "selected_bg": "#7aa2f7"
+  "selected_bg": "#7aa2f7",
+  "visual": "#bb9af7"
 }

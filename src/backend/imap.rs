@@ -576,6 +576,21 @@ impl MailBackend for ImapBackend {
         Ok(())
     }
 
+    fn append_draft(&mut self, mailbox: &str, raw: &[u8]) -> Result<()> {
+        let mailbox_name = mailbox_from_name(mailbox)?;
+        let options = ImapMessageAppendOptions {
+            flags: vec![Flag::Seen, Flag::Draft],
+            ..Default::default()
+        };
+        let (exists, _) = self.session()?.append(mailbox_name, raw, options)
+            .with_context(|| format!("saving draft to IMAP mailbox {mailbox:?}"))?;
+        if self.selected_mailbox.as_deref() == Some(mailbox)
+            && let Some(exists) = exists {
+            self.selected_exists = Some(exists);
+        }
+        Ok(())
+    }
+
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()> {
         self.ensure_selected(mailbox)?;
         let sequence = Self::uid_sequence(id)?;
@@ -804,7 +819,7 @@ fn run_credential_command(command: &str) -> Result<String> {
 fn collect_bodystructure_attachments(structure: &BodyStructure<'_>, names: &mut Vec<String>) {
     match structure {
         BodyStructure::Multi { bodies, .. } => {
-            for part in bodies.iter() { collect_bodystructure_attachments(part, names); }
+            for part in bodies.as_ref().iter() { collect_bodystructure_attachments(part, names); }
         }
         BodyStructure::Single { body, extension_data } => {
             let disposition = extension_data.as_ref()

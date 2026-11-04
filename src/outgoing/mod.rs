@@ -8,7 +8,7 @@ use crate::config::AccountConfig;
 use crate::model::OutgoingMessage;
 
 pub use smtp::{SmtpAuth, SmtpSender, SmtpSource};
-pub use wire::{InlineForwardParts, ReplyAudience, ReplyRecipients, build_outgoing, forward_html, forward_attribution, FORWARD_SEPARATOR, inline_forward_parts, forward_subject, reply_recipients, reply_subject, send_warnings};
+pub use wire::{build_draft, InlineForwardParts, ReplyAudience, ReplyRecipients, build_outgoing, forward_html, forward_attribution, FORWARD_SEPARATOR, inline_forward_parts, forward_subject, reply_recipients, reply_subject, send_warnings, validate_recipients};
 
 #[derive(Debug, Clone)]
 pub struct SendReceipt {

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
@@ -15,7 +17,7 @@ use crate::mail::{parse_body, render_html_for_terminal};
 use crate::outgoing::{ReplyAudience, reply_recipients, reply_subject, forward_subject, inline_forward_parts, forward_html, forward_attribution, FORWARD_SEPARATOR};
 use crate::mail_image::{MailImageEvent, MailImageLoader};
 use crate::model::{
-    Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessageSummary,
+    Capabilities, HtmlLine, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessageSummary,
     OutgoingAttachment, OutgoingMessage,
 };
 use crate::theme::{Theme, load_themes, persist_theme, persisted_theme, theme_index};
@@ -130,9 +132,7 @@ impl ComposeField {
             Self::To => Self::Cc,
             Self::Cc => Self::Bcc,
             Self::Bcc => Self::Subject,
-            Self::Subject => Self::Attachments,
-            Self::Attachments => Self::Headers,
-            Self::Headers => Self::Body,
+            Self::Subject | Self::Attachments | Self::Headers => Self::Body,
             Self::Body => Self::To,
         }
     }
@@ -143,9 +143,7 @@ impl ComposeField {
             Self::Cc => Self::To,
             Self::Bcc => Self::Cc,
             Self::Subject => Self::Bcc,
-            Self::Attachments => Self::Subject,
-            Self::Headers => Self::Attachments,
-            Self::Body => Self::Headers,
+            Self::Attachments | Self::Headers | Self::Body => Self::Subject,
         }
     }
 }
@@ -168,13 +166,409 @@ impl ComposeMode {
     }
 }
 
+/// A local directory picker. The state is intentionally not stored in drafts;
+/// only files the user actually selected are persisted.
+#[derive(Debug, Clone)]
+pub struct ComposeFileEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_directory: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComposeFilePicker {
+    pub directory: PathBuf,
+    pub entries: Vec<ComposeFileEntry>,
+    pub selected: usize,
+    pub show_hidden: bool,
+    /// Adjacent panes are cached on movement, never loaded by the renderer.
+    pub parent_entries: Vec<ComposeFileEntry>,
+    pub parent_selected: usize,
+    pub preview: ComposeFilePreview,
+    pub pending_count: usize,
+    pub pending_g: bool,
+    /// One-step-per-frame Ctrl-j/k motion, using the existing animation clock.
+    pub smooth_target: Option<usize>,
+    /// Inclusive visual selection anchored at the line where v was pressed.
+    pub visual_anchor: Option<usize>,
+    pub help_visible: bool,
+    pub help_query: String,
+    pub help_selected: usize,
+    pub help_scroll: usize,
+    /// Incremental search of the current directory (Enter accepts highlighted row).
+    pub search_query: Option<String>,
+    /// Pending PDF conversion is debounced so scrolling past PDFs starts no process.
+    pdf_preview_due: Option<(PathBuf, Instant)>,
+    /// No more than two PDF converters may run simultaneously.
+    pdf_preview_inflight: HashSet<PathBuf>,
+    /// Worker threads only put completed conversions here; never touch UI state.
+    pdf_preview_results: Arc<Mutex<VecDeque<(PathBuf, Result<Vec<u8>, String>)>>>,
+    /// Small in-memory cache prevents repeated PDF conversion on cursor reversals.
+    pdf_preview_cache: VecDeque<(PathBuf, Result<Vec<u8>, String>)>,
+}
+
+const PDF_PREVIEW_DEBOUNCE: Duration = Duration::from_millis(140);
+const PDF_PREVIEW_CONCURRENCY: usize = 2;
+const PDF_PREVIEW_CACHE_SIZE: usize = 6;
+
+#[derive(Debug, Clone)]
+pub enum ComposeFilePreview {
+    Empty,
+    Directory(Vec<ComposeFileEntry>),
+    Loading(&'static str),
+    Text { lines: Vec<String>, truncated: bool },
+    Patch(crate::patch_preview::PatchPreview),
+    Binary(u64),
+    Image(Vec<u8>),
+    Error(String),
+}
+
+fn compose_read_dir(directory: &Path, show_hidden: bool) -> anyhow::Result<Vec<ComposeFileEntry>> {
+    let mut entries = Vec::new();
+    for item in std::fs::read_dir(directory)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        if !show_hidden && name.starts_with('.') { continue; }
+        let path = item.path();
+        let is_directory = path.is_dir();
+        if is_directory || path.is_file() {
+            entries.push(ComposeFileEntry { path, name, is_directory });
+        }
+    }
+    entries.sort_by(|a, b| {
+        b.is_directory.cmp(&a.is_directory)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(entries)
+}
+
+/// Render a small first-page JPEG via Poppler in a *background worker*.
+/// JPEG thumbnails are much cheaper to encode/decode than full-resolution PNGs.
+/// The TUI thread must never call this function (or wait on its child process).
+fn compose_pdf_thumbnail(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let temp = tempfile::tempdir()?;
+    let output = temp.path().join("preview");
+    let mut child = ProcessCommand::new("pdftoppm")
+        .args(["-f", "1", "-l", "1", "-singlefile", "-scale-to", "850", "-jpeg",
+            "-jpegopt", "quality=70"])
+        .arg(path).arg(&output)
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        .map_err(|error| anyhow::anyhow!("PDF preview requires Poppler's pdftoppm: {error}"))?;
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() { anyhow::bail!("PDF preview could not render page one"); }
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(3) {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("PDF preview timed out");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let rendered = output.with_extension("jpg");
+    let metadata = std::fs::metadata(&rendered)?;
+    if metadata.len() > 16 * 1024 * 1024 { anyhow::bail!("PDF thumbnail too large"); }
+    Ok(std::fs::read(rendered)?)
+}
+
+fn compose_image_extension(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str())
+        .is_some_and(|extension| ["png", "jpg", "jpeg", "gif", "webp"]
+            .iter().any(|supported| extension.eq_ignore_ascii_case(supported)))
+}
+
+fn validate_picker_attachment(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+        anyhow::bail!("attachment must be a file of at most 16 MiB: {}", path.display());
+    }
+    Ok(())
+}
+
+impl ComposeFilePicker {
+    fn open(directory: PathBuf) -> anyhow::Result<Self> {
+        let mut picker = Self {
+            directory,
+            entries: Vec::new(),
+            selected: 0,
+            show_hidden: false,
+            parent_entries: Vec::new(),
+            parent_selected: 0,
+            preview: ComposeFilePreview::Empty,
+            pending_count: 0,
+            pending_g: false,
+            smooth_target: None,
+            visual_anchor: None,
+            help_visible: false,
+            help_query: String::new(),
+            help_selected: 0,
+            help_scroll: 0,
+            search_query: None,
+            pdf_preview_due: None,
+            pdf_preview_inflight: HashSet::new(),
+            pdf_preview_results: Arc::new(Mutex::new(VecDeque::new())),
+            pdf_preview_cache: VecDeque::new(),
+        };
+        picker.refresh()?;
+        Ok(picker)
+    }
+
+    fn refresh(&mut self) -> anyhow::Result<()> {
+        self.smooth_target = None;
+        self.visual_anchor = None;
+        self.entries = compose_read_dir(&self.directory, self.show_hidden)?;
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        self.parent_entries.clear();
+        self.parent_selected = 0;
+        if let Some(parent) = self.directory.parent() {
+            self.parent_entries = compose_read_dir(parent, self.show_hidden).unwrap_or_default();
+            if let Some(index) = self.parent_entries.iter()
+                .position(|entry| entry.path == self.directory) {
+                self.parent_selected = index;
+            }
+        }
+        self.refresh_preview();
+        Ok(())
+    }
+
+    fn refresh_preview(&mut self) {
+        // Only the *current* PDF may be scheduled. An in-flight conversion from
+        // a previous row can finish in the background but cannot replace this preview.
+        self.pdf_preview_due = None;
+        self.preview = match self.entries.get(self.selected) {
+            None => ComposeFilePreview::Empty,
+            Some(entry) if entry.is_directory => match compose_read_dir(&entry.path, self.show_hidden) {
+                Ok(entries) => ComposeFilePreview::Directory(entries),
+                Err(error) => ComposeFilePreview::Error(error.to_string()),
+            },
+            Some(entry) if entry.path.extension().and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf")) => {
+                if let Some((_, cached)) = self.pdf_preview_cache.iter()
+                    .find(|(path, _)| path == &entry.path) {
+                    match cached {
+                        Ok(bytes) => ComposeFilePreview::Image(bytes.clone()),
+                        Err(error) => ComposeFilePreview::Error(error.clone()),
+                    }
+                } else {
+                    if !self.pdf_preview_inflight.contains(&entry.path) {
+                        self.pdf_preview_due = Some((entry.path.clone(), Instant::now() + PDF_PREVIEW_DEBOUNCE));
+                    }
+                    ComposeFilePreview::Loading("Rendering PDF preview…")
+                }
+            }
+            Some(entry) if compose_image_extension(&entry.path) => {
+                match std::fs::metadata(&entry.path) {
+                    Ok(metadata) if metadata.len() <= 16 * 1024 * 1024 => {
+                        match std::fs::read(&entry.path) {
+                            Ok(bytes) => ComposeFilePreview::Image(bytes),
+                            Err(error) => ComposeFilePreview::Error(error.to_string()),
+                        }
+                    }
+                    Ok(metadata) => ComposeFilePreview::Binary(metadata.len()),
+                    Err(error) => ComposeFilePreview::Error(error.to_string()),
+                }
+            }
+            Some(entry) => match std::fs::File::open(&entry.path) {
+                Err(error) => ComposeFilePreview::Error(error.to_string()),
+                Ok(mut file) => match file.metadata() {
+                    Err(error) => ComposeFilePreview::Error(error.to_string()),
+                    Ok(metadata) => {
+                        // No unbounded reads while traversing large binary attachments.
+                        let mut bytes = Vec::new();
+                        match std::io::Read::by_ref(&mut file).take(24 * 1024).read_to_end(&mut bytes) {
+                            Err(error) => ComposeFilePreview::Error(error.to_string()),
+                            Ok(_) => match String::from_utf8(bytes) {
+                                Ok(text) if !text.contains('\0') => {
+                                    let truncated = metadata.len() > 24 * 1024 || text.lines().count() > 180;
+                                    if entry.path.extension().and_then(|ext| ext.to_str())
+                                        .is_some_and(|ext| ext.eq_ignore_ascii_case("patch") || ext.eq_ignore_ascii_case("diff")) {
+                                        ComposeFilePreview::Patch(crate::patch_preview::highlight_patch(&text, truncated))
+                                    } else {
+                                        ComposeFilePreview::Text { lines: text.lines().take(180).map(str::to_owned).collect(), truncated }
+                                    }
+                                }
+                                _ => ComposeFilePreview::Binary(metadata.len()),
+                            },
+                        }
+                    }
+                },
+            },
+        };
+    }
+
+    /// Poll completed previews without waiting, and launch only the most
+    /// recently selected PDF once the selection has been stable for 140 ms.
+    /// Yazi similarly preloads previews off the UI thread, avoiding navigation
+    /// stalls on external converters.
+    fn advance_pdf_preview(&mut self) {
+        // Drain a completed result batch under one brief lock. The mutex never
+        // covers the expensive Poppler process or image decoding.
+        let completed = if let Ok(mut results) = self.pdf_preview_results.lock() {
+            results.drain(..).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut refresh = false;
+        for (path, result) in completed {
+            self.pdf_preview_inflight.remove(&path);
+            self.pdf_preview_cache.retain(|(cached, _)| cached != &path);
+            self.pdf_preview_cache.push_back((path.clone(), result));
+            while self.pdf_preview_cache.len() > PDF_PREVIEW_CACHE_SIZE {
+                self.pdf_preview_cache.pop_front();
+            }
+            refresh |= self.smooth_target.is_none()
+                && self.entries.get(self.selected).is_some_and(|entry| entry.path == path);
+        }
+        if refresh { self.refresh_preview(); }
+
+        let ready = self.pdf_preview_due.as_ref()
+            .is_some_and(|(_, due)| *due <= Instant::now());
+        if !ready || self.pdf_preview_inflight.len() >= PDF_PREVIEW_CONCURRENCY { return; }
+        let Some((path, _)) = self.pdf_preview_due.take() else { return; };
+        if self.pdf_preview_inflight.contains(&path) { return; }
+        let results = Arc::clone(&self.pdf_preview_results);
+        let worker_path = path.clone();
+        match std::thread::Builder::new().name("aerc-pdf-preview".into()).spawn(move || {
+            let result = compose_pdf_thumbnail(&worker_path).map_err(|error| error.to_string());
+            if let Ok(mut queue) = results.lock() {
+                queue.push_back((worker_path, result));
+            }
+        }) {
+            Ok(_handle) => { self.pdf_preview_inflight.insert(path); }
+            Err(error) => { self.preview = ComposeFilePreview::Error(format!("PDF preview worker: {error}")); }
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        self.smooth_target = None;
+        self.selected = self.selected.saturating_add_signed(delta)
+            .min(self.entries.len().saturating_sub(1));
+        self.refresh_preview();
+    }
+
+    fn queue_smooth_scroll(&mut self, delta: isize) {
+        // Queue relative to the *visible* cursor so opposite-direction keys
+        // reverse immediately instead of inheriting an unfinished target.
+        let target = self.selected.saturating_add_signed(delta)
+            .min(self.entries.len().saturating_sub(1));
+        self.smooth_target = (target != self.selected).then_some(target);
+        // A new scroll invalidates a pending preview debounce; schedule only
+        // the final destination once the animation has settled.
+        if self.smooth_target.is_some() { self.pdf_preview_due = None; }
+    }
+
+    fn advance_smooth_scroll(&mut self) {
+        let Some(target) = self.smooth_target else { return; };
+        if target == self.selected { self.smooth_target = None; return; }
+        self.selected = self.selected.saturating_add_signed(if target > self.selected { 1 } else { -1 });
+        // Rebuilding a preview for every *intermediate* animation row makes
+        // Ctrl-j/k do filesystem I/O and image rasterization for files the user
+        // never stopped on. Keep the old preview while moving and refresh once.
+        if target == self.selected {
+            self.smooth_target = None;
+            self.refresh_preview();
+        }
+    }
+
+    pub fn help_matches(&self) -> Vec<usize> {
+        let query = self.help_query.trim().to_lowercase();
+        crate::app::PICKER_HELP_ENTRIES.iter().enumerate()
+            .filter(|(_, entry)| query.is_empty() || format!("{} {} {}", entry.category, entry.key, entry.description)
+                .to_lowercase().contains(&query))
+            .map(|(index, _)| index).collect()
+    }
+
+    /// Immutable match indices for the renderer's current-search counter.
+    pub fn search_matches_for_display(&self) -> Vec<usize> { self.search_matches() }
+
+    fn search_matches(&self) -> Vec<usize> {
+        let query = self.search_query.as_deref().unwrap_or("").to_lowercase();
+        let matches: Vec<usize> = self.entries.iter().enumerate()
+            .filter(|(_, entry)| entry.name.to_lowercase().contains(&query))
+            .map(|(index, _)| index).collect();
+        // A directory jump is the primary use case. Fall back to files when
+        // no folder matches, so slash remains useful for finding attachments.
+        let directories: Vec<usize> = matches.iter().copied()
+            .filter(|&index| self.entries[index].is_directory).collect();
+        if directories.is_empty() { matches } else { directories }
+    }
+
+    fn update_search_selection(&mut self) {
+        self.smooth_target = None;
+        if let Some(index) = self.search_matches().first().copied() {
+            self.selected = index;
+            self.refresh_preview();
+        }
+    }
+
+    fn next_search_match(&mut self, backwards: bool) {
+        self.smooth_target = None;
+        let matches = self.search_matches();
+        if matches.is_empty() { return; }
+        let next = matches.iter().position(|&index| index == self.selected)
+            .map_or(0, |position| if backwards {
+                (position + matches.len() - 1) % matches.len()
+            } else { (position + 1) % matches.len() });
+        self.selected = matches[next];
+        self.refresh_preview();
+    }
+
+    fn enter_directory(&mut self, directory: PathBuf) -> anyhow::Result<()> {
+        let previous = self.directory.clone();
+        self.search_query = None;
+        self.directory = directory;
+        self.selected = 0;
+        if let Err(error) = self.refresh() {
+            self.directory = previous;
+            self.refresh()?;
+            return Err(error);
+        }
+        if self.directory == previous.parent().unwrap_or(Path::new("")) {
+            if let Some(index) = self.entries.iter().position(|entry| entry.path == previous) {
+                self.selected = index;
+                self.refresh_preview();
+            }
+        }
+        Ok(())
+    }
+
+}
+
+#[derive(Debug, Clone)]
+struct RemovedAttachment {
+    index: usize,
+    path: PathBuf,
+    legacy: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Composer {
     pub to: String,
     pub cc: String,
     pub bcc: String,
+    /// Legacy semicolon-separated paths, kept for compatibility with old drafts.
+    #[serde(default)]
     pub attachments: String,
+    /// File-picker selections (supports spaces and semicolons in filenames).
+    #[serde(default)]
+    pub attachment_paths: Vec<PathBuf>,
     pub headers: String,
+    #[serde(skip)]
+    pub file_picker: Option<ComposeFilePicker>,
+    #[serde(skip)]
+    pub attachment_manager_open: bool,
+    #[serde(skip)]
+    pub attachment_manager_selected: usize,
+    /// Undo stack for detach operations in Ctrl+D; deliberately independent of text undo.
+    #[serde(skip)]
+    removed_attachments: Vec<RemovedAttachment>,
+    #[serde(skip)]
+    pub advanced_headers_open: bool,
+    #[serde(skip)]
+    advanced_previous: Option<(ComposeField, ComposeMode, usize)>,
     pub subject: String,
     pub body: String,
     pub field: ComposeField,
@@ -189,6 +583,18 @@ pub struct Composer {
     pub forwarded_raw: Option<Vec<u8>>,
     pub sending: bool,
     pub confirm_send: bool,
+    /// Prompt before discarding a nonempty unsent message. Not stored in drafts.
+    #[serde(skip)]
+    pub exit_prompt: bool,
+    /// Rich vs plain rendering in pre-send review; ephemeral, not draft content.
+    #[serde(skip)]
+    pub preview_html: bool,
+    #[serde(skip)]
+    pub preview_scroll: usize,
+    #[serde(skip)]
+    pub preview_rich_lines: Option<Vec<HtmlLine>>,
+    #[serde(skip)]
+    pub preview_forwarded_attachments: Vec<String>,
     #[serde(skip)]
     pub help_visible: bool,
     #[serde(skip)]
@@ -222,7 +628,14 @@ impl Composer {
             cc: String::new(),
             bcc: String::new(),
             attachments: String::new(),
+            attachment_paths: Vec::new(),
             headers: String::new(),
+            file_picker: None,
+            attachment_manager_open: false,
+            attachment_manager_selected: 0,
+            removed_attachments: Vec::new(),
+            advanced_headers_open: false,
+            advanced_previous: None,
             subject: String::new(),
             body: String::new(),
             field: ComposeField::To,
@@ -233,7 +646,9 @@ impl Composer {
             references: Vec::new(),
             forwarded_raw: None,
             sending: false,
-            confirm_send: false,
+            confirm_send: false, exit_prompt: false,
+            preview_html: true, preview_scroll: 0, preview_rich_lines: None,
+            preview_forwarded_attachments: Vec::new(),
             help_visible: false, help_query: String::new(), help_selected: 0, help_scroll: 0,
             visual_linewise: false, pending_g: false, pending_delete: false,
             pending_inner: false, pending_find: None, count: None,
@@ -280,7 +695,14 @@ impl Composer {
             cc: String::new(),
             bcc: String::new(),
             attachments: String::new(),
+            attachment_paths: Vec::new(),
             headers: String::new(),
+            file_picker: None,
+            attachment_manager_open: false,
+            attachment_manager_selected: 0,
+            removed_attachments: Vec::new(),
+            advanced_headers_open: false,
+            advanced_previous: None,
             subject,
             body,
             field: ComposeField::Body,
@@ -291,7 +713,9 @@ impl Composer {
             references,
             forwarded_raw: None,
             sending: false,
-            confirm_send: false,
+            confirm_send: false, exit_prompt: false,
+            preview_html: true, preview_scroll: 0, preview_rich_lines: None,
+            preview_forwarded_attachments: Vec::new(),
             help_visible: false, help_query: String::new(), help_selected: 0, help_scroll: 0,
             visual_linewise: false, pending_g: false, pending_delete: false,
             pending_inner: false, pending_find: None, count: None,
@@ -306,15 +730,328 @@ impl Composer {
         let body = format!("\n\n{attribution}\n{}\n", parts.plain);
         Ok(Self {
             to: String::new(), cc: String::new(), bcc: String::new(),
-            attachments: String::new(), headers: String::new(), subject, body,
+            attachments: String::new(), attachment_paths: Vec::new(), headers: String::new(),
+            file_picker: None, attachment_manager_open: false, attachment_manager_selected: 0,
+            removed_attachments: Vec::new(),
+            advanced_headers_open: false, advanced_previous: None,
+            subject, body,
             field: ComposeField::To, mode: ComposeMode::Insert, cursor: 0,
             visual_anchor: None, in_reply_to: None, references: Vec::new(),
-            forwarded_raw: Some(raw), sending: false, confirm_send: false,
+            forwarded_raw: Some(raw), sending: false, confirm_send: false, exit_prompt: false,
+            preview_html: true, preview_scroll: 0, preview_rich_lines: None,
+            preview_forwarded_attachments: Vec::new(),
             help_visible: false, help_query: String::new(), help_selected: 0, help_scroll: 0,
             visual_linewise: false, pending_g: false, pending_delete: false,
             pending_inner: false, pending_find: None, count: None,
             undo_history: Vec::new(), redo_history: Vec::new(),
         })
+    }
+
+    fn prepare_send_preview(&mut self) -> anyhow::Result<()> {
+        crate::outgoing::validate_recipients(&self.to, &self.cc, &self.bcc)?;
+        // Only parse/reflow rich mail and attachment metadata upon opening the
+        // preview, never while the terminal draws successive frames.
+        self.preview_forwarded_attachments = self.forwarded_raw.as_deref()
+            .and_then(|raw| crate::mail::extract_attachments(raw).ok())
+            .map(|parts| parts.into_iter().map(|part| part.filename).collect())
+            .unwrap_or_default();
+        self.preview_rich_lines = self.outgoing_html_preview()?
+            .map(|html| render_html_for_terminal(&html, 90).1);
+        self.preview_html = true;
+        self.preview_scroll = 0;
+        self.confirm_send = true;
+        Ok(())
+    }
+
+    /// The HTML actually used for inline forwards, if present. Normal plain
+    /// messages have no HTML alternative, so T correctly shows the same text.
+    pub fn outgoing_html_preview(&self) -> anyhow::Result<Option<String>> {
+        let Some(raw) = self.forwarded_raw.as_deref() else { return Ok(None); };
+        let parts = inline_forward_parts(raw)?;
+        Ok(parts.html.map(|html| {
+            let personal_note = self.body.split(FORWARD_SEPARATOR).next().unwrap_or("");
+            let original_headers = self.body.split(FORWARD_SEPARATOR).nth(1)
+                .and_then(|tail| tail.split("\n\n").next()).unwrap_or("");
+            let attribution = format!("{FORWARD_SEPARATOR}{original_headers}");
+            forward_html(&html, &attribution, personal_note)
+        }))
+    }
+
+    /// Unsaved mail must never disappear on a stray `q` or `Esc`.
+    /// A reply or forward with original material is also worth protecting.
+    pub fn has_unsent_content(&self) -> bool {
+        [&self.to, &self.cc, &self.bcc, &self.subject, &self.body, &self.headers,
+         &self.attachments].iter().any(|value| !value.trim().is_empty())
+            || !self.attachment_paths.is_empty()
+            || self.forwarded_raw.is_some()
+            || self.in_reply_to.is_some()
+    }
+
+    pub fn attachment_count(&self) -> usize {
+        self.attachment_paths.len()
+            + self.attachments.split(';').filter(|part| !part.trim().is_empty()).count()
+    }
+
+    fn remove_managed_attachment(&mut self) -> Option<PathBuf> {
+        let selected = self.attachment_manager_selected;
+        let (removed, index, legacy) = if selected < self.attachment_paths.len() {
+            (self.attachment_paths.remove(selected), selected, false)
+        } else {
+            let index = selected - self.attachment_paths.len();
+            let mut paths: Vec<String> = self.attachments.split(';').map(str::trim)
+                .filter(|path| !path.is_empty()).map(str::to_owned).collect();
+            if index >= paths.len() { return None; }
+            let removed = PathBuf::from(paths.remove(index));
+            self.attachments = paths.join(";");
+            (removed, index, true)
+        };
+        self.removed_attachments.push(RemovedAttachment {
+            index, path: removed.clone(), legacy,
+        });
+        self.attachment_manager_selected = selected.min(self.attachment_count().saturating_sub(1));
+        Some(removed)
+    }
+
+    fn undo_managed_attachment(&mut self) -> Option<PathBuf> {
+        let entry = self.removed_attachments.pop()?;
+        if entry.legacy {
+            let mut paths: Vec<String> = self.attachments.split(';').map(str::trim)
+                .filter(|path| !path.is_empty()).map(str::to_owned).collect();
+            let index = entry.index.min(paths.len());
+            paths.insert(index, entry.path.to_string_lossy().into_owned());
+            self.attachments = paths.join(";");
+            self.attachment_manager_selected = self.attachment_paths.len() + index;
+        } else {
+            let index = entry.index.min(self.attachment_paths.len());
+            self.attachment_paths.insert(index, entry.path.clone());
+            self.attachment_manager_selected = index;
+        }
+        Some(entry.path)
+    }
+
+    fn toggle_advanced_headers(&mut self) {
+        if let Some((field, mode, cursor)) = self.advanced_previous.take() {
+            self.advanced_headers_open = false;
+            self.field = field;
+            self.mode = mode;
+            self.cursor = cursor;
+            self.clear_pending();
+        } else {
+            let prior_mode = if self.mode == ComposeMode::Visual { ComposeMode::Normal } else { self.mode };
+            self.advanced_previous = Some((self.field, prior_mode, self.cursor));
+            self.advanced_headers_open = true;
+            self.switch_field(ComposeField::Headers);
+            self.mode = ComposeMode::Insert;
+        }
+    }
+
+    fn open_file_picker(&mut self) -> anyhow::Result<()> {
+        let directory = std::env::current_dir().or_else(|_| {
+            dirs::home_dir().ok_or_else(|| std::io::Error::other("no home directory"))
+        })?;
+        self.file_picker = Some(ComposeFilePicker::open(directory)?);
+        Ok(())
+    }
+
+    /// Return a short message to display in the status bar, if applicable.
+    fn file_picker_key(&mut self, key: KeyCode) -> anyhow::Result<Option<String>> {
+        let Some(picker) = self.file_picker.as_mut() else { return Ok(None); };
+        if picker.help_visible {
+            match key {
+                KeyCode::Esc | KeyCode::Char('?') if picker.help_query.is_empty() => picker.help_visible = false,
+                KeyCode::Esc => picker.help_visible = false,
+                KeyCode::Backspace => { picker.help_query.pop(); picker.help_selected = *picker.help_matches().first().unwrap_or(&0); picker.help_scroll = 0; }
+                KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') if picker.help_query.is_empty() => {
+                    let matches = picker.help_matches();
+                    if let Some(index) = matches.iter().position(|&i| i == picker.help_selected) {
+                        let index = if matches!(key, KeyCode::Up | KeyCode::Char('k')) { index.saturating_sub(1) } else { (index + 1).min(matches.len().saturating_sub(1)) };
+                        picker.help_selected = matches[index];
+                        picker.help_scroll = index.saturating_sub(5);
+                    }
+                }
+                KeyCode::Char(ch) => { picker.help_query.push(ch); picker.help_selected = *picker.help_matches().first().unwrap_or(&0); picker.help_scroll = 0; }
+                _ => {}
+            }
+            return Ok(None);
+        }
+        if picker.search_query.is_some() {
+            match key {
+                KeyCode::Esc => picker.search_query = None,
+                // Accept the highlighted match and return to normal navigation.
+                // Down/Up still cycle suggestions while the search is active.
+                KeyCode::Enter => picker.search_query = None,
+                KeyCode::Down => picker.next_search_match(false),
+                KeyCode::Up => picker.next_search_match(true),
+                KeyCode::Backspace => {
+                    if let Some(query) = picker.search_query.as_mut() { query.pop(); }
+                    picker.update_search_selection();
+                }
+                KeyCode::Tab | KeyCode::Right => {
+                    if let Some(entry) = picker.entries.get(picker.selected) {
+                        if entry.is_directory { picker.enter_directory(entry.path.clone())?; }
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(query) = picker.search_query.as_mut() { query.push(ch); }
+                    picker.update_search_selection();
+                }
+                _ => {}
+            }
+            return Ok(None);
+        }
+        if key == KeyCode::Char('/') {
+            picker.smooth_target = None;
+            picker.search_query = Some(String::new());
+            return Ok(None);
+        }
+        if key == KeyCode::Char('?') {
+            picker.help_visible = true;
+            picker.help_query.clear();
+            picker.help_selected = 0;
+            picker.help_scroll = 0;
+            return Ok(None);
+        }
+        if matches!(key, KeyCode::Esc | KeyCode::Char('q')) {
+            if picker.visual_anchor.take().is_none() { self.file_picker = None; }
+            return Ok(None);
+        }
+        if matches!(key, KeyCode::Char('v' | 'V')) {
+            if picker.visual_anchor.is_some() { picker.visual_anchor = None; }
+            else { picker.visual_anchor = Some(picker.selected); }
+            picker.pending_count = 0;
+            return Ok(None);
+        }
+        if picker.pending_g {
+            picker.pending_g = false;
+            if key == KeyCode::Char('g') {
+                picker.selected = 0;
+                picker.refresh_preview();
+                picker.pending_count = 0;
+                return Ok(None);
+            }
+        }
+        match key {
+            KeyCode::Char(digit @ '1'..='9') => {
+                picker.pending_count = picker.pending_count.saturating_mul(10)
+                    .saturating_add(digit.to_digit(10).unwrap_or(1) as usize).min(99_999);
+                return Ok(None);
+            }
+            KeyCode::Char('0') if picker.pending_count > 0 => {
+                picker.pending_count = picker.pending_count.saturating_mul(10).min(99_999);
+                return Ok(None);
+            }
+            KeyCode::Char('g') => { picker.pending_g = true; return Ok(None); }
+            _ => {}
+        }
+        let count = picker.pending_count.max(1);
+        picker.pending_count = 0;
+        if key == KeyCode::Char('x') {
+            let (start, end) = picker.visual_anchor
+                .map(|anchor| (anchor.min(picker.selected), anchor.max(picker.selected)))
+                .unwrap_or((picker.selected, picker.selected));
+            let paths: Vec<PathBuf> = picker.entries.iter().skip(start)
+                .take(end - start + 1).filter(|entry| !entry.is_directory)
+                .map(|entry| entry.path.clone()).collect();
+            let before = self.attachment_paths.len();
+            self.attachment_paths.retain(|path| !paths.contains(path));
+            let removed = before - self.attachment_paths.len();
+            picker.visual_anchor = None;
+            return Ok(Some(format!("removed {removed} attached file(s)")));
+        }
+        match key {
+            KeyCode::Up | KeyCode::Char('k') => picker.move_selection(-(count as isize)),
+            KeyCode::Down | KeyCode::Char('j') => picker.move_selection(count as isize),
+            KeyCode::PageUp => picker.move_selection(-10),
+            KeyCode::PageDown => picker.move_selection(10),
+            KeyCode::Home => { picker.selected = 0; picker.refresh_preview(); }
+            KeyCode::End | KeyCode::Char('G') => {
+                picker.selected = picker.entries.len().saturating_sub(1);
+                picker.refresh_preview();
+            }
+            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(parent) = picker.directory.parent() {
+                    picker.enter_directory(parent.to_path_buf())?;
+                }
+            }
+            KeyCode::Char('~') => {
+                if let Some(home) = dirs::home_dir() { picker.enter_directory(home)?; }
+            }
+            KeyCode::Char('d') => {
+                if let Some(home) = dirs::home_dir() {
+                    let downloads = home.join("Downloads");
+                    if downloads.is_dir() { picker.enter_directory(downloads)?; }
+                }
+            }
+            KeyCode::Char('.') => {
+                picker.show_hidden = !picker.show_hidden;
+                picker.refresh()?;
+            }
+            KeyCode::Char('l') | KeyCode::Right if picker.visual_anchor.is_none() => {
+                if let Some(entry) = picker.entries.get(picker.selected) {
+                    if entry.is_directory { picker.enter_directory(entry.path.clone())?; }
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(anchor) = picker.visual_anchor {
+                    let start = anchor.min(picker.selected);
+                    let end = anchor.max(picker.selected);
+                    // Directories are navigation-only, never attachment targets.
+                    let paths: Vec<_> = picker.entries.iter().skip(start).take(end - start + 1)
+                        .filter(|entry| !entry.is_directory).map(|entry| entry.path.clone()).collect();
+                    if paths.is_empty() {
+                        picker.visual_anchor = None;
+                        return Ok(Some("no files in visual selection".to_owned()));
+                    }
+                    // Space over an all-attached range detaches it. A mixed
+                    // range attaches only missing files, without disturbing
+                    // the files that are already attached.
+                    if key == KeyCode::Char(' ') && paths.iter().all(|path| self.attachment_paths.contains(path)) {
+                        self.attachment_paths.retain(|path| !paths.contains(path));
+                        picker.visual_anchor = None;
+                        return Ok(Some(format!("detached {} files from visual selection", paths.len())));
+                    }
+                    // Validate *before* any mutation so one invalid file
+                    // cannot leave a partially attached selection.
+                    for path in &paths {
+                        if !self.attachment_paths.contains(path) { validate_picker_attachment(path)?; }
+                    }
+                    let mut attached = 0;
+                    for path in paths {
+                        if !self.attachment_paths.contains(&path) {
+                            self.attachment_paths.push(path);
+                            attached += 1;
+                        }
+                    }
+                    picker.visual_anchor = None;
+                    return Ok(Some(format!("attached {attached} files from visual selection")));
+                }
+                if let Some(entry) = picker.entries.get(picker.selected).cloned() {
+                    if entry.is_directory {
+                        if key == KeyCode::Enter {
+                            picker.enter_directory(entry.path)?;
+                        } else {
+                            let last = picker.entries.len().saturating_sub(1);
+                            if picker.selected < last { picker.move_selection(1); }
+                        }
+                    } else {
+                        validate_picker_attachment(&entry.path)?;
+                        if let Some(index) = self.attachment_paths.iter().position(|existing| existing == &entry.path) {
+                            self.attachment_paths.remove(index);
+                        } else {
+                            self.attachment_paths.push(entry.path);
+                        }
+                        // Space is rapid multi-selection, Enter only toggles.
+                        if key == KeyCode::Char(' ') {
+                            let last = picker.entries.len().saturating_sub(1);
+                            if picker.selected < last { picker.move_selection(1); }
+                        }
+                        return Ok(Some(format!("updated attachments: {}", self.attachment_paths.len())));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
     }
 
     #[must_use]
@@ -355,6 +1092,19 @@ impl Composer {
         }
         self.visual_linewise = false;
         self.clear_pending();
+    }
+
+    /// Normal-mode j/k on headers navigate *fields*, not characters/lines.
+    /// Never leave the body using j/k: once there, motions are Vim motions.
+    fn move_header_field(&mut self, down: bool, count: usize) -> bool {
+        if self.field == ComposeField::Body || self.mode == ComposeMode::Insert { return false; }
+        for _ in 0..count.min(5) {
+            let next = if down { self.field.next() } else { self.field.previous() };
+            if !down && next == ComposeField::Body { break; }
+            self.switch_field(next);
+            if self.field == ComposeField::Body { break; }
+        }
+        true
     }
 
     fn clear_pending(&mut self) {
@@ -1167,6 +1917,8 @@ pub struct App {
     pub attachment_files: Vec<OutgoingAttachment>,
     attachment_pending: Option<MessageId>,
     attachment_preview: Option<Protocol>,
+    compose_file_preview_image: Option<Protocol>,
+    compose_file_preview_identity: Option<(PathBuf, u16, u16)>,
     pub help_visible: bool,
     pub help_query: String,
     pub help_selected: usize,
@@ -1284,6 +2036,8 @@ impl App {
             attachment_files: Vec::new(),
             attachment_pending: None,
             attachment_preview: None,
+            compose_file_preview_image: None,
+            compose_file_preview_identity: None,
             help_visible: false,
             help_query: String::new(),
             help_selected: 0,
@@ -1968,6 +2722,24 @@ impl App {
                     .unwrap_or("mail updated");
                 self.status = StatusLine::temporary(message, Duration::from_secs(2));
             }
+            WorkerEventKind::DraftSaveFailed { mailbox, error } => {
+                self.status = StatusLine::error(format!(
+                    "saved locally only: uploading to {mailbox} failed ({error}); Ctrl+n resumes"));
+            }
+            WorkerEventKind::DraftSaved { mailbox } => {
+                // Refresh cached Drafts on the next visit, or immediately if
+                // the user is already browsing that folder.
+                account.mailbox_cache.remove(&mailbox);
+                if let Some(folder) = account.mailboxes.iter_mut()
+                    .find(|folder| folder.name == mailbox) {
+                    folder.counts_known = false;
+                }
+                if account.current_mailbox.as_deref() == Some(mailbox.as_str()) {
+                    let _ = account.request_mailbox_page(mailbox.clone(), 0);
+                }
+                self.status = StatusLine::info(format!(
+                    "draft saved in {mailbox}; Ctrl+n resumes editing local recovery copy"));
+            }
             WorkerEventKind::MessageSent {
                 smtp_status,
                 sent_mailbox,
@@ -2295,9 +3067,25 @@ impl App {
         }
     }
 
+    /// Keep smooth scrolling at the normal animation rate, but check idle PDF
+    /// conversions less often to avoid redrawing the whole TUI 100 times/sec.
+    #[must_use]
+    pub fn animation_frame_interval(&self) -> Duration {
+        if self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
+            .is_some_and(|picker| picker.smooth_target.is_none()
+                && (picker.pdf_preview_due.is_some() || !picker.pdf_preview_inflight.is_empty())) {
+            Duration::from_millis(60)
+        } else {
+            Duration::from_millis(10)
+        }
+    }
+
     #[must_use]
     pub fn animation_active(&self) -> bool {
-        self.reader_smooth_target.is_some() || self.account().is_some_and(|account| {
+        self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
+            .is_some_and(|picker| picker.smooth_target.is_some()
+                || picker.pdf_preview_due.is_some() || !picker.pdf_preview_inflight.is_empty())
+            || self.reader_smooth_target.is_some() || self.account().is_some_and(|account| {
             account.smooth_message_target.is_some()
                 || account.smooth_mailbox_target.is_some()
                 || account.smooth_preview_target.is_some()
@@ -2308,6 +3096,19 @@ impl App {
     /// are positions inside the filtered list; mailbox targets deliberately do
     /// not open intermediate folders, so Ctrl-Shift-j/k stays responsive.
     pub fn advance_animation(&mut self) {
+        if let Some(picker) = self.composer.as_mut().and_then(|composer| composer.file_picker.as_mut()) {
+            // Advance one row and check PDF completions on each scheduled frame.
+            // Neither operation waits for the PDF renderer. If the picker is
+            // idle, let animations beneath the popup settle normally.
+            if picker.smooth_target.is_some() || picker.pdf_preview_due.is_some()
+                || !picker.pdf_preview_inflight.is_empty() {
+                if picker.smooth_target.is_some() {
+                    picker.advance_smooth_scroll();
+                }
+                picker.advance_pdf_preview();
+                return;
+            }
+        }
         let focus = self.focus;
         if focus == Focus::Preview {
             let Some(target) = self.reader_smooth_target else {
@@ -3968,6 +4769,40 @@ impl App {
         }
     }
 
+    /// Terminal graphics for the compose picker. Cached by path and cell size;
+    /// selection changes never decode images on each render frame.
+    pub fn ensure_compose_file_preview(&mut self, width: u16, height: u16) {
+        if self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
+            .is_some_and(|picker| picker.smooth_target.is_some()) {
+            return;
+        }
+        let candidate = self.composer.as_ref()
+            .and_then(|composer| composer.file_picker.as_ref())
+            .and_then(|picker| picker.entries.get(picker.selected)
+                .map(|entry| (entry.path.clone(), &picker.preview)));
+        let Some((path, ComposeFilePreview::Image(bytes))) = candidate else {
+            self.compose_file_preview_image = None;
+            self.compose_file_preview_identity = None;
+            return;
+        };
+        let identity = (path, width, height);
+        if self.compose_file_preview_identity.as_ref() == Some(&identity) { return; }
+        self.compose_file_preview_identity = Some(identity);
+        self.compose_file_preview_image = None;
+        let Some(picker) = &self.image_picker else { return; };
+        if let Ok(image) = image::load_from_memory(bytes) {
+            let target = reader_image_target_size(image.width(), image.height(), None, None,
+                picker.font_size().width, picker.font_size().height, width.max(1), height.max(1));
+            self.compose_file_preview_image = picker.new_protocol(image, target,
+                Resize::Fit(Some(image::imageops::FilterType::Lanczos3))).ok();
+        }
+    }
+
+    #[must_use]
+    pub fn compose_file_preview_image(&self) -> Option<&Protocol> {
+        self.compose_file_preview_image.as_ref()
+    }
+
     #[must_use]
     pub fn attachment_preview(&self) -> Option<&Protocol> { self.attachment_preview.as_ref() }
 
@@ -4186,11 +5021,26 @@ impl App {
             }
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
-            self.postpone_composer();
+        if composer.exit_prompt {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    if let Some(composer) = self.composer.as_mut() { composer.exit_prompt = false; }
+                    self.postpone_composer();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.composer = None;
+                    self.resumed_draft_account = None;
+                    self.status = StatusLine::temporary("unsent email discarded", Duration::from_secs(2));
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    if let Some(composer) = self.composer.as_mut() { composer.exit_prompt = false; }
+                }
+                _ => {}
+            }
             return;
         }
         if composer.confirm_send {
+            // The user reviews headers and the body before the final Send key.
             match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if let Some(composer) = self.composer.as_mut() { composer.confirm_send = false; }
@@ -4198,7 +5048,39 @@ impl App {
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     if let Some(composer) = self.composer.as_mut() { composer.confirm_send = false; }
-                    self.status = StatusLine::temporary("send cancelled", Duration::from_secs(1));
+                }
+                KeyCode::Char('T') => {
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.preview_html = !composer.preview_html;
+                        composer.preview_scroll = 0;
+                    }
+                }
+                KeyCode::Char('O') => self.open_compose_browser_preview(),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.preview_scroll = composer.preview_scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.preview_scroll = composer.preview_scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    if let Some(composer) = self.composer.as_mut() { composer.preview_scroll = usize::MAX; }
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    if let Some(composer) = self.composer.as_mut() { composer.preview_scroll = 0; }
+                }
+                KeyCode::PageDown => {
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.preview_scroll = composer.preview_scroll.saturating_add(15);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.preview_scroll = composer.preview_scroll.saturating_sub(15);
+                    }
                 }
                 _ => {}
             }
@@ -4236,6 +5118,99 @@ impl App {
             }
             return;
         }
+        if composer.attachment_manager_open {
+            let composer = self.composer.as_mut().expect("composer exists");
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => composer.attachment_manager_open = false,
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    composer.attachment_manager_open = false;
+                }
+                KeyCode::Char('j') | KeyCode::Down => composer.attachment_manager_selected =
+                    composer.attachment_manager_selected.saturating_add(1)
+                        .min(composer.attachment_count().saturating_sub(1)),
+                KeyCode::Char('k') | KeyCode::Up => composer.attachment_manager_selected =
+                    composer.attachment_manager_selected.saturating_sub(1),
+                KeyCode::Char('?') => {
+                    composer.help_visible = true;
+                    composer.help_query.clear();
+                    composer.help_selected = 0;
+                    composer.help_scroll = 0;
+                }
+                KeyCode::Char('x' | 'd') | KeyCode::Delete | KeyCode::Backspace => {
+                    if let Some(path) = composer.remove_managed_attachment() {
+                        self.status = StatusLine::temporary(
+                            format!("detached {}", path.display()), Duration::from_secs(2));
+                    }
+                }
+                KeyCode::Char('u') => {
+                    if let Some(path) = composer.undo_managed_attachment() {
+                        self.status = StatusLine::temporary(
+                            format!("reattached {}", path.display()), Duration::from_secs(2));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if composer.file_picker.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+                self.composer.as_mut().expect("composer exists").file_picker = None;
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                let picker = self.composer.as_mut().and_then(|composer| composer.file_picker.as_mut());
+                if let Some(picker) = picker {
+                    match key.code {
+                        KeyCode::Char('j') => picker.queue_smooth_scroll(8),
+                        KeyCode::Char('k') => picker.queue_smooth_scroll(-8),
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            match self.composer.as_mut().expect("composer exists").file_picker_key(key.code) {
+                Ok(Some(message)) => self.status = StatusLine::temporary(message, Duration::from_secs(2)),
+                Ok(None) => {},
+                Err(error) => self.status = StatusLine::error(format!("file picker: {error:#}")),
+            }
+            return;
+        }
+        if composer.advanced_headers_open {
+            let composer = self.composer.as_mut().expect("composer exists");
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => composer.toggle_advanced_headers(),
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => composer.toggle_advanced_headers(),
+                KeyCode::Backspace => composer.backspace(),
+                KeyCode::Delete => composer.delete_at_cursor(),
+                KeyCode::Left => composer.move_horizontal(-1),
+                KeyCode::Right => composer.move_horizontal(1),
+                KeyCode::Home => composer.cursor = 0,
+                KeyCode::End => composer.cursor = composer.char_count(),
+                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => composer.insert_char(ch),
+                _ => {},
+            }
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+            let composer = self.composer.as_mut().expect("composer exists");
+            composer.attachment_manager_open = true;
+            composer.attachment_manager_selected = 0;
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+            if let Err(error) = self.composer.as_mut().expect("composer exists").open_file_picker() {
+                self.status = StatusLine::error(format!("file picker: {error:#}"));
+            }
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+            self.composer.as_mut().expect("composer exists").toggle_advanced_headers();
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.postpone_composer();
+            return;
+        }
         let composer = self.composer.as_mut().expect("composer exists");
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -4270,6 +5245,11 @@ impl App {
                 KeyCode::Delete => composer.delete_at_cursor(),
                 KeyCode::Left => composer.move_horizontal(-1),
                 KeyCode::Right => composer.move_horizontal(1),
+                KeyCode::Up if composer.field != ComposeField::Body => {
+                    let previous = composer.field.previous();
+                    if previous != ComposeField::Body { composer.switch_field(previous); }
+                }
+                KeyCode::Down if composer.field != ComposeField::Body => composer.switch_field(composer.field.next()),
                 KeyCode::Up => composer.move_line(-1),
                 KeyCode::Down => composer.move_line(1),
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::ALT) => composer.insert_char(ch),
@@ -4333,11 +5313,27 @@ impl App {
             return;
         }
         let count = composer.count.take().unwrap_or(1);
+        // Header navigation is separate from body Vim motions.
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down if composer.move_header_field(true, count) => return,
+            KeyCode::Char('k') | KeyCode::Up if composer.move_header_field(false, count) => return,
+            _ => {}
+        }
         if composer.apply_motion(key.code, count) { return; }
         match composer.mode {
             ComposeMode::Normal => match key.code {
-                KeyCode::Enter => composer.confirm_send = true,
-                KeyCode::Esc | KeyCode::Char('q') => { self.composer = None; }
+                KeyCode::Enter => {
+                    if let Err(error) = composer.prepare_send_preview() {
+                        self.status = StatusLine::error(format!("cannot preview outgoing email: {error:#}"));
+                    }
+                },
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    if composer.has_unsent_content() {
+                        composer.exit_prompt = true;
+                    } else {
+                        self.composer = None;
+                    }
+                }
                 KeyCode::Char('i') => composer.mode = ComposeMode::Insert,
                 KeyCode::Char('a') => { composer.move_horizontal(1); composer.mode = ComposeMode::Insert; }
                 KeyCode::Char('I') => { composer.cursor = composer.first_nonblank(); composer.mode = ComposeMode::Insert; }
@@ -4393,6 +5389,36 @@ impl App {
         }
     }
 
+    fn open_compose_browser_preview(&mut self) {
+        let Some(composer) = self.composer.as_ref() else { return; };
+        let html = match composer.outgoing_html_preview() {
+            Ok(Some(html)) => html,
+            Ok(None) => {
+                // Plain-text-only emails still have a safe HTML browser projection.
+                let escaped = composer.body.replace('&', "&amp;")
+                    .replace('<', "&lt;").replace('>', "&gt;");
+                format!("<html><meta charset=\"utf-8\"><body><pre style=\"white-space:pre-wrap\">{escaped}</pre></body></html>")
+            }
+            Err(error) => {
+                self.status = StatusLine::error(format!("cannot preview HTML: {error:#}"));
+                return;
+            }
+        };
+        let result = (|| -> anyhow::Result<()> {
+            let directory = dirs::cache_dir().unwrap_or_else(std::env::temp_dir)
+                .join("aerc-rs").join("browser");
+            std::fs::create_dir_all(&directory)?;
+            let path = directory.join("compose-preview.html");
+            std::fs::write(&path, html.as_bytes())?;
+            open_url(path.to_string_lossy().as_ref())?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.status = StatusLine::temporary("opened outgoing email preview in browser", Duration::from_secs(2)),
+            Err(error) => self.status = StatusLine::error(format!("browser preview: {error:#}")),
+        }
+    }
+
     fn postponed_drafts_root() -> anyhow::Result<std::path::PathBuf> {
         let root = dirs::data_local_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot find local application data directory"))?;
@@ -4402,17 +5428,45 @@ impl App {
     fn postpone_composer(&mut self) {
         let Some(account) = self.account() else { return; };
         let Some(composer) = self.composer.as_ref() else { return; };
+        // Always write a local recovery copy first. If IMAP is offline or the
+        // Drafts APPEND fails, Ctrl+N can still recover the unsent message.
         let result = Self::postponed_drafts_root().and_then(|root| {
             crate::outgoing::drafts::save_draft(&root, &account.name, composer)
         });
-        match result {
-            Ok(()) => {
-                self.composer = None;
-                self.resumed_draft_account = None;
-                self.status = StatusLine::info("postponed locally; Ctrl-n resumes from this account");
-            }
-            Err(error) => self.status = StatusLine::error(format!("could not postpone: {error:#}")),
+        if let Err(error) = result {
+            self.status = StatusLine::error(format!("could not save draft: {error:#}"));
+            return;
         }
+        let draft_mailbox = account.mailboxes.iter()
+            .find(|mailbox| mailbox.role == MailboxRole::Drafts)
+            .map(|mailbox| mailbox.name.clone());
+        let draft_queued = if let Some(mailbox) = draft_mailbox {
+            let message = match outgoing_from_composer(composer, &account.from) {
+                Ok(message) => message,
+                Err(error) => {
+                    self.status = StatusLine::error(format!(
+                        "saved local recovery copy, but could not prepare IMAP draft: {error:#}"));
+                    return;
+                }
+            };
+            if self.account().is_some_and(|account|
+                account.worker.post(ActionKind::SaveDraft { message, mailbox }).is_ok()) {
+                true
+            } else {
+                self.status = StatusLine::error(
+                    "saved local recovery copy; Drafts worker is busy (Ctrl+n resumes)");
+                return;
+            }
+        } else {
+            false
+        };
+        self.composer = None;
+        self.resumed_draft_account = None;
+        self.status = if draft_queued {
+            StatusLine::info("saved local recovery copy; saving to Drafts folder…")
+        } else {
+            StatusLine::error("saved locally only: no Drafts mailbox found; Ctrl+n resumes")
+        };
     }
 
     fn restore_postponed_composer(&mut self) {
@@ -4446,59 +5500,17 @@ impl App {
             self.status = StatusLine::error("Add at least one To, Cc or Bcc recipient");
             return;
         }
-        let mut attachments = match load_compose_attachments(&composer.attachments) {
-            Ok(attachments) => attachments,
-            Err(error) => {
-                self.status = StatusLine::error(format!("attachment: {error:#}"));
-                return;
-            }
-        };
-        let custom_headers = match parse_compose_headers(&composer.headers) {
-            Ok(headers) => headers,
-            Err(error) => {
-                self.status = StatusLine::error(format!("header: {error:#}"));
-                return;
-            }
-        };
-        let mut html_body = None;
-        if let Some(raw) = composer.forwarded_raw.as_deref() {
-            let parts = match inline_forward_parts(raw) {
-                Ok(parts) => parts,
-                Err(error) => {
-                    self.status = StatusLine::error(format!("cannot inline-forward original email: {error:#}"));
-                    return;
-                }
-            };
-            attachments.extend(parts.attachments);
-            if let Some(html) = parts.html {
-                // Personal text preceding the forwarded-message marker belongs
-                // above the original HTML. Preserve that HTML with its CSS.
-                let personal_note = composer.body.split(FORWARD_SEPARATOR)
-                    .next().unwrap_or("");
-                let original_headers = composer.body.split(FORWARD_SEPARATOR)
-                    .nth(1).and_then(|tail| tail.split("\n\n").next()).unwrap_or("");
-                let attribution = format!("{FORWARD_SEPARATOR}{original_headers}");
-                html_body = Some(forward_html(&html, &attribution, personal_note));
-            }
-        }
-        let Some(account) = self.account() else {
+        if let Err(error) = crate::outgoing::validate_recipients(&composer.to, &composer.cc, &composer.bcc) {
+            self.status = StatusLine::error(format!("invalid recipient: {error:#}"));
             return;
-        };
-        let message = OutgoingMessage {
-            from: account.from.clone(),
-            to: composer.to.clone(),
-            cc: composer.cc.clone(),
-            bcc: composer.bcc.clone(),
-            subject: composer.subject.clone(),
-            body: composer.body.clone(),
-            html_body,
-            attachments,
-            custom_headers,
-            in_reply_to: composer.in_reply_to.clone(),
-            references: composer.references.clone(),
-            // The UI uses original bytes only to build inline alternatives and
-            // attachments. Never send a .eml attachment for ordinary Forward.
-            forwarded_raw: None,
+        }
+        let Some(account) = self.account() else { return; };
+        let message = match outgoing_from_composer(composer, &account.from) {
+            Ok(message) => message,
+            Err(error) => {
+                self.status = StatusLine::error(format!("cannot prepare email: {error:#}"));
+                return;
+            }
         };
         let sent_mailbox = account
             .mailboxes
@@ -4542,6 +5554,32 @@ impl App {
 
 
 
+/// Shared MIME-input assembly for SMTP and IMAP Drafts. The draft builder
+/// allows unfinished addresses; the Send path validates them separately.
+fn outgoing_from_composer(composer: &Composer, from: &str) -> anyhow::Result<OutgoingMessage> {
+    let mut attachments = load_compose_attachments(&composer.attachments, &composer.attachment_paths)?;
+    let custom_headers = parse_compose_headers(&composer.headers)?;
+    let mut html_body = None;
+    if let Some(raw) = composer.forwarded_raw.as_deref() {
+        let parts = inline_forward_parts(raw)?;
+        attachments.extend(parts.attachments);
+        if let Some(html) = parts.html {
+            let personal_note = composer.body.split(FORWARD_SEPARATOR).next().unwrap_or("");
+            let original_headers = composer.body.split(FORWARD_SEPARATOR)
+                .nth(1).and_then(|tail| tail.split("\n\n").next()).unwrap_or("");
+            html_body = Some(forward_html(&html,
+                &format!("{FORWARD_SEPARATOR}{original_headers}"), personal_note));
+        }
+    }
+    Ok(OutgoingMessage {
+        from: from.to_owned(), to: composer.to.clone(), cc: composer.cc.clone(),
+        bcc: composer.bcc.clone(), subject: composer.subject.clone(), body: composer.body.clone(),
+        html_body, attachments, custom_headers,
+        in_reply_to: composer.in_reply_to.clone(), references: composer.references.clone(),
+        forwarded_raw: None,
+    })
+}
+
 fn parse_compose_headers(raw: &str) -> anyhow::Result<Vec<(String, String)>> {
     raw.split(';').filter(|part| !part.trim().is_empty()).map(|part| {
         let (name, value) = part.split_once(':')
@@ -4550,35 +5588,55 @@ fn parse_compose_headers(raw: &str) -> anyhow::Result<Vec<(String, String)>> {
     }).collect()
 }
 
-fn load_compose_attachments(value: &str) -> anyhow::Result<Vec<OutgoingAttachment>> {
+fn load_compose_attachments(legacy: &str, selected: &[PathBuf]) -> anyhow::Result<Vec<OutgoingAttachment>> {
     let mut output = Vec::new();
-    for part in value.split(';').map(str::trim).filter(|part| !part.is_empty()) {
-        let path = std::path::Path::new(part);
-        let metadata = std::fs::metadata(path)?;
-        if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
-            anyhow::bail!("attachments must be files under 16 MiB: {part}");
-        }
-        let filename = path.file_name().and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("attachment has no valid UTF-8 filename"))?
-            .to_owned();
-        let content_type = match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
-            "txt" | "patch" | "diff" | "log" | "md" => "text/plain",
-            "html" | "htm" => "text/html",
-            "pdf" => "application/pdf",
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "webp" => "image/webp",
-            "eml" => "message/rfc822",
-            "zip" => "application/zip",
-            _ => "application/octet-stream",
-        };
-        output.push(OutgoingAttachment {
-            filename,
-            content_type: content_type.to_owned(),
-            data: std::fs::read(path)?,
-        });
+    // Older postponed drafts used a semicolon-delimited string. New selections
+    // are distinct paths, so filenames containing semicolons work correctly.
+    for part in legacy.split(';').map(str::trim).filter(|part| !part.is_empty()) {
+        output.push(load_compose_file(Path::new(part))?);
+    }
+    for path in selected {
+        output.push(load_compose_file(path)?);
     }
     Ok(output)
+}
+
+fn load_compose_file(path: &Path) -> anyhow::Result<OutgoingAttachment> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+        anyhow::bail!("attachment must be a file of at most 16 MiB: {}", path.display());
+    }
+    let filename = path.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("attachment has no valid UTF-8 filename"))?
+        .to_owned();
+    let content_type = if ["LICENSE", "COPYING", "Makefile", "Dockerfile", ".gitignore"]
+        .iter().any(|name| filename.eq_ignore_ascii_case(name)) {
+        "text/plain"
+    } else { match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "txt" | "patch" | "diff" | "log" | "md" | "rst" | "lock" | "rs"
+        | "c" | "h" | "cpp" | "hpp" | "py" | "sh" | "bash" | "zsh" | "fish"
+        | "ini" | "conf" | "cfg" | "gitignore" => "text/plain",
+        "toml" => "application/toml",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/yaml",
+        "csv" => "text/csv",
+        "xml" => "application/xml",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        "html" | "htm" => "text/html",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "eml" => "message/rfc822",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }};
+    Ok(OutgoingAttachment {
+        filename,
+        content_type: content_type.to_owned(),
+        data: std::fs::read(path)?,
+    })
 }
 
 fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
@@ -4951,6 +6009,7 @@ mod tests {
     };
     use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
+    use std::path::PathBuf;
 
     #[test]
     fn list_navigation_is_bounded() {
@@ -4987,6 +6046,410 @@ mod tests {
         assert_eq!(composer.mode, ComposeMode::Normal);
         assert_eq!(composer.visual_anchor, None);
         assert_eq!(composer.cursor, 0);
+    }
+
+    #[test]
+    fn normal_header_jk_switch_fields_without_changing_body_motions() {
+        let mut composer = Composer::new();
+        composer.mode = ComposeMode::Normal;
+        assert!(composer.move_header_field(true, 1));
+        assert_eq!(composer.field, ComposeField::Cc);
+        assert!(composer.move_header_field(true, 3));
+        assert_eq!(composer.field, ComposeField::Body);
+        assert!(!composer.move_header_field(false, 1));
+        composer.switch_field(ComposeField::To);
+        assert!(composer.move_header_field(false, 3));
+        assert_eq!(composer.field, ComposeField::To);
+        composer.mode = ComposeMode::Insert;
+        assert!(!composer.move_header_field(true, 1));
+        assert_eq!(composer.field, ComposeField::To);
+    }
+
+    #[test]
+    fn attachment_manager_detach_can_be_undone_in_original_order() {
+        let mut composer = Composer::new();
+        let a = PathBuf::from("/tmp/a.txt");
+        let b = PathBuf::from("/other/place/b.txt");
+        let c = PathBuf::from("/tmp/c.txt");
+        composer.attachment_paths = vec![a.clone(), b.clone(), c.clone()];
+        composer.attachment_manager_selected = 1;
+        assert_eq!(composer.remove_managed_attachment(), Some(b.clone()));
+        assert_eq!(composer.attachment_paths, vec![a.clone(), c.clone()]);
+        assert_eq!(composer.undo_managed_attachment(), Some(b.clone()));
+        assert_eq!(composer.attachment_paths, vec![a, b, c]);
+        assert_eq!(composer.attachment_manager_selected, 1);
+        assert_eq!(composer.undo_managed_attachment(), None);
+    }
+
+    #[test]
+    fn legacy_attachment_manager_detach_can_be_undone() {
+        let mut composer = Composer::new();
+        composer.attachments = "/tmp/old-a.txt;/tmp/old-b.txt".to_owned();
+        composer.attachment_manager_selected = 0;
+        assert_eq!(composer.remove_managed_attachment(), Some(PathBuf::from("/tmp/old-a.txt")));
+        assert_eq!(composer.attachment_count(), 1);
+        assert_eq!(composer.undo_managed_attachment(), Some(PathBuf::from("/tmp/old-a.txt")));
+        assert_eq!(composer.attachments, "/tmp/old-a.txt;/tmp/old-b.txt");
+    }
+
+    #[test]
+    fn closing_filled_composer_requires_explicit_draft_choice() {
+        let mut composer = Composer::new();
+        assert!(!composer.has_unsent_content());
+        composer.to = "someone@example.org".to_owned();
+        assert!(composer.has_unsent_content());
+        composer.to.clear();
+        composer.attachment_paths.push("/tmp/some-attachment.pdf".into());
+        assert!(composer.has_unsent_content());
+        composer.exit_prompt = true;
+        let restored: Composer = serde_json::from_slice(&serde_json::to_vec(&composer).unwrap()).unwrap();
+        assert!(!restored.exit_prompt);
+    }
+
+    #[test]
+    fn smooth_picker_scroll_only_refreshes_preview_at_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            std::fs::write(temp.path().join(format!("file-{index:02}.txt")),
+                format!("file content {index}")).unwrap();
+        }
+        let mut picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
+        let first = match &picker.preview {
+            super::ComposeFilePreview::Text { lines, .. } => lines.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        picker.queue_smooth_scroll(8);
+        for _ in 0..7 { picker.advance_smooth_scroll(); }
+        assert!(picker.smooth_target.is_some());
+        assert!(matches!(&picker.preview,
+            super::ComposeFilePreview::Text { lines, .. } if lines == &first));
+        picker.advance_smooth_scroll();
+        assert_eq!(picker.selected, 8);
+        assert!(picker.smooth_target.is_none());
+        assert!(matches!(&picker.preview,
+            super::ComposeFilePreview::Text { lines, .. } if lines != &first));
+    }
+
+    #[test]
+    fn picker_has_parent_and_file_preview_and_count_navigation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("alpha")).unwrap();
+        std::fs::write(temp.path().join("hello.txt"), b"hello from aerc").unwrap();
+        let mut picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
+        let index = picker.entries.iter().position(|entry| entry.name == "hello.txt").unwrap();
+        picker.move_selection(index as isize);
+        assert!(matches!(picker.preview, super::ComposeFilePreview::Text { .. }));
+        assert!(!picker.parent_entries.is_empty());
+        let mut composer = Composer::new();
+        composer.file_picker = Some(picker);
+        composer.file_picker_key(crossterm::event::KeyCode::Char('g')).unwrap();
+        composer.file_picker_key(crossterm::event::KeyCode::Char('g')).unwrap();
+        assert_eq!(composer.file_picker.as_ref().unwrap().selected, 0);
+        composer.file_picker_key(crossterm::event::KeyCode::Char('G')).unwrap();
+        assert_eq!(composer.file_picker.as_ref().unwrap().selected, index);
+    }
+
+    #[test]
+    fn send_review_can_prepare_rich_preview_without_an_html_alternative() {
+        let mut composer = Composer::new();
+        composer.to = "friend@example.com".to_owned();
+        composer.body = "Hello!".to_owned();
+        composer.prepare_send_preview().unwrap();
+        assert!(composer.confirm_send);
+        assert!(composer.preview_rich_lines.is_none());
+        assert_eq!(composer.preview_scroll, 0);
+    }
+
+    #[test]
+    fn compose_tabs_skip_file_paths_and_advanced_headers() {
+        assert_eq!(ComposeField::Subject.next(), ComposeField::Body);
+        assert_eq!(ComposeField::Body.previous(), ComposeField::Subject);
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Subject);
+        composer.toggle_advanced_headers();
+        assert_eq!(composer.field, ComposeField::Headers);
+        composer.headers = "Reply-To: team@example.com".to_owned();
+        composer.toggle_advanced_headers();
+        assert_eq!(composer.field, ComposeField::Subject);
+        assert_eq!(composer.headers, "Reply-To: team@example.com");
+    }
+
+    #[test]
+    fn picker_handles_semicolon_names_and_restores_selected_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("report;v2.txt"), b"attachment test").unwrap();
+        std::fs::create_dir(temp.path().join("folder")).unwrap();
+        let mut picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
+        assert!(picker.entries[0].is_directory);
+        let file_index = picker.entries.iter().position(|entry| entry.name == "report;v2.txt").unwrap();
+        picker.selected = file_index;
+        let mut composer = Composer::new();
+        composer.file_picker = Some(picker);
+        composer.file_picker_key(crossterm::event::KeyCode::Char(' ')).unwrap();
+        assert_eq!(composer.attachment_count(), 1);
+        let loaded = super::load_compose_attachments("", &composer.attachment_paths).unwrap();
+        assert_eq!(loaded[0].filename, "report;v2.txt");
+        assert_eq!(loaded[0].data.as_slice(), b"attachment test");
+        // Space on the final file does not jump back to the previous item.
+        composer.file_picker.as_mut().unwrap().selected = file_index;
+        composer.file_picker_key(crossterm::event::KeyCode::Char(' ')).unwrap();
+        assert_eq!(composer.attachment_count(), 0);
+    }
+
+    #[test]
+    fn picker_visual_range_attaches_files_after_count_motion() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..7 { std::fs::write(temp.path().join(format!("{index}.txt")), b"hi").unwrap(); }
+        let mut composer = Composer::new();
+        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        let key = |ch| crossterm::event::KeyCode::Char(ch);
+        composer.file_picker_key(key('v')).unwrap();
+        composer.file_picker_key(key('5')).unwrap();
+        composer.file_picker_key(key('j')).unwrap();
+        assert_eq!(composer.file_picker.as_ref().unwrap().selected, 5);
+        assert_eq!(composer.file_picker.as_ref().unwrap().visual_anchor, Some(0));
+        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        assert_eq!(composer.attachment_count(), 6);
+        assert!(composer.file_picker.as_ref().unwrap().visual_anchor.is_none());
+        // Re-selecting the same range does not add duplicates.
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('v')).unwrap();
+        composer.file_picker_key(key('5')).unwrap();
+        composer.file_picker_key(key('j')).unwrap();
+        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        assert_eq!(composer.attachment_count(), 6);
+    }
+
+    #[test]
+    fn picker_space_advances_and_stays_at_end_and_search_help_is_local() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] { std::fs::write(temp.path().join(name), b"ok").unwrap(); }
+        let mut composer = Composer::new();
+        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        let key = |ch| crossterm::event::KeyCode::Char(ch);
+        composer.file_picker_key(key(' ')).unwrap();
+        assert_eq!(composer.file_picker.as_ref().unwrap().selected, 1);
+        composer.file_picker_key(key(' ')).unwrap();
+        assert_eq!(composer.file_picker.as_ref().unwrap().selected, 2);
+        composer.file_picker_key(key(' ')).unwrap();
+        assert_eq!(composer.file_picker.as_ref().unwrap().selected, 2);
+        assert_eq!(composer.attachment_count(), 3);
+        composer.file_picker_key(key(' ')).unwrap();
+        assert_eq!(composer.file_picker.as_ref().unwrap().selected, 2);
+        assert_eq!(composer.attachment_count(), 2);
+        composer.file_picker_key(key('?')).unwrap();
+        composer.file_picker_key(key('v')).unwrap();
+        assert!(composer.file_picker.as_ref().unwrap().help_visible);
+        assert_eq!(composer.file_picker.as_ref().unwrap().help_query, "v");
+        composer.file_picker_key(crossterm::event::KeyCode::Esc).unwrap();
+        assert!(!composer.file_picker.as_ref().unwrap().help_visible);
+        composer.file_picker_key(key('v')).unwrap();
+        composer.file_picker_key(crossterm::event::KeyCode::Esc).unwrap();
+        assert!(composer.file_picker.as_ref().unwrap().visual_anchor.is_none());
+    }
+
+    #[test]
+    fn picker_slash_search_accepts_current_match_and_tab_opens_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["photos-2025", "photos-2026", "notes"] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        std::fs::write(temp.path().join("photos.txt"), b"hello").unwrap();
+        let mut composer = Composer::new();
+        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        let key = |ch| crossterm::event::KeyCode::Char(ch);
+        composer.file_picker_key(key('/')).unwrap();
+        for ch in "photos".chars() { composer.file_picker_key(key(ch)).unwrap(); }
+        let picker = composer.file_picker.as_ref().unwrap();
+        assert_eq!(picker.search_matches().len(), 2); // folder results take precedence
+        assert_eq!(picker.entries[picker.selected].name, "photos-2025");
+        composer.file_picker_key(crossterm::event::KeyCode::Down).unwrap();
+        let picker = composer.file_picker.as_ref().unwrap();
+        assert_eq!(picker.entries[picker.selected].name, "photos-2026");
+        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        let picker = composer.file_picker.as_ref().unwrap();
+        assert_eq!(picker.entries[picker.selected].name, "photos-2026");
+        assert!(picker.search_query.is_none());
+        // Enter should return to normal motion, so l opens the highlighted folder.
+        composer.file_picker_key(key('l')).unwrap();
+        let picker = composer.file_picker.as_ref().unwrap();
+        assert!(picker.directory.ends_with("photos-2026"));
+        composer.file_picker_key(key('/')).unwrap();
+        composer.file_picker_key(crossterm::event::KeyCode::Esc).unwrap();
+        assert!(composer.file_picker.as_ref().unwrap().search_query.is_none());
+        assert!(composer.file_picker.is_some());
+    }
+
+    #[test]
+    fn picker_visual_x_detaches_multiple_files_without_touching_others() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(temp.path().join(name), b"ok").unwrap();
+        }
+        let mut composer = Composer::new();
+        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        let key = |ch| crossterm::event::KeyCode::Char(ch);
+        composer.file_picker_key(key('v')).unwrap();
+        composer.file_picker_key(key('2')).unwrap();
+        composer.file_picker_key(key('j')).unwrap();
+        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        assert_eq!(composer.attachment_count(), 3);
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('v')).unwrap();
+        composer.file_picker_key(key('j')).unwrap();
+        composer.file_picker_key(key('x')).unwrap();
+        assert_eq!(composer.attachment_count(), 1);
+        assert_eq!(composer.attachment_paths[0].file_name().unwrap(), "c.txt");
+        assert!(composer.file_picker.as_ref().unwrap().visual_anchor.is_none());
+    }
+
+    #[test]
+    fn picker_visual_space_detaches_only_when_every_file_is_attached() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("0folder")).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(temp.path().join(name), b"hello").unwrap();
+        }
+        let mut composer = Composer::new();
+        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        let key = |ch| crossterm::event::KeyCode::Char(ch);
+        assert!(composer.file_picker.as_ref().unwrap().entries[0].is_directory);
+        // Attach a and b while selecting a directory too (which must be ignored).
+        composer.file_picker_key(key('v')).unwrap();
+        composer.file_picker_key(key('2')).unwrap();
+        composer.file_picker_key(key('j')).unwrap();
+        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        assert_eq!(composer.attachment_count(), 2);
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('v')).unwrap();
+        composer.file_picker_key(key('2')).unwrap();
+        composer.file_picker_key(key('j')).unwrap();
+        composer.file_picker_key(key(' ')).unwrap();
+        assert_eq!(composer.attachment_count(), 0); // folder is ignored
+        assert!(composer.file_picker.as_ref().unwrap().visual_anchor.is_none());
+
+        // A mixed range should attach the missing file without detaching an
+        // already attached file.
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('v')).unwrap();
+        composer.file_picker_key(key('j')).unwrap();
+        composer.file_picker_key(key(' ')).unwrap();
+        assert_eq!(composer.attachment_count(), 1); // a.txt only
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('g')).unwrap();
+        composer.file_picker_key(key('v')).unwrap();
+        composer.file_picker_key(key('2')).unwrap();
+        composer.file_picker_key(key('j')).unwrap();
+        composer.file_picker_key(key(' ')).unwrap();
+        assert_eq!(composer.attachment_count(), 2); // a.txt and b.txt
+        assert!(composer.attachment_paths.iter().all(|path| path.is_file()));
+    }
+
+    #[test]
+    fn picker_pdf_previews_are_deferred_and_stale_results_are_cached_not_displayed() {
+        let temp = tempfile::tempdir().unwrap();
+        let pdf = temp.path().join("a.pdf");
+        let text = temp.path().join("b.txt");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        std::fs::write(&text, b"text file").unwrap();
+        let mut picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
+        assert!(matches!(picker.preview, super::ComposeFilePreview::Loading(_)));
+        assert!(picker.pdf_preview_due.is_some());
+        // Navigate away before the debounce expires: no converter was started.
+        picker.move_selection(1);
+        assert!(picker.pdf_preview_due.is_none());
+        assert!(picker.pdf_preview_inflight.is_empty());
+        assert!(matches!(picker.preview, super::ComposeFilePreview::Text { .. }));
+        // Pretend an earlier conversion completed while the selection changed.
+        picker.pdf_preview_inflight.insert(pdf.clone());
+        picker.pdf_preview_results.lock().unwrap().push_back((pdf.clone(), Ok(vec![7, 8, 9])));
+        picker.advance_pdf_preview();
+        assert!(matches!(picker.preview, super::ComposeFilePreview::Text { .. }));
+        assert!(picker.pdf_preview_inflight.is_empty());
+        picker.move_selection(-1);
+        assert!(matches!(picker.preview, super::ComposeFilePreview::Image(ref bytes) if bytes == &[7, 8, 9]));
+        assert!(picker.pdf_preview_due.is_none());
+    }
+
+    #[test]
+    fn manage_attachments_removes_files_from_unrelated_directories() {
+        let mut composer = Composer::new();
+        let first = std::path::PathBuf::from("/tmp/one/first.txt");
+        let second = std::path::PathBuf::from("/home/example/elsewhere/second.txt");
+        composer.attachment_paths = vec![first, second.clone()];
+        composer.attachment_manager_selected = 0;
+        assert_eq!(composer.remove_managed_attachment().unwrap().file_name().unwrap(), "first.txt");
+        assert_eq!(composer.attachment_paths, vec![second]);
+        assert_eq!(composer.attachment_manager_selected, 0);
+        composer.attachments = "/tmp/legacy/old.txt".to_owned();
+        composer.attachment_manager_selected = 1;
+        assert_eq!(composer.remove_managed_attachment().unwrap().file_name().unwrap(), "old.txt");
+        assert_eq!(composer.attachment_count(), 1);
+    }
+
+    #[test]
+    fn picker_recognizes_image_files_for_terminal_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        std::fs::write(temp.path().join("photo.png"), png.into_inner()).unwrap();
+        let picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
+        match &picker.preview {
+            super::ComposeFilePreview::Image(bytes) => assert!(image::load_from_memory(bytes).is_ok()),
+            preview => panic!("expected a decodable image, got {preview:?}"),
+        }
+        assert!(super::compose_image_extension(&temp.path().join("a.WEBP")));
+    }
+
+    #[test]
+    fn picker_detects_known_source_file_mime_types() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, expected) in [("Cargo.toml", "application/toml"),
+            ("Cargo.lock", "text/plain"), ("lib.rs", "text/plain"),
+            ("sample.json", "application/json"), ("LICENSE", "text/plain")] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, "content").unwrap();
+            assert_eq!(super::load_compose_file(&path).unwrap().content_type, expected);
+        }
+    }
+
+    #[test]
+    fn picker_attached_files_are_encoded_as_mime_parts() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("hello.txt");
+        std::fs::write(&file, b"hello attachment content").unwrap();
+        let files = super::load_compose_attachments("", &[file]).unwrap();
+        let message = crate::model::OutgoingMessage {
+            from: "sender@example.com".to_owned(),
+            to: "receiver@example.com".to_owned(),
+            cc: String::new(), bcc: String::new(),
+            subject: "attachment smoke test".to_owned(),
+            body: "See the attachment".to_owned(),
+            html_body: None, attachments: files,
+            custom_headers: Vec::new(), in_reply_to: None,
+            references: Vec::new(), forwarded_raw: None,
+        };
+        let raw = crate::outgoing::build_outgoing(&message, "sender@example.com")
+            .unwrap().formatted();
+        let wire = String::from_utf8_lossy(&raw);
+        assert!(wire.contains("multipart/mixed"));
+        assert!(wire.contains("hello.txt"));
+        assert!(wire.contains("Content-Disposition: attachment"));
+    }
+
+    #[test]
+    fn compose_selected_file_paths_survive_postponed_draft_encoding() {
+        let mut composer = Composer::new();
+        composer.attachment_paths.push(std::path::PathBuf::from("/tmp/a file.pdf"));
+        let bytes = serde_json::to_vec(&composer).unwrap();
+        let restored: Composer = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.attachment_paths, composer.attachment_paths);
+        assert!(restored.file_picker.is_none());
+        assert!(!restored.advanced_headers_open);
     }
 
     #[test]

@@ -96,6 +96,11 @@ pub trait MailBackend: Send {
         let _ = (mailbox, raw, seen);
         Err(anyhow!("backend does not support appending messages"))
     }
+    /// Store an unsent message in Drafts. Backends should set the \Draft flag;
+    /// this fallback preserves interoperability with simpler backends.
+    fn append_draft(&mut self, mailbox: &str, raw: &[u8]) -> Result<()> {
+        self.append_message(mailbox, raw, true)
+    }
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()>;
     fn delete(&mut self, mailbox: &str, id: &MessageId) -> Result<()>;
     fn delete_many(&mut self, mailbox: &str, ids: &[MessageId]) -> Result<()> {

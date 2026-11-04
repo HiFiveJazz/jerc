@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
-use crate::app::Composer;
+use crate::app::{ComposeField, Composer};
 
 fn path_for(root: &Path, account: &str) -> PathBuf {
     // Hex encoding is an unambiguous, filesystem-safe account identifier.
@@ -44,6 +44,19 @@ pub fn load_draft(root: &Path, account: &str) -> Result<Option<Composer>> {
     draft.sending = false;
     draft.confirm_send = false;
     draft.visual_anchor = None;
+    // Migrate drafts written when Files(;) was still an editable field.
+    // The picker can now remove those selections just like newly added files.
+    let legacy = std::mem::take(&mut draft.attachments);
+    for value in legacy.split(';').map(str::trim).filter(|part| !part.is_empty()) {
+        let path = std::fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value));
+        if !draft.attachment_paths.contains(&path) {
+            draft.attachment_paths.push(path);
+        }
+    }
+    if matches!(draft.field, ComposeField::Attachments | ComposeField::Headers) {
+        draft.field = ComposeField::Body;
+        draft.cursor = draft.body.chars().count();
+    }
     Ok(Some(draft))
 }
 

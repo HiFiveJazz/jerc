@@ -18,6 +18,7 @@ pub struct Theme {
     pub border: Color,
     pub error: Color,
     pub warning: Color,
+    pub visual: Color,
     pub popup_bg: Color,
     pub status_bg: Color,
 }
@@ -88,6 +89,7 @@ struct ThemeSpec {
     success: Option<String>,
     error: Option<String>,
     warning: Option<String>,
+    visual: Option<String>,
     text: Option<String>,
     text_strong: Option<String>,
     text_muted: Option<String>,
@@ -157,6 +159,7 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
     let success = parse_color(spec.success.as_deref().unwrap_or("#9ece6a"))?;
     let error = parse_color(spec.error.as_deref().unwrap_or("#f7768e"))?;
     let warning = parse_color(spec.warning.as_deref().unwrap_or("#e0af68"))?;
+    let visual = parse_color(spec.visual.as_deref().unwrap_or("#bb9af7"))?;
     let foreground = parse_color(
         spec.text
             .as_deref()
@@ -196,6 +199,7 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
         border,
         error,
         warning,
+        visual,
         popup_bg: surface,
         status_bg: background,
     })
@@ -231,6 +235,7 @@ fn fallback_theme() -> Theme {
         border: Color::DarkGray,
         error: Color::LightRed,
         warning: Color::Yellow,
+        visual: Color::Magenta,
         popup_bg: Color::Reset,
         status_bg: Color::Reset,
     }
@@ -296,6 +301,13 @@ mod tests {
             assert_ne!(theme.current_line().bg, theme.status().bg);
             assert!(theme.current_line().add_modifier.contains(Modifier::BOLD));
         }
+    }
+
+    #[test]
+    fn builtin_tokyo_night_visual_color_matches_palette() {
+        use ratatui::style::Color;
+        let theme = parse_theme(include_str!("../themes/tokyo-night.json"), "tokyo-night").unwrap();
+        assert_eq!(theme.visual, Color::Rgb(187, 154, 247));
     }
 
     #[test]
