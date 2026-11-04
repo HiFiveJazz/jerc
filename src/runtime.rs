@@ -2,7 +2,7 @@ use std::io::{self, Stdout, Write};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{self, KeyEventKind, EnableMouseCapture, DisableMouseCapture};
@@ -179,6 +179,7 @@ fn event_loop(
     // stream of worker events (mailbox STATUS refreshes are a common example)
     // could starve Ctrl-j/Ctrl-k for hundreds of milliseconds.
     let mut next_animation_frame = Instant::now();
+    let mut next_setup_spinner_frame = Instant::now();
     let mut next_inbox_poll = Instant::now() + app.inbox_poll_interval();
 
     while !app.should_quit {
@@ -203,11 +204,28 @@ fn event_loop(
             next_animation_frame = Instant::now();
         }
 
+        // Browser OAuth and provider discovery happen on worker threads. They
+        // may generate no terminal events for many seconds, so animate their
+        // progress indicator on its own deadline (without blocking input).
+        let setup_busy = app.setup.as_ref()
+            .is_some_and(|wizard| wizard.authenticating || wizard.discovering);
+        if setup_busy {
+            if Instant::now() >= next_setup_spinner_frame {
+                if let Some(wizard) = app.setup.as_mut() { wizard.spin(); }
+                next_setup_spinner_frame = Instant::now() + Duration::from_millis(120);
+                render(terminal, app)?;
+                continue;
+            }
+        } else {
+            next_setup_spinner_frame = Instant::now();
+        }
+
         let deadline = if app.animation_active() {
             next_animation_frame.min(next_inbox_poll)
         } else {
             next_inbox_poll
         };
+        let deadline = if setup_busy { deadline.min(next_setup_spinner_frame) } else { deadline };
         let received = match runtime_rx.recv_timeout(
             deadline.saturating_duration_since(Instant::now())
         ) {

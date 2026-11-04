@@ -31,6 +31,14 @@ pub const LABELS: [&str; FIELD_COUNT] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupStep {
+    /// Only the account name and visible email address are needed initially.
+    Identity,
+    /// Discovered settings are editable before any OAuth request is made.
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WizardAction {
     Nothing,
     Close,
@@ -41,6 +49,8 @@ pub enum WizardAction {
 
 pub struct SetupWizard {
     pub fields: [String; FIELD_COUNT],
+    pub step: SetupStep,
+    pub spinner_frame: usize,
     pub edited: [bool; FIELD_COUNT],
     pub selected: usize,
     pub message: String,
@@ -61,9 +71,11 @@ impl SetupWizard {
         fields[TENANT] = "common".into();
         Self {
             fields,
+            step: SetupStep::Identity,
+            spinner_frame: 0,
             edited: [false; FIELD_COUNT],
-            selected: EMAIL,
-            message: "Enter an address, then Tab to discover settings. F5 rediscovers.".into(),
+            selected: NAME,
+            message: "Enter an account name and email, then press Enter to find settings.".into(),
             error: false,
             discovering: false,
             authenticating: false,
@@ -83,74 +95,143 @@ impl SetupWizard {
         }
     }
 
+    /// The rows visible at each step, in navigation order. Hidden provider-only
+    /// fields are not part of the tab sequence.
+    pub fn visible_fields(&self) -> Vec<usize> {
+        if self.step == SetupStep::Identity {
+            return vec![NAME, EMAIL];
+        }
+        let mut fields = vec![PROVIDER, IMAP_HOST, IMAP_PORT, IMAP_LOGIN,
+            SMTP_HOST, SMTP_PORT, SMTP_LOGIN, CLIENT_ID];
+        match self.provider_hint() {
+            "microsoft" => fields.push(TENANT),
+            "google" => fields.push(GOOGLE_SECRET),
+            _ => { fields.push(TENANT); fields.push(GOOGLE_SECRET); }
+        }
+        fields
+    }
+
+    /// Keep the first screen compact; the editable settings screen can grow.
+    pub fn popup_size(&self, screen_width: u16, screen_height: u16) -> (u16, u16) {
+        let max_height = if self.step == SetupStep::Identity { 13 } else { 24 };
+        (screen_width.saturating_sub(2).min(96).max(1),
+         screen_height.saturating_sub(2).min(max_height).max(1))
+    }
+
+    pub fn spinner(&self) -> &'static str {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        FRAMES[self.spinner_frame % FRAMES.len()]
+    }
+
+    pub fn spin(&mut self) {
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+    }
+
+    pub fn discovery_ready(&self) -> Result<()> {
+        ensure!(valid_mailbox_name(self.fields[EMAIL].trim()),
+            "enter a complete email address");
+        let name = self.fields[NAME].trim();
+        ensure!(!name.is_empty() && name.len() <= 80 && !name.chars().any(char::is_control),
+            "enter an account name (1–80 characters)");
+        Ok(())
+    }
+
     pub fn key(&mut self, key: KeyEvent) -> WizardAction {
+        // Do not allow an in-flight browser sign-in to mutate the identity or
+        // settings from which its OAuth state was created.
         if self.authenticating {
-            return if key.modifiers == KeyModifiers::CONTROL
-                && key.code == KeyCode::Char('c') { WizardAction::Close }
-            else { WizardAction::Nothing };
+            return WizardAction::Nothing;
         }
-        if key.code == KeyCode::F(7) && self.login_failed {
-            return WizardAction::SaveOffline;
+        if self.discovering {
+            if key.code == KeyCode::Esc {
+                self.discovering = false;
+                self.message = "Discovery cancelled. Edit the address or press Enter to retry.".into();
+            }
+            return WizardAction::Nothing;
         }
-        if self.login_failed && key.code == KeyCode::F(6) {
-            self.login_failed = false;
-            return WizardAction::Save;
+        if self.step == SetupStep::Settings && self.login_failed {
+            if key.code == KeyCode::F(7) { return WizardAction::SaveOffline; }
+            if key.code == KeyCode::F(6) { return WizardAction::Save; }
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
+                KeyCode::Char('s') if self.step == SetupStep::Identity => WizardAction::Discover,
                 KeyCode::Char('s') => WizardAction::Save,
                 _ => WizardAction::Nothing,
             };
         }
+
+        if self.step == SetupStep::Identity {
+            return match key.code {
+                KeyCode::Esc => WizardAction::Close,
+                KeyCode::F(5) => WizardAction::Discover,
+                KeyCode::F(2) => {
+                    self.step = SetupStep::Settings;
+                    self.selected = PROVIDER;
+                    self.source = None;
+                    self.error = false;
+                    self.message = "Manual configuration: fill in the servers, then continue.".into();
+                    WizardAction::Nothing
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.selected = NAME;
+                    WizardAction::Nothing
+                }
+                KeyCode::Down | KeyCode::Tab | KeyCode::Enter if self.selected == NAME => {
+                    self.selected = EMAIL;
+                    WizardAction::Nothing
+                }
+                KeyCode::Down | KeyCode::Tab | KeyCode::Enter => WizardAction::Discover,
+                KeyCode::Backspace => { self.edit_field(None); WizardAction::Nothing }
+                KeyCode::Char(ch) if !ch.is_control() => {
+                    self.edit_field(Some(ch));
+                    WizardAction::Nothing
+                }
+                _ => WizardAction::Nothing,
+            };
+        }
+
         let identity_before = [EMAIL, NAME, PROVIDER, CLIENT_ID, TENANT, GOOGLE_SECRET]
             .map(|index| self.fields[index].clone());
         let action = match key.code {
-            KeyCode::Esc => WizardAction::Close,
-            KeyCode::F(5) if !self.discovering => WizardAction::Discover,
-            KeyCode::Up | KeyCode::BackTab => {
-                self.selected = self.selected.saturating_sub(1);
+            KeyCode::Esc | KeyCode::F(4) => {
+                self.step = SetupStep::Identity;
+                self.selected = EMAIL;
+                self.error = false;
+                self.message = "Edit your email or account name, then find settings again.".into();
                 WizardAction::Nothing
             }
-            KeyCode::Down | KeyCode::Tab | KeyCode::Enter => {
-                if self.selected == EMAIL && !self.edited[NAME] {
-                    if let Some((_, domain)) = self.fields[EMAIL].trim().rsplit_once('@') {
-                        let name = domain.split('.').next().unwrap_or("Mail");
-                        let mut letters = name.chars();
-                        if let Some(first) = letters.next() {
-                            self.fields[NAME] = first.to_uppercase().collect::<String>() + letters.as_str();
-                        }
-                    }
-                }
-                let discover = self.selected == EMAIL && self.source.is_none()
-                    && !self.discovering && self.fields[EMAIL].contains('@');
-                if self.selected == FIELD_COUNT - 1 && key.code == KeyCode::Enter {
-                    return WizardAction::Save;
-                }
-                self.selected = (self.selected + 1).min(FIELD_COUNT - 1);
-                if discover { WizardAction::Discover } else { WizardAction::Nothing }
+            KeyCode::F(5) => WizardAction::Discover,
+            KeyCode::Enter => WizardAction::Save,
+            KeyCode::Up | KeyCode::BackTab => {
+                let rows = self.visible_fields();
+                let at = rows.iter().position(|field| *field == self.selected).unwrap_or(0);
+                self.selected = rows[at.saturating_sub(1)];
+                WizardAction::Nothing
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                let rows = self.visible_fields();
+                let at = rows.iter().position(|field| *field == self.selected).unwrap_or(0);
+                self.selected = rows[(at + 1).min(rows.len() - 1)];
+                WizardAction::Nothing
             }
             KeyCode::Left | KeyCode::Right if self.selected == PROVIDER => {
-                let items = ["Auto", "Microsoft 365", "Google"];
-                let current = items.iter().position(|item| *item == self.fields[PROVIDER]).unwrap_or(0);
+                let choices = ["Auto", "Microsoft 365", "Google"];
+                let at = choices.iter().position(|choice| *choice == self.fields[PROVIDER])
+                    .unwrap_or(0);
                 let next = if key.code == KeyCode::Left {
-                    (current + items.len() - 1) % items.len()
-                } else { (current + 1) % items.len() };
-                self.fields[PROVIDER] = items[next].to_owned();
+                    (at + choices.len() - 1) % choices.len()
+                } else { (at + 1) % choices.len() };
+                self.fields[PROVIDER] = choices[next].into();
                 self.edited[PROVIDER] = true;
                 WizardAction::Nothing
             }
             KeyCode::Backspace if self.selected != PROVIDER => {
-                self.fields[self.selected].pop();
-                self.edited[self.selected] = true;
-                if self.selected == EMAIL { self.source = None; }
+                self.edit_field(None);
                 WizardAction::Nothing
             }
             KeyCode::Char(ch) if self.selected != PROVIDER && !ch.is_control() => {
-                if self.fields[self.selected].len() < 256 {
-                    self.fields[self.selected].push(ch);
-                    self.edited[self.selected] = true;
-                    if self.selected == EMAIL { self.source = None; }
-                }
+                self.edit_field(Some(ch));
                 WizardAction::Nothing
             }
             _ => WizardAction::Nothing,
@@ -164,6 +245,23 @@ impl SetupWizard {
             self.message = "Account identity changed. Sign in again before saving.".into();
         }
         action
+    }
+
+    fn edit_field(&mut self, ch: Option<char>) {
+        if let Some(ch) = ch {
+            if self.fields[self.selected].len() < 256 {
+                self.fields[self.selected].push(ch);
+            }
+        } else {
+            self.fields[self.selected].pop();
+        }
+        self.edited[self.selected] = true;
+        if self.selected == EMAIL || self.selected == NAME {
+            self.authenticated = false;
+            self.login_failed = false;
+            if self.selected == EMAIL { self.source = None; }
+        }
+        self.error = false;
     }
 
     pub fn apply_discovery(&mut self, proposal: MailConfiguration) {
@@ -186,7 +284,9 @@ impl SetupWizard {
             }
         }
         self.source = Some(format!("{} ({})", proposal.provider, proposal.source));
-        self.message = "Settings discovered. Review and edit every field before saving.".into();
+        self.step = SetupStep::Settings;
+        self.selected = PROVIDER;
+        self.message = "Account settings found. Review the settings, then Enter to sign in.".into();
         self.discovering = false;
         self.error = false;
     }
@@ -211,7 +311,8 @@ impl SetupWizard {
     pub fn discovery_failed(&mut self, message: &str) {
         self.discovering = false;
         self.error = true;
-        self.message = format!("Discovery unavailable: {message}. Choose a provider and press F5.");
+        self.step = SetupStep::Identity;
+        self.message = format!("No account settings found: {message}. F5 retries; F2 opens manual setup.");
     }
 
     fn validate(&self) -> Result<String> {
@@ -417,9 +518,10 @@ mod tests {
     fn discovered_values_remain_editable_and_login_hint_does_not_override_manual_input() {
         let mut wizard = SetupWizard::new(true);
         wizard.fields[EMAIL] = "alias@example.edu".into();
-        let change = wizard.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(change, WizardAction::Discover);
-        assert_eq!(wizard.fields[NAME], "Example");
+        wizard.fields[NAME] = "Example".into();
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)), WizardAction::Nothing);
+        assert_eq!(wizard.selected, EMAIL);
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), WizardAction::Discover);
         let config = crate::discovery::discover_with_provider("alias@example.edu", "microsoft").unwrap();
         wizard.apply_discovery(config);
         assert_eq!(wizard.fields[SMTP_HOST], "smtp.office365.com");
@@ -453,8 +555,66 @@ mod tests {
     fn failed_login_does_not_silently_save() {
         let mut wizard = SetupWizard::new(false);
         wizard.login_failed = true;
+        wizard.step = SetupStep::Settings;
         assert_eq!(wizard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)), WizardAction::Save);
         assert_eq!(wizard.key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE)), WizardAction::SaveOffline);
+    }
+
+    #[test]
+    fn identity_first_then_discovered_settings_then_login() {
+        let mut wizard = SetupWizard::new(true);
+        assert_eq!(wizard.step, SetupStep::Identity);
+        assert_eq!(wizard.visible_fields(), vec![NAME, EMAIL]);
+        wizard.fields[NAME] = "Campus".into();
+        wizard.fields[EMAIL] = "alias@example.edu".into();
+        assert!(wizard.discovery_ready().is_ok());
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), WizardAction::Nothing);
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), WizardAction::Discover);
+        let discovered = crate::discovery::discover_with_provider("alias@example.edu", "microsoft").unwrap();
+        wizard.apply_discovery(discovered);
+        assert_eq!(wizard.step, SetupStep::Settings);
+        assert_eq!(wizard.fields[IMAP_HOST], "outlook.office365.com");
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), WizardAction::Save);
+        wizard.authenticating = true;
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)), WizardAction::Nothing);
+        wizard.suggest_login(Some("netid@example.edu".into()));
+        assert_eq!(wizard.fields[SMTP_LOGIN], "netid@example.edu");
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), WizardAction::Save);
+    }
+
+    #[test]
+    fn invalid_address_does_not_start_discovery_and_manual_path_is_available() {
+        let mut wizard = SetupWizard::new(true);
+        wizard.fields[NAME] = "Campus".into();
+        wizard.fields[EMAIL] = "not-an-address".into();
+        assert!(wizard.discovery_ready().is_err());
+        wizard.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(wizard.step, SetupStep::Settings);
+        assert_eq!(wizard.selected, PROVIDER);
+    }
+
+    #[test]
+    fn discovered_settings_remain_editable_and_tab_skips_hidden_fields() {
+        let mut wizard = SetupWizard::new(false);
+        wizard.fields[PROVIDER] = "Google".into();
+        wizard.step = SetupStep::Settings;
+        wizard.selected = CLIENT_ID;
+        wizard.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(wizard.selected, GOOGLE_SECRET);
+        assert!(!wizard.visible_fields().contains(&TENANT));
+        wizard.key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        assert_eq!(wizard.step, SetupStep::Identity);
+        assert_eq!(wizard.selected, EMAIL);
+    }
+
+    #[test]
+    fn spinner_cycles_while_waiting() {
+        let mut wizard = SetupWizard::new(true);
+        let initial = wizard.spinner();
+        wizard.spin();
+        assert_ne!(wizard.spinner(), initial);
+        for _ in 0..7 { wizard.spin(); }
+        assert_eq!(wizard.spinner(), initial);
     }
 
     #[test]

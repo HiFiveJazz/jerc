@@ -1,0 +1,2 @@
+AERC_RS_GOOGLE_CLIENT_ID="406964657835-aq8lmia8j95dhl1a2bvharmfk3t1hgqj.apps.googleusercontent.com" AERC_RS_GOOGLE_CLIENT_SECRET="kSmqreRr0qwBWJgbf5Y-PjSU" AERC_RS_MICROSOFT_CLIENT_ID="9e5f94bc-e8a4-4e73-b8be-63364c29d753" cargo build --release
+AERC_RS_GOOGLE_CLIENT_ID="406964657835-aq8lmia8j95dhl1a2bvharmfk3t1hgqj.apps.googleusercontent.com" AERC_RS_GOOGLE_CLIENT_SECRET="kSmqreRr0qwBWJgbf5Y-PjSU" AERC_RS_MICROSOFT_CLIENT_ID="9e5f94bc-e8a4-4e73-b8be-63364c29d753" cargo run --release

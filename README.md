@@ -552,28 +552,33 @@ authentication.
 
 ### Interactive account setup (first-run and add-account)
 
-Start `aerc-rs` with no `config.toml` (or with an empty `[[accounts]]` list)
-for an automatic setup wizard. Once mail accounts exist, press **Ctrl-a** from
-the normal mailbox screen to add another. The wizard shows every discovered
-field and lets you edit email, account label, provider, IMAP/SMTP servers and
-ports, independent IMAP/SMTP usernames, your OAuth application client ID and
-the Microsoft tenant. **Click** a row or use **Tab / Shift-Tab / arrows** to
-select it, type to edit, and use **Left/Right** on Provider to switch Auto,
-Microsoft 365, or Google. **F5** runs HTTPS/ISPDB/DNS discovery on a background
-thread; leaving the email field triggers initial discovery too. Discovery is
-only a suggestion and never silently overwrites manually edited fields.
+Start `aerc-rs` with no mail accounts configured to open the setup wizard
+immediately. With existing accounts, press **Ctrl-a** from the mailbox screen.
+The wizard now starts with just **account name** and **email address**. Press
+**Enter** (or Tab from the email field) to discover settings on a background
+thread. A spinner indicates that discovery is in progress.
 
-Press **Ctrl-S** to start OAuth in the system browser using *your registered*
-application. After sign-in, Microsoft can suggest a login UPN that differs from
-an alias or display email. Review the suggested usernames, then press **Ctrl-S**
-again to save the new `[[accounts]]` entry and load the mailbox without
-restarting. Failed OAuth? **F6** retries; **Ctrl-S** can still save the account
-for a later `--oauth-login` when an administrator grants consent. **Esc**
-cancels before saving (and closes the app when no account exists). No passwords,
-access tokens or refresh tokens are stored in `config.toml`.
+When provider configuration is found, the next screen announces **Account
+settings found** and shows the detected IMAP/SMTP servers, ports, provider,
+independent login usernames, and OAuth registration. All discovered fields
+remain editable: **Tab / Shift-Tab / Up / Down** moves between them,
+**Left/Right** switches the provider, and mouse clicks select rows. The current
+row highlight fills the entire form width. **F4** or **Esc** returns to the
+name/email screen; **F5** rediscovers; **F2** on the first screen enters manual
+settings if provider discovery is unavailable. Existing hand-edited server
+fields are never silently overwritten by discovery.
 
-The first version supports OAuth-enabled Microsoft 365 and Google accounts
-with TLS IMAP and SMTP. Other providers still require manual configuration.
+Press **Enter** or **Ctrl-S** on the settings screen to continue to OAuth in
+your system browser. A non-blocking spinner stays animated while the browser
+is open. After a successful login, Microsoft may suggest an account login UPN
+that differs from the visible email alias. Review the suggestion and press
+**Enter** or **Ctrl-S** once more to save and load the new account without
+restarting. Failed OAuth? **F6** retries. **F7** explicitly saves a disconnected
+account for later login; otherwise failures never silently save. No passwords,
+access tokens, or refresh tokens are stored in `config.toml`.
+
+The wizard currently supports Microsoft 365 and Google with OAuth and encrypted
+IMAP/SMTP. Other providers still require manual configuration.
 
 ### Desktop OAuth credentials in the setup wizard
 

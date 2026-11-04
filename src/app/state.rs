@@ -2466,8 +2466,8 @@ impl App {
 
     pub fn setup_discovered(&mut self, email: String, result: Result<crate::discovery::MailConfiguration, String>) {
         if let Some(wizard) = self.setup.as_mut() {
-            if wizard.authenticating || wizard.saved ||
-                !wizard.fields[crate::setup::EMAIL].eq_ignore_ascii_case(&email) { return; }
+            if !wizard.discovering || wizard.authenticating || wizard.saved ||
+                !wizard.fields[crate::setup::EMAIL].trim().eq_ignore_ascii_case(&email) { return; }
             match result {
                 Ok(config) => wizard.apply_discovery(config),
                 Err(error) => wizard.discovery_failed(&error),
@@ -2512,11 +2512,17 @@ impl App {
                 let Some(sender) = self.setup_sender.clone() else { return; };
                 let Some(wizard) = self.setup.as_mut() else { return; };
                 if wizard.discovering { return; }
+                if let Err(error) = wizard.discovery_ready() {
+                    wizard.error = true;
+                    wizard.message = format!("Cannot discover settings: {error}");
+                    return;
+                }
                 let email = wizard.fields[crate::setup::EMAIL].trim().to_owned();
                 let provider = wizard.provider_hint().to_owned();
                 wizard.discovering = true;
                 wizard.error = false;
-                wizard.message = "Finding provider settings…".into();
+                wizard.spinner_frame = 0;
+                wizard.message = "Finding account settings…".into();
                 std::thread::spawn(move || {
                     let result = crate::discovery::discover_with_provider(&email, &provider)
                         .map_err(|error| error.to_string());
@@ -2562,7 +2568,8 @@ impl App {
                             wizard.authenticating = true;
                             wizard.login_failed = false;
                             wizard.error = false;
-                            wizard.message = "Opening your OAuth browser sign-in…".into();
+                            wizard.spinner_frame = 0;
+                            wizard.message = "Waiting for browser sign-in…".into();
                             let Some(sender) = self.setup_sender.clone() else {
                                 wizard.authenticating = false;
                                 wizard.error = true;
@@ -5899,21 +5906,37 @@ impl App {
     /// Drag the mailbox divider. Mouse moves over the attachment list select
     /// the hovered file, and footer clicks activate Open/Save/Mark actions.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
-        if let Some(wizard) = self.setup.as_mut() {
-            if !wizard.authenticating && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                let popup_height = height.saturating_sub(2).min(24).max(1);
-                let popup_width = width.saturating_sub(2).min(94).max(1);
+        if self.setup.is_some() {
+            let mut continue_clicked = false;
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let wizard = self.setup.as_mut().expect("wizard exists");
+                let (popup_width, popup_height) = wizard.popup_size(width, height);
                 let popup_y = height.saturating_sub(popup_height) / 2;
                 let popup_x = width.saturating_sub(popup_width) / 2;
-                let list_y = popup_y.saturating_add(3);
-                let list_height = usize::from(popup_height.saturating_sub(7));
-                let first = wizard.selected.saturating_sub(list_height.saturating_sub(1))
-                    .min(crate::setup::FIELD_COUNT.saturating_sub(list_height));
-                if mouse.column > popup_x && mouse.column < popup_x.saturating_add(popup_width)
-                    && mouse.row >= list_y && usize::from(mouse.row - list_y) < list_height {
-                    wizard.selected = (first + usize::from(mouse.row - list_y))
-                        .min(crate::setup::FIELD_COUNT.saturating_sub(1));
+                let header_height = if wizard.step == crate::setup::SetupStep::Identity { 2 } else { 3 };
+                let list_y = popup_y.saturating_add(1 + header_height);
+                let list_height = usize::from(popup_height.saturating_sub(5 + header_height));
+                let fields = wizard.visible_fields();
+                let selected_pos = fields.iter().position(|field| *field == wizard.selected)
+                    .unwrap_or(0);
+                let first = selected_pos.saturating_sub(list_height.saturating_sub(1))
+                    .min(fields.len().saturating_sub(list_height));
+                if mouse.column > popup_x && mouse.column < popup_x.saturating_add(popup_width) {
+                    if mouse.row >= list_y && usize::from(mouse.row - list_y) < list_height
+                        && !wizard.authenticating && !wizard.discovering {
+                        if let Some(field) = fields.get(first + usize::from(mouse.row - list_y)) {
+                            wizard.selected = *field;
+                        }
+                    }
+                    // The last interior row presents the primary Continue action.
+                    if mouse.row == popup_y.saturating_add(popup_height).saturating_sub(2)
+                        && !wizard.authenticating && !wizard.discovering && !wizard.saved {
+                        continue_clicked = true;
+                    }
                 }
+            }
+            if continue_clicked {
+                self.handle_setup_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
             }
             return;
         }
