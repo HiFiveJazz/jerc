@@ -400,3 +400,41 @@ or Thunderbird, grant their OAuth permissions, or bypass tenant consent. Do not
 use another application’s registration without authorization. Microsoft/Google
 provider approvals still apply. OAuth tokens remain account/client-bound and
 are stored in the private per-account token file.
+
+### Isolated Microsoft OAuth compatibility probe (local fork)
+
+The Microsoft desktop/browser login is already authorization-code + PKCE. It
+can use an explicitly configured **authorized public client** and matching
+loopback redirect. No third-party client ID or client secret is shipped.
+
+To isolate an experiment from the usual aerc-rs refresh-token store, create a
+separate config file using the existing `[[accounts]]` fields and:
+
+```toml
+[accounts.oauth]
+provider = "microsoft"
+client_id = "YOUR_AUTHORIZED_PUBLIC_CLIENT_ID"
+tenant = "common"
+flow = "browser"
+callback_host = "localhost"
+callback_path = "/"
+credential_namespace = "oauth-lab"
+scope = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
+```
+
+Use your actual university IMAP/SMTP `source` and `outgoing` URIs in that
+account; the public-client registration must permit the specified redirect and
+permissions. A consent grant for one client ID is not transferred to another.
+
+```sh
+cargo run -- --config ./oauth-lab.toml --oauth-inspect "University"
+cargo run -- --config ./oauth-lab.toml --oauth-login "University"
+cargo run -- --config ./oauth-lab.toml --oauth-probe "University"
+```
+
+`--oauth-probe` tests the **actual** refresh-token exchange, IMAP XOAUTH2
+authentication, mailbox LIST, and SMTP authentication over TLS (if an SMTP
+outgoing URI is configured), with **no email sent**. It reports safe HTTP error
+codes if Microsoft rejects an OAuth token exchange. It cannot override an
+organization's application consent policy, and does not replace a test against
+the eventual production application registration.

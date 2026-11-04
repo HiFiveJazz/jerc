@@ -33,6 +33,11 @@ struct Cli {
     #[arg(long, value_name = "ACCOUNT_NAME", conflicts_with = "oauth_login")]
     oauth_inspect: Option<String>,
 
+    /// Test Microsoft/Google token refresh, live IMAP XOAUTH2, and (if set)
+    /// SMTP OAuth authentication. Does not read mail or send any messages.
+    #[arg(long, value_name = "ACCOUNT_NAME", conflicts_with_all = ["oauth_login", "oauth_inspect"])]
+    oauth_probe: Option<String>,
+
     /// Validate accounts and benchmark folder/header scanning without opening the TUI.
     #[arg(long)]
     headless_check: bool,
@@ -47,6 +52,9 @@ fn main() -> Result<()> {
     if let Some(name) = &cli.oauth_inspect {
         return aerc_rs::oauth::inspect_account(&config.accounts, name);
     }
+    if let Some(name) = &cli.oauth_probe {
+        return oauth_probe(&config, name);
+    }
     if cli.headless_check {
         return headless_check(&config);
     }
@@ -58,6 +66,42 @@ fn load_config(cli: &Cli) -> Result<Config> {
         return Ok(Config::single_maildir(cli.name.clone(), maildir.clone()));
     }
     Config::load(cli.config.as_deref())
+}
+
+fn oauth_probe(config: &Config, name: &str) -> Result<()> {
+    let account = config.accounts.iter().find(|account| account.name == name)
+        .with_context(|| format!("no account named {name:?} in config"))?;
+    let settings = aerc_rs::oauth::OAuthSettings::for_account(account)?
+        .with_context(|| format!("account {name:?} has no [accounts.oauth] configuration"))?;
+    println!("Testing OAuth for {name:?} (no email will be sent)");
+
+    // Deliberately discard the access token without displaying it. The IMAP
+    // and SMTP probes use their real, existing protocol authentication paths.
+    drop(settings.access_token().context("refreshing OAuth token")?);
+    println!("  OAuth refresh: OK");
+
+    let mut backend = backend::from_account(account)?;
+    backend.connect().context("connecting/authenticating to IMAP using XOAUTH2")?;
+    println!("  IMAP XOAUTH2: OK");
+    let mailboxes = backend.list_mailboxes().context("listing IMAP mailboxes")?;
+    println!("  IMAP mailbox LIST: OK ({} folders)", mailboxes.len());
+
+    if let Some(outgoing) = account.outgoing.as_deref() {
+        if outgoing.starts_with("smtp://") || outgoing.starts_with("smtps://") ||
+           outgoing.starts_with("smtp+") || outgoing.starts_with("smtps+") {
+            let source = aerc_rs::outgoing::SmtpSource::parse(outgoing)?
+                .with_account_oauth(account)?;
+            let sender = aerc_rs::outgoing::SmtpSender::new(source, account.outgoing_cred_cmd.clone());
+            sender.probe_oauth().context("authenticating to SMTP without sending a message")?;
+            println!("  SMTP OAuth authentication: OK (no message sent)");
+        } else {
+            println!("  SMTP: skipped (not an SMTP outgoing URI)");
+        }
+    } else {
+        println!("  SMTP: skipped (no outgoing server configured)");
+    }
+    println!("OAuth/IMAP/SMTP probe completed for {name:?}.");
+    Ok(())
 }
 
 fn headless_check(config: &Config) -> Result<()> {

@@ -57,6 +57,7 @@ pub struct OAuthSettings {
     callback_path: String,
     prompt: Option<String>,
     login_hint: Option<String>,
+    credential_namespace: Option<String>,
 }
 
 impl std::fmt::Debug for OAuthSettings {
@@ -96,6 +97,25 @@ struct DevicePollReply {
     access_token: Option<String>,
     refresh_token: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OAuthFailure {
+    error: Option<String>,
+    #[serde(default)]
+    error_codes: Vec<i64>,
+}
+
+fn safe_oauth_failure(status: u16, failure: &OAuthFailure) -> String {
+    let mut message = format!("OAuth token endpoint rejected request (HTTP {status})");
+    if let Some(error) = failure.error.as_deref().filter(|error| error.len() <= 64 &&
+        error.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')) {
+        message.push_str(&format!(": {error}"));
+    }
+    if let Some(code) = failure.error_codes.first() {
+        message.push_str(&format!(" (AADSTS{code})"));
+    }
+    message
 }
 
 impl OAuthSettings {
@@ -160,6 +180,12 @@ impl OAuthSettings {
                 bail!("OAuth login_hint must be a nonempty single-line address or username");
             }
         }
+        if let Some(namespace) = oauth.credential_namespace.as_deref() {
+            if namespace.is_empty() || namespace.len() > 48 ||
+                !namespace.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')) {
+                bail!("OAuth credential_namespace must contain 1-48 ASCII letters, digits, _ or -");
+            }
+        }
         let scope = if let Some(custom) = oauth.scope.as_deref() {
             if custom.trim().is_empty() || custom.len() > 2048 || custom.chars().any(char::is_control) {
                 bail!("OAuth scope must contain valid printable scopes");
@@ -171,6 +197,7 @@ impl OAuthSettings {
             account_name: name.to_owned(), flow, callback_host: callback_host.to_owned(),
             callback_path: callback_path.to_owned(), prompt: prompt.map(str::to_owned),
             login_hint: oauth.login_hint.clone(),
+            credential_namespace: oauth.credential_namespace.clone(),
         })
     }
 
@@ -179,7 +206,12 @@ impl OAuthSettings {
         // Hash the name to keep a user-supplied account label out of paths.
         let digest = digest::digest(&digest::SHA256, self.account_name.as_bytes());
         let key: String = digest.as_ref()[..16].iter().map(|byte| format!("{byte:02x}")).collect();
-        Ok(base.join("aerc-rs").join("oauth").join(format!("{key}.json")))
+        let directory = base.join("aerc-rs").join("oauth");
+        let directory = match self.credential_namespace.as_deref() {
+            Some(namespace) => directory.join(namespace),
+            None => directory,
+        };
+        Ok(directory.join(format!("{key}.json")))
     }
 
     pub fn refresh_token(&self) -> Result<String> {
@@ -242,11 +274,16 @@ impl OAuthSettings {
 
     fn request_token(&self, form: &[(&str, &str)]) -> Result<TokenReply> {
         let agent = ureq::Agent::new_with_config(ureq::Agent::config_builder()
-            .timeout_global(Some(HTTP_TIMEOUT)).https_only(true).build());
-        // Do not print the response body or the URL query parameters. They may
-        // contain tokens or provider-specific credential details.
+            .timeout_global(Some(HTTP_TIMEOUT)).https_only(true)
+            .http_status_as_error(false).build());
+        // Never print request parameters, raw error JSON, or token responses.
         let mut response = agent.post(&self.token_endpoint).send_form(form.iter().copied())
-            .map_err(|_| anyhow!("OAuth token exchange failed; check consent and provider configuration"))?;
+            .map_err(|_| anyhow!("OAuth token request failed (network/TLS error)"))?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let failure: OAuthFailure = response.body_mut().read_json().unwrap_or_default();
+            bail!("{}", safe_oauth_failure(status, &failure));
+        }
         let token: TokenReply = response.body_mut().read_json()
             .context("decoding OAuth token response")?;
         if token.access_token.is_empty() { bail!("OAuth token endpoint returned no access token"); }
@@ -515,6 +552,7 @@ pub fn inspect_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
         if settings.provider == "google" { "consent (default)" } else { "provider default" },
     ));
     if settings.login_hint.is_some() { println!("  Login hint: configured"); }
+    println!("  Token store: {}", settings.credential_namespace.as_deref().unwrap_or("default"));
     if settings.flow == LoginFlow::Browser {
         println!("  Register the callback host and path; the loopback port is selected at runtime.");
     }
@@ -630,6 +668,37 @@ mod tests {
         let (url, _, _) = settings.authorization_url(MICROSOFT_NATIVE_REDIRECT).unwrap();
         assert_eq!(url.query_pairs().find(|(key, _)| key == "scope").unwrap().1,
             "offline_access https://outlook.office.com/IMAP.AccessAsUser.All");
+    }
+
+    #[test]
+    fn experimental_credential_namespace_uses_a_separate_token_directory() {
+        let ordinary = OAuthSettings::from_config("University", &OAuthConfig {
+            provider: "microsoft".into(), client_id: Some("local-public-client".into()),
+            ..Default::default()
+        }).unwrap();
+        let experimental = OAuthSettings::from_config("University", &OAuthConfig {
+            provider: "microsoft".into(), client_id: Some("local-public-client".into()),
+            credential_namespace: Some("oauth-lab".into()), ..Default::default()
+        }).unwrap();
+        assert_ne!(ordinary.token_file().unwrap(), experimental.token_file().unwrap());
+        assert_eq!(experimental.token_file().unwrap().parent().unwrap().file_name().and_then(|name| name.to_str()), Some("oauth-lab"));
+        for value in ["../escape", "a/b", "", "x.y", "a b"] {
+            assert!(OAuthSettings::from_config("University", &OAuthConfig {
+                provider: "microsoft".into(), client_id: Some("local-public-client".into()),
+                credential_namespace: Some(value.into()), ..Default::default()
+            }).is_err());
+        }
+    }
+
+    #[test]
+    fn safe_oauth_failure_does_not_include_descriptions_or_credentials() {
+        let error = OAuthFailure { error: Some("invalid_grant".into()), error_codes: vec![65001] };
+        let message = safe_oauth_failure(400, &error);
+        assert!(message.contains("AADSTS65001"));
+        assert!(message.contains("invalid_grant"));
+        assert!(!message.contains("refresh_token"));
+        let unsafe_error = OAuthFailure { error: Some("token=secret\n".into()), error_codes: vec![] };
+        assert!(!safe_oauth_failure(400, &unsafe_error).contains("secret"));
     }
 
     #[test]

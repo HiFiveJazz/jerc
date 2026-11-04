@@ -110,6 +110,11 @@ pub struct OAuthConfig {
     /// permissions and offline access if those are needed).
     #[serde(default)]
     pub scope: Option<String>,
+    /// Optional separate credential store for an OAuth experiment. Use a
+    /// distinct value in a local fork so sign-in cannot replace production
+    /// refresh tokens for an account with the same name.
+    #[serde(default)]
+    pub credential_namespace: Option<String>,
 }
 
 impl std::fmt::Debug for AccountConfig {

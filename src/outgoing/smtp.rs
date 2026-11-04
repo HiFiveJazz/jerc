@@ -239,10 +239,22 @@ impl SmtpSender {
         }
     }
 
-    // Lettre's high-level transport does not expose RFC 7628 OAUTHBEARER.
-    // Keep existing transports untouched and use its low-level SMTP connection
-    // only when OAUTHBEARER was explicitly configured.
-    fn send_oauthbearer(&self, email: &lettre::Message, raw_message: &[u8]) -> Result<Response> {
+    /// Exercise SMTP OAuth using the same TLS, EHLO and SASL negotiation as
+    /// sending, but quit immediately after AUTH succeeds. Never sends MAIL FROM,
+    /// RCPT TO or DATA; safe to run on an existing mailbox.
+    pub fn probe_oauth(&self) -> Result<()> {
+        if !matches!(self.source.auth, SmtpAuth::XOAuth2 | SmtpAuth::OAuthBearer) ||
+            self.source.account_oauth.is_none() {
+            bail!("SMTP OAuth probe requires an account with [accounts.oauth]");
+        }
+        let mut connection = self.authenticated_oauth_connection()?;
+        let _ = connection.quit();
+        Ok(())
+    }
+
+    /// Lettre's high-level transport does not expose RFC 7628 OAUTHBEARER.
+    /// The low-level path is shared by actual sends and credential-only probes.
+    fn authenticated_oauth_connection(&self) -> Result<SmtpConnection> {
         let credential = self.source.credential(self.credential_command.as_deref())?;
         let token = self.source.access_token(&credential)?;
         let hello = ClientId::default();
@@ -312,6 +324,11 @@ impl SmtpSender {
             bail!("SMTP server supports neither AUTH OAUTHBEARER nor XOAUTH2 after TLS");
         }
 
+        Ok(connection)
+    }
+
+    fn send_oauthbearer(&self, email: &lettre::Message, raw_message: &[u8]) -> Result<Response> {
+        let mut connection = self.authenticated_oauth_connection()?;
         let result = connection
             .send(email.envelope(), raw_message)
             .context("sending message through authenticated SMTP connection")?;

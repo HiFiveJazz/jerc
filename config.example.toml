@@ -130,9 +130,13 @@ new_mail_sound_name = "message-new-email"
 # prompt = "select_account"  # google: consent/select_account/none;
 #                            # microsoft: login/consent/select_account/none
 # login_hint = "you@example.com" # prefill account; does not change consent
+# credential_namespace = "oauth-lab" # optional isolated token store for a local OAuth experiment
+#                         # does not touch the original account's refresh token
 # scope = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
 #                            # advanced override; missing scopes may break IMAP/SMTP
 # Diagnose without network: aerc-rs --oauth-inspect "ACCOUNT NAME"
+# Live verification after --oauth-login: aerc-rs --oauth-probe "ACCOUNT NAME"
+# --oauth-probe checks token refresh, IMAP auth/LIST, and SMTP AUTH without sending mail.
 # Redirect paths and consent are validated against the selected app registration.
 # These settings cannot grant unregistered redirect URIs, app identity, or admin consent.
 # After configuring, run: aerc-rs --oauth-login "ACCOUNT NAME"
