@@ -65,13 +65,14 @@ Copy `config.example.toml` to `~/.config/aerc-rs/config.toml` and keep it privat
 ```toml
 [[accounts]]
 name = "Personal"
-source = "imaps://you%40gmail.com@imap.gmail.com:993"
-source_cred_cmd = "pass show mail/personal-app-password"
-from = "Your Name <you@gmail.com>"
-outgoing = "smtps://you%40gmail.com@smtp.gmail.com:465"
-outgoing_cred_cmd = "pass show mail/personal-app-password"
-default_mailbox = "INBOX"
-page_size = 100
+email = "you@gmail.com"
+source = "imap"       # secure IMAP (993)
+outgoing = "smtp"     # secure SMTP (465 for Gmail, 587 for Microsoft)
+copy_to = ""         # Gmail already files messages in Sent
+
+[accounts.oauth]
+provider = "google"
+client_id = "YOUR_GOOGLE_DESKTOP_CLIENT_ID" # or publisher-provided build ID
 
 [ui]
 remote_images = false # privacy-safe default; press I to toggle in-session
@@ -80,6 +81,18 @@ new_mail_bell = false # optional terminal BEL; independent of desktop notificati
 new_mail_notifications = true # requires notify-send and a notification daemon
 new_mail_sound_name = "message-new-email" # name in your active freedesktop/COSMIC sound theme
 ```
+
+Shorthand account settings accept an ordinary `email` address; **no `%40` URL
+encoding is needed**. `incoming = "imap"` is an alias for `source = "imap"`.
+`outgoing = "smtp"` picks a TLS-protected SMTP connection for known providers;
+`outgoing = "smtps"` forces implicit TLS on port 465, while
+`outgoing = "starttls"` forces STARTTLS on port 587. `outgoing = "none"`
+disables sending. Gmail and Outlook.com can be detected from the email domain;
+Google Workspace and Microsoft 365 custom domains use `[accounts.oauth].provider`.
+For other providers, specify `imap_host` and `smtp_host` (and optional
+`imap_port`/`smtp_port`). Full `imaps://` and `smtps://` URLs, sendmail paths,
+and credential commands remain supported. The shorthand never stores a token.
+Run `aerc-rs --oauth-login Personal` once for browser OAuth accounts.
 
 `page_size` controls interactive pagination. Existing `max_messages` settings are retained for compatibility/headless checks and no longer make the TUI wait for one giant initial fetch. Add more `[[accounts]]` blocks to the same config to use multiple accounts. `Alt-n`/`Alt-p` cycles accounts; `Alt-1` through `Alt-9` jumps directly to an account. `[ / ]` and Ctrl-PageUp/Ctrl-PageDown also switch accounts; click an account in the top tab bar to select it. Account switches preserve each account's mailbox and cached state.
 
@@ -294,8 +307,9 @@ For native OAuth desktop sign-in, add an OAuth table **under an account**:
 ```toml
 [[accounts]]
 name = "Work"
-source = "imaps://you%40example.com@outlook.office365.com:993"
-outgoing = "smtp://you%40example.com@smtp.office365.com:587"
+email = "you@example.com"
+source = "imap"
+outgoing = "smtp"
 copy_to = "Sent Items"
 from = "You <you@example.com>"
 
@@ -312,8 +326,9 @@ stores sent mail itself:
 ```toml
 [[accounts]]
 name = "Personal"
-source = "imaps://you%40gmail.com@imap.gmail.com:993"
-outgoing = "smtps://you%40gmail.com@smtp.gmail.com:465"
+email = "you@gmail.com"
+source = "imap"
+outgoing = "smtp"
 copy_to = ""
 
 [accounts.oauth]

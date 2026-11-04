@@ -39,6 +39,8 @@ pub fn from_source(source: &str) -> Result<Box<dyn MailBackend>> {
     let account = AccountConfig {
         name: "direct".to_owned(),
         source: source.to_owned(),
+        email: None, imap_host: None, smtp_host: None,
+        imap_port: None, smtp_port: None,
         default_mailbox: "INBOX".to_owned(),
         source_cred_cmd: None,
         from: None,

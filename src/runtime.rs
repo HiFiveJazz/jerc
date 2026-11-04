@@ -71,21 +71,37 @@ fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<Str
     let mut warnings = Vec::new();
     config.accounts.retain_mut(|account| {
         if backend::from_account(account).is_err() {
-            let scheme = safe_scheme(&account.source);
-            warnings.push(format!(
-                "{}: incoming source uses invalid or unsupported scheme '{scheme}'. \
-                 Use maildir://, imaps://, imaps+login://, imaps+oauthbearer://, or imaps+xoauth2://. Account skipped.",
-                account.name,
-            ));
+            if account.source.trim().is_empty() || matches!(account.source.as_str(), "imap" | "imaps") {
+                warnings.push(format!(
+                    "{}: incoming IMAP shorthand could not be configured. Set email and, \
+                     for a custom provider, imap_host; or use a full imaps:// URI. Account skipped.",
+                    account.name,
+                ));
+            } else {
+                let scheme = safe_scheme(&account.source);
+                warnings.push(format!(
+                    "{}: incoming source uses invalid or unsupported scheme '{scheme}'. \
+                     Use maildir://, imaps://, imaps+login://, imaps+oauthbearer://, or imaps+xoauth2://. Account skipped.",
+                    account.name,
+                ));
+            }
             return false;
         }
         if outgoing::from_account(account).is_err() {
-            let scheme = account.outgoing.as_deref().map(safe_scheme).unwrap_or("<missing>");
-            warnings.push(format!(
-                "{}: outgoing transport '{scheme}' is invalid. Use smtp:// or smtps:// \
-                 (optional +login, +plain, +xoauth2 or +oauthbearer), or an absolute sendmail path. Receiving works; sending disabled until fixed.",
-                account.name,
-            ));
+            if account.outgoing.as_deref().is_some_and(|outgoing| matches!(outgoing, "smtp" | "smtps" | "starttls")) {
+                warnings.push(format!(
+                    "{}: outgoing SMTP shorthand could not be configured. Set email and, \
+                     for a custom provider, smtp_host; or use a full smtps:// or smtp:// URI. Receiving works; sending disabled until fixed.",
+                    account.name,
+                ));
+            } else {
+                let scheme = account.outgoing.as_deref().map(safe_scheme).unwrap_or("<missing>");
+                warnings.push(format!(
+                    "{}: outgoing transport '{scheme}' is invalid. Use smtp:// or smtps:// \
+                     (optional +login, +plain, +xoauth2 or +oauthbearer), or an absolute sendmail path. Receiving works; sending disabled until fixed.",
+                    account.name,
+                ));
+            }
             account.outgoing = None;
         }
         true
@@ -341,6 +357,29 @@ mod multi_account_tests {
         assert_eq!(validated.accounts[0].name, "Working");
         assert!(warnings[0].contains("Broken"));
         assert!(!warnings[0].contains("secret"));
+    }
+
+    #[test]
+    fn invalid_shorthand_does_not_block_other_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, r#"
+            [[accounts]]
+            name = "Broken"
+            email = "person@custom.example"
+            incoming = "imap"
+            outgoing = "smtp"
+            [[accounts]]
+            name = "Working"
+            email = "worker@gmail.com"
+            incoming = "imap"
+            outgoing = "smtp"
+        "#).unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        let (validated, warnings) = validate_account_configuration(config).unwrap();
+        assert_eq!(validated.accounts.len(), 1);
+        assert_eq!(validated.accounts[0].name, "Working");
+        assert!(warnings[0].contains("imap_host"));
     }
 
     #[test]

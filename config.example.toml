@@ -10,6 +10,26 @@ name = "Kernel Maildir"
 source = "maildir://~/Mail/kernel"
 default_mailbox = "INBOX"
 
+# Simplest Google OAuth account (remove leading # characters to use):
+# [[accounts]]
+# name = "Personal"
+# email = "you@gmail.com"
+# source = "imap"    # incoming = "imap" is also accepted
+# outgoing = "smtp"  # automatic secure TLS: Gmail 465, Microsoft 587
+# copy_to = ""       # Gmail automatically saves sent mail
+# [accounts.oauth]
+# provider = "google"
+# client_id = "YOUR_REGISTERED_GOOGLE_DESKTOP_CLIENT_ID"
+# Run: aerc-rs --oauth-login Personal
+#
+# For Google Workspace or Microsoft 365 custom domains, the OAuth provider
+# selects known servers. For other domains, set:
+# imap_host = "imap.example.com"
+# smtp_host = "smtp.example.com"
+# Optional imap_port / smtp_port, or outgoing = "starttls" for port 587.
+# outgoing = "smtps" forces implicit TLS on 465; "none" disables sending.
+# Full URI forms and credential commands remain supported; advanced examples:
+#
 # Gmail / normal IMAPS with an app password + SMTP submission.
 # Add as many [[accounts]] blocks as needed. Use Alt-n / Alt-p to rotate
 # accounts, Alt-1..Alt-9 to choose one, or click its tab. Press ! for

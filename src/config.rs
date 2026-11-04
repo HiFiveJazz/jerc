@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use url::Url;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -19,7 +20,22 @@ pub struct Config {
 #[derive(Clone, Deserialize)]
 pub struct AccountConfig {
     pub name: String,
+    #[serde(default, alias = "incoming")]
     pub source: String,
+    /// Plain email address for shorthand IMAP/SMTP configuration. Never needs
+    /// URL escaping. Existing source/outgoing URIs continue to work unchanged.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Optional server overrides for non-preset providers. Hostnames only,
+    /// without a scheme, username, port or password.
+    #[serde(default)]
+    pub imap_host: Option<String>,
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    #[serde(default)]
+    pub imap_port: Option<u16>,
+    #[serde(default)]
+    pub smtp_port: Option<u16>,
     #[serde(default = "default_mailbox")]
     pub default_mailbox: String,
     /// Optional command that prints the account password/refresh token/access
@@ -81,6 +97,9 @@ impl std::fmt::Debug for AccountConfig {
         f.debug_struct("AccountConfig")
             .field("name", &self.name)
             .field("source", &format_args!("{scheme}://<redacted>"))
+            .field("email_configured", &self.email.is_some())
+            .field("imap_host", &self.imap_host)
+            .field("smtp_host", &self.smtp_host)
             .field("default_mailbox", &self.default_mailbox)
             .field(
                 "source_cred_cmd",
@@ -167,10 +186,22 @@ impl Config {
         let mut config: Self = toml::from_str(&contents)
             .with_context(|| format!("parsing config {}", path.display()))?;
         config.config_path = Some(path);
+        config.normalize_accounts();
         if config.accounts.is_empty() {
             return Err(anyhow!("config contains no [[accounts]] entries"));
         }
         Ok(config)
+    }
+
+    fn normalize_accounts(&mut self) {
+        for account in &mut self.accounts {
+            // Preserve multi-account recovery: a malformed shortcut must not
+            // prevent an unrelated valid account from launching. Leave its
+            // unexpanded scheme in place so the existing startup validation
+            // can skip the bad incoming account or disable only its outgoing
+            // transport (and show the warning in the TUI).
+            let _ = account.normalize_shorthand();
+        }
     }
 
     #[must_use]
@@ -179,6 +210,11 @@ impl Config {
             accounts: vec![AccountConfig {
                 name,
                 source: format!("maildir://{}", path.display()),
+                email: None,
+                imap_host: None,
+                smtp_host: None,
+                imap_port: None,
+                smtp_port: None,
                 default_mailbox: default_mailbox(),
                 source_cred_cmd: None,
                 from: None,
@@ -193,6 +229,139 @@ impl Config {
             config_path: None,
         }
     }
+}
+
+/// Known provider settings. This is intentionally not a generic DNS guess:
+/// custom domains must supply their actual mail hosts unless the user selected
+/// an OAuth provider that tells us where their mailbox is hosted.
+#[derive(Clone, Copy)]
+enum MailPreset {
+    Google,
+    Microsoft365,
+    OutlookCom,
+}
+
+impl MailPreset {
+    fn for_account(account: &AccountConfig, email: &str) -> Option<Self> {
+        let domain = email.rsplit_once('@')?.1.to_ascii_lowercase();
+        let microsoft_consumer = matches!(domain.as_str(),
+            "outlook.com" | "hotmail.com" | "live.com" | "msn.com");
+        match account.oauth.as_ref().map(|oauth| oauth.provider.to_ascii_lowercase()) {
+            Some(provider) if provider == "google" => Some(Self::Google),
+            Some(provider) if provider == "microsoft" => Some(if microsoft_consumer {
+                Self::OutlookCom
+            } else {
+                Self::Microsoft365
+            }),
+            _ => match domain.as_str() {
+                "gmail.com" | "googlemail.com" => Some(Self::Google),
+                _ if microsoft_consumer => Some(Self::OutlookCom),
+                _ => None,
+            },
+        }
+    }
+
+    const fn imap_host(self) -> &'static str {
+        match self {
+            Self::Google => "imap.gmail.com",
+            Self::Microsoft365 | Self::OutlookCom => "outlook.office365.com",
+        }
+    }
+
+    const fn smtp_host(self) -> &'static str {
+        match self {
+            Self::Google => "smtp.gmail.com",
+            Self::Microsoft365 => "smtp.office365.com",
+            Self::OutlookCom => "smtp-mail.outlook.com",
+        }
+    }
+
+    const fn smtp_starttls(self) -> bool {
+        !matches!(self, Self::Google)
+    }
+}
+
+impl AccountConfig {
+    /// Expand user-friendly shorthand at load time. Everything downstream still
+    /// receives the same fully qualified URIs and OAuth settings as before.
+    fn normalize_shorthand(&mut self) -> Result<()> {
+        let email = self.email.as_deref().map(str::trim).filter(|email| !email.is_empty());
+        if let Some(value) = email {
+            let Some((local, domain)) = value.rsplit_once('@') else {
+                return Err(anyhow!("email must be a complete address, e.g. you@example.com"));
+            };
+            if local.is_empty() || local.contains('@') || !valid_hostname(domain)
+                || value.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+                return Err(anyhow!("email must be a valid, unescaped email address"));
+            }
+        }
+        let preset = email.and_then(|email| MailPreset::for_account(self, email));
+
+        let incoming = if self.source.trim().is_empty() && email.is_some() {
+            "imap"
+        } else {
+            self.source.trim()
+        };
+        if matches!(incoming, "imap" | "imaps" | "imaps+login" | "imaps+xoauth2" | "imaps+oauthbearer") {
+            let email = email.ok_or_else(|| anyhow!("email is required when source = 'imap'"))?;
+            let host = self.imap_host.as_deref()
+                .or_else(|| preset.map(MailPreset::imap_host))
+                .ok_or_else(|| anyhow!("unknown mail provider: set imap_host for this account"))?;
+            let port = self.imap_port.unwrap_or(993);
+            let scheme = match incoming { "imap" => "imaps", other => other };
+            self.source = build_mail_uri(scheme, email, host, port)?;
+        } else if incoming.is_empty() {
+            return Err(anyhow!("missing incoming mail source; set email and source = 'imap', or use an IMAP/Maildir URI"));
+        }
+
+        if let Some(outgoing) = self.outgoing.as_deref().map(|value| value.trim().to_owned()) {
+            match outgoing.as_str() {
+                "none" => self.outgoing = None,
+                "smtp" | "smtps" | "starttls" => {
+                    let email = email.ok_or_else(|| anyhow!("email is required for outgoing = 'smtp'"))?;
+                    let host = self.smtp_host.as_deref()
+                        .or_else(|| preset.map(MailPreset::smtp_host))
+                        .ok_or_else(|| anyhow!("unknown mail provider: set smtp_host for this account"))?;
+                    let starttls = match outgoing.as_str() {
+                        "smtps" => false,
+                        "starttls" => true,
+                        _ => self.smtp_port.map_or_else(
+                            || preset.is_none_or(MailPreset::smtp_starttls),
+                            |port| port != 465,
+                        ),
+                    };
+                    let scheme = if starttls { "smtp" } else { "smtps" };
+                    let port = self.smtp_port.unwrap_or(if starttls { 587 } else { 465 });
+                    self.outgoing = Some(build_mail_uri(scheme, email, host, port)?);
+                }
+                _ => {} // Keep existing full SMTP and sendmail URLs untouched.
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && host.split('.').all(|label| !label.is_empty() && label.len() <= 63
+            && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-'))
+}
+
+/// Use Url's userinfo encoder; an email address remains plain text in TOML and
+/// is escaped only inside the generated URL. No credential is ever inserted.
+fn build_mail_uri(scheme: &str, username: &str, host: &str, port: u16) -> Result<String> {
+    if !valid_hostname(host) || port == 0 {
+        return Err(anyhow!("invalid mail server hostname or port"));
+    }
+    let mut url = Url::parse(&format!("{scheme}://{host}:{port}"))
+        .context("constructing secure mail server URI")?;
+    url.set_username(username)
+        .map_err(|()| anyhow!("invalid email address for mail server URI"))?;
+    Ok(url.to_string())
 }
 
 /// Persist the theme directly into the user's TOML config, preserving account
@@ -398,6 +567,138 @@ mod tests {
         let account = &config.accounts[0];
         assert_eq!(account.oauth.as_ref().unwrap().provider, "microsoft");
         assert!(account.copy_to.is_none());
+    }
+
+    #[test]
+    fn gmail_shorthand_uses_plain_email_and_secure_provider_hosts() {
+        let mut config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Personal"
+            email = "first.last+tag@gmail.com"
+            incoming = "imap"
+            outgoing = "smtp"
+            copy_to = ""
+            [accounts.oauth]
+            provider = "google"
+            client_id = "test-public-client"
+        "#).unwrap();
+        config.normalize_accounts();
+        let account = &config.accounts[0];
+        let incoming = crate::backend::ImapSource::parse(&account.source).unwrap();
+        let outgoing = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        assert_eq!(incoming.username, "first.last+tag@gmail.com");
+        assert_eq!(incoming.host, "imap.gmail.com");
+        assert_eq!(incoming.port, 993);
+        assert_eq!(outgoing.username, incoming.username);
+        assert_eq!(outgoing.host, "smtp.gmail.com");
+        assert_eq!(outgoing.port, 465);
+        assert!(account.source.contains("%40"));
+        assert!(account.source.contains("first.last+tag%40gmail.com"));
+        assert_eq!(account.copy_to.as_deref(), Some(""));
+        assert!(!format!("{account:?}").contains("first.last"));
+    }
+
+    #[test]
+    fn google_workspace_uses_oauth_provider_even_with_custom_email_domain() {
+        let mut config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "University"
+            email = "student@university.edu"
+            source = "imap"
+            outgoing = "starttls"
+            [accounts.oauth]
+            provider = "google"
+            client_id = "test-public-client"
+        "#).unwrap();
+        config.normalize_accounts();
+        let account = &config.accounts[0];
+        assert_eq!(crate::backend::ImapSource::parse(&account.source).unwrap().host, "imap.gmail.com");
+        let smtp = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        assert_eq!(smtp.host, "smtp.gmail.com");
+        assert_eq!(smtp.port, 587);
+    }
+
+    #[test]
+    fn microsoft_preset_uses_starttls_587() {
+        let mut config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Work"
+            email = "worker@example.edu"
+            source = "imap"
+            outgoing = "smtp"
+            [accounts.oauth]
+            provider = "microsoft"
+            client_id = "test-public-client"
+        "#).unwrap();
+        config.normalize_accounts();
+        let account = &config.accounts[0];
+        assert_eq!(crate::backend::ImapSource::parse(&account.source).unwrap().host, "outlook.office365.com");
+        let smtp = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        assert_eq!(smtp.host, "smtp.office365.com");
+        assert_eq!(smtp.port, 587);
+    }
+
+    #[test]
+    fn custom_provider_requires_explicit_hosts_and_respects_port_overrides() {
+        let mut config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Custom"
+            email = "person@example.org"
+            incoming = "imap"
+            outgoing = "smtp"
+            imap_host = "mail.example.org"
+            smtp_host = "relay.example.org"
+            imap_port = 1993
+            smtp_port = 2525
+        "#).unwrap();
+        config.normalize_accounts();
+        let account = &config.accounts[0];
+        let imap = crate::backend::ImapSource::parse(&account.source).unwrap();
+        let smtp = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        assert_eq!(imap.port, 1993);
+        assert_eq!(imap.host, "mail.example.org");
+        assert_eq!(smtp.port, 2525);
+        assert_eq!(smtp.host, "relay.example.org");
+        assert!(account.outgoing.as_deref().unwrap().starts_with("smtp://"));
+    }
+
+    #[test]
+    fn shorthand_fails_closed_on_missing_hosts_or_host_injection() {
+        let mut config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Unknown"
+            email = "person@unknown.test"
+            source = "imap"
+            outgoing = "smtp"
+        "#).unwrap();
+        assert!(config.accounts[0].normalize_shorthand().is_err());
+        let mut config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Unknown"
+            email = "person@unknown.test"
+            source = "imap"
+            imap_host = "mail.test@evil.test"
+        "#).unwrap();
+        assert!(config.accounts[0].normalize_shorthand().is_err());
+    }
+
+    #[test]
+    fn existing_uris_maildir_and_sendmail_are_not_modified() {
+        let mut config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Legacy"
+            source = "imaps+oauthbearer://user%40example.com@imap.example.com:993"
+            outgoing = "smtps+xoauth2://user%40example.com@smtp.example.com:465"
+
+            [[accounts]]
+            name = "Local"
+            source = "maildir:///tmp/example"
+            outgoing = "/usr/sbin/sendmail"
+        "#).unwrap();
+        let original = config.accounts.iter().map(|a| (a.source.clone(), a.outgoing.clone())).collect::<Vec<_>>();
+        config.normalize_accounts();
+        let updated = config.accounts.iter().map(|a| (a.source.clone(), a.outgoing.clone())).collect::<Vec<_>>();
+        assert_eq!(original, updated);
     }
 
     #[test]

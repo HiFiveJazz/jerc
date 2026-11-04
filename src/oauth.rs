@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -199,9 +199,10 @@ impl OAuthSettings {
                 params.append_pair("access_type", "offline").append_pair("prompt", "consent");
             }
         }
-        println!("Authorize account {:?} in your browser.", self.account_name);
-        if !open_browser(authorization.as_str()) {
-            println!("Open this authorization URL in your browser:\n{}", authorization);
+        if open_browser(authorization.as_str()) {
+            println!("Check your browser to finish signing in to {:?}.", self.account_name);
+        } else {
+            println!("Could not launch your browser. Open this URL to sign in:\n{}", authorization);
         }
         let started = Instant::now();
         let code = loop {
@@ -253,14 +254,27 @@ impl OAuthSettings {
 }
 
 fn open_browser(url: &str) -> bool {
+    // Browser launchers may inherit our terminal and print GTK/desktop
+    // warnings even after spawning the browser. Keep OAuth's CLI output
+    // limited to actionable status messages; browser errors stay in the UI.
     #[cfg(target_os = "linux")]
-    { return Command::new("xdg-open").arg(url).spawn().is_ok(); }
+    { return spawn_browser(Command::new("xdg-open").arg(url)); }
     #[cfg(target_os = "macos")]
-    { return Command::new("open").arg(url).spawn().is_ok(); }
+    { return spawn_browser(Command::new("open").arg(url)); }
     #[cfg(windows)]
-    { return Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn().is_ok(); }
+    { return spawn_browser(Command::new("rundll32").args(["url.dll,FileProtocolHandler", url])); }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     { let _ = url; false }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn spawn_browser(command: &mut Command) -> bool {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
 }
 
 pub fn login_account(accounts: &[AccountConfig], name: &str) -> Result<()> {

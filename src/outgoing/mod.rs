@@ -93,7 +93,10 @@ mod sender_tests {
 
     fn account(from: Option<&str>, outgoing: &str, source: &str) -> AccountConfig {
         AccountConfig {
-            name: "Test".into(), source: source.into(), default_mailbox: "INBOX".into(),
+            name: "Test".into(), source: source.into(),
+            email: None, imap_host: None, smtp_host: None,
+            imap_port: None, smtp_port: None,
+            default_mailbox: "INBOX".into(),
             source_cred_cmd: None, from: from.map(str::to_owned),
             outgoing: Some(outgoing.into()), outgoing_cred_cmd: None,
             copy_to: None, oauth: None,
