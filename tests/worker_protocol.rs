@@ -64,7 +64,7 @@ impl MailBackend for FakeBackend {
 #[test]
 fn worker_preserves_request_correlation() {
     let (tx, rx) = sync_channel(8);
-    let mut worker = WorkerHandle::spawn(3, Box::new(FakeBackend), None, tx);
+    let mut worker = WorkerHandle::spawn(3, Box::new(FakeBackend), None, None, tx);
     let request_id = worker.post(ActionKind::Connect).unwrap();
     let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
         panic!("expected worker event");
@@ -78,7 +78,7 @@ fn worker_preserves_request_correlation() {
 #[test]
 fn worker_preserves_pagination_metadata() {
     let (tx, rx) = sync_channel(8);
-    let mut worker = WorkerHandle::spawn(0, Box::new(FakeBackend), None, tx);
+    let mut worker = WorkerHandle::spawn(0, Box::new(FakeBackend), None, None, tx);
     let request_id = worker
         .post(ActionKind::OpenMailbox {
             name: "INBOX".to_owned(),
@@ -182,7 +182,7 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
         fail_append: false,
     };
     let (tx, rx) = sync_channel(8);
-    let mut worker = WorkerHandle::spawn(0, Box::new(backend), Some(Box::new(FakeSender)), tx);
+    let mut worker = WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
     worker
         .post(ActionKind::Send {
             message: OutgoingMessage {
@@ -234,7 +234,7 @@ fn sent_append_failure_is_reported_and_not_retried_as_smtp_send() {
     let appended = Arc::new(Mutex::new(Vec::new()));
     let backend = AppendingBackend { appended: Arc::clone(&appended), fail_append: true };
     let (tx, rx) = sync_channel(8);
-    let mut worker = WorkerHandle::spawn(0, Box::new(backend), Some(Box::new(FakeSender)), tx);
+    let mut worker = WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
     worker.post(ActionKind::Send {
         message: OutgoingMessage {
             from: "sender@example.com".into(), to: "receiver@example.com".into(),

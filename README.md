@@ -154,3 +154,68 @@ copies if necessary. The file-attachment manager (**Ctrl+D**) now supports
 Message-list **p** toggles split preview (lowercase); the preview area has no
 label. Subjects preserve their original emoji variation selectors and use
 the full available column width instead of coercing text-mode glyphs.
+
+## Diagnosing intermittent IMAP startup stalls
+
+The optional `AERC_RS_PERF_LOG` environment variable records worker action queue
+waits and IMAP stage durations without printing into the TUI. Each line contains timestamp, per-launch `run_id`, worker name, operation label,
+queue duration, operation duration, and success/failure. Mailbox navigation
+lifecycle events also contain a numerical `request_id` so enqueued operations,
+worker execution, and UI application can be correlated. It does **not** record
+mailbox names, recipients, Message-IDs, credentials, or email contents.
+The file is created with mode 0600 on Unix.
+
+```bash
+cargo build --release
+AERC_RS_PERF_LOG=/tmp/aerc-rs-timings.log ./target/release/aerc-rs
+```
+
+Use the client normally and exit when you notice a slow startup or message load.
+Inspect `/tmp/aerc-rs-timings.log` for slow `imap_auth`, `imap_list`,
+`imap_select`, `imap_fetch_headers`, or `imap_fetch_body` stages and their
+corresponding `worker_*` action. A large `queue_ms` indicates aerc-rs delayed
+the action behind earlier work; a large `duration_ms` with a small queue means
+the operation itself was slow. The file appends across restarts so multiple
+fast and slow sessions can be compared. Remove it when finished profiling.
+
+The tracing option is off by default.
+
+### Background STATUS isolation
+
+IMAP accounts now use one interactive session for opening folders and loading
+messages plus a **lazily connected second session** solely for unread-count
+`STATUS` checks. A slow count request no longer blocks interactive `SELECT` or
+`FETCH`; local Maildir accounts retain one worker. Pending folder opens and
+reader body requests are coalesced to the newest selection, and request IDs
+prevent stale responses from overwriting the current browser. Count failures
+are best-effort and don't reset the active view.
+
+The foreground/background worker separation remains in place. The private
+persistent message index described below now complements the per-session cache;
+first-time IMAP login/SELECT/FETCH can still be slow when Gmail or the network
+is slow.
+
+### Persistent, private IMAP message index
+
+IMAP accounts now keep a small local index under
+`~/.cache/aerc-rs/mail-index/` (or the platform's user cache directory).
+The mailbox list, recently viewed folder headers, and a limited number of
+already-read message bodies are loaded before network connection so warm
+startup and returning to folders can show messages immediately. The current
+foreground/background worker model still refreshes headers and counts in the
+background. Cache writes happen on a separate thread, use atomic file rename,
+and have private directory (`0700`) and file (`0600`) permissions on Unix.
+
+The cache is **not** the source of truth. An IMAP `SELECT` refresh revalidates
+`UIDVALIDITY`; cached UID IDs include their validity generation, and stale IDs
+are rejected before a server read or mutation. An empty, old, malformed, or
+oversized cache is ignored. Maildir accounts still use their local filesystem.
+
+This first disk-cache milestone improves perceived navigation and warm startup.
+It does **not** yet implement full CONDSTORE/QRESYNC incremental flag sync,
+server-side push/IDLE, or complete offline message mirroring: unchanged
+first-page headers are still fetched for reconciliation when revisiting a
+folder. The first launch and genuinely uncached messages remain subject to
+Gmail/IMAP latency. To clear private cached data, stop aerc-rs and remove
+`~/.cache/aerc-rs/mail-index/`. Set `AERC_RS_DISABLE_CACHE=1` when
+benchmarking the uncached behavior without deleting previously saved data.

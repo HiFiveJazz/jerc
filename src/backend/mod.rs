@@ -87,6 +87,8 @@ pub trait MailBackend: Send {
     fn connect(&mut self) -> Result<()>;
     fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>>;
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)>;
+    /// UIDVALIDITY from the currently selected mailbox, if provided by IMAP.
+    fn mailbox_uid_validity(&self, _name: &str) -> Option<u32> { None }
     fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage>;
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody>;
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>>;

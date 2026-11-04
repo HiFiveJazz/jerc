@@ -1,10 +1,12 @@
 pub mod app;
+mod cache;
 pub mod backend;
 pub mod config;
 pub mod mail;
 pub mod mail_image;
 pub mod model;
 pub mod outgoing;
+mod perf;
 pub mod patch_preview;
 pub mod runtime;
 pub mod theme;

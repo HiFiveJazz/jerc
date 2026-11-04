@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId(pub String);
 
 impl fmt::Display for MessageId {
@@ -9,7 +9,7 @@ impl fmt::Display for MessageId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MessageFlags(u16);
 
 impl MessageFlags {
@@ -74,7 +74,7 @@ impl MessageFlags {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum MailboxRole {
     Inbox,
     Sent,
@@ -85,7 +85,7 @@ pub enum MailboxRole {
     Other,
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Mailbox {
     pub name: String,
     pub role: MailboxRole,
@@ -109,7 +109,7 @@ impl Mailbox {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct MessageSummary {
     pub id: MessageId,
     pub message_id: Option<String>,
@@ -147,14 +147,14 @@ impl MessageSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HtmlImageCandidate {
     pub source: String,
     pub width_px: Option<u32>,
     pub height_px: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct HtmlSpanStyle {
     pub foreground: Option<(u8, u8, u8)>,
     pub background: Option<(u8, u8, u8)>,
@@ -166,18 +166,18 @@ pub struct HtmlSpanStyle {
     pub image: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct HtmlSpan {
     pub text: String,
     pub style: HtmlSpanStyle,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct HtmlLine {
     pub spans: Vec<HtmlSpan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct MessageBody {
     pub id: MessageId,
     /// The MIME text/plain representation when one exists.

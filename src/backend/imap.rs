@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::num::NonZeroU32;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use io_imap::client::{ImapClient, ImapClientStd, ImapClientStdConnectOptions};
@@ -213,6 +213,7 @@ pub struct ImapBackend {
     session: Option<ImapClientStd>,
     selected_mailbox: Option<String>,
     selected_exists: Option<u32>,
+    selected_uid_validity: Option<u32>,
 }
 
 impl std::fmt::Debug for ImapBackend {
@@ -245,6 +246,7 @@ impl ImapBackend {
             session: None,
             selected_mailbox: None,
             selected_exists: None,
+            selected_uid_validity: None,
         }
     }
 
@@ -256,12 +258,16 @@ impl ImapBackend {
 
     fn select(&mut self, mailbox: &str) -> Result<io_imap::rfc3501::select::ImapMailboxSelectData> {
         let mailbox_name = mailbox_from_name(mailbox)?;
-        let selected = self
+        let started = Instant::now();
+        let selected_result = self
             .session()?
             .select(mailbox_name, ImapMailboxSelectOptions::default())
-            .with_context(|| format!("selecting IMAP mailbox {mailbox:?}"))?;
+            .with_context(|| format!("selecting IMAP mailbox {mailbox:?}"));
+        crate::perf::record("imap_select", None, started.elapsed(), selected_result.is_ok());
+        let selected = selected_result?;
         self.selected_mailbox = Some(mailbox.to_owned());
         self.selected_exists = Some(selected.exists.unwrap_or(0));
+        self.selected_uid_validity = selected.uid_validity.map(|uid| uid.get());
         Ok(selected)
     }
 
@@ -282,12 +288,38 @@ impl ImapBackend {
         }
     }
 
+    fn decode_uid(id: &MessageId) -> Result<(Option<u32>, u32)> {
+        let raw = id.0.strip_prefix("imap-uid:")
+            .ok_or_else(|| anyhow!("message ID is not an IMAP UID"))?;
+        if let Some((validity, uid)) = raw.split_once(':') {
+            let validity = validity.parse::<u32>().context("parsing UIDVALIDITY")?;
+            let uid = uid.parse::<u32>().context("parsing IMAP UID")?;
+            Ok((Some(validity), uid))
+        } else {
+            // Legacy IDs are supported for already-loaded messages, but never
+            // written to the new disk cache without UIDVALIDITY.
+            Ok((None, raw.parse::<u32>().context("parsing IMAP UID")?))
+        }
+    }
+
     fn uid_from_id(id: &MessageId) -> Result<u32> {
-        id.0
-            .strip_prefix("imap-uid:")
-            .ok_or_else(|| anyhow!("message ID is not an IMAP UID"))?
-            .parse::<u32>()
-            .context("parsing IMAP UID")
+        Self::decode_uid(id).map(|(_, uid)| uid)
+    }
+
+    /// Reject stale cached IDs after SELECT if the server reset this mailbox.
+    fn check_uid_generation(&self, id: &MessageId) -> Result<()> {
+        let (expected, _) = Self::decode_uid(id)?;
+        if let Some(expected) = expected {
+            if self.selected_uid_validity != Some(expected) {
+                bail!("mailbox UIDVALIDITY changed; refresh this folder before acting on cached mail");
+            }
+        }
+        Ok(())
+    }
+
+    fn check_many_uid_generations(&self, ids: &[MessageId]) -> Result<()> {
+        for id in ids { self.check_uid_generation(id)?; }
+        Ok(())
     }
 
     fn uid_sequence(id: &MessageId) -> Result<SequenceSet> {
@@ -329,69 +361,85 @@ impl MailBackend for ImapBackend {
     }
 
     fn connect(&mut self) -> Result<()> {
-        let credential = self.source.credential(self.credential_command.as_deref())?;
+        let started = Instant::now();
+        let credential_result = self.source.credential(self.credential_command.as_deref());
+        crate::perf::record("imap_credential", None, started.elapsed(), credential_result.is_ok());
+        let credential = credential_result?;
         let connect_url = Url::parse(&format!(
             "imaps://{}:{}",
             self.source.host, self.source.port
         ))
         .context("building IMAP connection URL")?;
-        let (mut client, _) = ImapClientStd::connect(
+        let started = Instant::now();
+        let client_result = ImapClientStd::connect(
             &connect_url,
             ImapClientStdConnectOptions::default(),
         )
-        .context("connecting to IMAP server")?;
+        .context("connecting to IMAP server");
+        crate::perf::record("imap_tls_connect", None, started.elapsed(), client_result.is_ok());
+        let (mut client, _) = client_result?;
         client
             .stream
             .set_read_timeout(Some(IO_TIMEOUT))
             .context("setting IMAP read timeout")?;
 
-        match self.source.auth {
-            ImapAuth::Password | ImapAuth::Login => {
-                client
-                    .login(
-                        &self.source.username,
-                        &credential,
-                        ImapLoginOptions::default(),
-                    )
-                    .context("IMAP authentication failed")?;
+        let started = Instant::now();
+        let auth_result = (|| -> Result<()> {
+            match self.source.auth {
+                ImapAuth::Password | ImapAuth::Login => {
+                    client
+                        .login(
+                            &self.source.username,
+                            &credential,
+                            ImapLoginOptions::default(),
+                        )
+                        .context("IMAP authentication failed")?;
+                }
+                ImapAuth::OAuthBearer => {
+                    let access_token = self.source.access_token(&credential)?;
+                    client
+                        .auth_oauthbearer(
+                            &self.source.username,
+                            &self.source.host,
+                            self.source.port,
+                            &access_token,
+                            ImapAuthOauthbearerOptions::default(),
+                        )
+                        .context("IMAP OAUTHBEARER authentication failed")?;
+                }
+                ImapAuth::XOAuth2 => {
+                    let access_token = self.source.access_token(&credential)?;
+                    client
+                        .auth_xoauth2(
+                            &self.source.username,
+                            &access_token,
+                            ImapAuthXoauth2Options::default(),
+                        )
+                        .context("IMAP XOAUTH2 authentication failed")?;
+                }
             }
-            ImapAuth::OAuthBearer => {
-                let access_token = self.source.access_token(&credential)?;
-                client
-                    .auth_oauthbearer(
-                        &self.source.username,
-                        &self.source.host,
-                        self.source.port,
-                        &access_token,
-                        ImapAuthOauthbearerOptions::default(),
-                    )
-                    .context("IMAP OAUTHBEARER authentication failed")?;
-            }
-            ImapAuth::XOAuth2 => {
-                let access_token = self.source.access_token(&credential)?;
-                client
-                    .auth_xoauth2(
-                        &self.source.username,
-                        &access_token,
-                        ImapAuthXoauth2Options::default(),
-                    )
-                    .context("IMAP XOAUTH2 authentication failed")?;
-            }
-        }
+            Ok(())
+        })();
+        crate::perf::record("imap_auth", None, started.elapsed(), auth_result.is_ok());
+        auth_result?;
 
         self.session = Some(client);
         self.selected_mailbox = None;
         self.selected_exists = None;
+        self.selected_uid_validity = None;
         Ok(())
     }
 
     fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>> {
         let reference: ImapMailbox<'static> = "".to_owned().try_into().context("building LIST reference")?;
         let pattern: ListMailbox<'static> = "*".to_owned().try_into().context("building LIST pattern")?;
-        let names = self
+        let started = Instant::now();
+        let names_result = self
             .session()?
             .list(reference, pattern)
-            .context("listing IMAP mailboxes")?;
+            .context("listing IMAP mailboxes");
+        crate::perf::record("imap_list", None, started.elapsed(), names_result.is_ok());
+        let names = names_result?;
 
         let mut selectable: Vec<(String, MailboxRole)> = names
             .into_iter()
@@ -417,15 +465,23 @@ impl MailBackend for ImapBackend {
             .collect())
     }
 
+    fn mailbox_uid_validity(&self, name: &str) -> Option<u32> {
+        (self.selected_mailbox.as_deref() == Some(name))
+            .then_some(self.selected_uid_validity).flatten()
+    }
+
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)> {
         let mailbox = mailbox_from_name(name)?;
-        let items = self
+        let started = Instant::now();
+        let items_result = self
             .session()?
             .status(
                 mailbox,
                 Cow::Owned(vec![StatusDataItemName::Messages, StatusDataItemName::Unseen]),
             )
-            .with_context(|| format!("reading status for {name:?}"))?;
+            .with_context(|| format!("reading status for {name:?}"));
+        crate::perf::record("imap_status", None, started.elapsed(), items_result.is_ok());
+        let items = items_result?;
         let mut total = 0usize;
         let mut unread = 0usize;
         for item in items {
@@ -488,10 +544,13 @@ impl MailBackend for ImapBackend {
             MessageDataItemName::BodyStructure,
         ]
         .into();
-        let fetched = self
+        let started = Instant::now();
+        let fetched_result = self
             .session()?
             .fetch(sequence, items, ImapMessageFetchOptions::default())
-            .with_context(|| format!("fetching headers from {name:?}"))?;
+            .with_context(|| format!("fetching headers from {name:?}"));
+        crate::perf::record("imap_fetch_headers", None, started.elapsed(), fetched_result.is_ok());
+        let fetched = fetched_result?;
 
         let mut messages = Vec::with_capacity(fetched.len());
         for data_items in fetched.values() {
@@ -517,7 +576,10 @@ impl MailBackend for ImapBackend {
             let (Some(uid), Some(headers)) = (uid, headers) else {
                 continue;
             };
-            let id = MessageId(format!("imap-uid:{uid}"));
+            let id = match self.selected_uid_validity {
+                Some(validity) => MessageId(format!("imap-uid:{validity}:{uid}")),
+                None => MessageId(format!("imap-uid:{uid}")),
+            };
             if let Ok(mut summary) = parse_summary(id, &headers, size, flags) {
                 summary.has_attachment_hint |= !attachment_names.is_empty();
                 summary.attachment_names_hint = attachment_names;
@@ -546,12 +608,16 @@ impl MailBackend for ImapBackend {
 
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
         self.ensure_selected(mailbox)?;
+        self.check_uid_generation(id)?;
         let uid = Self::uid_from_id(id)?;
         let uid = NonZeroU32::new(uid).ok_or_else(|| anyhow!("IMAP UID cannot be zero"))?;
         let mut raw = Vec::new();
-        self.session()?
+        let started = Instant::now();
+        let fetched_result = self.session()?
             .fetch_body_stream(uid, true, &mut raw)
-            .with_context(|| format!("fetching IMAP message UID {uid}"))?;
+            .with_context(|| format!("fetching IMAP message UID {uid}"));
+        crate::perf::record("imap_fetch_body", None, started.elapsed(), fetched_result.is_ok());
+        fetched_result?;
         if raw.is_empty() {
             bail!("IMAP server did not return requested UID {uid}");
         }
@@ -593,6 +659,7 @@ impl MailBackend for ImapBackend {
 
     fn set_seen(&mut self, mailbox: &str, id: &MessageId, seen: bool) -> Result<()> {
         self.ensure_selected(mailbox)?;
+        self.check_uid_generation(id)?;
         let sequence = Self::uid_sequence(id)?;
         let mut opts = ImapMessageStoreOptions::default();
         opts.uid = true;
@@ -605,6 +672,7 @@ impl MailBackend for ImapBackend {
 
     fn delete(&mut self, mailbox: &str, id: &MessageId) -> Result<()> {
         self.ensure_selected(mailbox)?;
+        self.check_uid_generation(id)?;
         let sequence = Self::uid_sequence(id)?;
         let mut opts = ImapMessageStoreOptions::default();
         opts.uid = true;
@@ -623,6 +691,7 @@ impl MailBackend for ImapBackend {
             return Ok(());
         }
         self.ensure_selected(mailbox)?;
+        self.check_many_uid_generations(ids)?;
         let sequence = Self::uid_sequence_many(ids)?;
         let mut opts = ImapMessageStoreOptions::default();
         opts.uid = true;
@@ -645,6 +714,7 @@ impl MailBackend for ImapBackend {
             // by marking only their selected UIDs deleted and expunging those
             // UIDs. This is *not* used for a generic mail server or other folder.
             self.ensure_selected(source)?;
+            self.check_many_uid_generations(ids)?;
             let uids = Self::uid_sequence_many(ids)?;
             let mut options = ImapMessageStoreOptions::default();
             options.uid = true;
@@ -666,6 +736,7 @@ impl MailBackend for ImapBackend {
             // Adding INBOX in Gmail must not remove the message from the All Mail
             // view, so COPY (add label) instead of MOVE (remove source).
             self.ensure_selected(source)?;
+            self.check_many_uid_generations(ids)?;
             let uids = Self::uid_sequence_many(ids)?;
             let mut options = ImapMessageCopyOptions::default();
             options.uid = true;
@@ -679,6 +750,7 @@ impl MailBackend for ImapBackend {
 
     fn move_to(&mut self, source: &str, destination: &str, id: &MessageId) -> Result<()> {
         self.ensure_selected(source)?;
+        self.check_uid_generation(id)?;
         let destination_mailbox = mailbox_from_name(destination)?;
         let sequence = Self::uid_sequence(id)?;
         let mut move_opts = ImapMessageMoveOptions::default();
@@ -719,6 +791,7 @@ impl MailBackend for ImapBackend {
             return Ok(());
         }
         self.ensure_selected(source)?;
+        self.check_many_uid_generations(ids)?;
         let destination_mailbox = mailbox_from_name(destination)?;
         let sequence = Self::uid_sequence_many(ids)?;
         let mut move_opts = ImapMessageMoveOptions::default();
@@ -982,6 +1055,22 @@ mod tests {
         assert!(!debug.contains("refresh-secret"));
         assert!(!debug.contains("client-secret"));
         assert!(!debug.contains("oauth.example.com"));
+    }
+
+    #[test]
+    fn cached_uid_generation_is_checked_before_mutations() {
+        use super::ImapBackend;
+        use crate::model::MessageId;
+        let source = ImapSource::parse("imaps://user%40example.com@imap.example.com").unwrap();
+        let mut backend = ImapBackend::new(source, None, 100);
+        backend.selected_uid_validity = Some(42);
+        let valid = MessageId("imap-uid:42:1234".into());
+        let stale = MessageId("imap-uid:41:1234".into());
+        assert_eq!(ImapBackend::uid_from_id(&valid).unwrap(), 1234);
+        assert!(backend.check_uid_generation(&valid).is_ok());
+        assert!(backend.check_uid_generation(&stale).is_err());
+        backend.selected_uid_validity = None;
+        assert!(backend.check_uid_generation(&valid).is_err());
     }
 
     #[test]

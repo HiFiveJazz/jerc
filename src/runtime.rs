@@ -2,7 +2,7 @@ use std::io::{self, Stdout, Write};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::{self, KeyEventKind};
@@ -63,10 +63,21 @@ fn create_workers(config: &Config, runtime_tx: SyncSender<RuntimeEvent>) -> Resu
         .enumerate()
         .map(|(index, account)| {
             let backend = backend::from_account(account)?;
+            // An independent IMAP session for background STATUS checks keeps
+            // unread-count discovery from blocking the interactive connection.
+            // Maildir checks are local and don't need a second worker.
+            let status_backend = if account.source.starts_with("imaps://")
+                || account.source.starts_with("imaps+")
+            {
+                Some(backend::from_account(account)?)
+            } else {
+                None
+            };
             let sender = outgoing::from_account(account)?;
             Ok(WorkerHandle::spawn(
                 index,
                 backend,
+                status_backend,
                 sender,
                 runtime_tx.clone(),
             ))

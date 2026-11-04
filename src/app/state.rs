@@ -12,6 +12,7 @@ use ratatui::layout::Size;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
 use crate::app::{Command, Focus, HELP_ENTRIES, command_for_key};
+use crate::cache::{self, CachedMailbox};
 use crate::config::Config;
 use crate::mail::{parse_body, render_html_for_terminal};
 use crate::outgoing::{ReplyAudience, reply_recipients, reply_subject, forward_subject, inline_forward_parts, forward_html, forward_attribution, FORWARD_SEPARATOR};
@@ -1479,15 +1480,6 @@ struct PendingCompose {
     intent: ComposeIntent,
 }
 
-#[derive(Debug, Clone)]
-struct CachedMailbox {
-    messages: Vec<MessageSummary>,
-    bodies: HashMap<MessageId, MessageBody>,
-    message_index: usize,
-    message_view_offset: usize,
-    next_page_offset: usize,
-    has_more: bool,
-}
 
 pub struct AccountState {
     pub name: String,
@@ -1514,7 +1506,12 @@ pub struct AccountState {
     pub next_page_offset: usize,
     pub has_more: bool,
     pub page_inflight: Option<(String, usize)>,
+    page_request_id: Option<u64>,
+    body_request_id: Option<u64>,
     mailbox_cache: HashMap<String, CachedMailbox>,
+    cache_writer: Option<cache::Writer>,
+    uid_validities: HashMap<String, u32>,
+    unverified_mailboxes: HashSet<String>,
     pub search_query: String,
     pub search_editing: bool,
     pub bodies: HashMap<MessageId, MessageBody>,
@@ -1633,6 +1630,7 @@ impl AccountState {
         let Some(name) = self.current_mailbox.clone() else {
             return;
         };
+        let uid_validity = self.uid_validities.get(&name).copied();
         self.mailbox_cache.insert(
             name,
             CachedMailbox {
@@ -1642,8 +1640,31 @@ impl AccountState {
                 message_view_offset: self.message_view_offset,
                 next_page_offset: self.next_page_offset,
                 has_more: self.has_more,
+                uid_validity,
             },
         );
+    }
+
+    fn persist_mailboxes(&self) {
+        if let Some(writer) = &self.cache_writer {
+            writer.send(cache::Change::Mailboxes(self.mailboxes.clone()));
+        }
+    }
+
+    fn persist_current_cache(&mut self) {
+        self.save_current_cache();
+        let Some(name) = self.current_mailbox.as_ref() else { return; };
+        if let (Some(writer), Some(cached)) = (&self.cache_writer, self.mailbox_cache.get(name)) {
+            if cached.uid_validity.is_some() && !self.unverified_mailboxes.contains(name) {
+                writer.send(cache::Change::Folder(name.clone(), cached.clone()));
+            }
+        }
+    }
+
+    fn remove_persistent_folder(&self, name: &str) {
+        if let Some(writer) = &self.cache_writer {
+            writer.send(cache::Change::RemoveFolder(name.to_owned()));
+        }
     }
 
     fn restore_cached_mailbox(&mut self, name: &str) -> bool {
@@ -1658,6 +1679,8 @@ impl AccountState {
         self.next_page_offset = cached.next_page_offset;
         self.has_more = cached.has_more;
         self.page_inflight = None;
+        self.page_request_id = None;
+        self.body_request_id = None;
         self.messages_loading = false;
         self.preview_scroll = 0;
         self.preview_max_scroll = 0;
@@ -1672,6 +1695,7 @@ impl AccountState {
     fn invalidate_current_cache(&mut self) {
         if let Some(name) = self.current_mailbox.as_ref() {
             self.mailbox_cache.remove(name);
+            self.remove_persistent_folder(name);
         }
     }
 
@@ -1711,17 +1735,15 @@ impl AccountState {
             return false;
         }
         let pending_name = name.clone();
-        if self
-            .worker
-            .post(ActionKind::OpenMailbox {
-                name,
-                offset,
-                limit: self.page_size,
-            })
-            .is_ok()
-        {
+        if let Ok(request_id) = self.worker.post(ActionKind::OpenMailbox {
+            name,
+            offset,
+            limit: self.page_size,
+        }) {
             self.page_inflight = Some((pending_name, offset));
+            self.page_request_id = Some(request_id);
             self.messages_loading = offset == 0;
+            crate::perf::record_request("ui_mailbox_request", request_id, None, Duration::ZERO, true);
             true
         } else {
             false
@@ -1745,17 +1767,16 @@ impl AccountState {
         let Some(id) = self.selected_message().map(|m| m.id.clone()) else {
             return;
         };
-        if self.bodies.contains_key(&id) || self.pending_bodies.contains(&id) {
+        if self.bodies.contains_key(&id) || self.pending_bodies.contains(&id)
+            || self.unverified_mailboxes.contains(&mailbox)
+        {
             return;
         }
-        if self
-            .worker
-            .post(ActionKind::FetchBody {
-                mailbox,
-                id: id.clone(),
-            })
-            .is_ok()
-        {
+        if let Ok(request_id) = self.worker.post(ActionKind::FetchBody {
+            mailbox,
+            id: id.clone(),
+        }) {
+            self.body_request_id = Some(request_id);
             // Only the newest requested reader body matters. The worker coalesces
             // queued body fetches to the newest opened selection; mirror that here so
             // discarded requests cannot leave a permanent "loading" marker.
@@ -1944,13 +1965,19 @@ impl App {
             .accounts
             .iter()
             .zip(workers)
-            .map(|(config, worker)| AccountState {
+            .map(|(config, worker)| {
+                let (snapshot, cache_writer) = cache::open(config);
+                let uid_validities = snapshot.folders.iter().filter_map(|(name, folder)| {
+                    folder.uid_validity.map(|validity| (name.clone(), validity))
+                }).collect();
+                let unverified_mailboxes = snapshot.folders.keys().cloned().collect();
+                let mut account = AccountState {
                 name: config.name.clone(),
                 default_mailbox: config.default_mailbox.clone(),
                 from: crate::outgoing::sender_from_account(config),
                 outgoing_configured: config.outgoing.is_some(),
                 capabilities: None,
-                mailboxes: Vec::new(),
+                mailboxes: snapshot.mailboxes,
                 mailbox_index: 0,
                 mailbox_view_offset: 0,
                 mailbox_view_height: 1,
@@ -1972,7 +1999,12 @@ impl App {
                 next_page_offset: 0,
                 has_more: false,
                 page_inflight: None,
-                mailbox_cache: HashMap::new(),
+                page_request_id: None,
+                body_request_id: None,
+                mailbox_cache: snapshot.folders,
+                cache_writer,
+                uid_validities,
+                unverified_mailboxes,
                 search_query: String::new(),
                 search_editing: false,
                 bodies: HashMap::new(),
@@ -1990,6 +2022,14 @@ impl App {
                 restore_message_index: None,
                 pending_mutations: 0,
                 worker,
+                };
+                if let Some(index) = account.mailboxes.iter().position(|m| m.name == account.default_mailbox) {
+                    account.mailbox_index = index;
+                }
+                if let Some(name) = account.selected_mailbox().map(|mailbox| mailbox.name.clone()) {
+                    let _ = account.restore_cached_mailbox(&name);
+                }
+                account
             })
             .collect();
         let themes = load_themes();
@@ -2413,6 +2453,7 @@ impl App {
                     .clone()
                     .unwrap_or_else(|| account.default_mailbox.clone());
                 account.mailboxes = mailboxes;
+                account.persist_mailboxes();
                 account.mailbox_index = account
                     .mailboxes
                     .iter()
@@ -2430,18 +2471,20 @@ impl App {
                     .map(|mailbox| mailbox.name.clone())
                 {
                     account.queue_unknown_mailbox_statuses(Some(&name));
-                    if account.current_mailbox.as_deref() != Some(name.as_str()) {
-                        if !account.restore_cached_mailbox(&name) {
-                            account.current_mailbox = Some(name.clone());
-                            account.messages.clear();
-                            account.bodies.clear();
-                            account.message_index = 0;
-                            account.message_view_offset = 0;
-                            account.next_page_offset = 0;
-                            account.has_more = false;
-                            let _ = account.request_mailbox_page(name, 0);
-                        }
-                    } else if account.messages.is_empty() && account.page_inflight.is_none() {
+                    if account.current_mailbox.as_deref() != Some(name.as_str())
+                        && !account.restore_cached_mailbox(&name)
+                    {
+                        account.current_mailbox = Some(name.clone());
+                        account.messages.clear();
+                        account.bodies.clear();
+                        account.message_index = 0;
+                        account.message_view_offset = 0;
+                        account.next_page_offset = 0;
+                        account.has_more = false;
+                    }
+                    // Cached rows remain visible while the first-page refresh
+                    // runs on the interactive IMAP worker.
+                    if account.page_inflight.is_none() {
                         let _ = account.request_mailbox_page(name, 0);
                     }
                 }
@@ -2473,6 +2516,7 @@ impl App {
                     // A cached Inbox from another tab is now stale even if the
                     // user is browsing a different mailbox/account.
                     account.mailbox_cache.remove(&name);
+                    account.remove_persistent_folder(&name);
                     self.status = StatusLine::temporary(format!(
                         "{} new message(s) in {}", new_count, account.name,
                     ), Duration::from_secs(6));
@@ -2494,16 +2538,43 @@ impl App {
                         }
                     }
                 }
+                account.persist_mailboxes();
                 Self::pump_mailbox_status(account);
             }
             WorkerEventKind::MailboxOpened {
                 name,
                 page,
+                uid_validity,
                 elapsed_micros,
             } => {
+                // A newer folder/page request supersedes this result even if
+                // both requests happen to name the same mailbox.
+                if account.page_request_id != Some(event.request_id) {
+                    crate::perf::record_request("ui_mailbox_stale", event.request_id, None, Duration::ZERO, true);
+                    return;
+                }
+                account.page_request_id = None;
                 let first_page = page.offset == 0;
+                let previous_validity = account.uid_validities.get(&name).copied();
+                let generation_changed = first_page && previous_validity.is_some()
+                    && previous_validity != uid_validity;
+                if generation_changed {
+                    // Cached UIDs may point to entirely different emails after
+                    // a server UIDVALIDITY reset: drop all old derived data.
+                    account.mailbox_cache.remove(&name);
+                    account.remove_persistent_folder(&name);
+                    account.bodies.clear();
+                }
+                if let Some(validity) = uid_validity {
+                    account.uid_validities.insert(name.clone(), validity);
+                } else {
+                    account.uid_validities.remove(&name);
+                }
+                account.unverified_mailboxes.remove(&name);
                 let selected_name = account.selected_mailbox().map(|mailbox| mailbox.name.clone());
                 if selected_name.as_deref() != Some(name.as_str()) {
+                    account.page_inflight = None;
+                    account.messages_loading = false;
                     if page.offset == 0 {
                         account.mailbox_cache.insert(
                             name,
@@ -2514,6 +2585,7 @@ impl App {
                                 message_view_offset: 0,
                                 next_page_offset: page.next_offset,
                                 has_more: page.has_more,
+                                uid_validity,
                             },
                         );
                     }
@@ -2530,9 +2602,12 @@ impl App {
                     account.page_inflight = None;
                 }
                 account.messages_loading = false;
+                crate::perf::record_request("ui_mailbox_applied", event.request_id, None, Duration::ZERO, true);
                 account.current_mailbox = Some(name.clone());
                 if page.offset == 0 {
-                    let selected_id = account.selected_message().map(|message| message.id.clone());
+                    let selected_id = (!generation_changed)
+                        .then(|| account.selected_message().map(|message| message.id.clone()))
+                        .flatten();
                     account.messages = page.messages;
                     account.message_index = selected_id
                         .and_then(|id| account.messages.iter().position(|message| message.id == id))
@@ -2571,9 +2646,11 @@ impl App {
                     account.smooth_message_target = None;
                     account.smooth_preview_target = None;
                     account.pending_bodies.clear();
+                    account.body_request_id = None;
                     account.pending_seen.clear();
                 }
                 account.last_scan_micros = Some(elapsed_micros);
+                account.persist_current_cache();
                 account.clamp_selection();
                 account.normalize_search_selection();
                 let visible = account.visible_message_indices();
@@ -2627,10 +2704,31 @@ impl App {
                 account.queue_unknown_mailbox_statuses(selected_mailbox.as_deref());
                 Self::pump_mailbox_status(account);
             }
+            WorkerEventKind::MailboxOpenFailed { name, error } => {
+                if account.page_request_id != Some(event.request_id) {
+                    crate::perf::record_request("ui_mailbox_stale", event.request_id, None, Duration::ZERO, false);
+                    return;
+                }
+                account.page_request_id = None;
+                account.page_inflight = None;
+                account.messages_loading = false;
+                self.status = StatusLine::error(format!("{}: could not open {name}: {error}", account.name));
+            }
+            WorkerEventKind::BodyLoadFailed { error } => {
+                if account.body_request_id != Some(event.request_id) { return; }
+                account.body_request_id = None;
+                account.pending_bodies.clear();
+                self.status = StatusLine::error(format!("{}: could not load email: {error}", account.name));
+            }
             WorkerEventKind::BodyLoaded(body) => {
+                if account.body_request_id != Some(event.request_id) {
+                    return;
+                }
+                account.body_request_id = None;
                 let id = body.id.clone();
                 account.pending_bodies.remove(&id);
                 account.bodies.insert(id.clone(), body);
+                account.persist_current_cache();
 
                 if (self.message_open || self.preview_split)
                     && account
@@ -2715,6 +2813,8 @@ impl App {
                         }
                     }
                 }
+                account.persist_current_cache();
+                account.persist_mailboxes();
             }
             WorkerEventKind::MutationComplete => {
                 account.pending_mutations = account.pending_mutations.saturating_sub(1);
@@ -2730,6 +2830,7 @@ impl App {
                 // Refresh cached Drafts on the next visit, or immediately if
                 // the user is already browsing that folder.
                 account.mailbox_cache.remove(&mailbox);
+                account.remove_persistent_folder(&mailbox);
                 if let Some(folder) = account.mailboxes.iter_mut()
                     .find(|folder| folder.name == mailbox) {
                     folder.counts_known = false;
@@ -2764,6 +2865,7 @@ impl App {
                     .collect::<Vec<_>>();
                 for name in &affected {
                     account.mailbox_cache.remove(name);
+                    account.remove_persistent_folder(name);
                     if let Some(mailbox) = account
                         .mailboxes
                         .iter_mut()
@@ -2812,6 +2914,12 @@ impl App {
                 };
             }
             WorkerEventKind::Error(error) => {
+                if account.mailbox_status_inflight == Some(event.request_id) {
+                    account.mailbox_status_inflight = None;
+                    // Background count lookup failure is nonfatal: keep the
+                    // current mailbox, reader, and interactive loading alive.
+                    return;
+                }
                 if account.inbox_poll_inflight == Some(event.request_id) {
                     // Background STATUS is best-effort: a transient server
                     // failure must not cancel an in-progress preview/compose
@@ -2830,12 +2938,19 @@ impl App {
                 account.inbox_poll_inflight = None;
                 account.connecting = false;
                 account.mailboxes_loading = false;
-                account.messages_loading = false;
-                account.page_inflight = None;
+                // A failure in an unrelated mutation/compose request must not
+                // cancel a currently loading mailbox or email. Navigation has
+                // dedicated error variants above and is correlated by ID.
+                if account.page_request_id.is_none() {
+                    account.messages_loading = false;
+                    account.page_inflight = None;
+                }
                 if account.mailbox_status_inflight == Some(event.request_id) {
                     account.mailbox_status_inflight = None;
                 }
-                account.pending_bodies.clear();
+                if account.body_request_id.is_none() {
+                    account.pending_bodies.clear();
+                }
                 account.pending_seen.clear();
                 if self
                     .pending_compose
@@ -3238,7 +3353,7 @@ impl App {
             return;
         }
         if let Some(account) = self.account_mut() {
-            account.save_current_cache();
+            account.persist_current_cache();
         }
         self.count_prefix = None;
         self.message_open = false;
@@ -3314,7 +3429,7 @@ impl App {
         let Some(account) = self.account_mut() else {
             return;
         };
-        account.save_current_cache();
+        account.persist_current_cache();
         account.smooth_mailbox_target = None;
         let previous = account.mailbox_index;
         account.mailbox_index = bounded_index(account.mailbox_index, account.mailboxes.len(), delta);
@@ -3337,6 +3452,9 @@ impl App {
         account.search_editing = false;
         account.queue_unknown_mailbox_statuses(Some(&name));
         if account.restore_cached_mailbox(&name) {
+            // Don't trade instant rendering for stale data: refresh the first
+            // page on the worker while the cached view stays on screen.
+            let _ = account.request_mailbox_page(name, 0);
             if preview_split {
                 account.request_selected_body();
             }
@@ -3347,9 +3465,11 @@ impl App {
         account.messages.clear();
         account.bodies.clear();
         account.pending_bodies.clear();
+        account.body_request_id = None;
         account.next_page_offset = 0;
         account.has_more = false;
         account.page_inflight = None;
+        account.page_request_id = None;
         let _ = account.request_mailbox_page(name, 0);
     }
 
@@ -4201,7 +4321,7 @@ impl App {
                 };
                 self.start_mutation(confirmation.source, confirmation.ids, confirmation.kind);
             }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') => {
                 self.confirmation = None;
                 self.status = StatusLine::temporary("delete cancelled", Duration::from_secs(2));
             }
@@ -4281,6 +4401,7 @@ impl App {
                 || source.to_ascii_lowercase().starts_with("[googlemail]/"))
         {
             account.mailbox_cache.remove(destination);
+            account.remove_persistent_folder(destination);
             if let Some(mailbox) = account.mailboxes.iter_mut()
                 .find(|mailbox| mailbox.name == *destination && mailbox.counts_known)
             {
@@ -4316,6 +4437,7 @@ impl App {
             // a server response containing their destination UIDs. Drop only
             // that cache; the active source list stays updated locally.
             account.mailbox_cache.remove(destination);
+            account.remove_persistent_folder(destination);
             if let Some(mailbox) = account
                 .mailboxes
                 .iter_mut()
@@ -4326,6 +4448,8 @@ impl App {
             }
         }
         account.normalize_search_selection();
+        account.persist_current_cache();
+        account.persist_mailboxes();
     }
 
     fn begin_search(&mut self) {
@@ -4950,6 +5074,7 @@ impl App {
         if let Some(name) = account.current_mailbox.clone() {
             account.invalidate_current_cache();
             account.page_inflight = None;
+            account.page_request_id = None;
             account.restore_message_index = Some(account.message_index);
             let _ = account.request_mailbox_page(name, 0);
         }
@@ -5027,7 +5152,7 @@ impl App {
                     if let Some(composer) = self.composer.as_mut() { composer.exit_prompt = false; }
                     self.postpone_composer();
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') => {
+                KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.composer = None;
                     self.resumed_draft_account = None;
                     self.status = StatusLine::temporary("unsent email discarded", Duration::from_secs(2));
