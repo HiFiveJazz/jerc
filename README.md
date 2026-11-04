@@ -17,7 +17,7 @@ A Rust terminal email client inspired by aerc's backend/worker model and lazygit
 - **Compose polish:** `j/k` in Normal mode moves through To/Cc/Bcc/Subject and enters Body, where Vim motions remain unchanged. The attachment picker now matches lazygitrs's three-pane Parent/Files/Preview layout with themed full-row selection, relative line numbers, file text previews, count motions and Ctrl-j/k smooth scrolling. `Space` selects files, `Ctrl+A` opens the picker (listed in `?`, not the footer). Attachments wrap to three rows before ellipsizing; empty fields are muted and filled ones use theme accents. `Enter` in Normal opens a full outgoing-message review with headers, recipients, attachments and body; `T` toggles HTML/plain for inline HTML forwards, `O` opens the outgoing HTML in a browser, `j/k` scroll, `Enter` sends and `Esc` edits.
 - **Modal compose/reply/forward:** the composer has NORMAL, INSERT, and VISUAL modes, with lazygitrs-style filled mode badges (blue, light green, and purple) in its bottom-right footer, white block cursor outside Insert mode, relative body line numbers, expanded Vim motions/text objects/undo, and a searchable compose `?` keymap plus concise footer hints. `Tab`/`Shift-Tab` cycles To → Cc → Bcc → Subject → Body. `Ctrl+A` opens a directory picker where Space/Enter adds or removes files; `Ctrl+O` opens advanced options for custom headers. `Enter` from NORMAL opens a centered send-confirmation popup; Ctrl-S is not used. `r` replies without quoted text, `R` uses an aerc-style dated attribution plus gray quoted text, `A` replies to all (minus own identities), `L` replies to List-Post, and `f` forwards with a Gmail-style original From/Date/Subject/To/Cc attribution and the original plain/HTML contents inline with MIME attachments preserved instead of attaching `forwarded.eml`. The original MIME bytes remain available to the composer for drafts and extraction.
 - **Compose attachments:** selected files are kept with postponed local drafts and sent as normal MIME attachments (16 MiB per file). Files with spaces or semicolons in their names are supported. The three-pane picker uses j/k, h/l, Backspace, Space/Enter and Esc, and does not depend on an external file manager. Press `v`, move with counted motions (such as `5j`), and use Enter to attach or `x` to detach the highlighted range; `Space` also detaches a visual range when all its files are already attached (folders are skipped); the selection has a blue side marker. Press `/` to search folders in the current directory (or files when no folder matches), Down/Up to cycle suggestions, Enter to finish searching on the selected item, Tab to open a matching folder, and Esc to leave search. Space advances except on the last row. Press `?` inside the picker for its full searchable keymap. `Ctrl+D` in compose opens a separate list of attachments from all directories; j/k moves, `x` or `d` detaches, and Esc closes it. PNG/JPEG/GIF/WebP images preview inside the picker; first-page PDF thumbnails require Poppler's `pdftoppm` (package `poppler` on Arch Linux). PDF thumbnails now render asynchronously after a short debounce and are cached during the picker session, so fast navigation does not wait for Poppler. Other file types retain the text/binary preview.
-- **Attachments:** IMAP headers are fetched with BODYSTRUCTURE so filenames and the separate theme-yellow `⧉` marker appear in the message browser without opening the email; rows with attachments show a second, muted filename line. The MIME parser remains authoritative after a body is loaded, preventing false positives from `multipart/mixed` wrappers. The reader shows decoded attachment filenames under the subject; `z` opens a proper attachment list. Image preview uses the same terminal graphics picker; PDF and other files are extracted to a private temporary file and opened using the OS file handler. External opener stdout/stderr are suppressed.
+- **Received attachments:** IMAP headers are fetched with BODYSTRUCTURE so filenames and the separate theme-yellow `⧉` marker appear in the message browser without opening the email; rows with attachments show a second, muted filename line. The MIME parser remains authoritative after a body is loaded. `z` opens the received-attachment browser: a left-side list with relative line numbers, Space marks and `v`/`V` range selection, and a right-side automatic image/text preview. `o`/Enter opens the highlighted file with the system handler. `s` prompts for a save directory, and saves every marked file (or just the highlighted one), without overwriting existing files and without trusting MIME filename paths. PDF/binary attachments show metadata and an Open action; received PDF thumbnails are not yet inlined. Terminal graphics decode is cached per selection instead of repeated on every frame.
 - **Mailing-list patches:** unified Git diff additions, deletions, headers and hunk ranges are styled distinctly, including `> `-quoted patches.
 - **New-mail updates:** Inbox STATUS is checked by background mail workers every 20 seconds by default, without blocking navigation. Desktop notifications are enabled by default using `notify-send`, with a `message-new-email` freedesktop sound-name hint for COSMIC or other configured sound themes (actual audio playback depends on the notification daemon). When the known Inbox count rises, its cache is invalidated and the visible Inbox is refreshed. `B` toggles an optional terminal bell (off by default); the terminal determines whether the BEL control character makes a sound. This is a lightweight polling fallback, not IMAP IDLE; if new and deleted mail cancel out in a single interval, a count-only poll may miss the arrival.
 - **Reader envelope:** displays Date, To, and any Cc/Bcc headers physically present in the mail. Bcc must not be guessed in recipient copies.
@@ -81,7 +81,9 @@ new_mail_notifications = true # requires notify-send and a notification daemon
 new_mail_sound_name = "message-new-email" # name in your active freedesktop/COSMIC sound theme
 ```
 
-`page_size` controls interactive pagination. Existing `max_messages` settings are retained for compatibility/headless checks and no longer make the TUI wait for one giant initial fetch. Add more `[[accounts]]` blocks to the same config to use multiple accounts; `[ / ]` rotates accounts and the top tab bar shows the active one.
+`page_size` controls interactive pagination. Existing `max_messages` settings are retained for compatibility/headless checks and no longer make the TUI wait for one giant initial fetch. Add more `[[accounts]]` blocks to the same config to use multiple accounts. `Alt-n`/`Alt-p` cycles accounts; `Alt-1` through `Alt-9` jumps directly to an account. `[ / ]` and Ctrl-PageUp/Ctrl-PageDown also switch accounts; click an account in the top tab bar to select it. Account switches preserve each account's mailbox and cached state.
+
+Invalid `outgoing` URLs no longer prevent startup: receiving remains available on that account, but sending is disabled until you fix its SMTP configuration. An invalid incoming `source` causes only that account to be skipped, provided another account is usable. Look for the persistent configuration-issues indicator in the top tab bar and press `!` for actionable, credential-redacted warnings. If **every** incoming account is invalid, startup still fails with a safe error.
 
 ## Main controls
 
@@ -92,9 +94,9 @@ Press `?` for the searchable complete map. Common controls:
 - `d` confirmed trash/delete; `D` immediate trash/delete; `a` archive; `U` restore an archived message to INBOX.
 - `/` filter current mailbox; `b` sidebar; `P` vertical preview; `Enter` full reader.
 - `r` reply without quote; `R` reply with quote; `A` reply all; `L` list reply; `f` inline forward; `c` compose.
-- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser. `m` toggles the Message-ID header. `z` in the reader or message list opens attachments, `p` previews decoded images in-terminal and Enter opens with `xdg-open` (on Linux).
+- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser. `m` toggles the Message-ID header. `z` opens received attachments with automatic previews; `j/k` moves, Space marks and advances, `v` selects a range then Space marks it, `a` marks/unmarks all, `o`/Enter opens, and `s` saves marked files to an entered directory. Clicking a filename previews it; footer Open/Save/Mark actions are mouse-clickable. The mailbox divider can be dragged to resize, or use Alt-h/Alt-l to adjust it from the keyboard.
 - In composer, Tab/Shift-Tab visits To, Cc, Bcc, Subject and Body. Ctrl+A opens an internal multi-select attachment picker (Space/Enter toggles files, h/Backspace moves to parent, l enters folders, . shows hidden files, Esc closes). Ctrl+O edits optional custom headers in advanced options (`X-Header: value; ...`). In NORMAL press `?` for the searchable compose-only shortcuts (`gg/G`, `w/W/b/B/e/E`, `vi` text objects, `dd/dw`, `f/F`, `o/O`, `u/Ctrl-r`, Visual and more). Enter shows a centered send confirmation; Ctrl-p postpones locally; Ctrl-n resumes the active account’s postponed draft. These are local files, not IMAP Drafts synchronization.
-- `[ / ]` previous/next account; `Ctrl-r` refreshes the current mailbox; `B` toggles the optional terminal bell. Desktop notifications can be toggled separately with `ui.new_mail_notifications`.
+- `Alt-n`/`Alt-p` next/previous account; `Alt-1`–`Alt-9` direct account selection; `[ / ]` and Ctrl-PageUp/PageDown also navigate, or click the top account tabs. `!` reviews configuration warnings; `Ctrl-r` refreshes the current mailbox; `B` toggles the optional terminal bell. Desktop notifications can be toggled separately with `ui.new_mail_notifications`.
 
 ## Themes
 
@@ -219,3 +221,29 @@ folder. The first launch and genuinely uncached messages remain subject to
 Gmail/IMAP latency. To clear private cached data, stop aerc-rs and remove
 `~/.cache/aerc-rs/mail-index/`. Set `AERC_RS_DISABLE_CACHE=1` when
 benchmarking the uncached behavior without deleting previously saved data.
+
+### Received attachment browser (PDF thumbnails and save destinations)
+
+In the reader, `z` opens received attachments. The left list uses full-width
+current-line highlighting, relative line numbers, `5j`/`5k`, `gg`/`G`, and
+100 FPS Ctrl-j/Ctrl-k smooth navigation. Space marks files and advances; `v`
+starts a visual range; Space marks the range; `a` marks all. `o` opens the
+selected attachment with the system viewer.
+
+Images and the **first page of PDFs** appear automatically on the right using
+the same terminal graphics protocol as the compose file picker. PDFs require
+Poppler's `pdftoppm` command (Arch: `sudo pacman -S poppler`). Rendering and
+image decoding run in a background thread, with a short debounce and an
+8-thumbnail cache; navigating the list never runs a PDF converter in the
+foreground. Opening the same message's attachment browser again can reuse
+up to 24 MiB of recently parsed attachments across six messages in memory,
+keyed by account, mailbox, UIDVALIDITY and message ID. First-time attachment
+fetches still use the provider's IMAP/other backend and can take longer.
+
+`s` opens a three-pane destination browser shared with the compose picker.
+Use `j/k` or counted motions to select folders, `l`/Enter to enter a folder,
+`h` to go to its parent, `.` for hidden entries, `n` to create a directory,
+and **`s` again to save** all marked attachments (or the highlighted one) into
+the current folder. Existing files are never overwritten; collisions get
+numbered filenames. The destination browser never reads file contents or
+launches thumbnails merely to choose a folder.

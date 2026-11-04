@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 
 use crate::config::AccountConfig;
-use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage};
+use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage, MessageSummary};
 
 pub use imap::{ImapBackend, ImapSource};
 pub use maildir::MaildirBackend;
@@ -82,6 +82,26 @@ pub fn redact_source(source: &str) -> String {
     }
 }
 
+/// Previously displayed IMAP summaries. UIDs may only be reused after a
+/// fresh SELECT confirms that UIDVALIDITY has not changed. This hint is
+/// deliberately metadata-only: message bodies never cross the worker queue.
+#[derive(Clone)]
+pub struct MailboxSyncHint {
+    pub uid_validity: u32,
+    pub uid_next: Option<u32>,
+    pub messages: Vec<MessageSummary>,
+}
+
+impl std::fmt::Debug for MailboxSyncHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailboxSyncHint")
+            .field("uid_validity", &self.uid_validity)
+            .field("uid_next", &self.uid_next)
+            .field("cached_message_count", &self.messages.len())
+            .finish()
+    }
+}
+
 pub trait MailBackend: Send {
     fn capabilities(&self) -> Capabilities;
     fn connect(&mut self) -> Result<()>;
@@ -89,7 +109,14 @@ pub trait MailBackend: Send {
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)>;
     /// UIDVALIDITY from the currently selected mailbox, if provided by IMAP.
     fn mailbox_uid_validity(&self, _name: &str) -> Option<u32> { None }
+    fn mailbox_uid_next(&self, _name: &str) -> Option<u32> { None }
     fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage>;
+    /// Optional metadata-only optimization; Maildir and older backends use
+    /// the regular open path without any protocol-specific coupling.
+    fn open_mailbox_with_hint(&mut self, name: &str, offset: usize, limit: usize,
+        _hint: Option<MailboxSyncHint>) -> Result<MessagePage> {
+        self.open_mailbox(name, offset, limit)
+    }
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody>;
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>>;
     /// Append an already-built RFC 5322 message to a mailbox. Outgoing mail uses

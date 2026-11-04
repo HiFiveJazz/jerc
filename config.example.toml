@@ -11,7 +11,9 @@ source = "maildir://~/Mail/kernel"
 default_mailbox = "INBOX"
 
 # Gmail / normal IMAPS with an app password + SMTP submission.
-# Add as many [[accounts]] blocks as needed; use [ / ] in the TUI to rotate them.
+# Add as many [[accounts]] blocks as needed. Use Alt-n / Alt-p to rotate
+# accounts, Alt-1..Alt-9 to choose one, or click its tab. Press ! for
+# config warnings; a bad outgoing SMTP URL disables sending but not reading.
 # [[accounts]]
 # name = "Personal"
 # source = "imaps://you%40gmail.com@imap.gmail.com:993"
@@ -43,8 +45,10 @@ default_mailbox = "INBOX"
 # outgoing = "smtps://you%40gmail.com:APP_PASSWORD@smtp.gmail.com:465"
 
 [ui]
-# Browser layout. `b` toggles the mailbox sidebar and `P` toggles a vertical preview.
-mailbox_width_percent = 33
+# Browser layout. Drag the mailbox divider, or press Alt-h / Alt-l to resize.
+# Width is remembered in ~/.config/aerc-rs/mailbox-width after an adjustment.
+# `b` toggles the sidebar; `p` toggles the message preview.
+mailbox_width_percent = 22
 
 # Initial theme. Press `t` in the TUI to preview/switch themes live; the chosen
 # theme is persisted in the aerc-rs config directory and overrides this value.

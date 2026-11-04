@@ -7,12 +7,13 @@ use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
 use ratatui::layout::Size;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
 use crate::app::{Command, Focus, HELP_ENTRIES, command_for_key};
 use crate::cache::{self, CachedMailbox};
+use crate::backend::MailboxSyncHint;
 use crate::config::Config;
 use crate::mail::{parse_body, render_html_for_terminal};
 use crate::outgoing::{ReplyAudience, reply_recipients, reply_subject, forward_subject, inline_forward_parts, forward_html, forward_attribution, FORWARD_SEPARATOR};
@@ -30,6 +31,76 @@ const MAX_COUNT_PREFIX: usize = 99_999;
 const MESSAGE_SCROLL_OFF: usize = 4;
 const READER_SCROLL_OFF: usize = 3;
 const PAGE_PREFETCH_MIN: usize = 48;
+// Ordinary navigation needs a small working set. Ctrl-j/k temporarily expands
+// the window around its destination instead of eagerly fetching 42 bodies for
+// every selected row. PEEK never changes the read state.
+const BODY_PREFETCH_FORWARD: usize = 12;
+const BODY_PREFETCH_BACKWARD: usize = 6;
+const BODY_PREFETCH_FAST_FORWARD: usize = 22;
+const BODY_PREFETCH_FAST_BACKWARD: usize = 8;
+const PREFETCH_WINDOW_REARM_ROWS: usize = 12;
+const MAX_CACHED_PREVIEW_BODIES: usize = 80;
+const MAX_CACHED_PREVIEW_BYTES: usize = 48 * 1024 * 1024;
+// Avoid silently downloading giant attachments simply because the cursor is
+// near a message. The user can still fetch any large message explicitly.
+const MAX_PREFETCH_MESSAGE_BYTES: u64 = 1024 * 1024;
+const MAX_PREFETCH_WINDOW_RAW_BYTES: u64 = 8 * 1024 * 1024;
+
+fn preview_body_bytes(body: &MessageBody) -> usize {
+    let text = [
+        body.plain_text.as_ref(), body.plain_fallback.as_ref(),
+        body.html_source.as_ref(), body.html_text.as_ref(),
+    ].into_iter().flatten().map(String::len).sum::<usize>();
+    let rich = body.html_lines.as_ref().map_or(0, |lines| lines.iter().flat_map(|line| &line.spans)
+        .map(|span| span.text.len()
+            + span.style.link.as_ref().map_or(0, String::len)
+            + span.style.image.as_ref().map_or(0, String::len))
+        .sum::<usize>());
+    text.saturating_add(rich)
+}
+
+fn preview_neighbor_positions(position: usize, count: usize, direction: isize, fast: bool) -> Vec<usize> {
+    if position >= count { return Vec::new(); }
+    let (forward, backward) = if fast {
+        (BODY_PREFETCH_FAST_FORWARD, BODY_PREFETCH_FAST_BACKWARD)
+    } else {
+        (BODY_PREFETCH_FORWARD, BODY_PREFETCH_BACKWARD)
+    };
+    let (ahead, behind) = if direction < 0 { (backward, forward) } else { (forward, backward) };
+    let after = (1..=ahead).filter_map(|distance| position.checked_add(distance))
+        .filter(|index| *index < count);
+    let before = (1..=behind).filter_map(|distance| position.checked_sub(distance));
+    if direction < 0 { before.chain(after).collect() }
+    else { after.chain(before).collect() }
+}
+
+/// Put imminent rows first, but also schedule the destination early enough
+/// that a long neoscroll has a chance to arrive on a warm body. Never preload
+/// unrelated rows between a far-away destination and the current viewport.
+fn preview_travel_positions(position: usize, destination: usize, count: usize) -> Vec<usize> {
+    if position >= count || destination >= count { return Vec::new(); }
+    let direction = if destination < position { -1 } else { 1 };
+    let mut positions = vec![position];
+    for distance in 1..=3 {
+        let next = if direction < 0 { position.checked_sub(distance) }
+            else { position.checked_add(distance).filter(|p| *p < count) };
+        if let Some(next) = next { positions.push(next); }
+    }
+    positions.push(destination);
+    let distance = position.abs_diff(destination);
+    if distance > 4 {
+        // Also warm the row just before arrival, and the next row if the
+        // animation continues after another Ctrl-j/k press.
+        let before = if direction < 0 { destination.checked_add(1) }
+            else { destination.checked_sub(1) };
+        let after = if direction < 0 { destination.checked_sub(1) }
+            else { destination.checked_add(1) };
+        positions.extend(before.into_iter().chain(after).filter(|p| *p < count));
+    }
+    positions.extend(preview_neighbor_positions(destination, count, direction, true));
+    let mut seen = HashSet::new();
+    positions.into_iter().filter(|p| seen.insert(*p)).collect()
+}
 
 /// Only a completed background poll against a known Inbox baseline can
 /// trigger a new-message alert. STATUS counts are not message identities;
@@ -94,7 +165,7 @@ impl StatusLine {
         }
     }
 
-    fn error(text: impl Into<String>) -> Self {
+    pub(crate) fn error(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             is_error: true,
@@ -182,6 +253,8 @@ pub struct ComposeFilePicker {
     pub entries: Vec<ComposeFileEntry>,
     pub selected: usize,
     pub show_hidden: bool,
+    /// Save-to-directory mode: never read or decode file contents.
+    pub directory_only: bool,
     /// Adjacent panes are cached on movement, never loaded by the renderer.
     pub parent_entries: Vec<ComposeFileEntry>,
     pub parent_selected: usize,
@@ -291,11 +364,20 @@ fn validate_picker_attachment(path: &Path) -> anyhow::Result<()> {
 
 impl ComposeFilePicker {
     fn open(directory: PathBuf) -> anyhow::Result<Self> {
+        Self::open_with_mode(directory, false)
+    }
+
+    fn open_directory_only(directory: PathBuf) -> anyhow::Result<Self> {
+        Self::open_with_mode(directory, true)
+    }
+
+    fn open_with_mode(directory: PathBuf, directory_only: bool) -> anyhow::Result<Self> {
         let mut picker = Self {
             directory,
             entries: Vec::new(),
             selected: 0,
             show_hidden: false,
+            directory_only,
             parent_entries: Vec::new(),
             parent_selected: 0,
             preview: ComposeFilePreview::Empty,
@@ -339,6 +421,22 @@ impl ComposeFilePicker {
         // Only the *current* PDF may be scheduled. An in-flight conversion from
         // a previous row can finish in the background but cannot replace this preview.
         self.pdf_preview_due = None;
+        if self.directory_only {
+            // Unlike the compose picker, saving only needs directory contents.
+            // Never block navigation on decoding images or reading file bodies.
+            self.preview = match self.entries.get(self.selected) {
+                None => ComposeFilePreview::Empty,
+                Some(entry) if entry.is_directory => match compose_read_dir(&entry.path, self.show_hidden) {
+                    Ok(entries) => ComposeFilePreview::Directory(entries),
+                    Err(error) => ComposeFilePreview::Error(error.to_string()),
+                },
+                Some(entry) => match std::fs::metadata(&entry.path) {
+                    Ok(metadata) => ComposeFilePreview::Binary(metadata.len()),
+                    Err(error) => ComposeFilePreview::Error(error.to_string()),
+                },
+            };
+            return;
+        }
         self.preview = match self.entries.get(self.selected) {
             None => ComposeFilePreview::Empty,
             Some(entry) if entry.is_directory => match compose_read_dir(&entry.path, self.show_hidden) {
@@ -1508,9 +1606,12 @@ pub struct AccountState {
     pub page_inflight: Option<(String, usize)>,
     page_request_id: Option<u64>,
     body_request_id: Option<u64>,
+    last_prefetch_window: Option<(String, Vec<MessageId>)>,
+    last_prefetch_anchor: Option<(String, usize, isize)>,
     mailbox_cache: HashMap<String, CachedMailbox>,
     cache_writer: Option<cache::Writer>,
     uid_validities: HashMap<String, u32>,
+    uid_nexts: HashMap<String, u32>,
     unverified_mailboxes: HashSet<String>,
     pub search_query: String,
     pub search_editing: bool,
@@ -1631,6 +1732,7 @@ impl AccountState {
             return;
         };
         let uid_validity = self.uid_validities.get(&name).copied();
+        let uid_next = self.uid_nexts.get(&name).copied();
         self.mailbox_cache.insert(
             name,
             CachedMailbox {
@@ -1641,6 +1743,7 @@ impl AccountState {
                 next_page_offset: self.next_page_offset,
                 has_more: self.has_more,
                 uid_validity,
+                uid_next,
             },
         );
     }
@@ -1681,6 +1784,7 @@ impl AccountState {
         self.page_inflight = None;
         self.page_request_id = None;
         self.body_request_id = None;
+        self.last_prefetch_window = None;
         self.messages_loading = false;
         self.preview_scroll = 0;
         self.preview_max_scroll = 0;
@@ -1738,10 +1842,20 @@ impl AccountState {
             return false;
         }
         let pending_name = name.clone();
+        // Give the worker only cached headers (never MIME bodies). It must
+        // validate UIDVALIDITY with the server before reusing even one row.
+        let hint = (offset == 0).then(|| self.mailbox_cache.get(&name))
+            .flatten()
+            .and_then(|folder| folder.uid_validity.map(|uid_validity| MailboxSyncHint {
+                uid_validity,
+                uid_next: folder.uid_next,
+                messages: folder.messages.clone(),
+            }));
         if let Ok(request_id) = self.worker.post(ActionKind::OpenMailbox {
             name,
             offset,
             limit: self.page_size,
+            hint,
         }) {
             self.page_inflight = Some((pending_name, offset));
             self.page_request_id = Some(request_id);
@@ -1770,15 +1884,18 @@ impl AccountState {
         let Some(id) = self.selected_message().map(|m| m.id.clone()) else {
             return;
         };
-        if self.bodies.contains_key(&id) || self.pending_bodies.contains(&id)
-            || self.unverified_mailboxes.contains(&mailbox)
-        {
+        if self.bodies.contains_key(&id) {
+            crate::perf::record("ui_preview_cache_hit", None, Duration::ZERO, true);
+            return;
+        }
+        if self.pending_bodies.contains(&id) || self.unverified_mailboxes.contains(&mailbox) {
             return;
         }
         if let Ok(request_id) = self.worker.post(ActionKind::FetchBody {
             mailbox,
             id: id.clone(),
         }) {
+            crate::perf::record("ui_preview_cache_miss", None, Duration::ZERO, true);
             self.body_request_id = Some(request_id);
             // Only the newest requested reader body matters. The worker coalesces
             // queued body fetches to the newest opened selection; mirror that here so
@@ -1786,6 +1903,106 @@ impl AccountState {
             self.pending_bodies.clear();
             self.pending_bodies.insert(id);
         }
+    }
+
+    /// Queue only nearby, missing preview bodies. A superseding window is
+    /// coalesced by the background worker; the foreground always wins.
+    fn prefetch_near_cursor(&mut self, direction: isize) {
+        let visible = self.visible_message_indices();
+        let Some(position) = visible.iter().position(|index| *index == self.message_index) else {
+            return;
+        };
+        self.prefetch_around_position(position, direction);
+    }
+
+    fn prefetch_around_position(&mut self, position: usize, direction: isize) {
+        self.prefetch_window(position, direction, None);
+    }
+
+    fn prefetch_for_scroll(&mut self, position: usize, destination: usize) {
+        if position == destination { return; }
+        self.prefetch_window(position, if destination < position { -1 } else { 1 }, Some(destination));
+    }
+
+    fn prefetch_window(&mut self, position: usize, direction: isize, destination: Option<usize>) {
+        let Some(mailbox) = self.current_mailbox.clone() else { return; };
+        if self.unverified_mailboxes.contains(&mailbox) { return; }
+        let visible = self.visible_message_indices();
+        if position >= visible.len() { return; }
+        let direction = if direction < 0 { -1 } else { 1 };
+        let destination = destination.filter(|target| *target < visible.len());
+        let anchor = destination.unwrap_or(position);
+        // Keep the existing window while it covers the moving cursor; a new
+        // window every animation frame would cancel almost every useful fetch.
+        if self.last_prefetch_window.is_some()
+            && self.last_prefetch_anchor.as_ref().is_some_and(|(name, last, dir)| {
+                name == &mailbox && *dir == direction
+                    && last.abs_diff(anchor) < PREFETCH_WINDOW_REARM_ROWS
+            }) {
+            return;
+        }
+        let positions = if let Some(target) = destination {
+            preview_travel_positions(position, target, visible.len())
+        } else {
+            std::iter::once(position)
+                .chain(preview_neighbor_positions(position, visible.len(), direction, false))
+                .collect::<Vec<_>>()
+        };
+        let mut raw_bytes = 0u64;
+        let ids = positions.into_iter()
+            .filter_map(|position| self.messages.get(visible[position]))
+            .filter(|message| message.size > 0 && message.size <= MAX_PREFETCH_MESSAGE_BYTES)
+            .filter(|message| !self.bodies.contains_key(&message.id)
+                && !self.pending_bodies.contains(&message.id))
+            .filter(|message| {
+                if raw_bytes.saturating_add(message.size) > MAX_PREFETCH_WINDOW_RAW_BYTES {
+                    false
+                } else {
+                    raw_bytes += message.size;
+                    true
+                }
+            })
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            self.last_prefetch_window = None;
+            self.last_prefetch_anchor = None;
+            return;
+        }
+        let window = (mailbox.clone(), ids.clone());
+        if self.last_prefetch_window.as_ref() == Some(&window) { return; }
+        if self.worker.post(ActionKind::PrefetchBodies { mailbox: mailbox.clone(), ids }).is_ok() {
+            crate::perf::record("ui_prefetch_window_submitted", None, Duration::ZERO, true);
+            self.last_prefetch_window = Some(window);
+            self.last_prefetch_anchor = Some((mailbox, anchor, direction));
+        }
+    }
+
+    /// Bound preloading by both message count and actual decoded-text size.
+    /// A large HTML newsletter may have much more resident data than its raw
+    /// RFC822 size suggests. Keep the current message even if it exceeds budget.
+    fn trim_preview_bodies(&mut self) {
+        let bytes = self.bodies.values().map(preview_body_bytes).sum::<usize>();
+        if self.bodies.len() <= MAX_CACHED_PREVIEW_BODIES && bytes <= MAX_CACHED_PREVIEW_BYTES {
+            return;
+        }
+        let mut ranked = self.messages.iter().enumerate()
+            .filter(|(_, message)| self.bodies.contains_key(&message.id))
+            .map(|(position, message)| (position.abs_diff(self.message_index), message.id.clone()))
+            .collect::<Vec<_>>();
+        ranked.sort_by_key(|(distance, _)| *distance);
+        let mut used = 0usize;
+        let mut keep = HashSet::new();
+        for (_, id) in ranked {
+            let Some(body) = self.bodies.get(&id) else { continue; };
+            let weight = preview_body_bytes(body);
+            if keep.len() >= MAX_CACHED_PREVIEW_BODIES
+                || (!keep.is_empty() && used.saturating_add(weight) > MAX_CACHED_PREVIEW_BYTES)
+            { continue; }
+            used = used.saturating_add(weight);
+            keep.insert(id);
+        }
+        self.bodies.retain(|id, _| keep.contains(id));
     }
 
     fn request_seen(&mut self, id: MessageId, seen: bool) -> bool {
@@ -1905,6 +2122,8 @@ pub struct App {
     pub account_index: usize,
     pub focus: Focus,
     pub status: StatusLine,
+    pub startup_warnings: Vec<String>,
+    pub show_startup_warnings: bool,
     pub should_quit: bool,
     inbox_poll_interval: Duration,
     new_mail_bell_enabled: bool,
@@ -1913,6 +2132,7 @@ pub struct App {
     new_mail_sound_name: String,
     new_mail_notices: VecDeque<(String, usize)>,
     pub mailbox_width_percent: u16,
+    pub mailbox_resizing: bool,
     pub sidebar_visible: bool,
     pub preview_split: bool,
     pub message_open: bool,
@@ -1938,9 +2158,28 @@ pub struct App {
     pub show_message_ids: bool,
     pub attachment_picker_visible: bool,
     pub attachment_selection: usize,
-    pub attachment_files: Vec<OutgoingAttachment>,
+    pub attachment_files: Arc<Vec<OutgoingAttachment>>,
+    // A small per-session MIME cache makes reopening a received attachment
+    // browser instantaneous instead of refetching the entire raw email.
+    // Include UIDVALIDITY to avoid reusing a recycled IMAP UID.
+    attachment_source: Option<(usize, String, Option<u32>, MessageId)>,
+    attachment_cache: VecDeque<((usize, String, Option<u32>, MessageId), Arc<Vec<OutgoingAttachment>>)>,
+    pub attachment_marked: HashSet<usize>,
+    pub attachment_visual_anchor: Option<usize>,
+    pub attachment_save_directory: Option<String>, // legacy path field, no longer used by save UI
+    /// Reuse the exact three-column local picker from compose for save destinations.
+    pub attachment_destination_picker: Option<ComposeFilePicker>,
+    pub attachment_new_folder: Option<String>,
+    attachment_pending_count: usize,
+    attachment_pending_g: bool,
+    attachment_smooth_target: Option<usize>,
+    attachment_preview_due: Option<(usize, Instant)>,
+    attachment_preview_inflight: HashSet<usize>,
+    attachment_preview_results: Arc<Mutex<VecDeque<(usize, Result<image::DynamicImage, String>)>>>,
+    attachment_preview_cache: VecDeque<(usize, Result<image::DynamicImage, String>)>,
     attachment_pending: Option<MessageId>,
     attachment_preview: Option<Protocol>,
+    attachment_preview_identity: Option<(usize, u16, u16)>,
     compose_file_preview_image: Option<Protocol>,
     compose_file_preview_identity: Option<(PathBuf, u16, u16)>,
     pub help_visible: bool,
@@ -1973,6 +2212,9 @@ impl App {
                 let uid_validities = snapshot.folders.iter().filter_map(|(name, folder)| {
                     folder.uid_validity.map(|validity| (name.clone(), validity))
                 }).collect();
+                let uid_nexts = snapshot.folders.iter().filter_map(|(name, folder)| {
+                    folder.uid_next.map(|uid_next| (name.clone(), uid_next))
+                }).collect();
                 let unverified_mailboxes = snapshot.folders.keys().cloned().collect();
                 let mut account = AccountState {
                 name: config.name.clone(),
@@ -2004,9 +2246,12 @@ impl App {
                 page_inflight: None,
                 page_request_id: None,
                 body_request_id: None,
+                last_prefetch_window: None,
+                last_prefetch_anchor: None,
                 mailbox_cache: snapshot.folders,
                 cache_writer,
                 uid_validities,
+                uid_nexts,
                 unverified_mailboxes,
                 search_query: String::new(),
                 search_editing: false,
@@ -2043,6 +2288,8 @@ impl App {
             account_index: 0,
             focus: Focus::Messages,
             status: StatusLine::info("starting workers…"),
+            startup_warnings: Vec::new(),
+            show_startup_warnings: false,
             should_quit: false,
             inbox_poll_interval: Duration::from_secs(config.ui.inbox_poll_seconds.clamp(10, 3600)),
             new_mail_bell_enabled: config.ui.new_mail_bell,
@@ -2050,7 +2297,8 @@ impl App {
             new_mail_notifications_enabled: config.ui.new_mail_notifications,
             new_mail_sound_name: config.ui.new_mail_sound_name.clone(),
             new_mail_notices: VecDeque::new(),
-            mailbox_width_percent: config.ui.mailbox_width_percent.clamp(20, 50),
+            mailbox_width_percent: stored_mailbox_width().unwrap_or(config.ui.mailbox_width_percent).clamp(12, 50),
+            mailbox_resizing: false,
             sidebar_visible: true,
             preview_split: false,
             message_open: false,
@@ -2076,9 +2324,24 @@ impl App {
             show_message_ids: false,
             attachment_picker_visible: false,
             attachment_selection: 0,
-            attachment_files: Vec::new(),
+            attachment_files: Arc::new(Vec::new()),
+            attachment_source: None,
+            attachment_cache: VecDeque::new(),
+            attachment_marked: HashSet::new(),
+            attachment_visual_anchor: None,
+            attachment_save_directory: None,
+            attachment_destination_picker: None,
+            attachment_new_folder: None,
+            attachment_pending_count: 0,
+            attachment_pending_g: false,
+            attachment_smooth_target: None,
+            attachment_preview_due: None,
+            attachment_preview_inflight: HashSet::new(),
+            attachment_preview_results: Arc::new(Mutex::new(VecDeque::new())),
+            attachment_preview_cache: VecDeque::new(),
             attachment_pending: None,
             attachment_preview: None,
+            attachment_preview_identity: None,
             compose_file_preview_image: None,
             compose_file_preview_identity: None,
             help_visible: false,
@@ -2157,9 +2420,35 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.show_startup_warnings {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('!')) {
+                self.show_startup_warnings = false;
+            }
+            return;
+        }
+        if !self.startup_warnings.is_empty() && key.code == KeyCode::Char('!')
+            && self.composer.is_none() && !self.attachment_picker_visible
+            && !self.help_visible && !self.theme_picker_visible && self.confirmation.is_none() {
+            self.show_startup_warnings = true;
+            return;
+        }
         if self.attachment_picker_visible {
             self.handle_attachment_picker_key(key);
             return;
+        }
+        if self.composer.is_none() && !self.message_open && self.sidebar_visible
+            && key.modifiers.contains(KeyModifiers::ALT) {
+            let adjustment = match key.code {
+                KeyCode::Char('h') => Some(-2_i32),
+                KeyCode::Char('l') => Some(2_i32),
+                _ => None,
+            };
+            if let Some(adjustment) = adjustment {
+                self.mailbox_width_percent = (i32::from(self.mailbox_width_percent) + adjustment)
+                    .clamp(12, 50) as u16;
+                let _ = persist_mailbox_width(self.mailbox_width_percent);
+                return;
+            }
         }
         if self.confirmation.is_some() {
             self.handle_confirmation_key(key);
@@ -2184,6 +2473,15 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
             self.restore_postponed_composer();
             return;
+        }
+        // Global account shortcuts work in the reader as well as the mailbox
+        // list, but must not steal input from compose or modal dialogs.
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            let command = command_for_key(key);
+            if matches!(command, Command::NextAccount | Command::PreviousAccount | Command::SelectAccount(_)) {
+                self.handle_command(command);
+                return;
+            }
         }
         if self.message_open && self.handle_reader_key(key) {
             return;
@@ -2516,10 +2814,11 @@ impl App {
                     mailbox.counts_known = true;
                 }
                 if new_count > 0 {
-                    // A cached Inbox from another tab is now stale even if the
-                    // user is browsing a different mailbox/account.
-                    account.mailbox_cache.remove(&name);
-                    account.remove_persistent_folder(&name);
+                    // Keep the UID-keyed header cache on new arrivals. The
+                    // next SELECT validates UIDVALIDITY and obtains a current
+                    // UID+FLAGS page before we reuse any old summary. Dropping
+                    // the cache here would force full header downloads on
+                    // precisely the refreshes that benefit from delta fetches.
                     self.status = StatusLine::temporary(format!(
                         "{} new message(s) in {}", new_count, account.name,
                     ), Duration::from_secs(6));
@@ -2548,6 +2847,7 @@ impl App {
                 name,
                 page,
                 uid_validity,
+                uid_next,
                 elapsed_micros,
             } => {
                 // A newer folder/page request supersedes this result even if
@@ -2573,6 +2873,11 @@ impl App {
                 } else {
                     account.uid_validities.remove(&name);
                 }
+                if let Some(next) = uid_next {
+                    account.uid_nexts.insert(name.clone(), next);
+                } else {
+                    account.uid_nexts.remove(&name);
+                }
                 account.unverified_mailboxes.remove(&name);
                 let selected_name = account.selected_mailbox().map(|mailbox| mailbox.name.clone());
                 if selected_name.as_deref() != Some(name.as_str()) {
@@ -2589,6 +2894,7 @@ impl App {
                                 next_page_offset: page.next_offset,
                                 has_more: page.has_more,
                                 uid_validity,
+                                uid_next,
                             },
                         );
                     }
@@ -2648,8 +2954,19 @@ impl App {
                     account.preview_max_scroll = 0;
                     account.smooth_message_target = None;
                     account.smooth_preview_target = None;
-                    account.pending_bodies.clear();
-                    account.body_request_id = None;
+                    // A verified same-folder refresh can finish while the
+                    // priority worker fetches the selected body. Keep the
+                    // request if its UID survived this fresh page; otherwise
+                    // invalidate it (especially after UIDVALIDITY changes).
+                    let still_selected = !generation_changed
+                        && account.body_request_id.is_some()
+                        && account.pending_bodies.len() == 1
+                        && account.selected_message().is_some_and(|message|
+                            account.pending_bodies.contains(&message.id));
+                    if !still_selected {
+                        account.pending_bodies.clear();
+                        account.body_request_id = None;
+                    }
                     account.pending_seen.clear();
                 }
                 account.last_scan_micros = Some(elapsed_micros);
@@ -2694,7 +3011,12 @@ impl App {
                     ),
                     Duration::from_secs(4),
                 );
-                if self.preview_split { account.request_selected_body(); }
+                account.last_prefetch_window = None;
+                if event.account == self.account_index { account.prefetch_near_cursor(1); }
+                if self.preview_split && event.account == self.account_index {
+                    account.request_selected_body();
+                    Self::mark_cached_selected_seen(account);
+                }
                 if account.pending_inbox_refresh && account.page_inflight.is_none()
                     && !(self.message_open && event.account == self.account_index)
                 {
@@ -2730,7 +3052,11 @@ impl App {
                 account.body_request_id = None;
                 let id = body.id.clone();
                 account.pending_bodies.remove(&id);
+                if account.bodies.contains_key(&id) {
+                    crate::perf::record("ui_selected_body_duplicate", None, Duration::ZERO, true);
+                }
                 account.bodies.insert(id.clone(), body);
+                account.trim_preview_bodies();
                 account.persist_current_cache();
 
                 if (self.message_open || self.preview_split)
@@ -2743,11 +3069,58 @@ impl App {
                 Self::pump_mailbox_status(account);
 
             }
-            WorkerEventKind::AttachmentsLoaded { id, attachments } => {
-                if self.attachment_pending.as_ref() == Some(&id) && self.attachment_picker_visible {
-                    self.attachment_files = attachments;
+            WorkerEventKind::BodyPrefetched { mailbox, body } => {
+                // The background connection can finish after a folder change,
+                // UIDVALIDITY reset, expunge, or account switch. Never apply a
+                // body unless it still belongs to the verified visible folder.
+                let id = body.id.clone();
+                if account.current_mailbox.as_deref() != Some(mailbox.as_str())
+                    || account.unverified_mailboxes.contains(&mailbox)
+                    || !account.messages.iter().any(|message| message.id == id)
+                {
+                    crate::perf::record("ui_prefetch_discarded", None, Duration::ZERO, true);
+                    return;
+                }
+                if account.bodies.contains_key(&id) {
+                    crate::perf::record("ui_prefetch_duplicate", None, Duration::ZERO, true);
+                    return;
+                }
+                crate::perf::record("ui_prefetch_applied", None, Duration::ZERO, true);
+                account.bodies.insert(id.clone(), body);
+                account.trim_preview_bodies();
+                if event.account == self.account_index && (self.message_open || self.preview_split)
+                    && account.selected_message().is_some_and(|message| message.id == id && message.unread())
+                {
+                    account.request_seen(id, true);
+                }
+                // Do not serialize the entire mailbox for every opportunistic
+                // body. The regular cache checkpoint saves it when needed.
+            }
+            WorkerEventKind::AttachmentsLoaded { mailbox, id, attachments } => {
+                let expected = self.attachment_source.as_ref().is_some_and(|(account, folder, _, wanted)|
+                    *account == event.account && folder == &mailbox && wanted == &id);
+                if expected && self.attachment_pending.as_ref() == Some(&id) && self.attachment_picker_visible {
+                    self.attachment_files = Arc::new(attachments);
+                    if let Some(source) = self.attachment_source.as_ref()
+                        .filter(|(account, _, _, message)| *account == event.account && message == &id).cloned() {
+                        let total_bytes = self.attachment_files.iter().map(|file| file.data.len()).sum::<usize>();
+                        if total_bytes <= 12 * 1024 * 1024 {
+                            self.attachment_cache.retain(|(key, _)| key != &source);
+                            self.attachment_cache.push_back((source, Arc::clone(&self.attachment_files)));
+                            while self.attachment_cache.len() > 6 || self.attachment_cache.iter()
+                                .flat_map(|(_, files)| files.iter()).map(|file| file.data.len()).sum::<usize>()
+                                > 24 * 1024 * 1024 {
+                                self.attachment_cache.pop_front();
+                            }
+                        }
+                    }
                     self.attachment_selection = 0;
+                    self.attachment_marked.clear();
+                    self.attachment_visual_anchor = None;
+                    self.attachment_preview = None;
+                    self.attachment_preview_identity = None;
                     self.attachment_pending = None;
+                    self.queue_attachment_preview();
                     self.status = StatusLine::info(format!("{} attachment(s) loaded", self.attachment_files.len()));
                 }
             }
@@ -2992,6 +3365,7 @@ impl App {
             Command::Quit => self.should_quit = true,
             Command::NextAccount => self.change_account(1),
             Command::PreviousAccount => self.change_account(-1),
+            Command::SelectAccount(index) => self.select_account(index),
             Command::Down => {
                 let count = self.take_count(1);
                 self.move_selection(isize::try_from(count).unwrap_or(isize::MAX));
@@ -3083,9 +3457,13 @@ impl App {
             Command::TogglePreviewSplit => {
                 self.count_prefix = None;
                 self.preview_split = !self.preview_split;
-                if self.preview_split {
-                    if let Some(account) = self.account_mut() {
+                let preview_split_enabled = self.preview_split;
+                if let Some(account) = self.account_mut() {
+                    account.last_prefetch_window = None;
+                    if preview_split_enabled {
                         account.request_selected_body();
+                        account.prefetch_near_cursor(1);
+                        Self::mark_cached_selected_seen(account);
                     }
                 }
             }
@@ -3189,18 +3567,26 @@ impl App {
     /// conversions less often to avoid redrawing the whole TUI 100 times/sec.
     #[must_use]
     pub fn animation_frame_interval(&self) -> Duration {
+        if self.attachment_picker_visible && self.attachment_smooth_target.is_none()
+            && self.attachment_destination_picker.as_ref().is_none_or(|picker| picker.smooth_target.is_none())
+            && (self.attachment_preview_due.is_some() || !self.attachment_preview_inflight.is_empty()) {
+            return Duration::from_millis(40);
+        }
         if self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
             .is_some_and(|picker| picker.smooth_target.is_none()
                 && (picker.pdf_preview_due.is_some() || !picker.pdf_preview_inflight.is_empty())) {
             Duration::from_millis(60)
         } else {
-            Duration::from_millis(10)
+            Duration::from_millis(10) // 100 FPS for smooth cursor animation.
         }
     }
 
     #[must_use]
     pub fn animation_active(&self) -> bool {
-        self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
+        (self.attachment_picker_visible && (self.attachment_smooth_target.is_some()
+            || self.attachment_preview_due.is_some() || !self.attachment_preview_inflight.is_empty()
+            || self.attachment_destination_picker.as_ref().is_some_and(|picker| picker.smooth_target.is_some())))
+            || self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
             .is_some_and(|picker| picker.smooth_target.is_some()
                 || picker.pdf_preview_due.is_some() || !picker.pdf_preview_inflight.is_empty())
             || self.reader_smooth_target.is_some() || self.account().is_some_and(|account| {
@@ -3214,6 +3600,25 @@ impl App {
     /// are positions inside the filtered list; mailbox targets deliberately do
     /// not open intermediate folders, so Ctrl-Shift-j/k stays responsive.
     pub fn advance_animation(&mut self) {
+        if self.attachment_picker_visible {
+            if let Some(picker) = &mut self.attachment_destination_picker {
+                if picker.smooth_target.is_some() { picker.advance_smooth_scroll(); }
+            } else if let Some(target) = self.attachment_smooth_target {
+                let next = self.attachment_selection.saturating_add_signed(
+                    if target > self.attachment_selection { 1 } else { -1 });
+                // Move the visual cursor, but don't start a decode at every
+                // intermediate row. Render only the destination thumbnail.
+                self.attachment_selection = next;
+                self.attachment_preview = None;
+                self.attachment_preview_identity = None;
+                if next == target {
+                    self.attachment_smooth_target = None;
+                    self.queue_attachment_preview();
+                }
+            }
+            self.advance_attachment_preview();
+            return;
+        }
         if let Some(picker) = self.composer.as_mut().and_then(|composer| composer.file_picker.as_mut()) {
             // Advance one row and check PDF completions on each scheduled frame.
             // Neither operation waits for the PDF renderer. If the picker is
@@ -3307,10 +3712,16 @@ impl App {
                     if remaining <= prefetch_distance {
                         let _ = account.request_next_page();
                     }
+                    // Large windows already cover intermediate rows. Do not
+                    // interrupt an active IMAP batch every few animation frames.
+                    if next % PREFETCH_WINDOW_REARM_ROWS == 0 || next == target_position {
+                        account.prefetch_near_cursor(if target_position >= current { 1 } else { -1 });
+                    }
                     if next == target_position {
                         account.smooth_message_target = None;
                         if preview_split {
                             account.request_selected_body();
+                            Self::mark_cached_selected_seen(account);
                         }
                     }
                 }
@@ -3352,9 +3763,13 @@ impl App {
     }
 
     fn change_account(&mut self, delta: isize) {
-        if self.accounts.is_empty() {
-            return;
-        }
+        if self.accounts.is_empty() { return; }
+        let target = offset_index(self.account_index, self.accounts.len(), delta);
+        self.select_account(target);
+    }
+
+    fn select_account(&mut self, index: usize) {
+        if index >= self.accounts.len() || index == self.account_index { return; }
         if let Some(account) = self.account_mut() {
             account.persist_current_cache();
         }
@@ -3366,7 +3781,10 @@ impl App {
         self.visual_anchor = None;
         self.confirmation = None;
         self.focus = Focus::Messages;
-        self.account_index = offset_index(self.account_index, self.accounts.len(), delta);
+        self.account_index = index;
+        if let Some(account) = self.account_mut() {
+            account.last_prefetch_window = None;
+        }
         if let Some(account) = self.account() {
             self.status = StatusLine::temporary(
                 format!("account: {}", account.name),
@@ -3409,7 +3827,11 @@ impl App {
         if account.message_index != previous {
             account.preview_scroll = 0;
             account.keep_message_cursor_visible();
-            if preview_split { account.request_selected_body(); }
+            account.prefetch_near_cursor(delta);
+            if preview_split {
+                account.request_selected_body();
+                Self::mark_cached_selected_seen(account);
+            }
         }
 
         let remaining = visible.len().saturating_sub(next.saturating_add(1));
@@ -3458,8 +3880,10 @@ impl App {
             // Don't trade instant rendering for stale data: refresh the first
             // page on the worker while the cached view stays on screen.
             let _ = account.request_mailbox_page(name, 0);
+            account.prefetch_near_cursor(1);
             if preview_split {
                 account.request_selected_body();
+                Self::mark_cached_selected_seen(account);
             }
             Self::pump_mailbox_status(account);
             return;
@@ -3469,6 +3893,7 @@ impl App {
         account.bodies.clear();
         account.pending_bodies.clear();
         account.body_request_id = None;
+        account.last_prefetch_window = None;
         account.next_page_offset = 0;
         account.has_more = false;
         account.page_inflight = None;
@@ -3781,7 +4206,13 @@ impl App {
                     .position(|index| *index == account.message_index)
                     .unwrap_or(0);
                 let base = account.smooth_message_target.unwrap_or(current);
-                account.smooth_message_target = Some(bounded_index(base, visible.len(), delta));
+                let target = bounded_index(base, visible.len(), delta);
+                account.smooth_message_target = Some(target);
+                if target != current {
+                    // Warm the entire travel corridor instead of repeatedly
+                    // canceling batches aimed at the moving destination.
+                    account.prefetch_for_scroll(current, target);
+                }
             }
             Focus::Preview => {
                 unreachable!("reader smooth scrolling is handled before borrowing account state")
@@ -3853,8 +4284,10 @@ impl App {
         if bottom {
             let _ = account.request_next_page();
         }
+        account.prefetch_near_cursor(if bottom { -1 } else { 1 });
         if preview_split {
             account.request_selected_body();
+            Self::mark_cached_selected_seen(account);
         }
     }
 
@@ -3883,6 +4316,7 @@ impl App {
                     account.preview_scroll = 0;
                     account.preview_max_scroll = 0;
                     account.request_selected_body();
+                    account.prefetch_near_cursor(1);
                     Self::mark_cached_selected_seen(account);
                 }
                 self.focus = Focus::Preview;
@@ -4832,67 +5266,520 @@ impl App {
         );
     }
 
+    fn reset_received_attachment_previews(&mut self) {
+        self.attachment_preview = None;
+        self.attachment_preview_identity = None;
+        self.attachment_preview_due = None;
+        self.attachment_preview_inflight.clear();
+        self.attachment_preview_cache.clear();
+        // Detach any outstanding worker of an earlier email: its Arc is no
+        // longer visible to this popup, even if the new email uses index 0.
+        self.attachment_preview_results = Arc::new(Mutex::new(VecDeque::new()));
+    }
+
     fn open_attachment_picker(&mut self) {
         let Some(account) = self.account() else { return; };
         let Some(message) = account.selected_message() else { return; };
         let Some(mailbox) = account.current_mailbox.clone() else { return; };
         let id = message.id.clone();
-        if account.worker.post(ActionKind::FetchAttachments { mailbox, id: id.clone() }).is_ok() {
-            self.attachment_picker_visible = true;
-            self.attachment_selection = 0;
-            self.attachment_files.clear();
-            self.attachment_preview = None;
-            self.attachment_pending = Some(id);
-            self.status = StatusLine::info("loading attachments…");
-        } else {
+        let validity = account.uid_validities.get(&mailbox).copied();
+        let source = (self.account_index, mailbox.clone(), validity, id.clone());
+        let cached = if account.unverified_mailboxes.contains(&mailbox) { None } else {
+            self.attachment_cache.iter().find(|(key, _)| key == &source)
+                .map(|(_, files)| Arc::clone(files))
+        };
+        crate::perf::record(if cached.is_some() { "ui_attachment_cache_hit" } else { "ui_attachment_cache_miss" },
+            None, Duration::ZERO, true);
+        if cached.is_none()
+            && account.worker.post(ActionKind::FetchAttachments { mailbox, id: id.clone() }).is_err() {
             self.status = StatusLine::error("mail worker busy; cannot load attachments");
+            return;
+        }
+        self.attachment_picker_visible = true;
+        self.attachment_selection = 0;
+        self.attachment_files = cached.clone().unwrap_or_else(|| Arc::new(Vec::new()));
+        self.attachment_marked.clear();
+        self.attachment_visual_anchor = None;
+        self.attachment_save_directory = None;
+        self.attachment_destination_picker = None;
+        self.attachment_new_folder = None;
+        self.attachment_pending_count = 0;
+        self.attachment_pending_g = false;
+        self.attachment_smooth_target = None;
+        self.attachment_source = Some(source);
+        self.reset_received_attachment_previews();
+        self.attachment_pending = if cached.is_some() { None } else { Some(id) };
+        if cached.is_some() {
+            self.queue_attachment_preview();
+            self.status = StatusLine::info("attachments restored from memory");
+        } else {
+            self.status = StatusLine::info("loading attachments…");
         }
     }
 
-    fn handle_attachment_picker_key(&mut self, key: KeyEvent) {
+    fn dismiss_attachment_picker(&mut self) {
+        self.attachment_picker_visible = false;
+        self.attachment_pending = None;
+        self.attachment_files = Arc::new(Vec::new());
+        self.attachment_source = None;
+        self.attachment_marked.clear();
+        self.attachment_visual_anchor = None;
+        self.attachment_save_directory = None;
+        self.attachment_destination_picker = None;
+        self.attachment_new_folder = None;
+        self.attachment_smooth_target = None;
+        self.reset_received_attachment_previews();
+    }
+
+    fn queue_attachment_preview(&mut self) {
+        self.attachment_preview_due = None;
+        if self.attachment_smooth_target.is_some() || self.attachment_destination_picker.is_some() { return; }
+        let index = self.attachment_selection;
+        let Some(file) = self.attachment_files.get(index) else { return; };
+        if !received_attachment_is_image(file) && !received_attachment_is_pdf(file) { return; }
+        if self.attachment_preview_cache.iter().any(|(cached, _)| *cached == index)
+            || self.attachment_preview_inflight.contains(&index) { return; }
+        // A short debounce avoids launching Poppler for every intermediate
+        // attachment while navigating rapidly. Images use a shorter delay.
+        let delay = if received_attachment_is_pdf(file) { 95 } else { 25 };
+        self.attachment_preview_due = Some((index, Instant::now() + Duration::from_millis(delay)));
+    }
+
+    fn advance_attachment_preview(&mut self) {
+        let completed = if let Ok(mut results) = self.attachment_preview_results.lock() {
+            results.drain(..).collect::<Vec<_>>()
+        } else { Vec::new() };
+        let mut selected_completed = false;
+        for (index, result) in completed {
+            self.attachment_preview_inflight.remove(&index);
+            self.attachment_preview_cache.retain(|(cached, _)| *cached != index);
+            self.attachment_preview_cache.push_back((index, result));
+            while self.attachment_preview_cache.len() > 8 { self.attachment_preview_cache.pop_front(); }
+            selected_completed |= index == self.attachment_selection;
+        }
+        if selected_completed { self.attachment_preview_identity = None; }
+        if self.attachment_smooth_target.is_some() || self.attachment_destination_picker.is_some() { return; }
+        let Some((index, due)) = self.attachment_preview_due else { return; };
+        if Instant::now() < due || !self.attachment_preview_inflight.is_empty() { return; }
+        self.attachment_preview_due = None;
+        if self.attachment_files.get(index).is_none() { return; }
+        // The MIME buffers are shared with the worker, not copied per image.
+        let files = Arc::clone(&self.attachment_files);
+        let queue = Arc::clone(&self.attachment_preview_results);
+        match std::thread::Builder::new().name("aerc-attachment-preview".into()).spawn(move || {
+            let start = Instant::now();
+            let result = decode_received_attachment_preview(&files[index]);
+            crate::perf::record("attachment_preview_decode", None, start.elapsed(), result.is_ok());
+            if let Ok(mut pending) = queue.lock() { pending.push_back((index, result)); }
+        }) {
+            Ok(_handle) => { self.attachment_preview_inflight.insert(index); }
+            Err(error) => {
+                self.attachment_preview_cache.push_back((index, Err(format!("preview worker: {error}"))));
+                self.attachment_preview_identity = None;
+            }
+        }
+    }
+
+    fn move_attachment_selection(&mut self, new_selection: usize) {
+        if self.attachment_files.is_empty() { return; }
+        let next = new_selection.min(self.attachment_files.len() - 1);
+        if next != self.attachment_selection {
+            self.attachment_selection = next;
+            self.attachment_preview = None;
+            self.attachment_preview_identity = None;
+            self.queue_attachment_preview();
+        }
+    }
+
+    fn handle_attachment_destination_key(&mut self, key: KeyEvent) {
+        if self.attachment_new_folder.is_some() {
+            match key.code {
+                KeyCode::Esc => self.attachment_new_folder = None,
+                KeyCode::Backspace => { if let Some(name) = &mut self.attachment_new_folder { name.pop(); } }
+                KeyCode::Enter => {
+                    let name = self.attachment_new_folder.take().unwrap_or_default();
+                    if name.is_empty() || name == "." || name == ".."
+                        || name.contains('/') || name.contains('\\') || name.chars().any(char::is_control) {
+                        self.status = StatusLine::error("enter a single safe folder name");
+                    } else if let Some(picker) = &mut self.attachment_destination_picker {
+                        let path = picker.directory.join(name);
+                        let result = (|| -> anyhow::Result<()> {
+                            std::fs::create_dir(&path)?;
+                            // Keep navigation consistent and refresh the current directory.
+                            picker.enter_directory(path)
+                        })();
+                        if let Err(error) = result { self.status = StatusLine::error(format!("could not create folder: {error}")); }
+                    }
+                }
+                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                    if let Some(name) = &mut self.attachment_new_folder { name.push(ch); }
+                },
+                _ => {}
+            }
+            return;
+        }
+        // Modal-wide actions must run before borrowing the picker mutably.
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.attachment_picker_visible = false;
-                self.attachment_preview = None;
-                self.attachment_pending = None;
-                self.attachment_files.clear();
+                self.attachment_destination_picker = None;
+                self.queue_attachment_preview();
+                return;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.attachment_files.is_empty() {
-                    self.attachment_selection = (self.attachment_selection + 1)
-                        .min(self.attachment_files.len() - 1);
-                    self.attachment_preview = None;
+            KeyCode::Char('s') => { self.save_selected_attachments(); return; }
+            KeyCode::Char('n') => { self.attachment_new_folder = Some(String::new()); return; }
+            _ => {}
+        }
+        let Some(picker) = self.attachment_destination_picker.as_mut() else { return; };
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('j' | 'k')) {
+            let delta = if key.code == KeyCode::Char('j') { 12 } else { -12 };
+            picker.queue_smooth_scroll(delta);
+            return;
+        }
+        if picker.pending_g {
+            picker.pending_g = false;
+            if key.code == KeyCode::Char('g') {
+                picker.selected = 0;
+                picker.pending_count = 0;
+                picker.refresh_preview();
+                return;
+            }
+        }
+        match key.code {
+            KeyCode::Char(d @ '1'..='9') => {
+                picker.pending_count = picker.pending_count.saturating_mul(10)
+                    .saturating_add(d.to_digit(10).unwrap_or(1) as usize).min(99_999);
+                return;
+            }
+            KeyCode::Char('0') if picker.pending_count > 0 => {
+                picker.pending_count = picker.pending_count.saturating_mul(10).min(99_999);
+                return;
+            }
+            KeyCode::Char('g') => { picker.pending_g = true; return; }
+            _ => {}
+        }
+        let count = picker.pending_count.max(1);
+        let explicit = picker.pending_count > 0;
+        picker.pending_count = 0;
+        let result = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => { picker.move_selection(count as isize); Ok(()) }
+            KeyCode::Char('k') | KeyCode::Up => { picker.move_selection(-(count as isize)); Ok(()) }
+            KeyCode::PageDown => { picker.move_selection(12); Ok(()) }
+            KeyCode::PageUp => { picker.move_selection(-12); Ok(()) }
+            KeyCode::Char('G') | KeyCode::End => {
+                picker.selected = if explicit { count.saturating_sub(1).min(picker.entries.len().saturating_sub(1)) }
+                    else { picker.entries.len().saturating_sub(1) };
+                picker.refresh_preview(); Ok(())
+            }
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                if let Some(parent) = picker.directory.parent().map(Path::to_path_buf) {
+                    picker.enter_directory(parent)
+                } else { Ok(()) }
+            }
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                if let Some(entry) = picker.entries.get(picker.selected) {
+                    if entry.is_directory { picker.enter_directory(entry.path.clone()) } else { Ok(()) }
+                } else { Ok(()) }
+            }
+            KeyCode::Char('~') => {
+                if let Some(home) = dirs::home_dir() { picker.enter_directory(home) }
+                else { Ok(()) }
+            }
+            KeyCode::Char('.') => { picker.show_hidden = !picker.show_hidden; picker.refresh() }
+            _ => Ok(()),
+        };
+        if let Err(error) = result { self.status = StatusLine::error(format!("file browser: {error}")); }
+    }
+
+    fn handle_attachment_picker_key(&mut self, key: KeyEvent) {
+        if self.attachment_destination_picker.is_some() {
+            self.handle_attachment_destination_key(key);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('j' | 'k')) {
+            let delta = if key.code == KeyCode::Char('j') { 12isize } else { -12isize };
+            let target = self.attachment_selection.saturating_add_signed(delta)
+                .min(self.attachment_files.len().saturating_sub(1));
+            self.attachment_smooth_target = (target != self.attachment_selection).then_some(target);
+            self.attachment_preview_due = None;
+            return;
+        }
+        if self.attachment_pending_g {
+            self.attachment_pending_g = false;
+            if key.code == KeyCode::Char('g') {
+                self.attachment_smooth_target = None;
+                self.move_attachment_selection(0);
+                self.attachment_pending_count = 0;
+                return;
+            }
+        }
+        match key.code {
+            KeyCode::Char(d @ '1'..='9') => {
+                self.attachment_pending_count = self.attachment_pending_count.saturating_mul(10)
+                    .saturating_add(d.to_digit(10).unwrap_or(1) as usize).min(99_999);
+                return;
+            }
+            KeyCode::Char('0') if self.attachment_pending_count > 0 => {
+                self.attachment_pending_count = self.attachment_pending_count.saturating_mul(10).min(99_999);
+                return;
+            }
+            KeyCode::Char('g') => { self.attachment_pending_g = true; return; }
+            _ => {}
+        }
+        let count = self.attachment_pending_count.max(1);
+        let explicit = self.attachment_pending_count > 0;
+        self.attachment_pending_count = 0;
+        self.attachment_smooth_target = None;
+        match key.code {
+            KeyCode::Esc if self.attachment_visual_anchor.is_some() => { self.attachment_visual_anchor = None; }
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_attachment_picker(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_attachment_selection(self.attachment_selection.saturating_add(count)),
+            KeyCode::Char('k') | KeyCode::Up => self.move_attachment_selection(self.attachment_selection.saturating_sub(count)),
+            KeyCode::Char('G') => self.move_attachment_selection(if explicit { count.saturating_sub(1) }
+                else { self.attachment_files.len().saturating_sub(1) }),
+            KeyCode::PageDown => self.move_attachment_selection(self.attachment_selection.saturating_add(12)),
+            KeyCode::PageUp => self.move_attachment_selection(self.attachment_selection.saturating_sub(12)),
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                if self.attachment_visual_anchor.is_some() { self.attachment_visual_anchor = None; }
+                else if !self.attachment_files.is_empty() { self.attachment_visual_anchor = Some(self.attachment_selection); }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(anchor) = self.attachment_visual_anchor.take() {
+                    let (start, end) = (anchor.min(self.attachment_selection), anchor.max(self.attachment_selection));
+                    for index in start..=end { self.attachment_marked.insert(index); }
+                } else if !self.attachment_files.is_empty() {
+                    let index = self.attachment_selection;
+                    if !self.attachment_marked.insert(index) { self.attachment_marked.remove(&index); }
+                    self.move_attachment_selection(index + 1);
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.attachment_selection = self.attachment_selection.saturating_sub(1);
-                self.attachment_preview = None;
+            KeyCode::Char('a') => {
+                if self.attachment_marked.len() == self.attachment_files.len() { self.attachment_marked.clear(); }
+                else { self.attachment_marked = (0..self.attachment_files.len()).collect(); }
             }
-            KeyCode::Char('p') => self.preview_attachment(),
+            KeyCode::Char('p') => self.attachment_preview_identity = None,
             KeyCode::Enter | KeyCode::Char('o') => self.open_attachment(),
+            KeyCode::Char('s') => self.prompt_attachment_save(),
             _ => {}
         }
     }
 
-    fn preview_attachment(&mut self) {
-        let Some(file) = self.attachment_files.get(self.attachment_selection) else { return; };
-        let Some(picker) = &self.image_picker else {
-            self.status = StatusLine::error("terminal image protocol unavailable");
+    /// Create terminal graphics only from decoded, cached thumbnails. Decoding
+    /// images and spawning pdftoppm happen on a worker, never on the 100 FPS
+    /// event/render thread.
+    pub fn ensure_attachment_preview(&mut self, width: u16, height: u16) {
+        if !self.attachment_picker_visible || width == 0 || height == 0 { return; }
+        let identity = (self.attachment_selection, width, height);
+        if self.attachment_preview_identity == Some(identity) { return; }
+        self.attachment_preview_identity = Some(identity);
+        self.attachment_preview = None;
+        let Some((_, Ok(image))) = self.attachment_preview_cache.iter()
+            .find(|(cached, _)| *cached == self.attachment_selection) else { return; };
+        let Some(picker) = &self.image_picker else { return; };
+        let target = reader_image_target_size(image.width(), image.height(), None, None,
+            picker.font_size().width, picker.font_size().height, width, height);
+        self.attachment_preview = picker.new_protocol(image.clone(), target,
+            Resize::Fit(Some(image::imageops::FilterType::Lanczos3))).ok();
+    }
+
+    pub fn attachment_preview_decoded(&self) -> bool {
+        self.attachment_preview_cache.iter().any(|(index, result)|
+            *index == self.attachment_selection && result.is_ok())
+    }
+
+    pub fn attachment_preview_error(&self) -> Option<&str> {
+        self.attachment_preview_cache.iter().find(|(index, _)| *index == self.attachment_selection)
+            .and_then(|(_, result)| result.as_ref().err().map(String::as_str))
+    }
+
+    fn prompt_attachment_save(&mut self) {
+        if self.attachment_files.is_empty() { return; }
+        let directory = dirs::download_dir().or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        match ComposeFilePicker::open_directory_only(directory) {
+            Ok(picker) => {
+                self.attachment_preview_due = None;
+                self.attachment_destination_picker = Some(picker);
+                self.attachment_new_folder = None;
+            }
+            Err(error) => self.status = StatusLine::error(format!("cannot open destination picker: {error}")),
+        }
+    }
+
+    fn save_selected_attachments(&mut self) {
+        let Some(picker) = &self.attachment_destination_picker else { return; };
+        let directory = picker.directory.clone();
+        if !directory.is_dir() {
+            self.status = StatusLine::error(format!("not an existing directory: {}", directory.display()));
             return;
-        };
-        match image::load_from_memory(&file.data) {
-            Ok(image) => {
-                let target = reader_image_target_size(image.width(), image.height(), None, None,
-                    picker.font_size().width, picker.font_size().height, 70, 18);
-                match picker.new_protocol(image, target, Resize::Fit(Some(image::imageops::FilterType::Lanczos3))) {
-                    Ok(protocol) => self.attachment_preview = Some(protocol),
-                    Err(error) => self.status = StatusLine::error(format!("attachment preview: {error}")),
+        }
+        let mut indices = if self.attachment_marked.is_empty() {
+            if self.attachment_files.is_empty() { Vec::new() } else { vec![self.attachment_selection] }
+        } else { self.attachment_marked.iter().copied().collect::<Vec<_>>() };
+        indices.sort_unstable();
+        let mut saved = 0;
+        let mut first_error = None;
+        for index in indices {
+            if let Some(file) = self.attachment_files.get(index) {
+                match save_attachment_without_overwrite(&directory, file, index) {
+                    Ok(_) => saved += 1,
+                    Err(error) => { if first_error.is_none() { first_error = Some(error.to_string()); } }
                 }
             }
-            Err(_) => self.status = StatusLine::temporary(
-                "not an image; press Enter to open with your system viewer",
-                Duration::from_secs(3),
-            ),
+        }
+        self.attachment_destination_picker = None;
+        if let Some(error) = first_error {
+            self.status = StatusLine::error(format!("saved {saved} file(s), error: {error}"));
+        } else {
+            self.status = StatusLine::temporary(format!("saved {saved} attachment(s) to {}", directory.display()),
+                Duration::from_secs(5));
+            self.attachment_marked.clear();
+        }
+        self.queue_attachment_preview();
+    }
+
+    pub fn attachment_pending_loading(&self) -> bool { self.attachment_pending.is_some() }
+
+    /// Drag the mailbox divider. Mouse moves over the attachment list select
+    /// the hovered file, and footer clicks activate Open/Save/Mark actions.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
+        if self.show_startup_warnings { return; }
+        if mouse.row == 0 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.composer.is_none() && !self.attachment_picker_visible
+            && !self.help_visible && !self.theme_picker_visible && self.confirmation.is_none() {
+            let mut left = 0usize;
+            for index in 0..self.accounts.len() {
+                let cells = unicode_width::UnicodeWidthStr::width(self.accounts[index].name.as_str()) + 2;
+                if usize::from(mouse.column) >= left && usize::from(mouse.column) < left + cells {
+                    self.select_account(index);
+                    return;
+                }
+                left += cells;
+                if index + 1 < self.accounts.len() { left += 2; }
+            }
+            if !self.startup_warnings.is_empty() {
+                let label = format!("  ! {} config issue(s) [! to inspect]", self.startup_warnings.len());
+                let len = unicode_width::UnicodeWidthStr::width(label.as_str());
+                if (left..left + len).contains(&usize::from(mouse.column)) {
+                    self.show_startup_warnings = true;
+                    return;
+                }
+            }
+        }
+        if self.attachment_picker_visible {
+            if self.attachment_destination_picker.is_some() {
+                let (_, _, files, _, footer) = crate::ui::attachment_destination_regions(
+                    ratatui::layout::Rect::new(0, 0, width, height));
+                // Only the [s] Save here button is actionable; clicking
+                // the Cancel instructions must never unexpectedly write files.
+                if mouse.row == footer.y && mouse.column >= footer.x
+                    && mouse.column < footer.x.saturating_add(15)
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.save_selected_attachments();
+                    return;
+                }
+                let Some(picker) = self.attachment_destination_picker.as_mut() else { return; };
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => picker.move_selection(3),
+                    MouseEventKind::ScrollUp => picker.move_selection(-3),
+                    MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
+                        if mouse.column >= files.x && mouse.column < files.right()
+                            && mouse.row >= files.y && mouse.row < files.bottom() {
+                            let visible = usize::from(files.height);
+                            let start = picker.selected.saturating_sub(visible / 2)
+                                .min(picker.entries.len().saturating_sub(visible));
+                            let next = start.saturating_add(usize::from(mouse.row - files.y))
+                                .min(picker.entries.len().saturating_sub(1));
+                            let already_selected = next == picker.selected;
+                            if !already_selected {
+                                picker.selected = next;
+                                picker.refresh_preview();
+                            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                                // Hover selects; clicking a selected folder enters it.
+                                if let Some(entry) = picker.entries.get(next) {
+                                    if entry.is_directory {
+                                        if let Err(error) = picker.enter_directory(entry.path.clone()) {
+                                            self.status = StatusLine::error(format!("file browser: {error}"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            let (_, list, _, footer) = crate::ui::attachment_regions(ratatui::layout::Rect::new(0, 0, width, height));
+            let inside_list = mouse.column >= list.x && mouse.column < list.x.saturating_add(list.width)
+                && mouse.row > list.y && mouse.row < list.y.saturating_add(list.height);
+            if inside_list && matches!(mouse.kind,
+                MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)) {
+                let rows = usize::from(list.height.saturating_sub(1));
+                let start = attachment_list_start(self.attachment_selection, self.attachment_files.len(), rows);
+                self.move_attachment_selection(start.saturating_add(usize::from(mouse.row - list.y).saturating_sub(1)));
+            }
+            match mouse.kind {
+                MouseEventKind::ScrollDown => self.move_attachment_selection(self.attachment_selection.saturating_add(3)),
+                MouseEventKind::ScrollUp => self.move_attachment_selection(self.attachment_selection.saturating_sub(3)),
+                MouseEventKind::Down(MouseButton::Left)
+                    if mouse.row == footer.y && mouse.column >= footer.x => {
+                    let x = usize::from(mouse.column - footer.x);
+                    if (1..=11).contains(&x) { self.open_attachment(); }
+                    else if (13..=26).contains(&x) { self.prompt_attachment_save(); }
+                    else if (28..=42).contains(&x) {
+                        if !self.attachment_files.is_empty() {
+                            let index = self.attachment_selection;
+                            if !self.attachment_marked.insert(index) { self.attachment_marked.remove(&index); }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.message_open {
+            let key = match mouse.kind {
+                MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                _ => None,
+            };
+            if let Some(code) = key { self.handle_key(KeyEvent::new(code, KeyModifiers::NONE)); }
+            self.mailbox_resizing = false;
+            return;
+        }
+        if !self.sidebar_visible || self.composer.is_some() || self.help_visible
+            || self.theme_picker_visible || self.confirmation.is_some() { self.mailbox_resizing = false; return; }
+        let separator = crate::ui::mailbox_column_width(width, self.mailbox_width_percent).saturating_sub(1);
+        if mouse.row > 0 && mouse.row < height.saturating_sub(1) {
+            let scrolling = match mouse.kind {
+                MouseEventKind::ScrollDown => Some(true),
+                MouseEventKind::ScrollUp => Some(false),
+                _ => None,
+            };
+            if let Some(down) = scrolling {
+                let mailbox = mouse.column < separator;
+                let key = match (mailbox, down) {
+                    (true, true) => KeyCode::Char('J'),
+                    (true, false) => KeyCode::Char('K'),
+                    (false, true) => KeyCode::Down,
+                    (false, false) => KeyCode::Up,
+                };
+                self.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+                return;
+            }
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if mouse.row > 0 && mouse.row < height.saturating_sub(1)
+                && mouse.column.abs_diff(separator) <= 1 => self.mailbox_resizing = true,
+            MouseEventKind::Drag(MouseButton::Left) if self.mailbox_resizing => {
+                self.mailbox_width_percent = mouse_width_percent(mouse.column, width);
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.mailbox_resizing => {
+                self.mailbox_resizing = false;
+                self.mailbox_width_percent = mouse_width_percent(mouse.column, width);
+                let _ = persist_mailbox_width(self.mailbox_width_percent);
+            }
+            _ => {}
         }
     }
 
@@ -5824,6 +6711,117 @@ fn copy_text_to_clipboard(_text: &str) -> std::io::Result<()> {
     ))
 }
 
+/// Only the final component of an attachment filename may be written to disk.
+/// A malicious MIME filename must never escape the chosen destination folder.
+fn received_attachment_is_pdf(file: &OutgoingAttachment) -> bool {
+    file.content_type.eq_ignore_ascii_case("application/pdf")
+        || file.filename.rsplit('.').next().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+}
+
+fn received_attachment_is_image(file: &OutgoingAttachment) -> bool {
+    file.content_type.starts_with("image/")
+}
+
+fn decode_received_attachment_preview(file: &OutgoingAttachment) -> Result<image::DynamicImage, String> {
+    // No unbounded PDF subprocess inputs or huge speculative image decodes.
+    if file.data.len() > 24 * 1024 * 1024 {
+        return Err("preview over 24 MiB; press o to open the original".into());
+    }
+    let image_bytes: std::borrow::Cow<'_, [u8]> = if received_attachment_is_pdf(file) {
+        let temp = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let input = temp.path().join("received.pdf");
+        std::fs::write(&input, &file.data).map_err(|err| err.to_string())?;
+        std::borrow::Cow::Owned(compose_pdf_thumbnail(&input).map_err(|err| err.to_string())?)
+    } else { std::borrow::Cow::Borrowed(&file.data) };
+    // Check declared dimensions before allocating decoded pixels. Huge
+    // compressed images must not expand into gigabytes of cache data.
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(image_bytes.as_ref()))
+        .with_guessed_format().map_err(|err| err.to_string())?
+        .into_dimensions().map_err(|err| err.to_string())?;
+    if u64::from(dimensions.0) * u64::from(dimensions.1) > 24_000_000 {
+        return Err("image has too many pixels for automatic preview; press o to open".into());
+    }
+    let decoded = image::load_from_memory(image_bytes.as_ref())
+        .map_err(|err| format!("attachment image decode: {err}"))?;
+    // Cache a terminal-sized image, not an enormous decoded camera original.
+    Ok(if decoded.width() > 1_200 || decoded.height() > 1_200 {
+        decoded.thumbnail(1_200, 1_200)
+    } else { decoded })
+}
+
+fn attachment_safe_name(name: &str, index: usize) -> String {
+    let basename = name.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("");
+    let safe = basename.chars().filter(|ch| !ch.is_control() && *ch != '/' && *ch != '\\')
+        .collect::<String>();
+    let safe = safe.trim().trim_matches('.');
+    if safe.is_empty() { format!("attachment-{}.bin", index + 1) } else { safe.to_owned() }
+}
+
+fn expand_attachment_directory(directory: &str) -> PathBuf {
+    let directory = directory.trim();
+    if directory == "~" { return dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")); }
+    if let Some(suffix) = directory.strip_prefix("~/") {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(suffix);
+    }
+    PathBuf::from(directory)
+}
+
+/// Create-only save with collision suffixes; existing files and symlinks are
+/// never truncated. Duplicate MIME filenames are common in message threads.
+fn save_attachment_without_overwrite(
+    directory: &Path, file: &OutgoingAttachment, index: usize,
+) -> anyhow::Result<PathBuf> {
+    use std::fs::OpenOptions;
+    let name = attachment_safe_name(&file.filename, index);
+    let (stem, suffix) = name.rsplit_once('.')
+        .filter(|(stem, suffix)| !stem.is_empty() && !suffix.is_empty())
+        .map_or((name.as_str(), ""), |(stem, suffix)| (stem, suffix));
+    for attempt in 0..10_000 {
+        let candidate = if attempt == 0 { name.clone() }
+            else if suffix.is_empty() { format!("{stem} ({attempt})") }
+            else { format!("{stem} ({attempt}).{suffix}") };
+        let path = directory.join(candidate);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut handle) => {
+                use std::io::Write as _;
+                if let Err(error) = handle.write_all(&file.data) {
+                    drop(handle);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error.into());
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("too many files named {name:?} in {}", directory.display())
+}
+
+fn attachment_list_start(selected: usize, count: usize, visible: usize) -> usize {
+    selected.saturating_sub(visible / 2).min(count.saturating_sub(visible))
+}
+
+fn mouse_width_percent(column: u16, total: u16) -> u16 {
+    if total == 0 { return 22; }
+    (((u32::from(column) + 1) * 100 / u32::from(total)) as u16).clamp(12, 50)
+}
+
+fn mailbox_width_state_file() -> Option<PathBuf> {
+    dirs::config_dir().map(|directory| directory.join("aerc-rs").join("mailbox-width"))
+}
+
+fn stored_mailbox_width() -> Option<u16> {
+    std::fs::read_to_string(mailbox_width_state_file()?).ok()?
+        .trim().parse::<u16>().ok().filter(|value| (12..=50).contains(value))
+}
+
+fn persist_mailbox_width(width: u16) -> std::io::Result<()> {
+    let Some(path) = mailbox_width_state_file() else { return Ok(()); };
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::write(path, format!("{}\n", width.clamp(12, 50)))
+}
+
 /// Keep the temporary path alive so external viewers can open it after the
 /// TUI immediately regains control. tempfile creates files with mode 0600.
 fn export_attachment_for_open(file: &OutgoingAttachment) -> anyhow::Result<std::path::PathBuf> {
@@ -6132,12 +7130,60 @@ mod tests {
     use super::{
         ComposeField, ComposeMode, Composer, ReaderPosition, ReaderSelection, ReaderWordMotion,
         bounded_index, inner_text_object_range, message_view_offset, offset_index,
-        reader_image_target_size, reader_selection_text, reader_word_target, reply_attribution,
-        url_at_cursor,
+        preview_neighbor_positions, preview_travel_positions, reader_image_target_size, reader_selection_text,
+        reader_word_target, reply_attribution, url_at_cursor,
     };
     use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
     use std::path::PathBuf;
+
+    #[test]
+    fn nearby_previews_favor_direction_with_bounded_normal_and_fast_windows() {
+        assert_eq!(preview_neighbor_positions(5, 10, 1, false), vec![6, 7, 8, 9, 4, 3, 2, 1, 0]);
+        assert_eq!(preview_neighbor_positions(5, 10, -1, false), vec![4, 3, 2, 1, 0, 6, 7, 8, 9]);
+        let normal = preview_neighbor_positions(50, 200, 1, false);
+        assert_eq!(&normal[..12], &(51..=62).collect::<Vec<_>>());
+        assert_eq!(&normal[12..], &(44..=49).rev().collect::<Vec<_>>());
+        assert_eq!(normal.len(), 18);
+        let fast = preview_neighbor_positions(50, 200, -1, true);
+        assert_eq!(&fast[..22], &(28..=49).rev().collect::<Vec<_>>());
+        assert_eq!(&fast[22..], &(51..=58).collect::<Vec<_>>());
+        assert_eq!(fast.len(), 30);
+        assert_eq!(preview_neighbor_positions(0, 3, 1, false), vec![1, 2]);
+        assert_eq!(preview_neighbor_positions(2, 3, -1, false), vec![1, 0]);
+        assert!(preview_neighbor_positions(3, 3, 1, false).is_empty());
+        assert!(preview_neighbor_positions(0, 0, -1, true).is_empty());
+    }
+
+    #[test]
+    fn smooth_scroll_prefetches_immediate_rows_then_destination_without_duplicates() {
+        let positions = preview_travel_positions(5, 27, 100);
+        assert_eq!(&positions[..7], &[5, 6, 7, 8, 27, 26, 28]);
+        assert_eq!(positions.len(), positions.iter().copied().collect::<std::collections::HashSet<_>>().len());
+        let backwards = preview_travel_positions(30, 8, 100);
+        assert_eq!(&backwards[..7], &[30, 29, 28, 27, 8, 9, 7]);
+        assert!(preview_travel_positions(100, 0, 100).is_empty());
+        assert!(preview_travel_positions(0, 100, 100).is_empty());
+        assert_eq!(preview_travel_positions(0, 0, 1), vec![0]);
+    }
+
+    #[test]
+    fn preview_size_budget_accounts_for_decoded_html_and_plain_text() {
+        use super::preview_body_bytes;
+        use crate::model::{HtmlLine, HtmlSpan, HtmlSpanStyle, MessageBody};
+        let body = MessageBody {
+            id: MessageId("test".into()),
+            plain_text: Some("plain".into()), plain_fallback: None,
+            html_source: Some("<p>html</p>".into()), html_text: Some("html".into()),
+            html_lines: Some(vec![HtmlLine { spans: vec![HtmlSpan {
+                text: "rich".into(),
+                style: HtmlSpanStyle { link: Some("https://example.org".into()), ..Default::default() },
+            }] }]),
+            html_renderer: None, html_render_width: 80,
+            attachment_count: 0, attachment_names: Vec::new(),
+        };
+        assert_eq!(preview_body_bytes(&body), 5 + 11 + 4 + 4 + 19);
+    }
 
     #[test]
     fn list_navigation_is_bounded() {
@@ -6823,5 +7869,74 @@ mod inbox_poll_tests {
         assert_eq!(inbox_new_mail_count(true, true, 10, 9), 0);
         assert_eq!(inbox_new_mail_count(true, false, 0, 12), 0);
         assert_eq!(inbox_new_mail_count(false, true, 10, 12), 0);
+    }
+}
+
+#[cfg(test)]
+mod received_attachment_browser_tests {
+    use super::*;
+
+    fn attachment(name: &str, bytes: &[u8]) -> OutgoingAttachment {
+        OutgoingAttachment { filename: name.into(), content_type: "text/plain".into(), data: bytes.to_vec() }
+    }
+
+    #[test]
+    fn received_attachment_filenames_cannot_escape_destination() {
+        assert_eq!(attachment_safe_name("../../important.txt", 0), "important.txt");
+        assert_eq!(attachment_safe_name("..\\..\\secret.pdf", 2), "secret.pdf");
+        assert_eq!(attachment_safe_name("..", 1), "attachment-2.bin");
+        assert_eq!(attachment_safe_name("\n", 0), "attachment-1.bin");
+    }
+
+    #[test]
+    fn received_pdf_attachment_recognizes_mime_and_filename() {
+        let mut file = attachment("document.bin", b"%PDF-1.4");
+        assert!(!received_attachment_is_pdf(&file));
+        file.content_type = "application/pdf".into();
+        assert!(received_attachment_is_pdf(&file));
+        file.content_type = "application/octet-stream".into();
+        file.filename = "presentation.PDF".into();
+        assert!(received_attachment_is_pdf(&file));
+    }
+
+    #[test]
+    fn destination_picker_does_not_decode_or_launch_pdf_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.pdf"), b"%PDF-1.4\n").unwrap();
+        let picker = ComposeFilePicker::open_directory_only(temp.path().to_path_buf()).unwrap();
+        assert!(picker.directory_only);
+        assert!(matches!(&picker.preview, ComposeFilePreview::Binary(_)));
+        assert!(picker.pdf_preview_due.is_none());
+        assert!(picker.pdf_preview_inflight.is_empty());
+    }
+
+    #[test]
+    fn attachment_session_cache_keys_include_mailbox_account_and_uidvalidity() {
+        let uid = MessageId("42".into());
+        let key = (0usize, "INBOX".to_owned(), Some(123u32), uid.clone());
+        assert_ne!(key, (0, "INBOX".to_owned(), Some(124u32), uid.clone()));
+        assert_ne!(key, (1, "INBOX".to_owned(), Some(123u32), uid.clone()));
+        assert_ne!(key, (0, "Archive".to_owned(), Some(123u32), uid));
+    }
+
+    #[test]
+    fn saving_multiple_same_named_attachments_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("report.txt"), "existing").unwrap();
+        let first = save_attachment_without_overwrite(directory.path(), &attachment("report.txt", b"first"), 0).unwrap();
+        let second = save_attachment_without_overwrite(directory.path(), &attachment("../../report.txt", b"second"), 1).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(directory.path().join("report.txt")).unwrap(), "existing");
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        assert_eq!(std::fs::read(second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn selection_start_and_drag_width_are_safely_bounded() {
+        assert_eq!(attachment_list_start(15, 30, 10), 10);
+        assert_eq!(attachment_list_start(1, 30, 10), 0);
+        assert_eq!(mouse_width_percent(0, 120), 12);
+        assert_eq!(mouse_width_percent(110, 120), 50);
+        assert_eq!(mouse_width_percent(24, 100), 25);
     }
 }

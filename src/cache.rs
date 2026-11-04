@@ -33,6 +33,9 @@ pub(crate) struct CachedMailbox {
     pub has_more: bool,
     /// RFC 3501 UIDVALIDITY is required for safely reusing cached IMAP UIDs.
     pub uid_validity: Option<u32>,
+    /// UIDNEXT from SELECT. Optional for caches written by older releases.
+    #[serde(default)]
+    pub uid_next: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -235,6 +238,24 @@ mod tests {
     }
 
     #[test]
+    fn older_cache_without_uidnext_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let mut snapshot = Snapshot::default();
+        snapshot.folders.insert("INBOX".into(), folder(55, 2));
+        write_snapshot(&path, &snapshot).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut value = value;
+        value["snapshot"]["folders"]["INBOX"].as_object_mut().unwrap()
+            .remove("uid_next");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.folders["INBOX"].uid_validity, Some(55));
+        assert_eq!(loaded.folders["INBOX"].uid_next, None);
+    }
+
+    #[test]
     fn corrupted_or_old_cache_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.json");
@@ -248,7 +269,7 @@ mod tests {
     fn cache_requires_uidvalidity() {
         let mut snapshot = Snapshot::default();
         let folder = CachedMailbox { messages: vec![], bodies: HashMap::new(), message_index: 0,
-            message_view_offset: 0, next_page_offset: 0, has_more: false, uid_validity: None };
+            message_view_offset: 0, next_page_offset: 0, has_more: false, uid_validity: None, uid_next: None };
         apply(&mut snapshot, Change::Folder("INBOX".into(), folder.clone()));
         assert!(!snapshot.folders.contains_key("INBOX"));
         apply(&mut snapshot, Change::Folder("INBOX".into(), CachedMailbox {
@@ -302,6 +323,7 @@ mod tests {
             next_page_offset: count as usize,
             has_more: false,
             uid_validity: Some(validity),
+            uid_next: None,
         }
     }
 

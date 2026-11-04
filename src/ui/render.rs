@@ -28,8 +28,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.help_visible {
         draw_help(frame, app);
     }
+    if app.show_startup_warnings {
+        draw_startup_warnings(frame, app);
+    }
     if app.attachment_picker_visible {
         draw_attachments(frame, app);
+        if app.attachment_destination_picker.is_some() {
+            draw_attachment_destination_picker(frame, app);
+        }
     }
     if app.theme_picker_visible {
         draw_theme_picker(frame, app);
@@ -69,7 +75,29 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         };
         spans.push(Span::styled(format!(" {} ", account.name), style));
     }
+    if !app.startup_warnings.is_empty() {
+        spans.push(Span::styled(
+            format!("  ! {} config issue(s) [! to inspect]", app.startup_warnings.len()),
+            theme.error(),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.text()), area);
+}
+
+fn draw_startup_warnings(frame: &mut Frame<'_>, app: &App) {
+    let theme = app.theme().clone();
+    let area = centered_rect(frame.area(), 85, 55);
+    frame.render_widget(Clear, area);
+    let block = Block::default().title(" Account configuration warnings ")
+        .borders(Borders::ALL).border_style(theme.error());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let details = app.startup_warnings.iter().enumerate()
+        .map(|(i, issue)| format!("{}. {}\n", i + 1, issue))
+        .collect::<Vec<_>>().join("\n");
+    frame.render_widget(Paragraph::new(format!(
+        "Other usable accounts remain active. Fix config.toml and restart to re-enable affected accounts or sending.\n\n{details}\nEsc / q / ! to close"
+    )).style(theme.text()).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -88,33 +116,28 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     match (app.sidebar_visible, app.preview_split) {
         (true, false) => {
-            let mailbox_percent = app.mailbox_width_percent.clamp(20, 50);
+            let mailbox_width = super::mailbox_column_width(area.width, app.mailbox_width_percent);
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(mailbox_percent),
-                    Constraint::Percentage(100_u16.saturating_sub(mailbox_percent)),
-                ])
+                .constraints([Constraint::Length(mailbox_width), Constraint::Min(1)])
                 .split(area);
             draw_mailboxes(frame, app, columns[0]);
             draw_messages(frame, app, columns[1]);
         }
         (false, false) => draw_messages(frame, app, area),
         (true, true) => {
-            let mailbox_percent = app.mailbox_width_percent.clamp(18, 32);
-            let remaining = 100_u16.saturating_sub(mailbox_percent);
-            let list_percent = remaining.saturating_mul(43) / 100;
+            let mailbox_width = super::mailbox_column_width(area.width, app.mailbox_width_percent);
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(mailbox_percent),
-                    Constraint::Percentage(list_percent),
-                    Constraint::Percentage(remaining.saturating_sub(list_percent)),
-                ])
+                .constraints([Constraint::Length(mailbox_width), Constraint::Min(1)])
                 .split(area);
+            let right = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+                .split(columns[1]);
             draw_mailboxes(frame, app, columns[0]);
-            draw_messages(frame, app, columns[1]);
-            draw_message(frame, app, columns[2]);
+            draw_messages(frame, app, right[0]);
+            draw_message(frame, app, right[1]);
         }
         (false, true) => {
             let columns = Layout::default()
@@ -135,7 +158,7 @@ fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(theme.border());
+        .border_style(if app.mailbox_resizing { theme.accent() } else { theme.border() });
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -249,9 +272,11 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let mut start = offset.min(visible.len().saturating_sub(1));
     if current_position < start { start = current_position; }
-    while start < current_position && row_heights[start..=current_position]
-        .iter().sum::<usize>() > height
-    { start += 1; }
+    let mut cursor_window_rows = row_heights[start..=current_position].iter().sum::<usize>();
+    while start < current_position && cursor_window_rows > height {
+        cursor_window_rows -= row_heights[start];
+        start += 1;
+    }
     let mut end = start;
     let mut used = 0usize;
     while end < visible.len() && used + row_heights[end] <= height {
@@ -1220,44 +1245,203 @@ fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
-fn draw_attachments(frame: &mut Frame<'_>, app: &App) {
+/// Received attachment browser: Yazi-like relative numbers and marks on the
+/// left, automatic inline preview on the right, mouse/keyboard actions below.
+fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
     let theme = app.theme().clone();
-    let area = centered_rect(frame.area(), 82, 76);
+    let (area, list_area, preview_area, footer) = super::attachment_regions(frame.area());
     frame.render_widget(Clear, area);
-    let block = Block::default().title(" Attachments ").borders(Borders::ALL)
-        .border_style(theme.accent());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let chunks = Layout::vertical([
-        Constraint::Percentage(42), Constraint::Min(4), Constraint::Length(1),
-    ]).split(inner);
-    let entries = app.attachment_files.iter().enumerate().map(|(index, item)| {
-        let label = format!(" {}  {}   ({} bytes)",
-            if item.content_type.starts_with("image/") { "▧" }
-            else if item.content_type == "application/pdf" { "▤" } else { "▫" },
-            item.filename, item.data.len());
-        Line::styled(label, if index == app.attachment_selection { theme.selected() } else { theme.text() })
-    }).collect::<Vec<_>>();
-    if entries.is_empty() {
-        frame.render_widget(Paragraph::new(" No attachments loaded (or this message has none)")
-            .style(theme.muted()), chunks[0]);
-    } else {
-        frame.render_widget(Paragraph::new(entries), chunks[0]);
+    let count = app.attachment_files.len();
+    let mark_count = app.attachment_marked.len();
+    let title = if mark_count == 0 { format!(" Attachments · {count} ") }
+        else { format!(" Attachments · {count} · {mark_count} marked ") };
+    frame.render_widget(Block::default().title(title).borders(Borders::ALL)
+        .border_style(theme.accent()), area);
+
+    // Left pane: header row + viewport-centered rows, with relative line
+    // numbers (absolute number on the cursor line) and persistent marks.
+    frame.render_widget(Block::default().borders(Borders::RIGHT)
+        .border_style(theme.border()), list_area);
+    frame.render_widget(Paragraph::new("  Files")
+        .style(theme.accent()), Rect::new(list_area.x, list_area.y, list_area.width, list_area.height.min(1)));
+    let rows = usize::from(list_area.height.saturating_sub(1));
+    let selected = app.attachment_selection.min(count.saturating_sub(1));
+    let start = selected.saturating_sub(rows / 2).min(count.saturating_sub(rows));
+    let end = (start + rows).min(count);
+    let digits = count.max(1).to_string().len();
+    for index in start..end {
+        let file = &app.attachment_files[index];
+        let active = index == selected;
+        let marked = app.attachment_marked.contains(&index);
+        let visual = app.attachment_visual_anchor.is_some_and(|anchor|
+            (anchor.min(selected)..=anchor.max(selected)).contains(&index));
+        let number = if active { index + 1 } else { index.abs_diff(selected) };
+        let prefix = format!("{} {:>digits$} {} ",
+            if visual { "▍" } else { " " }, number,
+            if marked { "✓" } else if file.content_type.starts_with("image/") { "▧" }
+                else if file.content_type == "application/pdf" { "▤" } else { "▫" });
+        let available = usize::from(list_area.width.saturating_sub(1))
+            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+        let name = truncate_display_width(&attachment_display_name(&file.filename), available);
+        let style = if active { theme.current_line().add_modifier(Modifier::BOLD) }
+            else if visual { theme.selected() }
+            else if marked { theme.unread() } else { theme.text() };
+        // Paragraph background fills the entire row instead of ending at the
+        // filename. This matches the Vim/Yazi full-width cursor highlight.
+        let rect = Rect::new(list_area.x, list_area.y.saturating_add(1 + (index - start) as u16),
+            list_area.width.saturating_sub(1), 1);
+        frame.render_widget(Paragraph::new(Line::from(format!("{prefix}{name}"))).style(style), rect);
     }
-    if let Some(protocol) = app.attachment_preview() {
-        let size = protocol.size();
-        if size.width <= chunks[1].width && size.height <= chunks[1].height {
-            let rect = Rect::new(chunks[1].x + (chunks[1].width - size.width)/2,
-                chunks[1].y, size.width, size.height);
-            frame.render_widget(TerminalImage::new(protocol), rect);
+    if start == end {
+        frame.render_widget(Paragraph::new(if app.attachment_pending_loading() {
+            " Loading attachments…"
+        } else { " No attachments" }).style(theme.muted()), Rect::new(list_area.x,
+            list_area.y.saturating_add(1), list_area.width.saturating_sub(1), 1));
+    }
+
+    // Right pane: preview the selected image/text automatically. Image decode
+    // happens at most once per selection and viewport size, not every frame.
+    let preview_w = preview_area.width.saturating_sub(3);
+    let preview_h = preview_area.height.saturating_sub(6);
+    app.ensure_attachment_preview(preview_w, preview_h);
+    let pleft = preview_area.x.saturating_add(2);
+    let pwidth = preview_area.width.saturating_sub(3);
+    if let Some(file) = app.attachment_files.get(selected) {
+        frame.render_widget(Paragraph::new(truncate_display_width(&attachment_display_name(&file.filename), usize::from(pwidth)))
+            .style(theme.accent()), Rect::new(pleft, preview_area.y, pwidth, 1));
+        frame.render_widget(Paragraph::new(format!("{}  ·  {}", file.content_type, attachment_human_size(file.data.len())))
+            .style(theme.muted()), Rect::new(pleft, preview_area.y.saturating_add(1), pwidth, 1));
+        let content = Rect::new(pleft, preview_area.y.saturating_add(3), pwidth,
+            preview_area.height.saturating_sub(4));
+        if let Some(protocol) = app.attachment_preview() {
+            let size = protocol.size();
+            if size.width <= content.width && size.height <= content.height {
+                let rect = Rect::new(content.x + content.width.saturating_sub(size.width)/2,
+                    content.y, size.width, size.height);
+                frame.render_widget(TerminalImage::new(protocol), rect);
+            }
+        } else if let Some(error) = app.attachment_preview_error() {
+            frame.render_widget(Paragraph::new(error.to_string()).style(theme.muted())
+                .wrap(Wrap { trim: false }), content);
+        } else if file.content_type == "application/pdf"
+            || file.filename.rsplit('.').next().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")) {
+            let message = if app.attachment_preview_decoded() {
+                "PDF thumbnail ready, but this terminal cannot display it.\nPress o to open the PDF."
+            } else { "Rendering PDF page 1…\n\nPreview runs off the UI thread using Poppler (pdftoppm)." };
+            frame.render_widget(Paragraph::new(message)
+                .style(theme.muted()).wrap(Wrap { trim: false }), content);
+        } else if file.content_type.starts_with("image/") {
+            let message = if app.attachment_preview_decoded() {
+                "Image ready, but this terminal cannot display it.\nPress o to open."
+            } else { "Preparing image preview…" };
+            frame.render_widget(Paragraph::new(message)
+                .style(theme.muted()).wrap(Wrap { trim: false }), content);
+        } else if let Some(preview) = attachment_text_preview(file) {
+            frame.render_widget(Paragraph::new(preview).style(theme.text())
+                .wrap(Wrap { trim: false }), content);
+        } else {
+            frame.render_widget(Paragraph::new("Binary attachment\n\nPress o to open or s to save.\nNo file is opened automatically.")
+                .style(theme.muted()).wrap(Wrap { trim: false }), content);
         }
     } else {
-        frame.render_widget(Paragraph::new(" p previews PNG/JPEG/GIF/WebP in the terminal;
- Enter opens via the system file handler (PDF, image, etc.)")
-            .style(theme.muted()), chunks[1]);
+        frame.render_widget(Paragraph::new("Select an attachment to preview it")
+            .style(theme.muted()), preview_area);
     }
-    frame.render_widget(Paragraph::new(" j/k select   p preview image   Enter/o open   Esc/q close")
-        .style(theme.accent()), chunks[2]);
+
+    let footer_first = Rect::new(footer.x, footer.y, footer.width, footer.height.min(1));
+    let footer_second = Rect::new(footer.x, footer.y.saturating_add(1), footer.width, footer.height.saturating_sub(1));
+    frame.render_widget(Paragraph::new(" [o] Open    [s] Browse & save    [Space] Mark")
+        .style(theme.accent()), footer_first);
+    frame.render_widget(Paragraph::new(" j/k · 5j/5k · gg/G · Ctrl-j/k smooth · v visual · a all · Esc close")
+        .style(theme.muted()), footer_second);
+}
+
+/// Save received attachments into a browsed directory (same Yazi-like
+/// parent/current/preview layout as the compose attachment picker). Users
+/// choose the destination instead of typing arbitrary paths.
+fn draw_attachment_destination_picker(frame: &mut Frame<'_>, app: &App) {
+    let Some(picker) = app.attachment_destination_picker.as_ref() else { return; };
+    let (area, parent_area, files_area, preview_area, footer) =
+        super::attachment_destination_regions(frame.area());
+    let theme = app.theme();
+    frame.render_widget(Clear, area);
+    let count = if app.attachment_marked.is_empty() { usize::from(!app.attachment_files.is_empty()) }
+        else { app.attachment_marked.len() };
+    let block = Block::default().title(format!(" Save {count} attachment(s) · choose destination "))
+        .borders(Borders::ALL).border_style(theme.accent());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 12 || inner.height < 5 { return; }
+    frame.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled(" 󰉋 ", theme.accent()),
+        Span::styled(truncate_display_width(&picker.directory.display().to_string(),
+            usize::from(inner.width.saturating_sub(4))), theme.text().add_modifier(Modifier::BOLD)),
+    ])), Rect::new(inner.x, inner.y, inner.width, 1));
+    if parent_area.width > 0 && parent_area.height > 0 {
+        frame.render_widget(Block::default().borders(Borders::RIGHT).border_style(theme.border()), parent_area);
+        compose_picker_rows(frame, Rect::new(parent_area.x, parent_area.y,
+            parent_area.width.saturating_sub(1), parent_area.height),
+            &picker.parent_entries, Some(picker.parent_selected), false, &[], None, theme);
+    }
+    if files_area.width > 0 && files_area.height > 0 {
+        frame.render_widget(Block::default().borders(Borders::RIGHT).border_style(theme.border()), files_area);
+        compose_picker_rows(frame, Rect::new(files_area.x, files_area.y,
+            files_area.width.saturating_sub(1), files_area.height),
+            &picker.entries, Some(picker.selected), true, &[], None, theme);
+    }
+    if preview_area.width > 2 && preview_area.height > 0 {
+        let preview_rect = Rect::new(preview_area.x.saturating_add(1), preview_area.y,
+            preview_area.width.saturating_sub(2), preview_area.height);
+        let lines: Vec<Line<'static>> = match &picker.preview {
+            crate::app::ComposeFilePreview::Directory(entries) => entries.iter()
+                .take(usize::from(preview_rect.height)).map(|entry| Line::styled(
+                    format!("{}{}", if entry.is_directory { "󰉋 " } else { "  " }, entry.name),
+                    if entry.is_directory { theme.accent() } else { theme.text() })).collect(),
+            crate::app::ComposeFilePreview::Binary(bytes) => vec![
+                Line::styled("File (choose a folder to enter)", theme.muted()),
+                Line::styled(format!("{bytes} bytes"), theme.text())],
+            crate::app::ComposeFilePreview::Empty => vec![Line::styled("Empty directory", theme.muted())],
+            crate::app::ComposeFilePreview::Error(error) => vec![Line::styled(error.clone(), theme.error())],
+            _ => vec![Line::styled("Select a directory", theme.muted())],
+        };
+        frame.render_widget(Paragraph::new(lines), preview_rect);
+    }
+    if let Some(name) = &app.attachment_new_folder {
+        frame.render_widget(Paragraph::new(format!(" New folder name: {name}▏  Enter create · Esc cancel"))
+            .style(theme.accent()), footer);
+    } else {
+        frame.render_widget(Paragraph::new(" [s] Save here  [Enter/l] Open folder  [h] Parent  [n] New folder  [Esc] Cancel")
+            .style(theme.accent()), footer);
+    }
+}
+
+fn attachment_display_name(name: &str) -> String {
+    name.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect()
+}
+
+fn attachment_human_size(bytes: usize) -> String {
+    if bytes < 1024 { format!("{bytes} B") }
+    else if bytes < 1024 * 1024 { format!("{:.1} KiB", bytes as f64 / 1024.0) }
+    else { format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0)) }
+}
+
+fn attachment_text_preview(file: &crate::model::OutgoingAttachment) -> Option<String> {
+    let name = file.filename.to_ascii_lowercase();
+    let textual = file.content_type.starts_with("text/")
+        || file.content_type.contains("json")
+        || file.content_type.contains("xml")
+        || [".txt", ".csv", ".html", ".md", ".rs", ".py", ".toml", ".ini", ".cfg", ".yaml", ".yml", ".log", ".diff", ".patch", ".eml"]
+            .iter().any(|suffix| name.ends_with(suffix));
+    if !textual { return None; }
+    let sample = &file.data[..file.data.len().min(32 * 1024)];
+    if sample.contains(&0) { return None; }
+    let preview = String::from_utf8_lossy(sample);
+    let mut text = preview.lines().take(200).map(|line| {
+        line.chars().map(|ch| if ch.is_control() && ch != '\t' { ' ' } else { ch })
+            .collect::<String>()
+    }).collect::<Vec<_>>().join("\n");
+    if file.data.len() > sample.len() { text.push_str("\n… truncated to 32 KiB"); }
+    Some(text)
 }
 
 fn draw_compose_exit_prompt(frame: &mut Frame<'_>, app: &App) {
@@ -2285,4 +2469,26 @@ mod tests {
         assert_eq!(spans[0].style.fg, Some(Color::Black));
     }
 
+}
+
+#[cfg(test)]
+mod attachment_preview_tests {
+    use super::*;
+    use crate::model::OutgoingAttachment;
+
+    #[test]
+    fn preview_text_is_bounded_and_does_not_display_binary() {
+        let file = OutgoingAttachment {
+            filename: "notes.txt".into(), content_type: "text/plain".into(),
+            data: vec![b'a'; 64 * 1024],
+        };
+        let preview = attachment_text_preview(&file).unwrap();
+        assert!(preview.len() < file.data.len());
+        assert!(preview.contains("truncated"));
+        let binary = OutgoingAttachment {
+            filename: "file.bin".into(), content_type: "application/octet-stream".into(),
+            data: vec![0, 1, 2],
+        };
+        assert!(attachment_text_preview(&binary).is_none());
+    }
 }

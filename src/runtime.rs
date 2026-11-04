@@ -4,8 +4,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::Instant;
 
-use anyhow::Result;
-use crossterm::event::{self, KeyEventKind};
+use anyhow::{Result, anyhow};
+use crossterm::event::{self, KeyEventKind, EnableMouseCapture, DisableMouseCapture};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::execute;
 use crossterm::terminal::{
@@ -24,10 +24,17 @@ use crate::worker::{RuntimeEvent, WorkerHandle};
 
 
 pub fn run_tui(config: Config) -> Result<()> {
+    let (config, configuration_warnings) = validate_account_configuration(config)?;
     let (runtime_tx, runtime_rx) = sync_channel::<RuntimeEvent>(4096);
     let workers = create_workers(&config, runtime_tx.clone())?;
     let mut app = App::new(&config, workers);
     app.bootstrap();
+    app.startup_warnings = configuration_warnings;
+    if !app.startup_warnings.is_empty() {
+        app.status = crate::app::StatusLine::error(format!(
+            "{} account configuration issue(s) — press ! for details", app.startup_warnings.len()
+        ));
+    }
 
     let _terminal_guard = TerminalGuard::enter()?;
     let stdout = io::stdout();
@@ -56,6 +63,52 @@ pub fn run_tui(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Invalid account URIs must not keep correctly configured accounts from
+/// opening. In particular, a bad SMTP URL disables only sending on that
+/// account; receiving remains available. Never include URL credentials or
+/// command values in diagnostics rendered by the TUI.
+fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<String>)> {
+    let mut warnings = Vec::new();
+    config.accounts.retain_mut(|account| {
+        if backend::from_account(account).is_err() {
+            let scheme = safe_scheme(&account.source);
+            warnings.push(format!(
+                "{}: incoming source uses invalid or unsupported scheme '{scheme}'. \
+                 Use maildir://, imaps://, imaps+login://, imaps+oauthbearer://, or imaps+xoauth2://. Account skipped.",
+                account.name,
+            ));
+            return false;
+        }
+        if outgoing::from_account(account).is_err() {
+            let scheme = account.outgoing.as_deref().map(safe_scheme).unwrap_or("<missing>");
+            warnings.push(format!(
+                "{}: outgoing transport '{scheme}' is invalid. Use smtp:// or smtps:// \
+                 (optionally +login, +plain, or +xoauth2). Receiving works; sending disabled until fixed.",
+                account.name,
+            ));
+            account.outgoing = None;
+        }
+        true
+    });
+    if config.accounts.is_empty() {
+        return Err(anyhow!(
+            "no usable incoming accounts; check [[accounts]].source in config.toml ({} account(s) invalid)",
+            warnings.len(),
+        ));
+    }
+    Ok((config, warnings))
+}
+
+fn safe_scheme(uri: &str) -> &str {
+    let scheme = uri.split_once("://").map_or("<invalid>", |(scheme, _)| scheme);
+    // Never display an entire malformed URI: it may include a password.
+    if scheme.len() > 32 || !scheme.chars().all(|ch| ch.is_ascii_alphanumeric() || "+-._".contains(ch)) {
+        "<invalid>"
+    } else {
+        scheme
+    }
+}
+
 fn create_workers(config: &Config, runtime_tx: SyncSender<RuntimeEvent>) -> Result<Vec<WorkerHandle>> {
     config
         .accounts
@@ -63,16 +116,10 @@ fn create_workers(config: &Config, runtime_tx: SyncSender<RuntimeEvent>) -> Resu
         .enumerate()
         .map(|(index, account)| {
             let backend = backend::from_account(account)?;
-            // An independent IMAP session for background STATUS checks keeps
-            // unread-count discovery from blocking the interactive connection.
-            // Maildir checks are local and don't need a second worker.
-            let status_backend = if account.source.starts_with("imaps://")
-                || account.source.starts_with("imaps+")
-            {
-                Some(backend::from_account(account)?)
-            } else {
-                None
-            };
+            // STATUS and preview preloading share a lazy background session.
+            // Maildir uses a separate inexpensive local worker as well, so
+            // disk reads cannot stall interactive navigation.
+            let status_backend = Some(backend::from_account(account)?);
             let sender = outgoing::from_account(account)?;
             Ok(WorkerHandle::spawn(
                 index,
@@ -125,9 +172,13 @@ fn event_loop(
         if app.animation_active() {
             let now = Instant::now();
             if now >= next_animation_frame {
+                let tick = Instant::now();
                 app.advance_animation();
                 next_animation_frame = now + app.animation_frame_interval();
                 render(terminal, app)?;
+                // Includes animation-state updates and terminal drawing. The
+                // separate render marker isolates the paint/layout portion.
+                crate::perf::record("ui_animation_tick", None, tick.elapsed(), true);
                 continue;
             }
         } else {
@@ -156,6 +207,7 @@ fn event_loop(
             continue;
         };
 
+        let background_update = matches!(&event, RuntimeEvent::Worker(_) | RuntimeEvent::MailImage(_));
         match event {
             RuntimeEvent::Input(event::Event::Key(key))
                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -164,6 +216,10 @@ fn event_loop(
             }
             RuntimeEvent::Input(event::Event::Key(_)) => continue,
             RuntimeEvent::Input(event::Event::Resize(_, _)) => {}
+            RuntimeEvent::Input(event::Event::Mouse(mouse)) => {
+                let size = terminal.size()?;
+                app.handle_mouse(mouse, size.width, size.height);
+            }
             RuntimeEvent::Input(_) => continue,
             RuntimeEvent::Worker(event) => app.handle_worker_event(event),
             RuntimeEvent::MailImage(event) => app.handle_mail_image_event(event),
@@ -188,6 +244,11 @@ fn event_loop(
             app.advance_animation();
             next_animation_frame = Instant::now() + app.animation_frame_interval();
         }
+        // Worker completions may arrive in bursts while preloading bodies.
+        // The animation deadline will paint them on the next ~100 Hz frame;
+        // rendering once *per* completion can overwhelm a terminal and make
+        // Ctrl-j/k stutter even though the mailbox worker is asynchronous.
+        if background_update && app.animation_active() { continue; }
         render(terminal, app)?;
     }
     Ok(())
@@ -212,7 +273,12 @@ fn notify_new_mail(account: &str, count: usize, sound: &str) {
 }
 
 fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
-    terminal.draw(|frame| ui::draw(frame, app))?;
+    let started = Instant::now();
+    let result = terminal.draw(|frame| ui::draw(frame, app));
+    // Opt-in frame timing distinguishes terminal paint/layout jank from slow
+    // network fetches. No message content or account information is logged.
+    crate::perf::record("ui_render_frame", None, started.elapsed(), result.is_ok());
+    result?;
     Ok(())
 }
 
@@ -221,7 +287,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, SetCursorStyle::SteadyBar)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, SetCursorStyle::SteadyBar)?;
         Ok(Self)
     }
 }
@@ -229,6 +295,68 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, SetCursorStyle::DefaultUserShape, LeaveAlternateScreen);
+    }
+}
+
+#[cfg(test)]
+mod multi_account_tests {
+    use super::{safe_scheme, validate_account_configuration};
+    use crate::config::Config;
+
+    #[test]
+    fn malformed_smtp_disables_sending_without_disabling_receiving() {
+        let config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Primary"
+            source = "maildir:///tmp/primary"
+            outgoing = "smtps://user:password@smtp.example.net:465"
+            [[accounts]]
+            name = "Secondary"
+            source = "maildir:///tmp/secondary"
+            outgoing = "imaps://sensitive:secret@imap.example.net:993"
+        "#).unwrap();
+        let (validated, errors) = validate_account_configuration(config).unwrap();
+        assert_eq!(validated.accounts.len(), 2);
+        assert!(validated.accounts[0].outgoing.is_some());
+        assert!(validated.accounts[1].outgoing.is_none());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("Secondary"));
+        assert!(errors[0].contains("receiving works") || errors[0].contains("Receiving works"));
+        assert!(!errors.join(" ").contains("secret"));
+    }
+
+    #[test]
+    fn invalid_incoming_skips_only_that_account() {
+        let config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Broken"
+            source = "pop3s://user:secret@server.example.net"
+            [[accounts]]
+            name = "Working"
+            source = "maildir:///tmp/working"
+        "#).unwrap();
+        let (validated, warnings) = validate_account_configuration(config).unwrap();
+        assert_eq!(validated.accounts.len(), 1);
+        assert_eq!(validated.accounts[0].name, "Working");
+        assert!(warnings[0].contains("Broken"));
+        assert!(!warnings[0].contains("secret"));
+    }
+
+    #[test]
+    fn no_valid_incoming_accounts_returns_safe_error() {
+        let config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Broken"
+            source = "pop3s://user:secret@server.example.net"
+        "#).unwrap();
+        let error = match validate_account_configuration(config) {
+            Ok(_) => panic!("expected invalid config"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no usable incoming accounts"));
+        assert!(!error.contains("secret"));
+        assert_eq!(safe_scheme("imaps://username:secret@host"), "imaps");
+        assert_eq!(safe_scheme("username:secret@host"), "<invalid>");
     }
 }

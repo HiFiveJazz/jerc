@@ -192,7 +192,7 @@ const fn default_message_width_percent() -> u16 {
 }
 
 const fn default_mailbox_width_percent() -> u16 {
-    33
+    22
 }
 
 fn default_true() -> bool { true }

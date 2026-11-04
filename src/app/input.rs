@@ -41,6 +41,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Browse", key: "Ctrl-d / Ctrl-u", description: "page down / up" },
     HelpEntry { category: "Browse", key: "/", description: "filter/search current mailbox" },
     HelpEntry { category: "Browse", key: "b", description: "toggle mailbox sidebar" },
+    HelpEntry { category: "Browse", key: "Alt-h / Alt-l or drag divider", description: "resize mailbox column" },
     HelpEntry { category: "Browse", key: "p", description: "toggle vertical message preview" },
     HelpEntry { category: "Browse", key: "Enter / l", description: "open selected message" },
     HelpEntry { category: "Browse", key: "v", description: "visual range selection" },
@@ -58,7 +59,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Message", key: "T", description: "toggle rich HTML / plain fallback" },
     HelpEntry { category: "Message", key: "I", description: "toggle remote images for this session" },
     HelpEntry { category: "Message", key: "m", description: "show / hide Message-ID in reader" },
-    HelpEntry { category: "Message", key: "z", description: "attachments picker: Enter open, p image preview" },
+    HelpEntry { category: "Message", key: "z", description: "attachments: PDF preview, 5j/k, Ctrl-j/k, Space mark, v range, s folder picker" },
     HelpEntry { category: "Message", key: "o", description: "open link under reader cursor" },
     HelpEntry { category: "Message", key: "O", description: "open original HTML email in the browser" },
     HelpEntry { category: "Message", key: "y", description: "copy visual selection to clipboard" },
@@ -66,7 +67,10 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "General", key: "t", description: "open searchable theme picker" },
     HelpEntry { category: "General", key: "Ctrl-r", description: "refresh current mailbox" },
     HelpEntry { category: "General", key: "B", description: "toggle new mail bell (Inbox checked periodically)" },
-    HelpEntry { category: "General", key: "[ / ]", description: "previous / next account" },
+    HelpEntry { category: "Accounts", key: "Alt-n / Alt-p", description: "next / previous email account" },
+    HelpEntry { category: "Accounts", key: "Alt-1 … Alt-9", description: "jump directly to account 1–9" },
+    HelpEntry { category: "Accounts", key: "[ / ]", description: "previous / next account (also Ctrl-PgUp/PgDn)" },
+    HelpEntry { category: "General", key: "!", description: "show account configuration warnings" },
     HelpEntry { category: "Message", key: "A / L", description: "reply all / reply to mailing list (List-Post)" },
     HelpEntry { category: "Compose", key: "Ctrl-p / Ctrl-n", description: "save in Drafts / resume the local recovery copy" },
     HelpEntry { category: "Compose", key: "Tab / Shift-Tab", description: "To, Cc, Bcc, Subject, Body" },
@@ -154,6 +158,7 @@ pub enum Command {
     Refresh,
     NextAccount,
     PreviousAccount,
+    SelectAccount(usize),
     ToggleThemePicker,
     ExportRaw,
     ToggleHelp,
@@ -175,6 +180,16 @@ pub enum Command {
 
 #[must_use]
 pub fn command_for_key(key: KeyEvent) -> Command {
+    // Alt-based shortcuts are portable in most modern terminals and avoid
+    // Ctrl-Tab ambiguity. Alt-1 through Alt-9 select a specific account.
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return match key.code {
+            KeyCode::Char('n') => Command::NextAccount,
+            KeyCode::Char('p') => Command::PreviousAccount,
+            KeyCode::Char(ch @ '1'..='9') => Command::SelectAccount((ch as u8 - b'1') as usize),
+            _ => Command::None,
+        };
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
         return match key.code {
             KeyCode::Char('j') | KeyCode::Char('J') => Command::SmoothMailboxDown,
@@ -246,6 +261,16 @@ pub fn command_for_key(key: KeyEvent) -> Command {
 mod tests {
     use super::{Command, Focus, HELP_ENTRIES, command_for_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn account_shortcuts_are_exposed() {
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)), Command::NextAccount);
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)), Command::PreviousAccount);
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)), Command::SelectAccount(0));
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT)), Command::SelectAccount(2));
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT)), Command::SelectAccount(8));
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)), Command::NextAccount);
+    }
 
     #[test]
     fn browser_focus_stays_on_messages() {

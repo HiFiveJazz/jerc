@@ -84,6 +84,7 @@ fn worker_preserves_pagination_metadata() {
             name: "INBOX".to_owned(),
             offset: 25,
             limit: 50,
+            hint: None,
         })
         .unwrap();
     let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
