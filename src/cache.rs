@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -99,7 +99,15 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
     let identity = crate::backend::redact_source(&account.source);
     let hash = stable_key(&format!("{}\0{identity}", account.name));
     let path = dir.join(format!("{hash:016x}.json"));
-    let snapshot = read_snapshot(&path).unwrap_or_default();
+    let cache_start = Instant::now();
+    let loaded = read_snapshot(&path);
+    // A successful disk read with no usable folders is not a warm mailbox
+    // cache. The log contains timing only, never account or message details.
+    crate::perf::record(
+        "cache_read", None, cache_start.elapsed(),
+        loaded.as_ref().is_some_and(|snapshot| !snapshot.folders.is_empty()),
+    );
+    let snapshot = loaded.unwrap_or_default();
     let (tx, rx) = mpsc::channel::<Change>();
     let mut stored = snapshot.clone();
     let join = thread::Builder::new()
@@ -247,5 +255,156 @@ mod tests {
             uid_validity: Some(42), ..folder
         }));
         assert!(snapshot.folders.contains_key("INBOX"));
+    }
+
+    fn summary(uid_validity: u32, uid: u32) -> MessageSummary {
+        MessageSummary {
+            id: MessageId(format!("imap-uid:{uid_validity}:{uid}")),
+            message_id: None,
+            in_reply_to: None,
+            references: Vec::new(),
+            from_name: "Sender".into(),
+            from_address: "sender@example.test".into(),
+            to: "recipient@example.test".into(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: format!("Subject {uid}"),
+            timestamp: i64::from(uid),
+            date_label: "Today".into(),
+            size: 25,
+            flags: crate::model::MessageFlags::empty(),
+            has_attachment_hint: false,
+            attachment_names_hint: vec![],
+        }
+    }
+
+    fn body(id: MessageId, text: &str) -> MessageBody {
+        MessageBody {
+            id,
+            plain_text: Some(text.into()),
+            plain_fallback: None,
+            html_source: None,
+            html_text: None,
+            html_lines: None,
+            html_renderer: None,
+            html_render_width: 0,
+            attachment_count: 0,
+            attachment_names: vec![],
+        }
+    }
+
+    fn folder(validity: u32, count: u32) -> CachedMailbox {
+        CachedMailbox {
+            messages: (1..=count).map(|uid| summary(validity, uid)).collect(),
+            bodies: HashMap::new(),
+            message_index: 0,
+            message_view_offset: 0,
+            next_page_offset: count as usize,
+            has_more: false,
+            uid_validity: Some(validity),
+        }
+    }
+
+    #[test]
+    fn cached_flags_subject_and_body_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let mut snapshot = Snapshot::default();
+        let mut inbox = folder(12, 2);
+        inbox.messages[0].subject = "Unicode: café ☃".into();
+        inbox.messages[0].flags.set(crate::model::MessageFlags::SEEN, true);
+        let first_id = inbox.messages[0].id.clone();
+        inbox.bodies.insert(first_id.clone(), body(first_id, "cached offline text"));
+        apply(&mut snapshot, Change::Folder("INBOX".into(), inbox));
+        write_snapshot(&path, &snapshot).unwrap();
+
+        let loaded = read_snapshot(&path).unwrap();
+        let inbox = loaded.folders.get("INBOX").unwrap();
+        assert_eq!(inbox.messages.len(), 2);
+        assert_eq!(inbox.messages[0].subject, "Unicode: café ☃");
+        assert!(!inbox.messages[0].unread());
+        let text = inbox.bodies.get(&inbox.messages[0].id).unwrap();
+        assert_eq!(text.plain_text.as_deref(), Some("cached offline text"));
+    }
+
+    #[test]
+    fn mismatched_uidvalidity_is_rejected_on_disk_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let mut snapshot = Snapshot::default();
+        let mut inbox = folder(100, 1);
+        inbox.messages[0].id = MessageId("imap-uid:99:1".into());
+        snapshot.folders.insert("INBOX".into(), inbox);
+        snapshot.folders.insert("Archive".into(), folder(100, 1));
+        write_snapshot(&path, &snapshot).unwrap();
+
+        let loaded = read_snapshot(&path).unwrap();
+        assert!(!loaded.folders.contains_key("INBOX"));
+        assert!(loaded.folders.contains_key("Archive"));
+    }
+
+    #[test]
+    fn mismatched_uidvalidity_in_cached_body_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let mut snapshot = Snapshot::default();
+        let mut inbox = folder(100, 1);
+        let bad_id = MessageId("imap-uid:99:1".into());
+        inbox.bodies.insert(bad_id.clone(), body(bad_id, "stale"));
+        snapshot.folders.insert("INBOX".into(), inbox);
+        write_snapshot(&path, &snapshot).unwrap();
+
+        assert!(!read_snapshot(&path).unwrap().folders.contains_key("INBOX"));
+    }
+
+    #[test]
+    fn folder_updates_limit_messages_bodies_and_size() {
+        let mut snapshot = Snapshot::default();
+        let mut inbox = folder(7, MAX_MESSAGES_PER_FOLDER as u32 + 2);
+        let first_id = inbox.messages[0].id.clone();
+        let removed_id = inbox.messages[MAX_MESSAGES_PER_FOLDER].id.clone();
+        inbox.bodies.insert(first_id.clone(), body(first_id.clone(), "keep"));
+        inbox.bodies.insert(removed_id.clone(), body(removed_id, "drop"));
+        let too_large_id = inbox.messages[1].id.clone();
+        inbox.bodies.insert(too_large_id.clone(), body(too_large_id, &"x".repeat(MAX_BODY_BYTES + 1)));
+        apply(&mut snapshot, Change::Folder("INBOX".into(), inbox));
+
+        let cached = snapshot.folders.get("INBOX").unwrap();
+        assert_eq!(cached.messages.len(), MAX_MESSAGES_PER_FOLDER);
+        assert_eq!(cached.next_page_offset, MAX_MESSAGES_PER_FOLDER);
+        assert!(cached.has_more);
+        assert_eq!(cached.bodies.len(), 1);
+        assert_eq!(cached.bodies[&first_id].plain_text.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn folder_removal_survives_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let mut snapshot = Snapshot::default();
+        apply(&mut snapshot, Change::Folder("INBOX".into(), folder(8, 1)));
+        apply(&mut snapshot, Change::Folder("Archive".into(), folder(8, 1)));
+        apply(&mut snapshot, Change::RemoveFolder("Archive".into()));
+        write_snapshot(&path, &snapshot).unwrap();
+
+        let loaded = read_snapshot(&path).unwrap();
+        assert!(loaded.folders.contains_key("INBOX"));
+        assert!(!loaded.folders.contains_key("Archive"));
+    }
+
+    #[test]
+    fn cache_over_size_limit_is_ignored_without_loading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.json");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_CACHE_BYTES + 1).unwrap();
+        assert!(read_snapshot(&path).is_none());
+    }
+
+    #[test]
+    fn cache_identity_keys_are_stable_and_distinct() {
+        assert_eq!(stable_key("account\0imap-a"), stable_key("account\0imap-a"));
+        assert_ne!(stable_key("account\0imap-a"), stable_key("account\0imap-b"));
+        assert_ne!(stable_key("account\0imap-a"), stable_key("other\0imap-a"));
     }
 }

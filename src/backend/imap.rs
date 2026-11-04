@@ -167,23 +167,31 @@ impl ImapSource {
             form.push(("scope", value));
         }
 
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(OAUTH_TIMEOUT))
-            .https_only(true)
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
-        let mut response = agent
-            .post(endpoint)
-            .send_form(form)
-            .context("exchanging OAuth refresh token")?;
-        let token: TokenResponse = response
-            .body_mut()
-            .read_json()
-            .context("decoding OAuth token response")?;
-        if token.access_token.is_empty() {
-            bail!("OAuth token endpoint returned an empty access token");
-        }
-        Ok(token.access_token)
+        // An OAuth HTTP refresh is distinct from the IMAP SASL round trip.
+        // Keep them separate in perf logs so a slow token server is not
+        // misdiagnosed as an io-imap / Gmail IMAP delay. Never log secrets.
+        let started = Instant::now();
+        let refreshed = (|| -> Result<String> {
+            let config = ureq::Agent::config_builder()
+                .timeout_global(Some(OAUTH_TIMEOUT))
+                .https_only(true)
+                .build();
+            let agent = ureq::Agent::new_with_config(config);
+            let mut response = agent
+                .post(endpoint)
+                .send_form(form)
+                .context("exchanging OAuth refresh token")?;
+            let token: TokenResponse = response
+                .body_mut()
+                .read_json()
+                .context("decoding OAuth token response")?;
+            if token.access_token.is_empty() {
+                bail!("OAuth token endpoint returned an empty access token");
+            }
+            Ok(token.access_token)
+        })();
+        crate::perf::record("imap_oauth_http_refresh", None, started.elapsed(), refreshed.is_ok());
+        refreshed
     }
 }
 
@@ -387,17 +395,21 @@ impl MailBackend for ImapBackend {
         let auth_result = (|| -> Result<()> {
             match self.source.auth {
                 ImapAuth::Password | ImapAuth::Login => {
-                    client
+                    let sasl_started = Instant::now();
+                    let result = client
                         .login(
                             &self.source.username,
                             &credential,
                             ImapLoginOptions::default(),
                         )
-                        .context("IMAP authentication failed")?;
+                        .context("IMAP authentication failed");
+                    crate::perf::record("imap_login_exchange", None, sasl_started.elapsed(), result.is_ok());
+                    result?;
                 }
                 ImapAuth::OAuthBearer => {
                     let access_token = self.source.access_token(&credential)?;
-                    client
+                    let sasl_started = Instant::now();
+                    let result = client
                         .auth_oauthbearer(
                             &self.source.username,
                             &self.source.host,
@@ -405,17 +417,22 @@ impl MailBackend for ImapBackend {
                             &access_token,
                             ImapAuthOauthbearerOptions::default(),
                         )
-                        .context("IMAP OAUTHBEARER authentication failed")?;
+                        .context("IMAP OAUTHBEARER authentication failed");
+                    crate::perf::record("imap_oauthbearer_exchange", None, sasl_started.elapsed(), result.is_ok());
+                    result?;
                 }
                 ImapAuth::XOAuth2 => {
                     let access_token = self.source.access_token(&credential)?;
-                    client
+                    let sasl_started = Instant::now();
+                    let result = client
                         .auth_xoauth2(
                             &self.source.username,
                             &access_token,
                             ImapAuthXoauth2Options::default(),
                         )
-                        .context("IMAP XOAUTH2 authentication failed")?;
+                        .context("IMAP XOAUTH2 authentication failed");
+                    crate::perf::record("imap_xoauth2_exchange", None, sasl_started.elapsed(), result.is_ok());
+                    result?;
                 }
             }
             Ok(())
