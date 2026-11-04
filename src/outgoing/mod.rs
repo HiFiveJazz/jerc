@@ -39,6 +39,10 @@ pub fn sender_from_account(account: &AccountConfig) -> String {
         // produce an actionable error, not silently send as another identity.
         return from.to_owned();
     }
+    // The visible From identity is independent of IMAP/SMTP authentication.
+    if let Some(email) = account.email.as_deref().filter(|value| !value.trim().is_empty()) {
+        return email.to_owned();
+    }
     if let Some(outgoing) = account.outgoing.as_deref() {
         if let Ok(smtp) = SmtpSource::parse(outgoing) {
             if smtp.username.parse::<lettre::message::Mailbox>().is_ok() {
@@ -94,7 +98,7 @@ mod sender_tests {
     fn account(from: Option<&str>, outgoing: &str, source: &str) -> AccountConfig {
         AccountConfig {
             name: "Test".into(), source: source.into(),
-            email: None, imap_host: None, smtp_host: None,
+            email: None, imap_username: None, smtp_username: None, imap_host: None, smtp_host: None,
             imap_port: None, smtp_port: None,
             default_mailbox: "INBOX".into(),
             source_cred_cmd: None, from: from.map(str::to_owned),

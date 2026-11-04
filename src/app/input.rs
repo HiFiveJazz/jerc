@@ -29,104 +29,74 @@ pub struct HelpEntry {
     pub description: &'static str,
 }
 
-/// Keep this list as the single source of truth for the searchable `?` popup.
-/// Count prefixes are intentionally not listed: `20j` is a Vim motion composed
-/// from a count plus `j`, not a separate keybinding.
+/// Searchable action palette, intentionally excluding generic Vim motions.
+/// Categories and the leading shortcut within each category sort alphabetically.
 pub const HELP_ENTRIES: &[HelpEntry] = &[
-    HelpEntry { category: "Browse", key: "j / k, ↑ / ↓", description: "move through visible messages" },
-    HelpEntry { category: "Browse", key: "J / K", description: "next / previous mailbox" },
-    HelpEntry { category: "Browse", key: "Ctrl-j / Ctrl-k", description: "smooth message scrolling" },
-    HelpEntry { category: "Browse", key: "Ctrl-Shift-j / Ctrl-Shift-k", description: "smooth mailbox scrolling" },
-    HelpEntry { category: "Browse", key: "g / G", description: "top / bottom" },
-    HelpEntry { category: "Browse", key: "Ctrl-d / Ctrl-u", description: "page down / up" },
-    HelpEntry { category: "Browse", key: "/", description: "filter/search current mailbox" },
-    HelpEntry { category: "Browse", key: "b", description: "toggle mailbox sidebar" },
-    HelpEntry { category: "Browse", key: "Alt-h / Alt-l or drag divider", description: "resize mailbox column" },
-    HelpEntry { category: "Browse", key: "p", description: "toggle vertical message preview" },
-    HelpEntry { category: "Browse", key: "Enter / l", description: "open selected message" },
-    HelpEntry { category: "Browse", key: "v", description: "visual range selection" },
-    HelpEntry { category: "Mail", key: "r / R", description: "reply without / with quoted text" },
-    HelpEntry { category: "Mail", key: "f", description: "forward" },
-    HelpEntry { category: "Mail", key: "c", description: "compose new message" },
-    HelpEntry { category: "Mail", key: "d / D", description: "delete with confirmation / immediately" },
-    HelpEntry { category: "Mail", key: "a / U", description: "archive / restore archived message to INBOX" },
-    HelpEntry { category: "Mail", key: "u", description: "toggle read / unread" },
-    HelpEntry { category: "Message", key: "Esc", description: "leave visual mode / close reader" },
-    HelpEntry { category: "Message", key: "h/j/k/l", description: "move reader cursor" },
-    HelpEntry { category: "Message", key: "w/b, 0/^/$, H/L", description: "word / line motions" },
-    HelpEntry { category: "Message", key: "gg / G, { / }", description: "document / paragraph motions" },
-    HelpEntry { category: "Message", key: "v / V, vi\" / vi' / vi() / vi[] / vi{}", description: "character / line visual selection and inner text objects" },
-    HelpEntry { category: "Message", key: "T", description: "toggle rich HTML / plain fallback" },
-    HelpEntry { category: "Message", key: "I", description: "toggle remote images for this session" },
-    HelpEntry { category: "Message", key: "m", description: "toggle full recipients and Message-ID in reader" },
-    HelpEntry { category: "Message", key: "z", description: "attachments: PDF preview, 5j/k, Ctrl-j/k, Space mark, v range, s folder picker" },
-    HelpEntry { category: "Message", key: "o", description: "open link under reader cursor" },
-    HelpEntry { category: "Message", key: "O", description: "open original HTML email in the browser" },
-    HelpEntry { category: "Message", key: "y", description: "copy visual selection to clipboard" },
-    HelpEntry { category: "Message", key: "e / E", description: "export raw RFC 5322 debug message" },
-    HelpEntry { category: "General", key: "t", description: "open searchable theme picker" },
-    HelpEntry { category: "General", key: "Ctrl-r", description: "refresh current mailbox" },
-    HelpEntry { category: "General", key: "B", description: "toggle new mail bell (Inbox checked periodically)" },
+    HelpEntry { category: "Accounts", key: "[ / ]", description: "previous / next account" },
+    HelpEntry { category: "Accounts", key: "Alt-1 … Alt-9", description: "switch directly to an email account" },
     HelpEntry { category: "Accounts", key: "Alt-n / Alt-p", description: "next / previous email account" },
-    HelpEntry { category: "Accounts", key: "Alt-1 … Alt-9", description: "jump directly to account 1–9" },
-    HelpEntry { category: "Accounts", key: "[ / ]", description: "previous / next account (also Ctrl-PgUp/PgDn)" },
     HelpEntry { category: "General", key: "!", description: "show account configuration warnings" },
-    HelpEntry { category: "Message", key: "A / L", description: "reply all / reply to mailing list (List-Post)" },
-    HelpEntry { category: "Compose", key: "Ctrl-p / Ctrl-n", description: "save in Drafts / resume the local recovery copy" },
-    HelpEntry { category: "Compose", key: "Tab / Shift-Tab", description: "To, Cc, Bcc, Subject, Body" },
-    HelpEntry { category: "General", key: "?", description: "search keybindings" },
-    HelpEntry { category: "General", key: "q / Ctrl-c", description: "quit" },
+    HelpEntry { category: "General", key: "?", description: "search command palette" },
+    HelpEntry { category: "General", key: "B", description: "toggle new-mail terminal bell" },
+    HelpEntry { category: "General", key: "Ctrl-r", description: "refresh selected mailbox" },
+    HelpEntry { category: "General", key: "N", description: "toggle desktop new-mail notifications (and sound)" },
+    HelpEntry { category: "General", key: "q / Ctrl-c", description: "quit aerc-rs" },
+    HelpEntry { category: "General", key: "t", description: "open theme picker" },
+    HelpEntry { category: "Mail actions", key: "a", description: "archive selected message" },
+    HelpEntry { category: "Mail actions", key: "A", description: "reply to all recipients" },
+    HelpEntry { category: "Mail actions", key: "c", description: "compose new email" },
+    HelpEntry { category: "Mail actions", key: "d / D", description: "delete (confirm) / delete immediately" },
+    HelpEntry { category: "Mail actions", key: "f", description: "forward message" },
+    HelpEntry { category: "Mail actions", key: "L", description: "reply to mailing list" },
+    HelpEntry { category: "Mail actions", key: "r / R", description: "reply / reply with quotation" },
+    HelpEntry { category: "Mail actions", key: "u", description: "mark read or unread" },
+    HelpEntry { category: "Mail actions", key: "U", description: "restore archived message to INBOX" },
+    HelpEntry { category: "Message", key: "e / E", description: "export original RFC 5322 message" },
+    HelpEntry { category: "Message", key: "Esc", description: "close the reader / exit selection" },
+    HelpEntry { category: "Message", key: "I", description: "toggle remote images for this session" },
+    HelpEntry { category: "Message", key: "m", description: "show full recipients and Message-ID" },
+    HelpEntry { category: "Message", key: "o", description: "open link under cursor" },
+    HelpEntry { category: "Message", key: "O", description: "open original HTML in browser" },
+    HelpEntry { category: "Message", key: "T", description: "toggle HTML / plain-text reader" },
+    HelpEntry { category: "Message", key: "y", description: "copy selected text" },
+    HelpEntry { category: "Message", key: "z", description: "open received attachments" },
+    HelpEntry { category: "Navigation", key: "/", description: "filter current mailbox" },
+    HelpEntry { category: "Navigation", key: "Ctrl-Shift-j / Ctrl-Shift-k", description: "smooth mailbox list scrolling" },
+    HelpEntry { category: "Navigation", key: "Enter", description: "open selected email" },
+    HelpEntry { category: "Navigation", key: "J / K", description: "next / previous mailbox" },
+    HelpEntry { category: "View", key: "Alt-h / Alt-l", description: "resize mailbox sidebar" },
+    HelpEntry { category: "View", key: "Alt-Shift-h / Alt-Shift-l", description: "resize message preview" },
+    HelpEntry { category: "View", key: "b", description: "show / hide mailbox sidebar" },
+    HelpEntry { category: "View", key: "p", description: "show / hide split preview" },
 ];
 
 /// Searchable help for the attachment picker; intentionally not duplicated
 /// in the global compose keymap or at the bottom of the picker.
 pub const PICKER_HELP_ENTRIES: &[HelpEntry] = &[
-    HelpEntry { category: "Browse", key: "j/k, arrows", description: "move selected file" },
-    HelpEntry { category: "Browse", key: "5j / 5k", description: "move by count" },
-    HelpEntry { category: "Browse", key: "gg / G", description: "first / last file" },
-    HelpEntry { category: "Browse", key: "h / l", description: "parent directory / open directory" },
-    HelpEntry { category: "Browse", key: "Ctrl-j / Ctrl-k", description: "smooth scroll" },
     HelpEntry { category: "Browse", key: ".", description: "toggle hidden files" },
-    HelpEntry { category: "Browse", key: "~ / d", description: "home / Downloads directory" },
     HelpEntry { category: "Browse", key: "/", description: "find folders or files in this directory" },
-    HelpEntry { category: "Browse", key: "Enter (search)", description: "accept matched row and exit search; arrows cycle; Tab opens folder" },
-    HelpEntry { category: "Select", key: "Space", description: "toggle file; in visual mode detach an all-attached range" },
-    HelpEntry { category: "Select", key: "v / V", description: "start or exit visual range selection" },
-    HelpEntry { category: "Select", key: "v 5j Enter", description: "attach all selected files in the range" },
-    HelpEntry { category: "Select", key: "x", description: "detach highlighted file or visual selection" },
-    HelpEntry { category: "Select", key: "Enter", description: "attach selection / open a directory" },
+    HelpEntry { category: "Browse", key: "Enter (search)", description: "accept a search match" },
+    HelpEntry { category: "Browse", key: "~ / d", description: "home / Downloads directory" },
     HelpEntry { category: "General", key: "?", description: "search picker keybindings" },
     HelpEntry { category: "General", key: "Esc / q", description: "exit visual selection / close picker" },
+    HelpEntry { category: "Select", key: "Enter", description: "attach selection / open a directory" },
+    HelpEntry { category: "Select", key: "Space", description: "toggle file; in visual mode detach an all-attached range" },
+    HelpEntry { category: "Select", key: "v / V", description: "start or exit visual range selection" },
+    HelpEntry { category: "Select", key: "x", description: "detach highlighted file or visual selection" },
 ];
 
 /// Compose-specific, searchable modal shortcuts. Do not clutter the editor.
 pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
-    HelpEntry { category: "Compose", key: "Tab / Shift-Tab", description: "next / previous recipient, subject or body field" },
-    HelpEntry { category: "Compose", key: "Enter (normal)", description: "preview outgoing email before sending" },
-    HelpEntry { category: "Send preview", key: "Enter / Esc", description: "send email / return to editor" },
-    HelpEntry { category: "Send preview", key: "T / O", description: "toggle HTML/plain, open browser preview" },
-    HelpEntry { category: "Send preview", key: "j/k, g/G", description: "scroll / jump through outgoing body" },
     HelpEntry { category: "Compose", key: "?", description: "search compose shortcuts" },
     HelpEntry { category: "Compose", key: "Ctrl-a", description: "open attachment file picker" },
-    HelpEntry { category: "Compose", key: "Ctrl-d", description: "manage attachments, j/k navigate, d/x detach, u undo" },
+    HelpEntry { category: "Compose", key: "Ctrl-d", description: "manage attached files" },
     HelpEntry { category: "Compose", key: "Ctrl-o", description: "open advanced options for custom email headers" },
     HelpEntry { category: "Compose", key: "Ctrl-p", description: "save locally and in the account Drafts folder" },
+    HelpEntry { category: "Compose", key: "Enter (normal)", description: "preview outgoing email before sending" },
     HelpEntry { category: "Compose", key: "Esc / q (normal)", description: "ask to save an unsent email in Drafts before closing" },
-    HelpEntry { category: "Vim", key: "i a I A", description: "insert before/after cursor, line start/end" },
-    HelpEntry { category: "Compose", key: "j/k (normal)", description: "next / previous To, Cc, Bcc, Subject field" },
-    HelpEntry { category: "Vim", key: "h j k l (body)", description: "left, down, up, right in body" },
-    HelpEntry { category: "Vim", key: "w W b B e E", description: "word and WORD navigation" },
-    HelpEntry { category: "Vim", key: "0 ^ $ H L", description: "beginning / first nonblank / end of line" },
-    HelpEntry { category: "Vim", key: "gg G", description: "first / last line in current field" },
-    HelpEntry { category: "Vim", key: "{ }", description: "previous / next paragraph" },
-    HelpEntry { category: "Vim", key: "v V", description: "character / whole-line visual selection" },
-    HelpEntry { category: "Vim", key: "vi\" vi' vi( vi[ vi{", description: "select inside quoted text / paired brackets" },
-    HelpEntry { category: "Vim", key: "f F", description: "find character forward / backward" },
-    HelpEntry { category: "Vim", key: "o O", description: "open new body line below / above" },
-    HelpEntry { category: "Vim", key: "x dd dw D", description: "delete character / line / word / to line end" },
-    HelpEntry { category: "Vim", key: "u / Ctrl-r", description: "undo / redo editing" },
-    HelpEntry { category: "Vim", key: "2j / 3w / …", description: "repeat a motion with a count" },
-    HelpEntry { category: "Vim", key: "Ctrl-j / Ctrl-k", description: "move down/up five body lines" },
+    HelpEntry { category: "Compose", key: "Tab / Shift-Tab", description: "next / previous recipient, subject or body field" },
+    HelpEntry { category: "Send preview", key: "Enter / Esc", description: "send email / return to editor" },
+    HelpEntry { category: "Send preview", key: "T / O", description: "toggle HTML/plain, open browser preview" },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +135,7 @@ pub enum Command {
     ToggleHtml,
     ToggleImages,
     ToggleBell,
+    ToggleNotifications,
     OpenOriginal,
     Yank,
     Compose,
@@ -246,6 +217,7 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('T') => Command::ToggleHtml,
         KeyCode::Char('I') => Command::ToggleImages,
         KeyCode::Char('B') => Command::ToggleBell,
+        KeyCode::Char('N') => Command::ToggleNotifications,
         KeyCode::Char('O') => Command::OpenOriginal,
         KeyCode::Char('y') => Command::Yank,
         KeyCode::Char('c') => Command::Compose,
@@ -285,6 +257,14 @@ mod tests {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT)),
             Command::ToggleBell
+        );
+    }
+
+    #[test]
+    fn uppercase_n_toggles_desktop_notifications() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            Command::ToggleNotifications
         );
     }
 
@@ -415,6 +395,18 @@ mod tests {
     #[test]
     fn help_does_not_advertise_count_combinations_as_keybindings() {
         assert!(HELP_ENTRIES.iter().all(|entry| !entry.key.contains("20j")));
+    }
+
+    #[test]
+    fn palette_categories_and_first_shortcuts_are_sorted_and_omit_vim_motions() {
+        let keys = HELP_ENTRIES.iter()
+            .map(|entry| (entry.category.to_ascii_lowercase(), entry.key.to_ascii_lowercase()))
+            .collect::<Vec<_>>();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+        assert!(!HELP_ENTRIES.iter().any(|entry| entry.category == "Vim"));
+        assert!(!HELP_ENTRIES.iter().any(|entry| entry.key.contains("vi")));
     }
 
     #[test]

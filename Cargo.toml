@@ -20,6 +20,7 @@ io-imap = { version = "0.8.1", default-features = false, features = ["rustls-rin
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "rustls-platform-verifier"] }
 mail-parser = { version = "1.0.1", features = ["full_encoding"] }
 percent-encoding = "2.3.2"
+roxmltree = "0.21"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "unstable-rendered-line-info"] }
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 ring = "0.17.4" # already used transitively by TLS; PKCE SHA-256 and secure random

@@ -316,7 +316,7 @@ impl SmtpSender {
             let auth = connection.auth(
                 &[Mechanism::Xoauth2],
                 &Credentials::new(self.source.username.clone(), token),
-            ).context("SMTP XOAUTH2 fallback authentication exchange")?;
+            ).map_err(|error| smtp_xoauth2_error(&self.source.host, error))?;
             if !auth.has_code(235) {
                 bail!("SMTP rejected XOAUTH2 fallback authentication (code {})", auth.code());
             }
@@ -424,6 +424,24 @@ fn smtp_advertises_oauthbearer(response: &Response) -> bool {
         matches!(fields.next(), Some(prefix) if prefix.eq_ignore_ascii_case("AUTH"))
             && fields.any(|mechanism| mechanism.eq_ignore_ascii_case("OAUTHBEARER"))
     })
+}
+
+/// SMTP AUTH is a separate Exchange Online policy, even when IMAP OAuth works.
+/// Never log bearer tokens; only enrich the server-authentication error.
+fn smtp_xoauth2_error(host: &str, error: impl std::fmt::Display) -> anyhow::Error {
+    let detail = error.to_string();
+    if (host.eq_ignore_ascii_case("smtp.office365.com")
+        || host.eq_ignore_ascii_case("smtp-mail.outlook.com"))
+        && detail.contains("535") {
+        anyhow!("Microsoft SMTP XOAUTH2 rejected authentication (535). \
+            IMAP OAuth may still work. Check the mailbox's SMTP AUTH policy, \
+            whether delegated SMTP.Send was consented, the outgoing username, \
+            and that smtp.office365.com:587 uses STARTTLS. \
+            Only your Exchange administrator can change tenant/mailbox SMTP AUTH restrictions. \
+            Server response: {detail}")
+    } else {
+        anyhow!("SMTP XOAUTH2 authentication exchange: {detail}")
+    }
 }
 
 fn decode_component(raw: &str) -> Result<String> {

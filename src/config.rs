@@ -26,6 +26,14 @@ pub struct AccountConfig {
     /// URL escaping. Existing source/outgoing URIs continue to work unchanged.
     #[serde(default)]
     pub email: Option<String>,
+    /// IMAP login identity, which may differ from the displayed email address.
+    /// Applies to `source = "imap"` shorthand; full URIs keep their own username.
+    #[serde(default)]
+    pub imap_username: Option<String>,
+    /// SMTP login identity, which may differ from the displayed email address.
+    /// Applies to `outgoing = "smtp"`/`starttls`/`smtps` shorthand.
+    #[serde(default)]
+    pub smtp_username: Option<String>,
     /// Optional server overrides for non-preset providers. Hostnames only,
     /// without a scheme, username, port or password.
     #[serde(default)]
@@ -124,6 +132,8 @@ impl std::fmt::Debug for AccountConfig {
             .field("name", &self.name)
             .field("source", &format_args!("{scheme}://<redacted>"))
             .field("email_configured", &self.email.is_some())
+            .field("imap_username_configured", &self.imap_username.is_some())
+            .field("smtp_username_configured", &self.smtp_username.is_some())
             .field("imap_host", &self.imap_host)
             .field("smtp_host", &self.smtp_host)
             .field("default_mailbox", &self.default_mailbox)
@@ -165,6 +175,9 @@ pub struct UiConfig {
     /// the remaining horizontal space.
     #[serde(default = "default_mailbox_width_percent")]
     pub mailbox_width_percent: u16,
+    /// Right reader column width as a percentage of the space after the sidebar.
+    #[serde(default = "default_preview_width_percent")]
+    pub preview_width_percent: u16,
     /// Selected theme, authoritative on startup and updated by the picker.
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -186,6 +199,10 @@ pub struct UiConfig {
     /// freedesktop sound theme name; COSMIC-installed themes can provide this.
     #[serde(default = "default_mail_sound_name")]
     pub new_mail_sound_name: String,
+    /// Optional explicit audio file for desktops that ignore notification sound hints.
+    /// Requires pw-play or paplay in PATH; otherwise the sound hint still works.
+    #[serde(default)]
+    pub new_mail_sound_file: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -194,12 +211,14 @@ impl Default for UiConfig {
             sidebar_width: default_sidebar_width(),
             message_width_percent: default_message_width_percent(),
             mailbox_width_percent: default_mailbox_width_percent(),
+            preview_width_percent: default_preview_width_percent(),
             theme: default_theme(),
             remote_images: false,
             inbox_poll_seconds: default_inbox_poll_seconds(),
             new_mail_bell: false,
             new_mail_notifications: true,
             new_mail_sound_name: default_mail_sound_name(),
+            new_mail_sound_file: None,
         }
     }
 }
@@ -237,6 +256,8 @@ impl Config {
                 name,
                 source: format!("maildir://{}", path.display()),
                 email: None,
+                imap_username: None,
+                smtp_username: None,
                 imap_host: None,
                 smtp_host: None,
                 imap_port: None,
@@ -321,6 +342,18 @@ impl AccountConfig {
                 return Err(anyhow!("email must be a valid, unescaped email address"));
             }
         }
+        for (label, value) in [
+            ("imap_username", self.imap_username.as_deref()),
+            ("smtp_username", self.smtp_username.as_deref()),
+        ] {
+            if let Some(username) = value {
+                if username.trim().is_empty() || username != username.trim()
+                    || username.chars().any(char::is_control)
+                {
+                    return Err(anyhow!("{label} must be a nonempty single-line login name"));
+                }
+            }
+        }
         let preset = email.and_then(|email| MailPreset::for_account(self, email));
 
         let incoming = if self.source.trim().is_empty() && email.is_some() {
@@ -335,7 +368,8 @@ impl AccountConfig {
                 .ok_or_else(|| anyhow!("unknown mail provider: set imap_host for this account"))?;
             let port = self.imap_port.unwrap_or(993);
             let scheme = match incoming { "imap" => "imaps", other => other };
-            self.source = build_mail_uri(scheme, email, host, port)?;
+            let username = self.imap_username.as_deref().unwrap_or(email);
+            self.source = build_mail_uri(scheme, username, host, port)?;
         } else if incoming.is_empty() {
             return Err(anyhow!("missing incoming mail source; set email and source = 'imap', or use an IMAP/Maildir URI"));
         }
@@ -358,7 +392,8 @@ impl AccountConfig {
                     };
                     let scheme = if starttls { "smtp" } else { "smtps" };
                     let port = self.smtp_port.unwrap_or(if starttls { 587 } else { 465 });
-                    self.outgoing = Some(build_mail_uri(scheme, email, host, port)?);
+                    let username = self.smtp_username.as_deref().unwrap_or(email);
+                    self.outgoing = Some(build_mail_uri(scheme, username, host, port)?);
                 }
                 _ => {} // Keep existing full SMTP and sendmail URLs untouched.
             }
@@ -476,6 +511,8 @@ const fn default_message_width_percent() -> u16 {
 const fn default_mailbox_width_percent() -> u16 {
     22
 }
+
+const fn default_preview_width_percent() -> u16 { 57 }
 
 fn default_true() -> bool { true }
 
@@ -786,6 +823,48 @@ mod tests {
         super::save_ui_theme(&path, "nord").unwrap();
         let config = super::Config::load(Some(&path)).unwrap();
         assert_eq!(config.ui.theme, "nord");
+    }
+
+    #[test]
+    fn separate_auth_usernames_preserve_display_identity() {
+        let mut config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "University"
+            email = "preferred.name@dartmouth.edu"
+            imap_username = "f00851y@dartmouth.edu"
+            smtp_username = "f00851y@dartmouth.edu"
+            source = "imap"
+            outgoing = "starttls"
+            [accounts.oauth]
+            provider = "microsoft"
+            client_id = "test-public-client"
+        "#).unwrap();
+        config.normalize_accounts();
+        let account = &config.accounts[0];
+        let imap = crate::backend::ImapSource::parse(&account.source).unwrap();
+        let smtp = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        assert_eq!(imap.username, "f00851y@dartmouth.edu");
+        assert_eq!(smtp.username, "f00851y@dartmouth.edu");
+        assert_eq!(smtp.host, "smtp.office365.com");
+        assert_eq!(smtp.port, 587);
+        assert_eq!(crate::outgoing::sender_from_account(account), "preferred.name@dartmouth.edu");
+        assert!(!format!("{account:?}").contains("f00851y"));
+    }
+
+    #[test]
+    fn full_smtp_uri_is_not_overwritten_by_shorthand_username() {
+        let mut config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Custom"
+            email = "display@example.com"
+            source = "imap"
+            imap_host = "imap.example.com"
+            smtp_username = "override@example.com"
+            outgoing = "smtp+xoauth2://explicit%40example.com@smtp.example.com:587"
+        "#).unwrap();
+        config.normalize_accounts();
+        let smtp = crate::outgoing::SmtpSource::parse(config.accounts[0].outgoing.as_deref().unwrap()).unwrap();
+        assert_eq!(smtp.username, "explicit@example.com");
     }
 
 }

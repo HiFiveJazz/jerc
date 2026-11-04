@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui_image::picker::Picker;
 
-use crate::app::App;
+use crate::app::{App, NewMailNotice};
 use crate::backend;
 use crate::config::Config;
 use crate::outgoing;
@@ -244,8 +244,8 @@ fn event_loop(
 
         // The desktop notification server owns the themed sound, not the
         // terminal. Never invoke a shell or block the TUI on a notification.
-        while let Some((account, count)) = app.take_new_mail_notice() {
-            notify_new_mail(&account, count, app.new_mail_sound_name());
+        while let Some(notice) = app.take_new_mail_notice() {
+            notify_new_mail(&notice, app.new_mail_sound_name(), app.new_mail_sound_file());
         }
         if app.take_new_mail_bell() {
             // Terminal bell: honors the user's terminal bell settings and
@@ -273,19 +273,52 @@ fn event_loop(
 /// Fire-and-forget freedesktop notification. `notify-send` is the Wayland/X11
 /// transport; the sound name is resolved by the user's active sound theme.
 /// Never print GTK warnings over the alternate screen.
-fn notify_new_mail(account: &str, count: usize, sound: &str) {
-    let title = if count == 1 { "New email" } else { "New emails" };
-    let body = format!("{count} new message(s) in {account}");
+fn notification_excerpt(value: &str, limit: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut excerpt = normalized.chars().take(limit).collect::<String>();
+    if normalized.chars().count() > limit { excerpt.push('…'); }
+    excerpt
+}
+
+fn notification_text(notice: &NewMailNotice) -> (String, String) {
+    let subject = notification_excerpt(&notice.subject, 100);
+    let title = if subject.is_empty() { format!("New email · {}", notice.account) }
+        else { subject };
+    let mut lines = Vec::new();
+    if !notice.sender.is_empty() { lines.push(format!("From: {}", notification_excerpt(&notice.sender, 80))); }
+    let excerpt = notification_excerpt(&notice.excerpt, 180);
+    if !excerpt.is_empty() { lines.push(excerpt); }
+    if notice.count > 1 { lines.push(format!("+{} more new messages · {}", notice.count - 1, notice.account)); }
+    if lines.is_empty() { lines.push(format!("{} new message(s) in {}", notice.count, notice.account)); }
+    (title, lines.join("\n"))
+}
+
+fn notify_new_mail(notice: &NewMailNotice, sound: &str, sound_file: Option<&str>) {
+    let (title, body) = notification_text(notice);
+    let sound_file = sound_file.filter(|file| std::path::Path::new(file).is_file());
     let mut command = ProcessCommand::new("notify-send");
-    command.args(["--app-name=aerc-rs", "--icon=mail-unread"])
-        .arg("--hint")
-        .arg(format!("string:sound-name:{sound}"))
-        .arg(title)
+    command.args(["--app-name=aerc-rs", "--icon=mail-unread"]);
+    // Explicit file playback and notification-server playback are mutually
+    // exclusive to avoid playing the same alert twice.
+    if sound_file.is_none() && !sound.trim().is_empty() {
+        command.arg("--hint").arg(format!("string:sound-name:{sound}"));
+    }
+    // Prevent untrusted subjects beginning with '-' from becoming CLI options.
+    command.arg("--").arg(title)
         .arg(body)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let _ = command.spawn();
+    if let Some(file) = sound_file {
+        // Never shell out. If PipeWire's pw-play is absent, try PulseAudio's
+        // compatible paplay command. Both run detached from terminal redraw.
+        for player in ["pw-play", "paplay"] {
+            if ProcessCommand::new(player).arg(file)
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+                .spawn().is_ok() { break; }
+        }
+    }
 }
 
 fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
@@ -397,5 +430,28 @@ mod multi_account_tests {
         assert!(!error.contains("secret"));
         assert_eq!(safe_scheme("imaps://username:secret@host"), "imaps");
         assert_eq!(safe_scheme("username:secret@host"), "<invalid>");
+    }
+}
+
+#[cfg(test)]
+mod new_mail_notification_tests {
+    use super::{notification_excerpt, notification_text};
+    use crate::app::NewMailNotice;
+
+    #[test]
+    fn includes_sender_subject_and_body_without_newlines_from_content() {
+        let notice = NewMailNotice { account: "University".into(), count: 2,
+            sender: "Professor\nSmith".into(), subject: "Office hours".into(),
+            excerpt: "Please   review\n the notes.".into() };
+        let (title, body) = notification_text(&notice);
+        assert_eq!(title, "Office hours");
+        assert!(body.contains("From: Professor Smith"));
+        assert!(body.contains("Please review the notes."));
+        assert!(body.contains("+1 more"));
+    }
+
+    #[test]
+    fn long_preview_is_bounded_by_chars() {
+        assert!(notification_excerpt(&"界".repeat(240), 180).chars().count() <= 181);
     }
 }

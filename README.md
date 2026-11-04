@@ -89,6 +89,44 @@ encoding is needed**. `incoming = "imap"` is an alias for `source = "imap"`.
 `outgoing = "starttls"` forces STARTTLS on port 587. `outgoing = "none"`
 disables sending. Gmail and Outlook.com can be detected from the email domain;
 Google Workspace and Microsoft 365 custom domains use `[accounts.oauth].provider`.
+For Thunderbird-style server discovery, run `aerc-rs --discover-email
+"you@example.com"`. This opt-in command requests the domain's HTTPS autoconfig
+files first, then Thunderbird's ISPDB, and **prints a suggested account TOML**
+without changing your configuration. It sends the full address only to the
+domain's own HTTPS autoconfig service; ISPDB receives just the domain. XML
+settings are untrusted suggestions: inspect them before using, and supply your
+own authorized OAuth registration separately. Some organizations don't publish
+IMAP/SMTP autoconfig (or use undiscoverable account IDs); the command then
+reports missing settings rather than guessing servers. MX-based discovery is
+not implemented.
+
+If your display address differs from the login ID (such as an institutional
+UPN), set `imap_username` and/or `smtp_username` under `[[accounts]]` when
+using `source = "imap"` and `outgoing = "smtp"`/`starttls`/`smtps`.
+For example:
+
+```toml
+[[accounts]]
+name = "University"
+email = "display.name@example.edu"
+from = "Display Name <display.name@example.edu>"
+imap_username = "login@example.edu"
+smtp_username = "login@example.edu"
+source = "imap"
+outgoing = "starttls"
+
+[accounts.oauth]
+provider = "microsoft"
+client_id = "YOUR_OWN_REGISTERED_PUBLIC_CLIENT_ID"
+```
+
+These identity overrides are not applied to explicit IMAP/SMTP URIs, which
+retain their embedded usernames. The `email` field remains the default visible
+From address for shorthand accounts; `from` always takes precedence. In a
+Microsoft OAuth test, try `--oauth-probe "University"` to verify SMTP AUTH
+before sending any messages. A successful connection still depends on tenant
+permissions and token scopes.
+
 For other providers, specify `imap_host` and `smtp_host` (and optional
 `imap_port`/`smtp_port`). Full `imaps://` and `smtps://` URLs, sendmail paths,
 and credential commands remain supported. The shorthand never stores a token.
@@ -109,7 +147,7 @@ Press `?` for the searchable complete map. Common controls:
 - `r` reply without quote; `R` reply with quote; `A` reply all; `L` list reply; `f` inline forward; `c` compose.
 - HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser. `m` toggles expanded recipients (Cc/Bcc) and Message-ID; the reader starts in compact-header mode. `z` opens received attachments with automatic previews; `j/k` moves, Space marks and advances, `v` selects a range then Space marks it, `a` marks/unmarks all, `o`/Enter opens, and `s` saves marked files to an entered directory. Clicking a filename previews it; footer Open/Save/Mark actions are mouse-clickable. The mailbox divider can be dragged to resize, or use Alt-h/Alt-l to adjust it from the keyboard.
 - In composer, Tab/Shift-Tab visits To, Cc, Bcc, Subject and Body. Ctrl+A opens an internal multi-select attachment picker (Space/Enter toggles files, h/Backspace moves to parent, l enters folders, . shows hidden files, Esc closes). Ctrl+O edits optional custom headers in advanced options (`X-Header: value; ...`). In NORMAL press `?` for the searchable compose-only shortcuts (`gg/G`, `w/W/b/B/e/E`, `vi` text objects, `dd/dw`, `f/F`, `o/O`, `u/Ctrl-r`, Visual and more). Enter shows a centered send confirmation; Ctrl-p postpones locally; Ctrl-n resumes the active account’s postponed draft. These are local files, not IMAP Drafts synchronization.
-- `Alt-n`/`Alt-p` next/previous account; `Alt-1`–`Alt-9` direct account selection; `[ / ]` and Ctrl-PageUp/PageDown also navigate, or click the top account tabs. `!` reviews configuration warnings; `Ctrl-r` refreshes the current mailbox; `B` toggles the optional terminal bell. Desktop notifications can be toggled separately with `ui.new_mail_notifications`.
+- `Alt-n`/`Alt-p` next/previous account; `Alt-1`–`Alt-9` direct account selection; `[ / ]` and Ctrl-PageUp/PageDown also navigate, or click the top account tabs. `!` reviews configuration warnings; `Ctrl-r` refreshes the current mailbox; `B` toggles the optional terminal bell. `N` toggles desktop new-mail notifications (and their sound) for this session, or click the rightmost footer bell (🔔 enabled / 🔕 muted). The initial state comes from `ui.new_mail_notifications`.
 
 ## Themes
 
@@ -438,3 +476,36 @@ outgoing URI is configured), with **no email sent**. It reports safe HTTP error
 codes if Microsoft rejects an OAuth token exchange. It cannot override an
 organization's application consent policy, and does not replace a test against
 the eventual production application registration.
+
+### Notification sounds and detailed previews
+
+In `[ui]`, set `new_mail_notifications = true` and
+`new_mail_sound_name = "message-new-email"`. The notification uses `notify-send`
+with a sound-name hint; the desktop notification daemon must support the
+selected sound theme for audio playback. If preferred, set `new_mail_bell = true`
+for an optional terminal bell (`B` toggles it during the session). New
+mail notifications show the newest message's sender, subject and a shortened
+plain-text body preview, with a count when multiple messages arrived. The
+read-only background IMAP fetch does not mark messages seen. If your notification
+server ignores sound-name hints, configure
+`new_mail_sound_file = "/absolute/path/to/aerc-rs/assets/sounds/new-mail.oga"`
+in `[ui]` and
+install `pw-play` or `paplay` to play the bundled alert directly. Direct file
+playback replaces the sound hint for that notification to avoid duplicate
+sound. New-message previews may disclose message content on a locked desktop.
+
+When preview is enabled with `p`, drag the divider between message list and
+reader or use `Alt-Shift-h`/`Alt-Shift-l` to resize it. Add
+`preview_width_percent = 57` under `[ui]` for the initial width. Changes are
+persisted in `~/.config/aerc-rs/preview-width`.
+
+### Microsoft SMTP XOAUTH2 (535)
+
+If you can read Exchange Online mail but `smtp.office365.com:587` returns
+`535 5.7.3`, your OAuth IMAP login may be correct while SMTP AUTH is
+separately restricted. Use `--oauth-probe "University"` to test SMTP AUTH
+without sending. Check the outgoing account address, the `SMTP.Send` delegated
+scope, TLS/STARTTLS on port 587, and ask your Exchange administrator whether
+SMTP AUTH is enabled for your mailbox and organization. Aerc-rs cannot enable
+SMTP AUTH against a tenant's policy. It never silently falls back to password
+authentication.

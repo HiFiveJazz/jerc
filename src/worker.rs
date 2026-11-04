@@ -18,6 +18,8 @@ pub enum ActionKind {
     Connect,
     ListMailboxes,
     MailboxStatus(String),
+    /// A single newest message preview after a known Inbox count increase.
+    NewMailPreview { mailbox: String, count: usize },
     OpenMailbox { name: String, offset: usize, limit: usize, hint: Option<MailboxSyncHint> },
     FetchBody { mailbox: String, id: MessageId },
     /// Read-only, opportunistic preview fetches on the background session.
@@ -69,6 +71,12 @@ pub enum WorkerEventKind {
         name: String,
         total: usize,
         unread: usize,
+    },
+    NewMailPreview {
+        count: usize,
+        sender: String,
+        subject: String,
+        excerpt: String,
     },
     MailboxOpened {
         name: String,
@@ -186,7 +194,7 @@ impl WorkerHandle {
                 Some(sender) => sender.try_send(action)?,
                 None => return Err(TrySendError::Disconnected(action)),
             }
-        } else if matches!(&action.kind, ActionKind::MailboxStatus(_)) {
+        } else if matches!(&action.kind, ActionKind::MailboxStatus(_) | ActionKind::NewMailPreview { .. }) {
             self.status_sender.as_ref().unwrap_or(&self.sender).try_send(action)?;
         } else {
             self.sender.try_send(action)?;
@@ -254,6 +262,7 @@ fn run_worker(
             ActionKind::Connect => "worker_connect",
             ActionKind::ListMailboxes => "worker_list_mailboxes",
             ActionKind::MailboxStatus(_) => "worker_mailbox_status",
+            ActionKind::NewMailPreview { .. } => "worker_new_mail_preview",
             ActionKind::OpenMailbox { .. } => "worker_open_mailbox",
             ActionKind::FetchBody { .. } => "worker_fetch_body",
             ActionKind::PrefetchBodies { .. } => "worker_prefetch_bodies",
@@ -280,6 +289,9 @@ fn run_worker(
                     capabilities: backend.capabilities(),
                 }),
             ActionKind::ListMailboxes => backend.list_mailboxes().map(WorkerEventKind::Mailboxes),
+            ActionKind::NewMailPreview { mailbox, count } => {
+                Ok(new_mail_preview(backend, &mailbox, count))
+            }
             ActionKind::MailboxStatus(name) => backend.mailbox_status(&name).map(|(total, unread)| {
                 WorkerEventKind::MailboxStatus {
                     name,
@@ -534,6 +546,21 @@ fn run_status_worker(
                     account, request_id: action.id, kind,
                 })).is_err() { break; }
             }
+            ActionKind::NewMailPreview { mailbox, count } => {
+                let result = (|| {
+                    if !connected {
+                        backend.connect()?;
+                        connected = true;
+                    }
+                    Ok::<_, anyhow::Error>(new_mail_preview(&mut *backend, &mailbox, count))
+                })();
+                let kind = result.unwrap_or(WorkerEventKind::NewMailPreview {
+                    count, sender: String::new(), subject: String::new(), excerpt: String::new(),
+                });
+                if runtime_tx.send(RuntimeEvent::Worker(WorkerEvent {
+                    account, request_id: action.id, kind,
+                })).is_err() { break; }
+            }
             ActionKind::MailboxStatus(name) => {
                 bodies_since_status = 0;
                 let result = (|| {
@@ -614,6 +641,25 @@ fn run_status_worker(
             _ => {} // The background worker never performs foreground mutations.
         }
     }
+}
+
+/// Best effort: a failed/empty body still yields the sender and subject.
+/// fetch_body uses IMAP BODY.PEEK and must never change the Seen flag.
+fn new_mail_preview(backend: &mut dyn MailBackend, mailbox: &str, count: usize) -> WorkerEventKind {
+    let mut sender = String::new();
+    let mut subject = String::new();
+    let mut excerpt = String::new();
+    if let Ok(page) = backend.open_mailbox(mailbox, 0, 1) {
+        if let Some(message) = page.messages.first() {
+            sender = if message.from_name.is_empty() { message.from_address.clone() }
+                else { message.from_name.clone() };
+            subject = message.subject.clone();
+            if let Ok(body) = backend.fetch_body(mailbox, &message.id) {
+                excerpt = body.display_text(false).chars().take(400).collect();
+            }
+        }
+    }
+    WorkerEventKind::NewMailPreview { count, sender, subject, excerpt }
 }
 
 fn write_export(path: &std::path::Path, raw: &[u8]) -> anyhow::Result<()> {

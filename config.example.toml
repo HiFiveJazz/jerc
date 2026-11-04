@@ -24,6 +24,10 @@ default_mailbox = "INBOX"
 #
 # For Google Workspace or Microsoft 365 custom domains, the OAuth provider
 # selects known servers. For other domains, set:
+# To discover real servers first: aerc-rs --discover-email "you@example.com"
+# The command prints TOML for review; it does NOT alter existing accounts.
+# imap_username = "actual-login@example.com" # if IMAP login differs from `email`
+# smtp_username = "actual-login@example.com" # if SMTP login differs from `email`
 # imap_host = "imap.example.com"
 # smtp_host = "smtp.example.com"
 # Optional imap_port / smtp_port, or outgoing = "starttls" for port 587.
@@ -69,6 +73,10 @@ default_mailbox = "INBOX"
 # Width is remembered in ~/.config/aerc-rs/mailbox-width after an adjustment.
 # `b` toggles the sidebar; `p` toggles the message preview.
 mailbox_width_percent = 22
+# When `p` enables the split reader, drag its left divider or use
+# Alt-Shift-h / Alt-Shift-l to make the reader wider/narrower.
+# Saved to ~/.config/aerc-rs/preview-width after an adjustment.
+preview_width_percent = 57
 
 # Active theme. Press `t` in the TUI to preview/switch themes live; the chosen
 # theme is saved back into [ui].theme in this config.toml.
@@ -84,8 +92,17 @@ new_mail_bell = false
 # Desktop notifications are ON by default. A sound-name hint asks the installed
 # sound theme (including COSMIC, when selected system-wide) to play its email sound.
 # Requires a freedesktop notification daemon and `notify-send` (libnotify).
+# The notification sound-name hint is optional; actual audio requires a sound
+# theme + daemon that honors it. For an optional terminal bell, set
+# new_mail_bell = true and enable audible bell in the terminal.
+# Press N or click the footer bell to toggle desktop alerts and their sound
+# for the current session; the configured value is restored on restart.
 new_mail_notifications = true
 new_mail_sound_name = "message-new-email"
+# Optional direct sound if your notification daemon ignores sound-name hints.
+# Requires `pw-play` (PipeWire) or `paplay` (PulseAudio), absolute file path.
+# Use the included assets/sounds/new-mail.oga from the repository if desired.
+# new_mail_sound_file = "/absolute/path/to/aerc-rs/assets/sounds/new-mail.oga"
 
 # Legacy layout options are still accepted so existing configs keep loading.
 # sidebar_width = 24

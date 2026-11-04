@@ -38,6 +38,11 @@ struct Cli {
     #[arg(long, value_name = "ACCOUNT_NAME", conflicts_with_all = ["oauth_login", "oauth_inspect"])]
     oauth_probe: Option<String>,
 
+    /// Discover secure IMAP/SMTP settings using provider HTTPS autoconfig and Thunderbird ISPDB.
+    /// Prints a proposed TOML account without modifying your config or credentials.
+    #[arg(long, value_name = "EMAIL_ADDRESS", conflicts_with_all = ["maildir", "oauth_login", "oauth_inspect", "oauth_probe", "headless_check"])]
+    discover_email: Option<String>,
+
     /// Validate accounts and benchmark folder/header scanning without opening the TUI.
     #[arg(long)]
     headless_check: bool,
@@ -45,6 +50,11 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(email) = &cli.discover_email {
+        let proposal = aerc_rs::discovery::discover(email)?;
+        println!("{}", proposal.to_toml());
+        return Ok(());
+    }
     let config = load_config(&cli)?;
     if let Some(name) = &cli.oauth_login {
         return aerc_rs::oauth::login_account(&config.accounts, name);

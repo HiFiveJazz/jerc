@@ -1,3 +1,6 @@
+/// Fixed cell width reserved for the right-aligned new-mail bell (🔔 / 🔕).
+pub(crate) const NOTIFICATION_INDICATOR_WIDTH: u16 = 4;
+
 mod render;
 
 pub use render::draw;
@@ -10,6 +13,14 @@ pub(crate) fn mailbox_column_width(total: u16, percent: u16) -> u16 {
     ((u32::from(total) * u32::from(percent.clamp(12, 50)) / 100) as u16)
         .max(12)
         .min(total.saturating_sub(32))
+}
+
+/// Width in cells for the reader on the right; always leave usable space
+/// for the message list. Applies with and without the mailbox sidebar.
+pub(crate) fn preview_column_width(total: u16, percent: u16) -> u16 {
+    if total <= 34 { return total / 2; }
+    ((u32::from(total) * u32::from(percent.clamp(25, 75)) / 100) as u16)
+        .clamp(16, total.saturating_sub(16))
 }
 
 /// The attachment popup, left file list, right preview and action footer.
@@ -75,6 +86,13 @@ mod layout_tests {
         assert_eq!(mailbox_column_width(120, 1), 14);
         assert_eq!(mailbox_column_width(120, 90), 60);
         assert!(mailbox_column_width(40, 50) <= 8);
+    }
+    #[test]
+    fn preview_width_has_bounded_space_for_both_panels() {
+        assert_eq!(preview_column_width(100, 57), 57);
+        assert_eq!(preview_column_width(100, 1), 25);
+        assert_eq!(preview_column_width(100, 99), 75);
+        assert_eq!(preview_column_width(24, 57), 12);
     }
     #[test]
     fn destination_panels_are_contiguous_and_inside_popup() {

@@ -2118,6 +2118,15 @@ fn reader_image_target_size(
     Size::new(width_cells, height_cells)
 }
 
+#[derive(Debug, Clone)]
+pub struct NewMailNotice {
+    pub account: String,
+    pub count: usize,
+    pub sender: String,
+    pub subject: String,
+    pub excerpt: String,
+}
+
 pub struct App {
     pub accounts: Vec<AccountState>,
     pub account_index: usize,
@@ -2131,9 +2140,12 @@ pub struct App {
     new_mail_bell_pending: bool,
     new_mail_notifications_enabled: bool,
     new_mail_sound_name: String,
-    new_mail_notices: VecDeque<(String, usize)>,
+    new_mail_sound_file: Option<String>,
+    new_mail_notices: VecDeque<NewMailNotice>,
     pub mailbox_width_percent: u16,
     pub mailbox_resizing: bool,
+    pub preview_width_percent: u16,
+    pub preview_resizing: bool,
     pub sidebar_visible: bool,
     pub preview_split: bool,
     pub message_open: bool,
@@ -2298,9 +2310,12 @@ impl App {
             new_mail_bell_pending: false,
             new_mail_notifications_enabled: config.ui.new_mail_notifications,
             new_mail_sound_name: config.ui.new_mail_sound_name.clone(),
+            new_mail_sound_file: config.ui.new_mail_sound_file.clone(),
             new_mail_notices: VecDeque::new(),
             mailbox_width_percent: stored_mailbox_width().unwrap_or(config.ui.mailbox_width_percent).clamp(12, 50),
             mailbox_resizing: false,
+            preview_width_percent: stored_preview_width().unwrap_or(config.ui.preview_width_percent).clamp(25, 75),
+            preview_resizing: false,
             sidebar_visible: true,
             preview_split: false,
             message_open: false,
@@ -2408,11 +2423,15 @@ impl App {
     }
 
     /// Only known count increases trigger notifications; never notify on initial sync.
-    pub fn take_new_mail_notice(&mut self) -> Option<(String, usize)> {
+    pub fn take_new_mail_notice(&mut self) -> Option<NewMailNotice> {
         self.new_mail_notices.pop_front()
     }
 
+    /// Desktop banners and their associated sound; independent of the terminal BEL setting.
+    pub fn notifications_enabled(&self) -> bool { self.new_mail_notifications_enabled }
+
     pub fn new_mail_sound_name(&self) -> &str { &self.new_mail_sound_name }
+    pub fn new_mail_sound_file(&self) -> Option<&str> { self.new_mail_sound_file.as_deref() }
 
     pub fn bootstrap(&mut self) {
         for account in &mut self.accounts {
@@ -2439,8 +2458,23 @@ impl App {
             self.handle_attachment_picker_key(key);
             return;
         }
+        if self.composer.is_none() && !self.message_open && self.preview_split
+            && key.modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) {
+            let adjustment = match key.code {
+                KeyCode::Char('h') | KeyCode::Char('H') => Some(3_i32),
+                KeyCode::Char('l') | KeyCode::Char('L') => Some(-3_i32),
+                _ => None,
+            };
+            if let Some(adjustment) = adjustment {
+                self.preview_width_percent = (i32::from(self.preview_width_percent) + adjustment)
+                    .clamp(25, 75) as u16;
+                let _ = persist_preview_width(self.preview_width_percent);
+                return;
+            }
+        }
         if self.composer.is_none() && !self.message_open && self.sidebar_visible
-            && key.modifiers.contains(KeyModifiers::ALT) {
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::SHIFT) {
             let adjustment = match key.code {
                 KeyCode::Char('h') => Some(-2_i32),
                 KeyCode::Char('l') => Some(2_i32),
@@ -2825,9 +2859,20 @@ impl App {
                     self.status = StatusLine::temporary(format!(
                         "{} new message(s) in {}", new_count, account.name,
                     ), Duration::from_secs(6));
-                    if self.new_mail_bell_enabled { self.new_mail_bell_pending = true; }
+                    if self.new_mail_bell_enabled && self.new_mail_notifications_enabled {
+                        self.new_mail_bell_pending = true;
+                    }
                     if self.new_mail_notifications_enabled {
-                        self.new_mail_notices.push_back((account.name.clone(), new_count));
+                        // Use the existing background IMAP session; do not block
+                        // rendering, fetch on the foreground session, or change \Seen.
+                        if account.worker.post(ActionKind::NewMailPreview {
+                            mailbox: name.clone(), count: new_count,
+                        }).is_err() {
+                            self.new_mail_notices.push_back(NewMailNotice {
+                                account: account.name.clone(), count: new_count,
+                                sender: String::new(), subject: String::new(), excerpt: String::new(),
+                            });
+                        }
                     }
                     if account.current_mailbox.as_deref() == Some(name.as_str()) {
                         // Never replace the reader underneath someone who is
@@ -2845,6 +2890,13 @@ impl App {
                 }
                 account.persist_mailboxes();
                 Self::pump_mailbox_status(account);
+            }
+            WorkerEventKind::NewMailPreview { count, sender, subject, excerpt } => {
+                if self.new_mail_notifications_enabled {
+                    self.new_mail_notices.push_back(NewMailNotice {
+                        account: account.name.clone(), count, sender, subject, excerpt,
+                    });
+                }
             }
             WorkerEventKind::MailboxOpened {
                 name,
@@ -3496,6 +3548,20 @@ impl App {
             Command::ToggleImages => {
                 self.count_prefix = None;
                 self.toggle_remote_images();
+            }
+            Command::ToggleNotifications => {
+                self.count_prefix = None;
+                self.new_mail_notifications_enabled = !self.new_mail_notifications_enabled;
+                if !self.new_mail_notifications_enabled {
+                    // Prevent previously queued messages from appearing after mute.
+                    self.new_mail_notices.clear();
+                    self.new_mail_bell_pending = false;
+                }
+                self.status = StatusLine::temporary(
+                    if self.new_mail_notifications_enabled { "new-mail notifications enabled" }
+                    else { "new-mail notifications muted" },
+                    Duration::from_secs(2),
+                );
             }
             Command::ToggleBell => {
                 self.count_prefix = None;
@@ -5656,6 +5722,17 @@ impl App {
     /// the hovered file, and footer clicks activate Open/Save/Mark actions.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
         if self.show_startup_warnings { return; }
+        // The rightmost footer bell is an action as well as a status indicator.
+        // Never steal clicks from compose, confirmation, or other open dialogs.
+        if height > 0 && width >= crate::ui::NOTIFICATION_INDICATOR_WIDTH
+            && mouse.row == height - 1 && mouse.column < width
+            && mouse.column >= width - crate::ui::NOTIFICATION_INDICATOR_WIDTH
+            && self.composer.is_none() && !self.attachment_picker_visible
+            && !self.help_visible && !self.theme_picker_visible && self.confirmation.is_none()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.handle_command(Command::ToggleNotifications);
+            return;
+        }
         if mouse.row == 0 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.composer.is_none() && !self.attachment_picker_visible
             && !self.help_visible && !self.theme_picker_visible && self.confirmation.is_none() {
@@ -5751,6 +5828,7 @@ impl App {
             return;
         }
         if self.message_open {
+            self.preview_resizing = false;
             let key = match mouse.kind {
                 MouseEventKind::ScrollDown => Some(KeyCode::Down),
                 MouseEventKind::ScrollUp => Some(KeyCode::Up),
@@ -5760,9 +5838,43 @@ impl App {
             self.mailbox_resizing = false;
             return;
         }
-        if !self.sidebar_visible || self.composer.is_some() || self.help_visible
-            || self.theme_picker_visible || self.confirmation.is_some() { self.mailbox_resizing = false; return; }
-        let separator = crate::ui::mailbox_column_width(width, self.mailbox_width_percent).saturating_sub(1);
+        if self.composer.is_some() || self.help_visible || self.theme_picker_visible
+            || self.confirmation.is_some() {
+            self.mailbox_resizing = false;
+            self.preview_resizing = false;
+            return;
+        }
+        let sidebar_width = if self.sidebar_visible {
+            crate::ui::mailbox_column_width(width, self.mailbox_width_percent)
+        } else { 0 };
+        let separator = sidebar_width.saturating_sub(1);
+        let right_width = width.saturating_sub(sidebar_width);
+        let preview_separator = sidebar_width.saturating_add(right_width.saturating_sub(
+            crate::ui::preview_column_width(right_width, self.preview_width_percent)
+        ));
+        if self.preview_split {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) if mouse.row > 0
+                    && mouse.row < height.saturating_sub(1)
+                    && mouse.column.abs_diff(preview_separator) <= 1 => {
+                        self.preview_resizing = true;
+                        self.mailbox_resizing = false;
+                        return;
+                    }
+                MouseEventKind::Drag(MouseButton::Left) if self.preview_resizing => {
+                    self.preview_width_percent = preview_percent_at(mouse.column, sidebar_width, right_width);
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) if self.preview_resizing => {
+                    self.preview_resizing = false;
+                    self.preview_width_percent = preview_percent_at(mouse.column, sidebar_width, right_width);
+                    let _ = persist_preview_width(self.preview_width_percent);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if !self.sidebar_visible { self.mailbox_resizing = false; return; }
         if mouse.row > 0 && mouse.row < height.saturating_sub(1) {
             let scrolling = match mouse.kind {
                 MouseEventKind::ScrollDown => Some(true),
@@ -6822,6 +6934,27 @@ fn mouse_width_percent(column: u16, total: u16) -> u16 {
     (((u32::from(column) + 1) * 100 / u32::from(total)) as u16).clamp(12, 50)
 }
 
+fn preview_percent_at(column: u16, sidebar_width: u16, remaining: u16) -> u16 {
+    if remaining == 0 { return 57; }
+    let inside = column.saturating_sub(sidebar_width).min(remaining);
+    (100 - (u32::from(inside) * 100 / u32::from(remaining)) as u16).clamp(25, 75)
+}
+
+fn preview_width_state_file() -> Option<PathBuf> {
+    dirs::config_dir().map(|directory| directory.join("aerc-rs").join("preview-width"))
+}
+
+fn stored_preview_width() -> Option<u16> {
+    std::fs::read_to_string(preview_width_state_file()?).ok()?
+        .trim().parse::<u16>().ok().filter(|value| (25..=75).contains(value))
+}
+
+fn persist_preview_width(width: u16) -> std::io::Result<()> {
+    let Some(path) = preview_width_state_file() else { return Ok(()); };
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::write(path, format!("{}\n", width.clamp(25, 75)))
+}
+
 fn mailbox_width_state_file() -> Option<PathBuf> {
     dirs::config_dir().map(|directory| directory.join("aerc-rs").join("mailbox-width"))
 }
@@ -7151,6 +7284,25 @@ mod tests {
     use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
     use std::path::PathBuf;
+
+    #[test]
+    fn mute_toggle_drops_queued_alerts_and_restores_desktop_notifications() {
+        let config: crate::config::Config = toml::from_str(
+            "[ui]\nnew_mail_notifications = true\nnew_mail_bell = true"
+        ).expect("valid config");
+        let mut app = super::App::new(&config, vec![]);
+        app.new_mail_notices.push_back(super::NewMailNotice {
+            account: "University".into(), count: 1, sender: String::new(),
+            subject: "test".into(), excerpt: String::new(),
+        });
+        app.new_mail_bell_pending = true;
+        app.handle_command(super::Command::ToggleNotifications);
+        assert!(!app.notifications_enabled());
+        assert!(app.take_new_mail_notice().is_none());
+        assert!(!app.take_new_mail_bell());
+        app.handle_command(super::Command::ToggleNotifications);
+        assert!(app.notifications_enabled());
+    }
 
     #[test]
     fn nearby_previews_favor_direction_with_bounded_normal_and_fast_windows() {
@@ -7726,11 +7878,11 @@ mod tests {
     #[test]
     fn compose_help_search_uses_its_own_keymap() {
         let mut composer = Composer::new();
-        composer.help_query = "brackets".to_owned();
+        composer.help_query = "attachment".to_owned();
         let matches = composer.compose_help_matches();
         assert!(!matches.is_empty());
         assert!(matches.iter().all(|&index| {
-            super::super::input::COMPOSE_HELP_ENTRIES[index].description.contains("brackets")
+            super::super::input::COMPOSE_HELP_ENTRIES[index].description.contains("attachment")
         }));
     }
 
@@ -7953,5 +8105,16 @@ mod received_attachment_browser_tests {
         assert_eq!(mouse_width_percent(0, 120), 12);
         assert_eq!(mouse_width_percent(110, 120), 50);
         assert_eq!(mouse_width_percent(24, 100), 25);
+    }
+}
+
+#[cfg(test)]
+mod preview_width_tests {
+    use super::preview_percent_at;
+    #[test]
+    fn preview_drag_uses_remaining_right_hand_region() {
+        assert_eq!(preview_percent_at(60, 20, 100), 60);
+        assert_eq!(preview_percent_at(5, 20, 100), 75);
+        assert_eq!(preview_percent_at(200, 20, 100), 25);
     }
 }

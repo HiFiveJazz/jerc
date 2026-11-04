@@ -133,7 +133,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .split(area);
             let right = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+                .constraints([Constraint::Min(1), Constraint::Length(super::preview_column_width(columns[1].width, app.preview_width_percent))])
                 .split(columns[1]);
             draw_mailboxes(frame, app, columns[0]);
             draw_messages(frame, app, right[0]);
@@ -142,7 +142,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         (false, true) => {
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+                .constraints([Constraint::Min(1), Constraint::Length(super::preview_column_width(area.width, app.preview_width_percent))])
                 .split(area);
             draw_messages(frame, app, columns[0]);
             draw_message(frame, app, columns[1]);
@@ -1143,7 +1143,23 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(count) = app.count_prefix {
         spans.push(Span::styled(format!("    {count}"), theme.accent()));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.status()), area);
+    // Reserve the far-right footer cells so long status text never covers the
+    // notification state. The glyph can also be clicked to toggle alerts.
+    let indicator_width = super::NOTIFICATION_INDICATOR_WIDTH.min(area.width);
+    let status_area = Rect::new(area.x, area.y, area.width - indicator_width, area.height);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.status()), status_area);
+    if indicator_width == super::NOTIFICATION_INDICATOR_WIDTH {
+        let (glyph, style) = if app.notifications_enabled() {
+            (" 🔔 ", theme.accent())
+        } else {
+            (" 🔕 ", theme.muted())
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(glyph, style)))
+                .style(theme.status()),
+            Rect::new(area.right().saturating_sub(indicator_width), area.y, indicator_width, area.height),
+        );
+    }
 }
 
 fn draw_search_header(frame: &mut Frame<'_>, area: Rect, query: &str, app: &App) {
@@ -1194,7 +1210,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App) {
         });
         let table = Table::new(
             rows,
-            [Constraint::Length(10), Constraint::Length(22), Constraint::Min(20)],
+            [Constraint::Length(13), Constraint::Length(27), Constraint::Min(20)],
         )
         .style(theme.text())
         .column_spacing(1)
