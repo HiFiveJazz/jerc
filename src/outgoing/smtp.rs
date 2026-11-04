@@ -2,7 +2,12 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
+use lettre::transport::smtp::client::{SmtpConnection, TlsParameters};
+use lettre::transport::smtp::commands::Ehlo;
+use lettre::transport::smtp::extension::ClientId;
+use lettre::transport::smtp::response::Response;
 use lettre::{SmtpTransport, Transport};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -17,9 +22,11 @@ const OAUTH_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SmtpAuth {
     None,
+    Auto,
     Plain,
     Login,
     XOAuth2,
+    OAuthBearer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,25 +48,25 @@ pub struct SmtpSource {
     client_id: Option<String>,
     client_secret: Option<String>,
     scope: Option<String>,
+    account_oauth: Option<crate::oauth::OAuthSettings>,
 }
 
 impl SmtpSource {
     pub fn parse(source: &str) -> Result<Self> {
         let url = Url::parse(source).context("parsing SMTP outgoing URI")?;
         let (tls, auth) = match url.scheme() {
-            "smtps" | "smtps+plain" => (SmtpTls::Implicit, SmtpAuth::Plain),
+            "smtps" | "smtps+auto" => (SmtpTls::Implicit, SmtpAuth::Auto),
+            "smtps+plain" => (SmtpTls::Implicit, SmtpAuth::Plain),
             "smtps+login" => (SmtpTls::Implicit, SmtpAuth::Login),
             "smtps+xoauth2" => (SmtpTls::Implicit, SmtpAuth::XOAuth2),
+            "smtps+oauthbearer" => (SmtpTls::Implicit, SmtpAuth::OAuthBearer),
             "smtps+none" => (SmtpTls::Implicit, SmtpAuth::None),
-            "smtp" | "smtp+plain" => (SmtpTls::StartTls, SmtpAuth::Plain),
+            "smtp" | "smtp+auto" => (SmtpTls::StartTls, SmtpAuth::Auto),
+            "smtp+plain" => (SmtpTls::StartTls, SmtpAuth::Plain),
             "smtp+login" => (SmtpTls::StartTls, SmtpAuth::Login),
             "smtp+xoauth2" => (SmtpTls::StartTls, SmtpAuth::XOAuth2),
+            "smtp+oauthbearer" => (SmtpTls::StartTls, SmtpAuth::OAuthBearer),
             "smtp+none" => (SmtpTls::StartTls, SmtpAuth::None),
-            "smtp+oauthbearer" | "smtps+oauthbearer" => {
-                bail!(
-                    "SMTP OAUTHBEARER is not implemented yet; use +xoauth2 when your provider supports it (Gmail does)"
-                );
-            }
             _ => bail!("unsupported SMTP outgoing scheme"),
         };
 
@@ -88,7 +95,10 @@ impl SmtpSource {
             }
         }
 
-        if auth == SmtpAuth::XOAuth2 {
+        let auth = if auth == SmtpAuth::Auto && token_endpoint.is_some() {
+            SmtpAuth::OAuthBearer // negotiate OAuth only; never downgrade to password
+        } else { auth };
+        if matches!(auth, SmtpAuth::XOAuth2 | SmtpAuth::OAuthBearer) {
             if let Some(endpoint) = &token_endpoint {
                 let parsed = Url::parse(endpoint).context("parsing SMTP OAuth token endpoint")?;
                 if parsed.scheme() != "https" {
@@ -114,7 +124,21 @@ impl SmtpSource {
             client_id,
             client_secret,
             scope,
+            account_oauth: None,
         })
+    }
+
+    pub fn with_account_oauth(mut self, account: &crate::config::AccountConfig) -> Result<Self> {
+        if let Some(settings) = crate::oauth::OAuthSettings::for_account(account)? {
+            if matches!(self.auth, SmtpAuth::Plain | SmtpAuth::Login | SmtpAuth::None) {
+                bail!("OAuth account cannot use SMTP password or no-auth scheme; use smtps:// or +xoauth2");
+            }
+            self.account_oauth = Some(settings);
+            // An unsuffixed SMTP URI must not try PLAIN/LOGIN with an OAuth
+            // token; force token-only capability negotiation for this account.
+            if self.auth == SmtpAuth::Auto { self.auth = SmtpAuth::OAuthBearer; }
+        }
+        Ok(self)
     }
 
     #[must_use]
@@ -132,6 +156,9 @@ impl SmtpSource {
         if let Some(secret) = &self.secret {
             return Ok(secret.clone());
         }
+        if let Some(oauth) = &self.account_oauth {
+            return oauth.refresh_token();
+        }
         let command = command.ok_or_else(|| {
             anyhow!(
                 "SMTP outgoing URI contains no credential; add a URI password/token or outgoing_cred_cmd"
@@ -141,6 +168,9 @@ impl SmtpSource {
     }
 
     fn access_token(&self, credential: &str) -> Result<String> {
+        if let Some(oauth) = &self.account_oauth {
+            return oauth.access_token();
+        }
         let Some(endpoint) = self.token_endpoint.as_deref() else {
             return Ok(credential.to_owned());
         };
@@ -209,6 +239,87 @@ impl SmtpSender {
         }
     }
 
+    // Lettre's high-level transport does not expose RFC 7628 OAUTHBEARER.
+    // Keep existing transports untouched and use its low-level SMTP connection
+    // only when OAUTHBEARER was explicitly configured.
+    fn send_oauthbearer(&self, email: &lettre::Message, raw_message: &[u8]) -> Result<Response> {
+        let credential = self.source.credential(self.credential_command.as_deref())?;
+        let token = self.source.access_token(&credential)?;
+        let hello = ClientId::default();
+        let tls = TlsParameters::new(self.source.host.clone())
+            .context("configuring SMTP TLS certificate verification")?;
+        let mut connection = match self.source.tls {
+            SmtpTls::Implicit => SmtpConnection::connect(
+                (self.source.host.as_str(), self.source.port),
+                Some(SMTP_TIMEOUT),
+                &hello,
+                Some(&tls),
+                None,
+            ),
+            SmtpTls::StartTls => SmtpConnection::connect(
+                (self.source.host.as_str(), self.source.port),
+                Some(SMTP_TIMEOUT),
+                &hello,
+                None,
+                None,
+            ),
+        }
+        .context("connecting to SMTP server")?;
+
+        if self.source.tls == SmtpTls::StartTls {
+            // Required STARTTLS, never opportunistic: no token on plaintext.
+            connection.starttls(&tls, &hello).context("upgrading SMTP connection to TLS")?;
+        }
+        if !connection.is_encrypted() {
+            bail!("SMTP OAUTHBEARER requires an encrypted TLS connection");
+        }
+
+        // Lettre's ServerInfo currently drops unknown AUTH mechanisms; query
+        // the post-TLS EHLO reply so we can fail clearly before sending a token.
+        let extensions = connection
+            .command(Ehlo::new(hello))
+            .context("reading SMTP authentication capabilities")?;
+        if smtp_advertises_oauthbearer(&extensions) {
+            let sasl = oauthbearer_initial_response(
+                &self.source.username, &self.source.host, self.source.port, &token,
+            )?;
+            // The command contains a bearer token; never log it or include it in an error.
+            let auth = connection
+                .command(format!("AUTH OAUTHBEARER {}\r\n", BASE64.encode(sasl)))
+                .context("SMTP OAUTHBEARER authentication exchange")?;
+            if auth.has_code(334) {
+                // RFC 7628 section 3: acknowledge the server's error challenge
+                // with a dummy 0x01 response, and let SMTP finish the exchange.
+                // Do not decode/log its potentially sensitive JSON challenge.
+                let _ = connection.command("AQ==\r\n");
+                bail!("SMTP rejected OAUTHBEARER credentials (334 challenge)");
+            }
+            if !auth.has_code(235) {
+                bail!("SMTP rejected OAUTHBEARER authentication (code {})", auth.code());
+            }
+        } else if connection.server_info().supports_auth_mechanism(Mechanism::Xoauth2) {
+            // Gmail and some other providers advertise XOAUTH2, not RFC 7628.
+            // Both use the same OAuth 2.0 access token. Never fall back to a
+            // password mechanism, and never retry after rejected credentials.
+            let auth = connection.auth(
+                &[Mechanism::Xoauth2],
+                &Credentials::new(self.source.username.clone(), token),
+            ).context("SMTP XOAUTH2 fallback authentication exchange")?;
+            if !auth.has_code(235) {
+                bail!("SMTP rejected XOAUTH2 fallback authentication (code {})", auth.code());
+            }
+        } else {
+            bail!("SMTP server supports neither AUTH OAUTHBEARER nor XOAUTH2 after TLS");
+        }
+
+        let result = connection
+            .send(email.envelope(), raw_message)
+            .context("sending message through authenticated SMTP connection")?;
+        // QUIT is best effort: SMTP accepted DATA already; never resubmit here.
+        let _ = connection.quit();
+        Ok(result)
+    }
+
     fn transport(&self) -> Result<SmtpTransport> {
         let credential = self
             .source
@@ -232,12 +343,17 @@ impl SmtpSender {
                 self.source.username.clone(),
                 secret,
             ));
-            builder = builder.authentication(vec![match self.source.auth {
-                SmtpAuth::None => unreachable!(),
-                SmtpAuth::Plain => Mechanism::Plain,
-                SmtpAuth::Login => Mechanism::Login,
-                SmtpAuth::XOAuth2 => Mechanism::Xoauth2,
-            }]);
+            // Lettre checks the post-TLS EHLO mechanism list and chooses the
+            // first mutually supported option. Never retry a rejected password
+            // using a different mechanism or downgrade to cleartext SMTP.
+            let methods = match self.source.auth {
+                SmtpAuth::Auto => vec![Mechanism::Plain, Mechanism::Login],
+                SmtpAuth::Plain => vec![Mechanism::Plain],
+                SmtpAuth::Login => vec![Mechanism::Login],
+                SmtpAuth::XOAuth2 => vec![Mechanism::Xoauth2],
+                SmtpAuth::None | SmtpAuth::OAuthBearer => unreachable!(),
+            };
+            builder = builder.authentication(methods);
         }
         Ok(builder.build())
     }
@@ -247,11 +363,14 @@ impl MailSender for SmtpSender {
     fn send(&mut self, message: &OutgoingMessage) -> Result<SendReceipt> {
         let email = crate::outgoing::build_outgoing(message, &self.source.username)?;
         let raw_message = email.formatted();
-        let response = self
-            .transport()?
-            .send_raw(email.envelope(), &raw_message)
-            .context("sending message through SMTP")?;
-        if !response.is_positive() {
+        let response = if self.source.auth == SmtpAuth::OAuthBearer {
+            self.send_oauthbearer(&email, &raw_message)?
+        } else {
+            self.transport()?
+                .send_raw(email.envelope(), &raw_message)
+                .context("sending message through SMTP")?
+        };
+        if !response.has_code(250) {
             bail!("SMTP relay returned a non-success response");
         }
         Ok(SendReceipt {
@@ -262,6 +381,32 @@ impl MailSender for SmtpSender {
             server_files_sent_copy: self.source.host.eq_ignore_ascii_case("smtp.gmail.com"),
         })
     }
+}
+
+/// RFC 7628's GS2 header and bearer key/value fields. Do not put tokens in
+/// log messages, Debug implementations, or anyhow error context.
+fn oauthbearer_initial_response(user: &str, host: &str, port: u16, token: &str) -> Result<String> {
+    if user.is_empty() || token.is_empty() || user.chars().any(char::is_control)
+        || token.chars().any(char::is_control)
+        || host.chars().any(char::is_control)
+    {
+        bail!("invalid SMTP OAuth identity or access token");
+    }
+    // RFC 5801 section 3.1: GS2 authzid uses =2C for comma and =3D for '='.
+    let escaped_user = user.replace('=', "=3D").replace(',', "=2C");
+    Ok(format!(
+        "n,a={escaped_user},\x01host={host}\x01port={port}\x01auth=Bearer {token}\x01\x01"
+    ))
+}
+
+/// Inspect the post-TLS EHLO reply, rather than Lettre's Mechanism enum (which
+/// does not recognize OAUTHBEARER and consequently omits it from ServerInfo).
+fn smtp_advertises_oauthbearer(response: &Response) -> bool {
+    response.has_code(250) && response.message().any(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        matches!(fields.next(), Some(prefix) if prefix.eq_ignore_ascii_case("AUTH"))
+            && fields.any(|mechanism| mechanism.eq_ignore_ascii_case("OAUTHBEARER"))
+    })
 }
 
 fn decode_component(raw: &str) -> Result<String> {
@@ -298,7 +443,8 @@ fn run_credential_command(command: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SmtpAuth, SmtpSource};
+    use super::{SmtpAuth, SmtpSource, oauthbearer_initial_response, smtp_advertises_oauthbearer};
+    use lettre::transport::smtp::response::Response;
 
     #[test]
     fn parses_secure_password_smtp() {
@@ -307,7 +453,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source.username, "user@example.com");
-        assert_eq!(source.auth, SmtpAuth::Plain);
+        assert_eq!(source.auth, SmtpAuth::Auto);
         assert_eq!(source.port, 465);
         assert!(!source.redacted().contains("password"));
     }
@@ -322,5 +468,59 @@ mod tests {
         let debug = format!("{source:?}");
         assert!(!debug.contains("refresh-token"));
         assert!(!debug.contains("client_id=abc"));
+    }
+
+    #[test]
+    fn auto_smtp_with_refresh_endpoint_never_downgrades_to_password() {
+        let source = SmtpSource::parse(
+            "smtps://a%40example.org:refresh@smtp.example.org:465?token_endpoint=https%3A%2F%2Foauth.example.org%2Ftoken"
+        ).unwrap();
+        assert_eq!(source.auth, SmtpAuth::OAuthBearer);
+        let explicit = SmtpSource::parse(
+            "smtp+plain://a%40example.org:pw@smtp.example.org:587"
+        ).unwrap();
+        assert_eq!(explicit.auth, SmtpAuth::Plain);
+    }
+
+    #[test]
+    fn parses_both_oauthbearer_tls_schemes() {
+        let implicit = SmtpSource::parse(
+            "smtps+oauthbearer://alice%40example.org:refresh-secret@smtp.example.org:465?token_endpoint=https%3A%2F%2Foauth.example.org%2Ftoken",
+        ).unwrap();
+        assert_eq!(implicit.auth, SmtpAuth::OAuthBearer);
+        assert_eq!(implicit.port, 465);
+        let explicit = SmtpSource::parse(
+            "smtp+oauthbearer://alice%40example.org:secret@smtp.example.org:587",
+        ).unwrap();
+        assert_eq!(explicit.auth, SmtpAuth::OAuthBearer);
+        assert_eq!(explicit.port, 587);
+        assert!(!format!("{implicit:?}").contains("refresh-secret"));
+        assert!(!implicit.redacted().contains("refresh-secret"));
+    }
+
+    #[test]
+    fn rejects_insecure_oauthbearer_token_endpoint() {
+        let result = SmtpSource::parse(
+            "smtp+oauthbearer://alice%40example.org:secret@smtp.example.org:587?token_endpoint=http%3A%2F%2Flocalhost%2Ftoken",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn oauthbearer_initial_response_uses_rfc_7628_layout_and_gs2_escape() {
+        let frame = oauthbearer_initial_response(
+            "alice,test=one@example.org", "smtp.example.org", 587, "opaque.token",
+        ).unwrap();
+        assert_eq!(frame, "n,a=alice=2Ctest=3Done@example.org,\x01host=smtp.example.org\x01port=587\x01auth=Bearer opaque.token\x01\x01");
+        assert!(oauthbearer_initial_response("alice\r\nINJECT", "smtp.example.org", 587, "token").is_err());
+        assert!(oauthbearer_initial_response("alice", "smtp.example.org", 587, "token\x01INJECT").is_err());
+    }
+
+    #[test]
+    fn smtp_auth_capabilities_are_checked_after_tls() {
+        let supported: Response = "250-smtp.example.org Hello\r\n250-AUTH LOGIN PLAIN OAUTHBEARER\r\n250 SIZE 12000\r\n".parse().unwrap();
+        let unsupported: Response = "250-smtp.gmail.com Hello\r\n250-AUTH PLAIN LOGIN XOAUTH2\r\n250 SIZE 12000\r\n".parse().unwrap();
+        assert!(smtp_advertises_oauthbearer(&supported));
+        assert!(!smtp_advertises_oauthbearer(&unsupported));
     }
 }

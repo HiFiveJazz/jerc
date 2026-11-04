@@ -22,7 +22,7 @@ pub fn from_account(account: &AccountConfig) -> Result<Box<dyn MailBackend>> {
 
     if ImapSource::supports(&account.source) {
         return Ok(Box::new(ImapBackend::new(
-            ImapSource::parse(&account.source)?,
+            ImapSource::parse(&account.source)?.with_account_oauth(account)?,
             account.source_cred_cmd.clone(),
             account.max_messages,
         )));
@@ -44,6 +44,8 @@ pub fn from_source(source: &str) -> Result<Box<dyn MailBackend>> {
         from: None,
         outgoing: None,
         outgoing_cred_cmd: None,
+        copy_to: None,
+        oauth: None,
         max_messages: 200,
         page_size: 100,
     };

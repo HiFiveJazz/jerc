@@ -23,6 +23,11 @@ struct Cli {
     #[arg(long, default_value = "Local")]
     name: String,
 
+    /// Sign in to a configured Google/Microsoft OAuth account using a browser.
+    /// Tokens are stored privately, not in config.toml.
+    #[arg(long, value_name = "ACCOUNT_NAME")]
+    oauth_login: Option<String>,
+
     /// Validate accounts and benchmark folder/header scanning without opening the TUI.
     #[arg(long)]
     headless_check: bool,
@@ -31,6 +36,9 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = load_config(&cli)?;
+    if let Some(name) = &cli.oauth_login {
+        return aerc_rs::oauth::login_account(&config.accounts, name);
+    }
     if cli.headless_check {
         return headless_check(&config);
     }

@@ -369,6 +369,27 @@ fn attachment_subtitle(names: &[String]) -> String {
     else { names.iter().take(2).map(String::as_str).collect::<Vec<_>>().join(" · ") }
 }
 
+#[cfg(test)]
+mod compact_address_header_tests {
+    use super::compact_address_header;
+
+    #[test]
+    fn short_recipient_stays_intact_and_long_recipient_collapses() {
+        assert_eq!(compact_address_header("a@example.com", 30), "a@example.com");
+        let long = compact_address_header("áβγ-long-address@example.com", 5);
+        assert!(long.starts_with("áβγ-l…"));
+        assert!(long.contains("[m: details]"));
+    }
+}
+
+// Compact mode avoids making large list conversations consume the reader.
+// Never truncate the underlying recipient data used for reply/reply-all.
+fn compact_address_header(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let compact = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() { format!("{compact}…  [m: details]") } else { compact }
+}
+
 fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let theme = app.theme().clone();
     let content_area = if !app.message_open {
@@ -445,20 +466,26 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 } else { "unknown".to_owned() }
             )]),
             Line::from(vec![Span::styled("To: ", theme.accent()), Span::raw(
-                if message.to.is_empty() { "(not supplied)".to_owned() } else { message.to.clone() }
+                if message.to.is_empty() { "(not supplied)".to_owned() }
+                else if app.show_header_details { message.to.clone() }
+                else { compact_address_header(&message.to, 95) }
             )]),
             Line::from(vec![
                 Span::styled("Subject: ", theme.accent()),
                 Span::raw(message.subject.clone()),
             ]),
         ];
-        if !message.cc.is_empty() {
-            lines.push(Line::from(vec![Span::styled("Cc: ", theme.accent()), Span::raw(message.cc.clone())]));
+        if app.show_header_details {
+            if !message.cc.is_empty() {
+                lines.push(Line::from(vec![Span::styled("Cc: ", theme.accent()), Span::raw(message.cc.clone())]));
+            }
+            if !message.bcc.is_empty() {
+                lines.push(Line::from(vec![Span::styled("Bcc: ", theme.accent()), Span::raw(message.bcc.clone())]));
+            }
+        } else if !message.cc.is_empty() || !message.bcc.is_empty() {
+            lines.push(Line::from(Span::styled("Recipients hidden · m: show details", theme.muted())));
         }
-        if !message.bcc.is_empty() {
-            lines.push(Line::from(vec![Span::styled("Bcc: ", theme.accent()), Span::raw(message.bcc.clone())]));
-        }
-        if app.show_message_ids {
+        if app.show_header_details {
             if let Some(message_id) = &message.message_id {
                 lines.push(Line::from(vec![
                     Span::styled("Message-ID: ", theme.accent()),

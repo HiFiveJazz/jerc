@@ -1,4 +1,5 @@
 mod smtp;
+mod sendmail;
 pub mod drafts;
 mod wire;
 
@@ -8,6 +9,7 @@ use crate::config::AccountConfig;
 use crate::model::OutgoingMessage;
 
 pub use smtp::{SmtpAuth, SmtpSender, SmtpSource};
+pub use sendmail::SendmailSender;
 pub use wire::{build_draft, InlineForwardParts, ReplyAudience, ReplyRecipients, build_outgoing, forward_html, forward_attribution, FORWARD_SEPARATOR, inline_forward_parts, forward_subject, reply_recipients, reply_subject, send_warnings, validate_recipients};
 
 #[derive(Debug, Clone)]
@@ -56,16 +58,37 @@ pub fn from_account(account: &AccountConfig) -> Result<Option<Box<dyn MailSender
     let Some(source) = account.outgoing.as_deref() else {
         return Ok(None);
     };
-    let source = SmtpSource::parse(source)?;
+    if let Some(sender) = SendmailSender::from_outgoing(source)? {
+        return Ok(Some(Box::new(sender)));
+    }
+    let source = SmtpSource::parse(source)?.with_account_oauth(account)?;
     Ok(Some(Box::new(SmtpSender::new(
         source,
         account.outgoing_cred_cmd.clone(),
     ))))
 }
 
+/// Explicit per-account copy-to policy. None uses legacy provider detection;
+/// Some(empty) skips any APPEND; nonempty names are exact mailbox targets.
+#[must_use]
+pub fn sent_copy_targets(setting: Option<&str>) -> Option<Vec<String>> {
+    setting.and_then(|value| {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") { return None; }
+        if value.is_empty() || value.eq_ignore_ascii_case("none") { return Some(Vec::new()); }
+        let mut folders = Vec::<String>::new();
+        for target in value.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            if !folders.iter().any(|name| name == target) {
+                folders.push(target.to_owned());
+            }
+        }
+        Some(folders)
+    })
+}
+
 #[cfg(test)]
 mod sender_tests {
-    use super::sender_from_account;
+    use super::{sender_from_account, sent_copy_targets};
     use crate::config::AccountConfig;
 
     fn account(from: Option<&str>, outgoing: &str, source: &str) -> AccountConfig {
@@ -73,8 +96,19 @@ mod sender_tests {
             name: "Test".into(), source: source.into(), default_mailbox: "INBOX".into(),
             source_cred_cmd: None, from: from.map(str::to_owned),
             outgoing: Some(outgoing.into()), outgoing_cred_cmd: None,
+            copy_to: None, oauth: None,
             max_messages: 100, page_size: 100,
         }
+    }
+
+    #[test]
+    fn explicit_sent_policy_supports_disabled_multiple_and_auto() {
+        assert!(sent_copy_targets(None).is_none());
+        assert!(sent_copy_targets(Some("auto")).is_none());
+        assert_eq!(sent_copy_targets(Some("")), Some(Vec::new()));
+        assert_eq!(sent_copy_targets(Some("none")), Some(Vec::new()));
+        assert_eq!(sent_copy_targets(Some(" Sent, Archive, Sent ")),
+            Some(vec!["Sent".into(), "Archive".into()]));
     }
 
     #[test]

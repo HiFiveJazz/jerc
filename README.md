@@ -4,7 +4,7 @@ A Rust terminal email client inspired by aerc's backend/worker model and lazygit
 
 ## What works
 
-- Maildir and TLS IMAP backends with password/app-password, OAUTHBEARER/XOAUTH2, refresh-token exchange, UID mutations, SMTP sending, and bounded worker queues.
+- Maildir and TLS IMAP backends with password/app-password, OAUTHBEARER/XOAUTH2, refresh-token exchange, UID mutations, SMTP sending (including RFC 7628 OAUTHBEARER when advertised), and bounded worker queues.
 - **Paged mailbox loading:** the TUI fetches `page_size` headers at a time (100 by default), keeps loaded mail cached per mailbox, and automatically requests older pages near the bottom. Returning to an already-open mailbox restores its cached list immediately.
 - **Fast mailbox switching:** `J/K` changes folders, while `Ctrl-Shift-j/Ctrl-Shift-k` smoothly moves the folder cursor without loading every intermediate folder.
 - **Neovim-style message scrolling:** `j/k`, counts, `Ctrl-j/Ctrl-k`, `Ctrl-d/Ctrl-u`, `g/G`, and a four-row scrolloff. The renderer owns the visible slice, avoiding Ratatui offset artifacts and stale gutter contents.
@@ -94,7 +94,7 @@ Press `?` for the searchable complete map. Common controls:
 - `d` confirmed trash/delete; `D` immediate trash/delete; `a` archive; `U` restore an archived message to INBOX.
 - `/` filter current mailbox; `b` sidebar; `P` vertical preview; `Enter` full reader.
 - `r` reply without quote; `R` reply with quote; `A` reply all; `L` list reply; `f` inline forward; `c` compose.
-- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser. `m` toggles the Message-ID header. `z` opens received attachments with automatic previews; `j/k` moves, Space marks and advances, `v` selects a range then Space marks it, `a` marks/unmarks all, `o`/Enter opens, and `s` saves marked files to an entered directory. Clicking a filename previews it; footer Open/Save/Mark actions are mouse-clickable. The mailbox divider can be dragged to resize, or use Alt-h/Alt-l to adjust it from the keyboard.
+- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser. `m` toggles expanded recipients (Cc/Bcc) and Message-ID; the reader starts in compact-header mode. `z` opens received attachments with automatic previews; `j/k` moves, Space marks and advances, `v` selects a range then Space marks it, `a` marks/unmarks all, `o`/Enter opens, and `s` saves marked files to an entered directory. Clicking a filename previews it; footer Open/Save/Mark actions are mouse-clickable. The mailbox divider can be dragged to resize, or use Alt-h/Alt-l to adjust it from the keyboard.
 - In composer, Tab/Shift-Tab visits To, Cc, Bcc, Subject and Body. Ctrl+A opens an internal multi-select attachment picker (Space/Enter toggles files, h/Backspace moves to parent, l enters folders, . shows hidden files, Esc closes). Ctrl+O edits optional custom headers in advanced options (`X-Header: value; ...`). In NORMAL press `?` for the searchable compose-only shortcuts (`gg/G`, `w/W/b/B/e/E`, `vi` text objects, `dd/dw`, `f/F`, `o/O`, `u/Ctrl-r`, Visual and more). Enter shows a centered send confirmation; Ctrl-p postpones locally; Ctrl-n resumes the active account’s postponed draft. These are local files, not IMAP Drafts synchronization.
 - `Alt-n`/`Alt-p` next/previous account; `Alt-1`–`Alt-9` direct account selection; `[ / ]` and Ctrl-PageUp/PageDown also navigate, or click the top account tabs. `!` reviews configuration warnings; `Ctrl-r` refreshes the current mailbox; `B` toggles the optional terminal bell. Desktop notifications can be toggled separately with `ui.new_mail_notifications`.
 
@@ -115,7 +115,7 @@ Built-ins live in `themes/*.json`. Custom themes use the same flat semantic pale
 }
 ```
 
-Put the file in `~/.config/aerc-rs/themes/my-theme.json`, then press `t`.
+Put the file in `~/.config/aerc-rs/themes/my-theme.json`, set `[ui] theme = "my-theme"` in `config.toml`, or select it with `t`. The picker writes the selected theme back into `config.toml`; old standalone `theme` state files no longer override that setting.
 
 ## Validate and benchmark
 
@@ -247,3 +247,91 @@ and **`s` again to save** all marked attachments (or the highlighted one) into
 the current folder. Existing files are never overwritten; collisions get
 numbered filenames. The destination browser never reads file contents or
 launches thumbnails merely to choose a folder.
+
+### SMTP OAUTHBEARER (non-Google providers)
+
+For SMTP servers advertising `AUTH OAUTHBEARER` after TLS, set `outgoing` to
+`smtps+oauthbearer://` (port 465) or `smtp+oauthbearer://` (port 587, mandatory
+STARTTLS). Use `outgoing_cred_cmd` and the optional `token_endpoint`, `client_id`,
+`client_secret`, and `scope` query fields just like XOAUTH2. The credential is
+an access token unless `token_endpoint` is present, in which case it is a
+refresh token. The client checks advertised authentication capabilities before
+sending any bearer token and reports a safe error if the server lacks this
+mechanism. Sending uses Lettre's secure low-level SMTP connection and its
+message-delivery code, with no separate SMTP implementation. If the server
+instead advertises XOAUTH2 (as Gmail does), the OAuth-bearing scheme negotiates
+XOAUTH2 as a compatibility fallback; it never falls back to password auth.
+
+**Gmail / Google Workspace:** Google documents SMTP `XOAUTH2` rather than
+`OAUTHBEARER`. Use `smtps+xoauth2://` or `smtp+xoauth2://` for Google accounts;
+changing the scheme to OAUTHBEARER cannot enable an unadvertised server feature.
+
+### Per-account Sent policy, SMTP negotiation, sendmail, and browser OAuth
+
+Each `[[accounts]]` can set `copy_to` (alias `copy-to`) to an existing mailbox
+name. `copy_to = ""` or `copy_to = "none"` disables the client-side Sent APPEND;
+`copy_to = "Sent"` stores a local/server copy in that folder, and comma-separated
+names copy to each requested folder. Omitting it preserves the previous
+auto-detection behavior: Gmail SMTP normally files Sent itself, and other
+providers use the detected Sent mailbox. **Do not set a Sent APPEND for Gmail
+unless you want to risk duplicate messages.** SMTP/local submission is never
+retried just because a Sent APPEND fails.
+
+Outgoing transports accept secure `smtp://` (required STARTTLS on 587) and
+`smtps://` (TLS on 465). Unsuffixed URLs automatically select a mutually
+advertised PLAIN or LOGIN method after TLS; `+plain`, `+login`, `+xoauth2`,
+`+oauthbearer`, and `+none` remain available as explicit choices. An OAuth
+account or a URL with a refresh-token endpoint negotiates OAuth without
+falling back to password authentication. A rejected credential is not retried
+under a different mechanism. Local MTA users can use an absolute sendmail
+path, e.g. `outgoing = "/usr/sbin/sendmail"`, or
+`outgoing = "sendmail:///usr/sbin/sendmail"`. The executable must exist.
+It is invoked directly (no shell) with envelope recipients so Bcc remains
+private. Local queue acceptance is not a guarantee of final delivery.
+
+For native OAuth desktop sign-in, add an OAuth table **under an account**:
+
+```toml
+[[accounts]]
+name = "Work"
+source = "imaps://you%40example.com@outlook.office365.com:993"
+outgoing = "smtp://you%40example.com@smtp.office365.com:587"
+copy_to = "Sent Items"
+from = "You <you@example.com>"
+
+[accounts.oauth]
+provider = "microsoft"  # or "google" for a Gmail account
+client_id = "YOUR_PUBLISHER_REGISTERED_PUBLIC_CLIENT_ID"
+# tenant = "common"  # optional Microsoft tenant selector
+```
+
+For Gmail, the corresponding account uses `imap.gmail.com:993`,
+`smtp.gmail.com:465`, and typically `copy_to = ""` because Gmail already
+stores sent mail itself:
+
+```toml
+[[accounts]]
+name = "Personal"
+source = "imaps://you%40gmail.com@imap.gmail.com:993"
+outgoing = "smtps://you%40gmail.com@smtp.gmail.com:465"
+copy_to = ""
+
+[accounts.oauth]
+provider = "google"
+client_id = "YOUR_REGISTERED_GOOGLE_DESKTOP_CLIENT_ID"
+```
+
+Then run `aerc-rs --oauth-login Work` (or `--oauth-login Personal`) once.
+The browser flow uses PKCE and a
+loopback callback, requesting IMAP/SMTP access with offline consent. Refresh
+tokens are written under the user configuration directory (`aerc-rs/oauth/`)
+with private file permissions; they are not copied into the TOML file.
+Subsequent IMAP/SMTP connections automatically refresh their access tokens.
+An app publisher can provide OAuth client IDs at build time using
+`AERC_RS_GOOGLE_CLIENT_ID` or `AERC_RS_MICROSOFT_CLIENT_ID` (and an optional
+`AERC_RS_GOOGLE_CLIENT_SECRET` for a Google desktop public client). This allows
+end users to sign in without manually creating or pasting tokens. **A developer
+must first register and, where required, verify these OAuth clients; this
+patch does not bundle an approved application identity.** Microsoft tenants may
+require administrator consent, and some disallow SMTP AUTH entirely.
+Legacy refresh-token URLs and credential commands remain supported.

@@ -22,7 +22,7 @@ use crate::model::{
     Capabilities, HtmlLine, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessageSummary,
     OutgoingAttachment, OutgoingMessage,
 };
-use crate::theme::{Theme, load_themes, persist_theme, persisted_theme, theme_index};
+use crate::theme::{Theme, load_themes, theme_index};
 use crate::worker::{ActionKind, RuntimeEvent, WorkerEvent, WorkerEventKind, WorkerHandle};
 
 const SMOOTH_SCROLL_ROWS: isize = 22;
@@ -1584,6 +1584,7 @@ pub struct AccountState {
     pub default_mailbox: String,
     pub from: String,
     pub outgoing_configured: bool,
+    pub copy_to: Option<String>,
     pub capabilities: Option<Capabilities>,
     pub mailboxes: Vec<Mailbox>,
     pub mailbox_index: usize,
@@ -2155,7 +2156,8 @@ pub struct App {
     reader_image_target_width: u16,
     reader_image_target_height: u16,
     pub reader_images_enabled: bool,
-    pub show_message_ids: bool,
+    pub show_header_details: bool,
+    theme_config_path: Option<PathBuf>,
     pub attachment_picker_visible: bool,
     pub attachment_selection: usize,
     pub attachment_files: Arc<Vec<OutgoingAttachment>>,
@@ -2221,6 +2223,7 @@ impl App {
                 default_mailbox: config.default_mailbox.clone(),
                 from: crate::outgoing::sender_from_account(config),
                 outgoing_configured: config.outgoing.is_some(),
+                copy_to: config.copy_to.clone(),
                 capabilities: None,
                 mailboxes: snapshot.mailboxes,
                 mailbox_index: 0,
@@ -2281,8 +2284,7 @@ impl App {
             })
             .collect();
         let themes = load_themes();
-        let configured_theme = persisted_theme().unwrap_or_else(|| config.ui.theme.clone());
-        let theme_index = theme_index(&themes, &configured_theme);
+        let theme_index = theme_index(&themes, &config.ui.theme);
         Self {
             accounts,
             account_index: 0,
@@ -2321,7 +2323,8 @@ impl App {
             reader_image_target_width: 48,
             reader_image_target_height: 18,
             reader_images_enabled: config.ui.remote_images,
-            show_message_ids: false,
+            show_header_details: false,
+            theme_config_path: config.config_path.clone(),
             attachment_picker_visible: false,
             attachment_selection: 0,
             attachment_files: Arc::new(Vec::new()),
@@ -2579,7 +2582,7 @@ impl App {
                 true
             }
             KeyCode::Char('m') => {
-                self.toggle_message_ids();
+                self.toggle_header_details();
                 true
             }
             KeyCode::Char('z') => {
@@ -3222,6 +3225,7 @@ impl App {
                 sent_mailbox,
                 sent_copy_saved,
                 sent_copy_warning,
+                sent_copy_disabled,
             } => {
                 // A successful SMTP submission makes our mailbox snapshots stale even
                 // when the provider files Sent itself (Gmail), and especially when the
@@ -3277,6 +3281,8 @@ impl App {
                         format!("SMTP accepted ({smtp_status}); {warning}"),
                         Duration::from_secs(8),
                     )
+                } else if sent_copy_disabled {
+                    StatusLine::temporary(format!("Message accepted ({smtp_status}); Sent copy disabled"), Duration::from_secs(5))
                 } else if sent_copy_saved {
                     StatusLine::temporary(
                         format!("SMTP accepted ({smtp_status}); saved to Sent"),
@@ -5128,10 +5134,17 @@ impl App {
         self.theme_picker_visible = false;
         self.theme_query.clear();
         let id = self.theme().id.clone();
-        if let Err(error) = persist_theme(&id) {
-            self.status = StatusLine::error(format!("could not persist theme: {error:#}"));
+        if let Some(path) = self.theme_config_path.as_deref() {
+            if let Err(error) = crate::config::save_ui_theme(path, &id) {
+                self.status = StatusLine::error(format!("could not save [ui] theme: {error:#}"));
+            } else {
+                self.status = StatusLine::temporary("theme saved in config.toml", Duration::from_secs(2));
+            }
         } else {
-            self.status = StatusLine::temporary("theme saved", Duration::from_secs(2));
+            self.status = StatusLine::temporary(
+                "theme changed for this session (set [ui] theme in config.toml to persist)",
+                Duration::from_secs(4),
+            );
         }
     }
 
@@ -5258,10 +5271,10 @@ impl App {
         );
     }
 
-    fn toggle_message_ids(&mut self) {
-        self.show_message_ids = !self.show_message_ids;
+    fn toggle_header_details(&mut self) {
+        self.show_header_details = !self.show_header_details;
         self.status = StatusLine::temporary(
-            if self.show_message_ids { "Message-ID shown" } else { "Message-ID hidden" },
+            if self.show_header_details { "message details expanded" } else { "message details collapsed" },
             Duration::from_secs(2),
         );
     }
@@ -6527,6 +6540,7 @@ impl App {
                 return;
             }
         };
+        let copy_to = crate::outgoing::sent_copy_targets(account.copy_to.as_deref());
         let sent_mailbox = account
             .mailboxes
             .iter()
@@ -6537,6 +6551,7 @@ impl App {
             .post(ActionKind::Send {
                 message,
                 sent_mailbox,
+                copy_to,
             })
             .is_ok()
         {

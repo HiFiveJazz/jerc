@@ -58,7 +58,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Message", key: "v / V, vi\" / vi' / vi() / vi[] / vi{}", description: "character / line visual selection and inner text objects" },
     HelpEntry { category: "Message", key: "T", description: "toggle rich HTML / plain fallback" },
     HelpEntry { category: "Message", key: "I", description: "toggle remote images for this session" },
-    HelpEntry { category: "Message", key: "m", description: "show / hide Message-ID in reader" },
+    HelpEntry { category: "Message", key: "m", description: "toggle full recipients and Message-ID in reader" },
     HelpEntry { category: "Message", key: "z", description: "attachments: PDF preview, 5j/k, Ctrl-j/k, Space mark, v range, s folder picker" },
     HelpEntry { category: "Message", key: "o", description: "open link under reader cursor" },
     HelpEntry { category: "Message", key: "O", description: "open original HTML email in the browser" },

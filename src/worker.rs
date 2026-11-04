@@ -35,6 +35,9 @@ pub enum ActionKind {
     Send {
         message: OutgoingMessage,
         sent_mailbox: Option<String>,
+        /// None = legacy auto; Some(empty) = disable; Some(names) = APPEND to
+        /// every explicit folder, even when the SMTP provider files Sent.
+        copy_to: Option<Vec<String>>,
     },
     SaveDraft { message: OutgoingMessage, mailbox: String },
     Shutdown,
@@ -90,6 +93,7 @@ pub enum WorkerEventKind {
         sent_mailbox: Option<String>,
         sent_copy_saved: bool,
         sent_copy_warning: Option<String>,
+        sent_copy_disabled: bool,
     },
     Error(String),
     Stopped,
@@ -347,32 +351,37 @@ fn run_worker(
             ActionKind::Send {
                 message,
                 sent_mailbox,
+                copy_to,
             } => match outgoing.as_deref_mut() {
                 Some(sender) => sender.send(&message).map(|receipt| {
                     let mut sent_copy_saved = false;
                     let mut sent_copy_warning = None;
-                    if !receipt.server_files_sent_copy {
-                        if let Some(mailbox) = sent_mailbox.as_deref() {
-                            match backend.append_message(mailbox, &receipt.raw_message, true) {
-                                Ok(()) => sent_copy_saved = true,
-                                Err(error) => {
-                                    sent_copy_warning = Some(format!(
-                                        "SMTP accepted the message, but saving a Sent copy to {mailbox:?} failed: {error:#}"
-                                    ));
-                                }
+                    let targets = match copy_to.as_ref() {
+                        Some(folders) => folders.clone(),
+                        None if receipt.server_files_sent_copy => Vec::new(),
+                        None => sent_mailbox.clone().into_iter().collect(),
+                    };
+                    for mailbox in &targets {
+                        match backend.append_message(mailbox, &receipt.raw_message, true) {
+                            Ok(()) => sent_copy_saved = true,
+                            Err(_error) => {
+                                // SMTP already succeeded; never retry the send
+                                // merely because a server-side Sent APPEND fails.
+                                sent_copy_warning = Some(format!(
+                                    "SMTP accepted the message, but saving a Sent copy to {mailbox:?} failed"
+                                ));
                             }
-                        } else {
-                            sent_copy_warning = Some(
-                                "SMTP accepted the message, but the account advertises no Sent mailbox"
-                                    .to_owned(),
-                            );
                         }
+                    }
+                    if copy_to.is_none() && !receipt.server_files_sent_copy && targets.is_empty() {
+                        sent_copy_warning = Some("message submitted, but no Sent mailbox was advertised".to_owned());
                     }
                     WorkerEventKind::MessageSent {
                         smtp_status: receipt.smtp_status,
                         sent_mailbox,
                         sent_copy_saved,
                         sent_copy_warning,
+                        sent_copy_disabled: copy_to.as_ref().is_some_and(Vec::is_empty),
                     }
                 }),
                 None => Err(anyhow::anyhow!(

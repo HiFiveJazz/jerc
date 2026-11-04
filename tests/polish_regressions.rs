@@ -123,3 +123,32 @@ fn gmail_style_forward_attribution_preserves_origin_headers() {
     assert!(forward.contains("Cc: Team <team@example.test>\n"));
     assert!(!forward.contains("Bcc:"));
 }
+
+const REACTION_WITHOUT_FILES: &[u8] = b"From: Someone <someone@example.org>\r\nSubject: Reaction\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=react\r\n\r\n--react\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nLiked your email\r\n--react\r\nContent-Type: text/vnd.google.email-reaction+json; charset=utf-8\r\n\r\n{\"emoji\":\"smile\",\"version\":1}\r\n--react\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Liked your email</p>\r\n--react--\r\n";
+
+#[test]
+fn gmail_reaction_metadata_is_not_a_downloadable_attachment() {
+    let files = extract_attachments(REACTION_WITHOUT_FILES).unwrap();
+    assert!(files.is_empty(), "reaction JSON is MIME metadata, not a user file");
+    let body = parse_body(MessageId("reaction".into()), REACTION_WITHOUT_FILES).unwrap();
+    assert_eq!(body.attachment_count, 0);
+    assert!(body.attachment_names.is_empty());
+}
+
+#[test]
+fn gmail_reaction_does_not_hide_real_attachments() {
+    let raw = b"From: Someone <someone@example.org>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nHello\r\n--x\r\nContent-Type: text/vnd.google.email-reaction+json\r\n\r\n{\"emoji\":\"smile\"}\r\n--x\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=report.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n--x--\r\n";
+    let files = extract_attachments(raw).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].filename, "report.pdf");
+    let body = parse_body(MessageId("reaction-and-attachment".into()), raw).unwrap();
+    assert_eq!(body.attachment_count, 1);
+}
+
+#[test]
+fn explicitly_attached_reaction_json_is_still_available() {
+    let raw = b"From: Someone <someone@example.org>\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nHello\r\n--x\r\nContent-Type: text/vnd.google.email-reaction+json\r\nContent-Disposition: attachment; filename=reaction.json\r\n\r\n{\"emoji\":\"smile\"}\r\n--x--\r\n";
+    let files = extract_attachments(raw).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].filename, "reaction.json");
+}

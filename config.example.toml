@@ -50,8 +50,8 @@ default_mailbox = "INBOX"
 # `b` toggles the sidebar; `p` toggles the message preview.
 mailbox_width_percent = 22
 
-# Initial theme. Press `t` in the TUI to preview/switch themes live; the chosen
-# theme is persisted in the aerc-rs config directory and overrides this value.
+# Active theme. Press `t` in the TUI to preview/switch themes live; the chosen
+# theme is saved back into [ui].theme in this config.toml.
 theme = "default"
 # Remote images can disclose your IP/read time to senders. Press I to toggle in-session.
 remote_images = false
@@ -70,3 +70,41 @@ new_mail_sound_name = "message-new-email"
 # Legacy layout options are still accepted so existing configs keep loading.
 # sidebar_width = 24
 # message_width_percent = 48
+
+# Other SMTP providers may advertise SASL OAUTHBEARER (RFC 7628).
+# Use smtps+oauthbearer:// on port 465, or smtp+oauthbearer:// on port 587.
+# The same OAuth refresh-token URL parameters and outgoing_cred_cmd apply.
+# Google Gmail SMTP advertises XOAUTH2, so +xoauth2 is recommended for Google.
+# +oauthbearer will also negotiate XOAUTH2 when OAUTHBEARER is unavailable.
+# outgoing = "smtps+oauthbearer://you%40example.net@smtp.example.net:465?token_endpoint=https%3A%2F%2Fauth.example.net%2Ftoken&client_id=YOUR_CLIENT_ID"
+
+# -----------------------------------------------------------------------------
+# Outgoing delivery additions (per account; put these keys in [[accounts]])
+# -----------------------------------------------------------------------------
+# copy_to = ""                 # aerc-style: disable APPEND (recommended for Gmail)
+# copy_to = "Sent"             # force APPEND to specified folder
+# copy_to = "Sent, Archive"    # force APPEND to both folders
+# Omitting copy_to keeps prior aerc-rs behavior: for smtp.gmail.com rely on
+# Gmail's automatic Sent filing; elsewhere append to the detected Sent folder.
+# Explicit Sent on Gmail may cause duplicates. No copying occurs before send succeeds.
+# outgoing = "/usr/sbin/sendmail"          # aerc-compatible local MTA, Unix
+# outgoing = "sendmail:///usr/sbin/sendmail" # equivalent URI form
+# The sendmail command uses -i -f <sender> -- <envelope recipients> (incl. Bcc)
+# and sends the RFC 5322 bytes through stdin. No shell is invoked.
+# outgoing = "smtps://you%40example.com@smtp.example.com:465"
+# The unsuffixed scheme now negotiates PLAIN or LOGIN based on TLS EHLO.
+# For OAuth, choose +xoauth2/+oauthbearer or an [accounts.oauth] block.
+
+# Browser OAuth setup example (put this table DIRECTLY after the related
+# [[accounts]] block; do not add it after [ui], which is not an account):
+# [accounts.oauth]
+# provider = "google"  # or "microsoft"
+# client_id = "PUBLISHER_OAUTH_DESKTOP_CLIENT_ID"
+# client_secret = "OPTIONAL_GOOGLE_DESKTOP_PUBLIC_CLIENT_SECRET"
+# tenant = "common"  # Microsoft only; organizational tenant ID also supported
+# After configuring, run: aerc-rs --oauth-login "ACCOUNT NAME"
+# It opens a browser and stores a private refresh token outside config.toml.
+# Apps can embed public IDs at build-time via AERC_RS_GOOGLE_CLIENT_ID,
+# AERC_RS_GOOGLE_CLIENT_SECRET, and AERC_RS_MICROSOFT_CLIENT_ID.
+# OAuth desktop clients must be registered (and possibly verified) by the
+# publisher. OAuth is not available with a made-up client ID.

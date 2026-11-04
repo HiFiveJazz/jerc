@@ -58,6 +58,7 @@ pub struct ImapSource {
     client_id: Option<String>,
     client_secret: Option<String>,
     scope: Option<String>,
+    account_oauth: Option<crate::oauth::OAuthSettings>,
 }
 
 impl ImapSource {
@@ -126,7 +127,16 @@ impl ImapSource {
             client_id,
             client_secret,
             scope,
+            account_oauth: None,
         })
+    }
+
+    pub fn with_account_oauth(mut self, account: &crate::config::AccountConfig) -> Result<Self> {
+        if let Some(settings) = crate::oauth::OAuthSettings::for_account(account)? {
+            self.auth = ImapAuth::XOAuth2;
+            self.account_oauth = Some(settings);
+        }
+        Ok(self)
     }
 
     #[must_use]
@@ -141,6 +151,9 @@ impl ImapSource {
         if let Some(secret) = &self.secret {
             return Ok(secret.clone());
         }
+        if let Some(oauth) = &self.account_oauth {
+            return oauth.refresh_token();
+        }
         let command = credential_command.ok_or_else(|| {
             anyhow!(
                 "IMAP source contains no credential; add a URI password/token or source_cred_cmd"
@@ -150,6 +163,10 @@ impl ImapSource {
     }
 
     fn access_token(&self, credential: &str) -> Result<String> {
+        if let Some(oauth) = &self.account_oauth {
+            // Stored refresh tokens can rotate; always read via the OAuth store.
+            return oauth.access_token();
+        }
         let Some(endpoint) = self.token_endpoint.as_deref() else {
             return Ok(credential.to_owned());
         };

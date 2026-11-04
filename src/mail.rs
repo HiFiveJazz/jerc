@@ -193,11 +193,23 @@ pub fn attachment_hint(headers: &[u8]) -> bool {
 
 /// Decoded MIME attachments in display order. Never infer a file path from a
 /// sender-provided filename: names are sanitized at the UI/export boundary.
+/// Some providers include internal metadata MIME parts (not user files) in
+/// multipart/alternative. mail-parser classifies unknown text subtypes as
+/// attachments, so hide unlabelled Gmail reaction JSON but preserve real files
+/// explicitly marked attachment or supplied with a filename.
+fn visible_mime_attachment(part: &mail_parser::MessagePart<'_>) -> bool {
+    if part.is_content_type("text", "vnd.google.email-reaction+json") {
+        return part.attachment_name().is_some_and(|name| !name.trim().is_empty())
+            || part.content_disposition().is_some_and(|disposition| disposition.is_attachment());
+    }
+    true
+}
+
 pub fn extract_attachments(raw: &[u8]) -> Result<Vec<OutgoingAttachment>> {
     let parsed = MessageParser::new().parse(raw)
         .ok_or_else(|| anyhow!("unable to parse MIME attachments"))?;
     let mut results = Vec::new();
-    for (index, part) in parsed.attachments().enumerate() {
+    for (index, part) in parsed.attachments().filter(|part| visible_mime_attachment(part)).enumerate() {
         let raw_name = part.attachment_name().unwrap_or("");
         let name = raw_name.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("").trim();
         let filename = if name.is_empty() || name == "." || name == ".." {
@@ -274,6 +286,16 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         .map(|(text, lines, renderer)| (Some(text), Some(lines), Some(renderer)))
         .unwrap_or((None, None, None));
 
+    let attachment_names: Vec<String> = message.attachments()
+        .filter(|part| visible_mime_attachment(part))
+        .enumerate()
+        .map(|(index, part)| {
+            let raw = part.attachment_name().unwrap_or("");
+            let name = raw.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("").trim();
+            if name.is_empty() || name == "." || name == ".." {
+                format!("attachment-{}", index + 1)
+            } else { name.to_owned() }
+        }).collect();
     Ok(MessageBody {
         id,
         plain_text,
@@ -283,14 +305,8 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         html_lines,
         html_renderer,
         html_render_width,
-        attachment_count: message.attachments().count(),
-        attachment_names: message.attachments().enumerate().map(|(index, part)| {
-            let raw = part.attachment_name().unwrap_or("");
-            let name = raw.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("").trim();
-            if name.is_empty() || name == "." || name == ".." {
-                format!("attachment-{}", index + 1)
-            } else { name.to_owned() }
-        }).collect(),
+        attachment_count: attachment_names.len(),
+        attachment_names,
     })
 }
 

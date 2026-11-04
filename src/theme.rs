@@ -252,32 +252,6 @@ pub fn theme_index(themes: &[Theme], name: &str) -> usize {
 }
 
 #[must_use]
-pub fn persisted_theme() -> Option<String> {
-    fs::read_to_string(theme_state_path())
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
-
-pub fn persist_theme(name: &str) -> Result<()> {
-    let path = theme_state_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating theme state directory {}", parent.display()))?;
-    }
-    fs::write(&path, format!("{name}\n"))
-        .with_context(|| format!("writing theme state {}", path.display()))
-}
-
-#[must_use]
-pub fn theme_state_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("aerc-rs")
-        .join("theme")
-}
-
-#[must_use]
 pub fn theme_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))

@@ -83,7 +83,7 @@ fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<Str
             let scheme = account.outgoing.as_deref().map(safe_scheme).unwrap_or("<missing>");
             warnings.push(format!(
                 "{}: outgoing transport '{scheme}' is invalid. Use smtp:// or smtps:// \
-                 (optionally +login, +plain, or +xoauth2). Receiving works; sending disabled until fixed.",
+                 (optional +login, +plain, +xoauth2 or +oauthbearer), or an absolute sendmail path. Receiving works; sending disabled until fixed.",
                 account.name,
             ));
             account.outgoing = None;

@@ -201,6 +201,7 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
                 forwarded_raw: None,
             },
             sent_mailbox: Some("Sent".to_owned()),
+            copy_to: None,
         })
         .unwrap();
 
@@ -212,6 +213,7 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
         sent_mailbox,
         sent_copy_saved,
         sent_copy_warning,
+        sent_copy_disabled,
     } = event.kind
     else {
         panic!("expected sent event");
@@ -219,6 +221,7 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
     assert_eq!(smtp_status, "2.0.0");
     assert_eq!(sent_mailbox.as_deref(), Some("Sent"));
     assert!(sent_copy_saved);
+    assert!(!sent_copy_disabled);
     assert_eq!(sent_copy_warning, None);
 
     let appended = appended.lock().unwrap();
@@ -244,6 +247,7 @@ fn sent_append_failure_is_reported_and_not_retried_as_smtp_send() {
             in_reply_to: None, references: vec![], forwarded_raw: None,
         },
         sent_mailbox: Some("Sent".into()),
+        copy_to: None,
     }).unwrap();
     let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
         panic!("worker event expected");
@@ -254,5 +258,64 @@ fn sent_append_failure_is_reported_and_not_retried_as_smtp_send() {
     assert!(!sent_copy_saved);
     assert!(sent_copy_warning.unwrap().contains("SMTP accepted"));
     assert!(appended.lock().unwrap().is_empty());
+    worker.shutdown();
+}
+
+#[test]
+fn sent_copy_can_be_disabled_without_appending_to_server() {
+    let appended = Arc::new(Mutex::new(Vec::new()));
+    let backend = AppendingBackend { appended: Arc::clone(&appended), fail_append: false };
+    let (tx, rx) = sync_channel(8);
+    let mut worker = WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
+    worker.post(ActionKind::Send {
+        message: OutgoingMessage {
+            from: "sender@example.com".into(), to: "receiver@example.com".into(),
+            cc: String::new(), bcc: String::new(), subject: "no copy".into(),
+            body: "test".into(), html_body: None, attachments: vec![], custom_headers: vec![],
+            in_reply_to: None, references: vec![], forwarded_raw: None,
+        },
+        sent_mailbox: Some("Sent".into()),
+        copy_to: Some(Vec::new()),
+    }).unwrap();
+    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+        panic!("worker event expected");
+    };
+    let WorkerEventKind::MessageSent { sent_copy_saved, sent_copy_disabled, .. } = event.kind else {
+        panic!("SMTP accepted message but worker returned error");
+    };
+    assert!(!sent_copy_saved);
+    assert!(sent_copy_disabled);
+    assert!(appended.lock().unwrap().is_empty());
+    worker.shutdown();
+}
+
+#[test]
+fn sent_copy_explicit_multiple_folders_appends_both() {
+    let appended = Arc::new(Mutex::new(Vec::new()));
+    let backend = AppendingBackend { appended: Arc::clone(&appended), fail_append: false };
+    let (tx, rx) = sync_channel(8);
+    let mut worker = WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
+    worker.post(ActionKind::Send {
+        message: OutgoingMessage {
+            from: "sender@example.com".into(), to: "receiver@example.com".into(),
+            cc: String::new(), bcc: String::new(), subject: "multiple".into(),
+            body: "test".into(), html_body: None, attachments: vec![], custom_headers: vec![],
+            in_reply_to: None, references: vec![], forwarded_raw: None,
+        },
+        sent_mailbox: Some("Sent".into()),
+        copy_to: Some(vec!["Sent".into(), "Project Archive".into()]),
+    }).unwrap();
+    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+        panic!("worker event expected");
+    };
+    let WorkerEventKind::MessageSent { sent_copy_saved, sent_copy_warning, .. } = event.kind else {
+        panic!("SMTP accepted message but worker returned error");
+    };
+    assert!(sent_copy_saved);
+    assert!(sent_copy_warning.is_none());
+    let appended = appended.lock().unwrap();
+    assert_eq!(appended.iter().map(|(name, _, _)| name.as_str()).collect::<Vec<_>>(),
+        vec!["Sent", "Project Archive"]);
+    drop(appended);
     worker.shutdown();
 }
