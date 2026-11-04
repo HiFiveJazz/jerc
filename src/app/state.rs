@@ -1947,7 +1947,7 @@ impl App {
             .map(|(config, worker)| AccountState {
                 name: config.name.clone(),
                 default_mailbox: config.default_mailbox.clone(),
-                from: config.from.clone().unwrap_or_default(),
+                from: crate::outgoing::sender_from_account(config),
                 outgoing_configured: config.outgoing.is_some(),
                 capabilities: None,
                 mailboxes: Vec::new(),
@@ -5027,7 +5027,7 @@ impl App {
                     if let Some(composer) = self.composer.as_mut() { composer.exit_prompt = false; }
                     self.postpone_composer();
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') => {
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') => {
                     self.composer = None;
                     self.resumed_draft_account = None;
                     self.status = StatusLine::temporary("unsent email discarded", Duration::from_secs(2));

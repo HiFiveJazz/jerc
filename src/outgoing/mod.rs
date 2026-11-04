@@ -26,6 +26,32 @@ pub trait MailSender: Send {
     fn send(&mut self, message: &OutgoingMessage) -> Result<SendReceipt>;
 }
 
+/// Resolve the visible From address consistently with SMTP's fallback.
+/// If `from` is omitted, SMTP uses the decoded outgoing URI username; the
+/// Drafts builder must use the same identity instead of an empty string.
+/// IMAP username is a last resort for transports with non-address logins.
+#[must_use]
+pub fn sender_from_account(account: &AccountConfig) -> String {
+    if let Some(from) = account.from.as_deref().filter(|value| !value.trim().is_empty()) {
+        // Respect explicit configuration, including an invalid value: it must
+        // produce an actionable error, not silently send as another identity.
+        return from.to_owned();
+    }
+    if let Some(outgoing) = account.outgoing.as_deref() {
+        if let Ok(smtp) = SmtpSource::parse(outgoing) {
+            if smtp.username.parse::<lettre::message::Mailbox>().is_ok() {
+                return smtp.username;
+            }
+        }
+    }
+    if let Ok(imap) = crate::backend::ImapSource::parse(&account.source) {
+        if imap.username.parse::<lettre::message::Mailbox>().is_ok() {
+            return imap.username;
+        }
+    }
+    String::new()
+}
+
 pub fn from_account(account: &AccountConfig) -> Result<Option<Box<dyn MailSender>>> {
     let Some(source) = account.outgoing.as_deref() else {
         return Ok(None);
@@ -35,4 +61,54 @@ pub fn from_account(account: &AccountConfig) -> Result<Option<Box<dyn MailSender
         source,
         account.outgoing_cred_cmd.clone(),
     ))))
+}
+
+#[cfg(test)]
+mod sender_tests {
+    use super::sender_from_account;
+    use crate::config::AccountConfig;
+
+    fn account(from: Option<&str>, outgoing: &str, source: &str) -> AccountConfig {
+        AccountConfig {
+            name: "Test".into(), source: source.into(), default_mailbox: "INBOX".into(),
+            source_cred_cmd: None, from: from.map(str::to_owned),
+            outgoing: Some(outgoing.into()), outgoing_cred_cmd: None,
+            max_messages: 100, page_size: 100,
+        }
+    }
+
+    #[test]
+    fn missing_from_uses_decoded_smtp_login_for_drafts_and_send() {
+        let config = account(None,
+            "smtps://jazz%40gmail.com@smtp.gmail.com:465",
+            "imaps://different%40gmail.com@imap.gmail.com:993");
+        let from = sender_from_account(&config);
+        assert_eq!(from, "jazz@gmail.com");
+        let draft = crate::model::OutgoingMessage {
+            from, to: String::new(), cc: String::new(), bcc: String::new(),
+            subject: "Test unsent".into(), body: "Body".into(),
+            html_body: None, attachments: Vec::new(), custom_headers: Vec::new(),
+            in_reply_to: None, references: Vec::new(), forwarded_raw: None,
+        };
+        let wire = super::build_draft(&draft, "").unwrap();
+        let headers = String::from_utf8_lossy(&wire);
+        assert!(headers.contains("From: jazz@gmail.com"));
+        assert!(headers.contains("X-Unsent: 1"));
+    }
+
+    #[test]
+    fn explicit_from_preserves_display_name() {
+        let config = account(Some("Jazz Bhatia <jazz@gmail.com>"),
+            "smtps://jazz%40gmail.com@smtp.gmail.com",
+            "imaps://jazz%40gmail.com@imap.gmail.com");
+        assert_eq!(sender_from_account(&config), "Jazz Bhatia <jazz@gmail.com>");
+    }
+
+    #[test]
+    fn falls_back_to_imap_login_if_smtp_uses_alias_or_empty_identity() {
+        let config = account(None,
+            "smtps://opaque-token@smtp.example.org",
+            "imaps://jazz%40example.org@imap.example.org");
+        assert_eq!(sender_from_account(&config), "jazz@example.org");
+    }
 }

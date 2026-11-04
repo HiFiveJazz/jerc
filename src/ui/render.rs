@@ -1262,19 +1262,35 @@ fn draw_attachments(frame: &mut Frame<'_>, app: &App) {
 
 fn draw_compose_exit_prompt(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme();
-    let area = centered_rect(frame.area(), 68, 24);
+    // A compact dialog avoids a large empty area on tall terminals. The
+    // action hints always occupy the last line inside the dialog, not the
+    // second line below the prompt as they did on fullscreen terminals.
+    let viewport = frame.area();
+    let width = viewport.width.min(72).max(1);
+    let height = viewport.height.min(9).max(1);
+    let area = Rect::new(
+        viewport.x + viewport.width.saturating_sub(width) / 2,
+        viewport.y + viewport.height.saturating_sub(height) / 2,
+        width, height,
+    );
     frame.render_widget(Clear, area);
     let block = Block::default().title(" Save unsent email? ")
         .borders(Borders::ALL).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(Text::from(vec![
-        Line::styled("Save this email as a local draft before closing?", theme.text()),
-        Line::raw(""),
-        Line::from(vec![Span::styled("Y / Enter", theme.accent()), Span::styled("  Save draft     ", theme.text()),
-            Span::styled("N", theme.accent()), Span::styled("  Discard     ", theme.text()),
-            Span::styled("Esc", theme.accent()), Span::styled("  Keep editing", theme.text())]),
-    ])).wrap(Wrap { trim: false }), inner);
+    if inner.height == 0 { return; }
+    let prompt = "Save this email to Drafts before closing?";
+    frame.render_widget(
+        Paragraph::new(prompt).style(theme.text()).wrap(Wrap { trim: false }),
+        Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1)),
+    );
+    let footer = Line::from(vec![
+        Span::styled("Y / Enter", theme.accent()), Span::styled(" Save    ", theme.text()),
+        Span::styled("D / N", theme.accent()), Span::styled(" Discard    ", theme.text()),
+        Span::styled("Esc", theme.accent()), Span::styled(" Keep editing", theme.text()),
+    ]);
+    frame.render_widget(Paragraph::new(footer),
+        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1));
 }
 
 fn draw_confirmation(frame: &mut Frame<'_>, app: &App) {
@@ -2020,10 +2036,34 @@ fn truncate_chars(text: &str, width: usize) -> String {
 }
 
 fn subject_for_list(subject: &str) -> String {
-    // Respect the sender's original grapheme clusters and presentation selectors.
-    // Altering emoji to text presentation (FE0E) made color-emoji fallbacks render
-    // only one half of the glyph in the message-list Table cell.
-    subject.to_owned()
+    // Prefer monochrome text presentation ONLY where the character has a known
+    // text-style glyph. Do not rewrite emoji-only characters such as 👋, flags,
+    // skin-tone variants or joined sequences: the old blanket FE0E insertion
+    // made the terminal paint half a wide glyph over the next cell. This keeps
+    // full-width subject cells and one terminal row per message.
+    let mut output = String::with_capacity(subject.len());
+    for cluster in UnicodeSegmentation::graphemes(subject, true) {
+        let mut chars = cluster.chars();
+        let base = chars.next();
+        if let Some(base) = base {
+            let simple = chars.all(|ch| ch == '\u{fe0e}' || ch == '\u{fe0f}');
+            if simple && supports_safe_text_presentation(base) {
+                output.push(base);
+                output.push('\u{fe0e}');
+                continue;
+            }
+        }
+        output.push_str(cluster);
+    }
+    output
+}
+
+/// Unicode characters with established text/emoji variants whose *text*
+/// presentation can fit a normal terminal cell. Emoji-only pictographs stay
+/// untouched because not all terminals/font stacks provide a text glyph.
+fn supports_safe_text_presentation(ch: char) -> bool {
+    matches!(ch, '☀' | '☁' | '☂' | '☃' | '☎' | '☘' | '☺' | '☹'
+        | '✂' | '✈' | '✉' | '✌' | '❤' | '❄' | '✔' | '✖')
 }
 
 fn relative_number(index: usize, current: usize) -> String {
@@ -2109,9 +2149,11 @@ mod tests {
     }
 
     #[test]
-    fn browse_subject_preserves_native_emoji_presentation() {
+    fn browse_subject_requests_monochrome_only_for_text_capable_symbols() {
+        assert_eq!(subject_for_list("❤️ Mail ☀️"), "❤\u{fe0e} Mail ☀\u{fe0e}");
+        // Preserve emoji-only/wide glyphs and joined emoji. FE0E fallback
+        // caused half-glyph clipping with the user's Apple Color Emoji font.
         assert_eq!(subject_for_list("👋 Welcome to KLIPY!"), "👋 Welcome to KLIPY!");
-        assert_eq!(subject_for_list("🎉️ Sale"), "🎉️ Sale");
         assert_eq!(subject_for_list("👨\u{200d}💻 Status"), "👨\u{200d}💻 Status");
     }
 

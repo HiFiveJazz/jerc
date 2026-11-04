@@ -347,7 +347,11 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
 /// The returned bytes must never be submitted to SMTP directly.
 pub fn build_draft(message: &OutgoingMessage, default_from: &str) -> Result<Vec<u8>> {
     let sender = if message.from.trim().is_empty() { default_from } else { &message.from };
-    let mailbox: Mailbox = sender.parse().context("invalid draft sender")?;
+    if sender.trim().is_empty() {
+        bail!("no draft sender available; add `from = \"you@example.com\"` to this account in config.toml");
+    }
+    let mailbox: Mailbox = sender.parse()
+        .context("invalid draft sender (check this account's `from` address in config.toml)")?;
     let mut staged = message.clone();
     staged.to = mailbox.email.to_string();
     staged.cc.clear();
@@ -403,6 +407,14 @@ mod draft_tests {
             html_body: None, attachments: Vec::new(), custom_headers: Vec::new(),
             in_reply_to: None, references: Vec::new(), forwarded_raw: None,
         }
+    }
+
+    #[test]
+    fn missing_sender_has_an_actionable_error() {
+        let mut message = message();
+        message.from.clear();
+        let error = build_draft(&message, "").unwrap_err();
+        assert!(error.to_string().contains("config.toml"));
     }
 
     #[test]
