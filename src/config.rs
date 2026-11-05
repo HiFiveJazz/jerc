@@ -11,10 +11,27 @@ pub struct Config {
     pub accounts: Vec<AccountConfig>,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub contacts: ContactsConfig,
     /// Source config file, used to persist user-selected UI settings without
     /// overriding the value with an unrelated state file.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
+}
+
+/// Optional native contacts policy. No network scopes or provider APIs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ContactsConfig {
+    pub autocomplete: bool,
+    pub learn_from_inbox: bool,
+    pub learn_from_sent: bool,
+}
+
+impl Default for ContactsConfig {
+    fn default() -> Self {
+        Self { autocomplete: true, learn_from_inbox: true, learn_from_sent: true }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -283,7 +300,8 @@ impl Config {
                 Ok(config)
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                accounts: Vec::new(), ui: UiConfig::default(), config_path: Some(path),
+                accounts: Vec::new(), ui: UiConfig::default(),
+                contacts: ContactsConfig::default(), config_path: Some(path),
             }),
             Err(err) => Err(err).with_context(|| format!("reading config {}", path.display())),
         }
@@ -324,6 +342,7 @@ impl Config {
                 page_size: default_page_size(),
             }],
             ui: UiConfig::default(),
+            contacts: ContactsConfig::default(),
             config_path: None,
         }
     }

@@ -2,6 +2,7 @@ pub mod app;
 mod cache;
 pub mod backend;
 pub mod config;
+pub mod contacts;
 pub mod discovery;
 pub mod mail;
 pub mod oauth;

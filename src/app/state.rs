@@ -16,6 +16,7 @@ use crate::setup::{SetupWizard, WizardAction};
 use crate::cache::{self, CachedMailbox};
 use crate::backend::MailboxSyncHint;
 use crate::config::Config;
+use crate::contacts::{ContactBook, ContactsModal, ContactEdit, recipient_query, replace_recipient, recipients};
 use crate::mail::{parse_body, render_html_for_terminal};
 use crate::outgoing::{ReplyAudience, reply_recipients, reply_subject, forward_subject, inline_forward_parts, forward_html, forward_attribution, FORWARD_SEPARATOR};
 use crate::mail_image::{MailImageEvent, MailImageLoader};
@@ -698,6 +699,10 @@ pub struct Composer {
     #[serde(skip)]
     pub help_visible: bool,
     #[serde(skip)]
+    pub contact_suggestion: usize,
+    #[serde(skip)]
+    pub dismissed_contact_query: Option<String>,
+    #[serde(skip)]
     pub help_query: String,
     #[serde(skip)]
     pub help_selected: usize,
@@ -749,7 +754,8 @@ impl Composer {
             confirm_send: false, exit_prompt: false,
             preview_html: true, preview_scroll: 0, preview_rich_lines: None,
             preview_forwarded_attachments: Vec::new(),
-            help_visible: false, help_query: String::new(), help_selected: 0, help_scroll: 0,
+            help_visible: false, contact_suggestion: 0, dismissed_contact_query: None,
+            help_query: String::new(), help_selected: 0, help_scroll: 0,
             visual_linewise: false, pending_g: false, pending_delete: false,
             pending_inner: false, pending_find: None, count: None,
             undo_history: Vec::new(), redo_history: Vec::new(),
@@ -816,7 +822,8 @@ impl Composer {
             confirm_send: false, exit_prompt: false,
             preview_html: true, preview_scroll: 0, preview_rich_lines: None,
             preview_forwarded_attachments: Vec::new(),
-            help_visible: false, help_query: String::new(), help_selected: 0, help_scroll: 0,
+            help_visible: false, contact_suggestion: 0, dismissed_contact_query: None,
+            help_query: String::new(), help_selected: 0, help_scroll: 0,
             visual_linewise: false, pending_g: false, pending_delete: false,
             pending_inner: false, pending_find: None, count: None,
             undo_history: Vec::new(), redo_history: Vec::new(),
@@ -840,7 +847,8 @@ impl Composer {
             forwarded_raw: Some(raw), sending: false, confirm_send: false, exit_prompt: false,
             preview_html: true, preview_scroll: 0, preview_rich_lines: None,
             preview_forwarded_attachments: Vec::new(),
-            help_visible: false, help_query: String::new(), help_selected: 0, help_scroll: 0,
+            help_visible: false, contact_suggestion: 0, dismissed_contact_query: None,
+            help_query: String::new(), help_selected: 0, help_scroll: 0,
             visual_linewise: false, pending_g: false, pending_delete: false,
             pending_inner: false, pending_find: None, count: None,
             undo_history: Vec::new(), redo_history: Vec::new(),
@@ -1191,6 +1199,8 @@ impl Composer {
             self.mode = ComposeMode::Normal;
         }
         self.visual_linewise = false;
+        self.contact_suggestion = 0;
+        self.dismissed_contact_query = None;
         self.clear_pending();
     }
 
@@ -1231,6 +1241,8 @@ impl Composer {
         self.cursor = cursor.min(self.char_count());
         self.visual_anchor = None;
         self.visual_linewise = false;
+        self.contact_suggestion = 0;
+        self.dismissed_contact_query = None;
     }
 
     fn byte_index(text: &str, char_index: usize) -> usize {
@@ -1245,6 +1257,8 @@ impl Composer {
         self.remember_edit();
         self.field_mut().insert(byte, ch);
         self.cursor = cursor.saturating_add(1);
+        self.contact_suggestion = 0;
+        self.dismissed_contact_query = None;
     }
 
     fn backspace(&mut self) {
@@ -1275,6 +1289,8 @@ impl Composer {
         self.field_mut().replace_range(start_byte..end_byte, "");
         self.cursor = start.min(self.char_count());
         self.visual_anchor = None;
+        self.contact_suggestion = 0;
+        self.dismissed_contact_query = None;
     }
 
     fn move_horizontal(&mut self, delta: isize) {
@@ -2285,6 +2301,15 @@ pub struct App {
     pub visual_anchor: Option<usize>,
     pub confirmation: Option<MutationConfirmation>,
     pub composer: Option<Composer>,
+    pub contacts: ContactBook,
+    pub contacts_modal: Option<ContactsModal>,
+    contacts_path: PathBuf,
+    contacts_writable: bool,
+    contacts_autocomplete: bool,
+    contacts_learn_inbox: bool,
+    contacts_learn_sent: bool,
+    contacts_dirty: bool,
+    contacts_save_due: Option<Instant>,
     pending_compose: Option<PendingCompose>,
     resumed_draft_account: Option<usize>,
 }
@@ -2373,12 +2398,18 @@ impl App {
             .collect();
         let themes = load_themes();
         let theme_index = theme_index(&themes, &config.ui.theme);
+        let contacts_path = ContactBook::default_path();
+        let loaded_contacts = ContactBook::load(&contacts_path);
+        let contacts_writable = loaded_contacts.is_ok();
+        let contacts_warning = loaded_contacts.as_ref().err().map(|error|
+            format!("Contacts file could not be loaded; preserving it unchanged: {error:#}"));
+        let contacts = loaded_contacts.unwrap_or_default();
         Self {
             accounts,
             account_index: 0,
             focus: Focus::Messages,
             status: StatusLine::info("starting workers…"),
-            startup_warnings: Vec::new(),
+            startup_warnings: contacts_warning.into_iter().collect(),
             show_startup_warnings: false,
             should_quit: false,
             setup: config.accounts.is_empty().then(|| SetupWizard::new(true)),
@@ -2461,6 +2492,15 @@ impl App {
             visual_anchor: None,
             confirmation: None,
             composer: None,
+            contacts,
+            contacts_modal: None,
+            contacts_path,
+            contacts_writable,
+            contacts_autocomplete: config.contacts.autocomplete,
+            contacts_learn_inbox: config.contacts.learn_from_inbox,
+            contacts_learn_sent: config.contacts.learn_from_sent,
+            contacts_dirty: false,
+            contacts_save_due: None,
             pending_compose: None,
             resumed_draft_account: None,
         }
@@ -2478,6 +2518,264 @@ impl App {
     #[must_use]
     pub fn theme(&self) -> &Theme {
         &self.themes[self.theme_index.min(self.themes.len().saturating_sub(1))]
+    }
+
+    /// On-disk writes are delayed to batch incoming pages; no I/O in drawing.
+    fn mark_contacts_dirty(&mut self) {
+        if !self.contacts_writable { return; }
+        self.contacts_dirty = true;
+        if self.contacts_save_due.is_none() {
+            self.contacts_save_due = Some(Instant::now() + Duration::from_secs(3));
+        }
+    }
+
+    pub fn contact_save_deadline(&self) -> Option<Instant> { self.contacts_save_due }
+
+    pub fn flush_contacts(&mut self, force: bool) {
+        if !self.contacts_dirty || !self.contacts_writable { return; }
+        if !force && self.contacts_save_due.is_some_and(|due| Instant::now() < due) { return; }
+        match self.contacts.save(&self.contacts_path) {
+            Ok(()) => { self.contacts_dirty = false; self.contacts_save_due = None; }
+            Err(error) => {
+                self.contacts_save_due = Some(Instant::now() + Duration::from_secs(10));
+                self.status = StatusLine::error(format!("contacts not saved: {error:#}"));
+            }
+        }
+    }
+
+    pub fn contact_suggestions(&self) -> Vec<usize> {
+        if !self.contacts_autocomplete { return Vec::new(); }
+        let Some(composer) = &self.composer else { return Vec::new(); };
+        if composer.mode != ComposeMode::Insert
+            || !matches!(composer.field, ComposeField::To | ComposeField::Cc | ComposeField::Bcc)
+            || composer.help_visible || composer.confirm_send || composer.sending || composer.exit_prompt
+            || composer.file_picker.is_some() || composer.attachment_manager_open
+            || composer.advanced_headers_open || self.contacts_modal.is_some() { return Vec::new(); }
+        let query = recipient_query(composer.field_value(), composer.cursor);
+        if composer.dismissed_contact_query.as_deref() == Some(query.as_str()) { return Vec::new(); }
+        let mut excluded = HashSet::new();
+        for field in [&composer.to, &composer.cc, &composer.bcc] {
+            for (_, address) in recipients(field) {
+                excluded.insert(address.to_ascii_lowercase());
+            }
+        }
+        // Do not exclude our own account identities: composing a message to
+        // oneself is valid, and often how users test a newly saved contact.
+        // Already-completed recipients are still filtered above.
+        self.contacts.suggest(&query, &excluded)
+    }
+
+    fn accept_contact_suggestion(&mut self, id: usize) {
+        let Some(contact) = self.contacts.entries.get(id) else { return; };
+        let Some(composer) = &mut self.composer else { return; };
+        composer.remember_edit();
+        let cursor = composer.cursor;
+        composer.cursor = replace_recipient(composer.field_mut(), cursor, contact);
+        composer.contact_suggestion = 0;
+        composer.dismissed_contact_query = Some(recipient_query(composer.field_value(), composer.cursor));
+    }
+
+    fn open_contacts(&mut self) {
+        self.contacts_modal = Some(ContactsModal { view_height: 15,
+            matches: self.contacts.filtered(""), ..ContactsModal::default() });
+    }
+
+    fn handle_contacts_key(&mut self, key: KeyEvent) {
+        let Some(mut modal) = self.contacts_modal.take() else { return; };
+        if self.handle_contacts_modal_key(&mut modal, key) {
+            self.contacts_modal = Some(modal);
+        }
+    }
+
+    /// Returns false to close the manager. Removing the modal from App while
+    /// handling it permits edits without nested mutable borrows.
+    fn handle_contacts_modal_key(&mut self, modal: &mut ContactsModal, key: KeyEvent) -> bool {
+        if modal.help {
+            match key.code {
+                KeyCode::Esc => { modal.help = false; modal.help_query.clear(); }
+                KeyCode::Backspace => { modal.help_query.pop(); }
+                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => modal.help_query.push(ch),
+                _ => {}
+            }
+            return true;
+        }
+        if key.code == KeyCode::Esc && modal.edit.is_some() {
+            modal.edit = None;
+            return true;
+        }
+        if let Some(editor) = modal.edit.as_mut() {
+            let save = match key.code {
+                KeyCode::Tab | KeyCode::BackTab => { editor.toggle(); false }
+                KeyCode::Left => { editor.cursor = editor.cursor.saturating_sub(1); false }
+                KeyCode::Right => { editor.cursor = (editor.cursor + 1).min(editor.value().chars().count()); false }
+                KeyCode::Home => { editor.cursor = 0; false }
+                KeyCode::End => { editor.cursor = editor.value().chars().count(); false }
+                KeyCode::Backspace => { editor.backspace(); false }
+                KeyCode::Delete => {
+                    if editor.cursor < editor.value().chars().count() { editor.cursor += 1; editor.backspace(); }
+                    false
+                }
+                KeyCode::Enter if !editor.active_email => { editor.toggle(); false }
+                KeyCode::Enter => true,
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                    editor.insert(ch); false
+                }
+                _ => false,
+            };
+            if save { self.save_contact_editor(modal); }
+            return true;
+        }
+        if modal.confirm_delete {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    if !self.contacts_writable {
+                        self.status = StatusLine::error("contacts are read-only: fix the contacts.json load error");
+                    } else {
+                        let matches = self.contacts.filtered(&modal.query);
+                        if let Some(&id) = matches.get(modal.selected) {
+                            self.contacts.entries.remove(id);
+                            self.mark_contacts_dirty();
+                        }
+                        modal.matches = self.contacts.filtered(&modal.query);
+                        modal.ensure_visible(modal.matches.len());
+                    }
+                    modal.confirm_delete = false;
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => modal.confirm_delete = false,
+                _ => {}
+            }
+            return true;
+        }
+        if modal.searching {
+            // Keep the filtered list navigable without leaving the search
+            // input. This mirrors Ctrl-j/k in the normal contacts view.
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('j' | 'J') | KeyCode::Enter => modal.smooth(modal.matches.len(), 10),
+                    KeyCode::Char('k' | 'K') => modal.smooth(modal.matches.len(), -10),
+                    _ => {}
+                }
+                return true;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => modal.searching = false,
+                KeyCode::Backspace => { modal.query.pop(); modal.selected = 0; modal.scroll = 0; }
+                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                    modal.query.push(ch); modal.selected = 0; modal.scroll = 0;
+                }
+                _ => {}
+            }
+            modal.smooth_target = None;
+            modal.matches = self.contacts.filtered(&modal.query);
+            modal.ensure_visible(modal.matches.len());
+            return true;
+        }
+        let len = modal.matches.len();
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                // Some enhanced keyboard protocols report Ctrl-J as
+                // Ctrl+Enter instead of Ctrl+Char('j').
+                KeyCode::Char('j' | 'J') | KeyCode::Enter => modal.smooth(len, 10),
+                KeyCode::Char('k' | 'K') => modal.smooth(len, -10),
+                _ => {}
+            }
+            return true;
+        }
+        let mut preserve_count = false;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return false,
+            KeyCode::Char('?') => { modal.help = true; modal.help_query.clear(); }
+            KeyCode::Char('/') => { modal.searching = true; }
+            KeyCode::Char('a') => modal.edit = Some(ContactEdit::new(None)),
+            KeyCode::Char('e') => {
+                modal.edit = modal.matches.get(modal.selected).map(|&i| ContactEdit::new(Some(&self.contacts.entries[i])));
+            }
+            KeyCode::Enter => {
+                if let Some(id) = modal.matches.get(modal.selected).copied() {
+                    if self.composer.as_ref().is_some_and(|c|
+                        matches!(c.field, ComposeField::To | ComposeField::Cc | ComposeField::Bcc)) {
+                        self.accept_contact_suggestion(id);
+                        return false;
+                    }
+                    modal.edit = Some(ContactEdit::new(Some(&self.contacts.entries[id])));
+                }
+            }
+            KeyCode::Char('p') => {
+                if !self.contacts_writable {
+                    self.status = StatusLine::error("contacts are read-only: fix the contacts.json load error");
+                } else if let Some(&id) = modal.matches.get(modal.selected) {
+                    self.contacts.entries[id].favorite = !self.contacts.entries[id].favorite;
+                    self.mark_contacts_dirty();
+                    modal.matches = self.contacts.filtered(&modal.query);
+                    if let Some(position) = modal.matches.iter().position(|&i| i == id) {
+                        modal.selected = position;
+                        modal.ensure_visible(modal.matches.len());
+                    }
+                }
+            }
+            KeyCode::Char('d') => { if len > 0 { modal.confirm_delete = true; } }
+            KeyCode::Char('j') | KeyCode::Down => {
+                modal.navigate(len, modal.pending_count.unwrap_or(1).min(9999) as isize);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                modal.navigate(len, -(modal.pending_count.unwrap_or(1).min(9999) as isize));
+            }
+            KeyCode::PageDown => modal.navigate(len, modal.view_height.max(1) as isize),
+            KeyCode::PageUp => modal.navigate(len, -(modal.view_height.max(1) as isize)),
+            KeyCode::Char('H') => { modal.selected = modal.scroll; modal.smooth_target = None; }
+            KeyCode::Char('M') => { modal.selected = (modal.scroll + modal.view_height / 2).min(len.saturating_sub(1)); modal.smooth_target = None; }
+            KeyCode::Char('L') => { modal.selected = (modal.scroll + modal.view_height.saturating_sub(1)).min(len.saturating_sub(1)); modal.smooth_target = None; }
+            KeyCode::Char('G') | KeyCode::End => {
+                modal.selected = modal.pending_count.map(|n| n.saturating_sub(1))
+                    .unwrap_or(len.saturating_sub(1)).min(len.saturating_sub(1));
+                modal.ensure_visible(len);
+                modal.smooth_target = None;
+            }
+            KeyCode::Char('g') => {
+                if modal.pending_g {
+                    modal.selected = modal.pending_count.map(|n| n.saturating_sub(1)).unwrap_or(0)
+                        .min(len.saturating_sub(1));
+                    modal.ensure_visible(len);
+                    modal.smooth_target = None;
+                } else { modal.pending_g = true; preserve_count = true; }
+            }
+            KeyCode::Char('0') if modal.pending_count.is_none() => {
+                modal.selected = 0; modal.scroll = 0; modal.smooth_target = None;
+            }
+            KeyCode::Char(d @ '0'..='9') => {
+                modal.pending_count = Some(modal.pending_count.unwrap_or(0).saturating_mul(10)
+                    .saturating_add(d.to_digit(10).unwrap_or(0) as usize).min(9999));
+                preserve_count = true;
+            }
+            _ => {}
+        }
+        if !preserve_count { modal.pending_count = None; modal.pending_g = false; }
+        true
+    }
+
+    fn save_contact_editor(&mut self, modal: &mut ContactsModal) {
+        let Some(editor) = modal.edit.as_ref().cloned() else { return; };
+        if !self.contacts_writable {
+            self.status = StatusLine::error("contacts are read-only: fix the contacts.json load error");
+            return;
+        }
+        match self.contacts.edit(editor.original_email.as_deref(), &editor.name, &editor.email) {
+            Ok(()) => {
+                self.mark_contacts_dirty();
+                self.flush_contacts(true);
+                modal.edit = None;
+                modal.matches = self.contacts.filtered(&modal.query);
+                if let Some(id) = self.contacts.find(&editor.email) {
+                    if let Some(position) = modal.matches.iter().position(|i| *i == id) {
+                        modal.selected = position;
+                    }
+                }
+                modal.ensure_visible(modal.matches.len());
+                self.status = StatusLine::temporary("contact saved", Duration::from_secs(2));
+            }
+            Err(error) => self.status = StatusLine::error(format!("contact: {error:#}")),
+        }
     }
 
     #[must_use]
@@ -2709,6 +3007,21 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         if self.setup.is_some() {
             self.handle_setup_key(key);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('c')
+            && self.contacts_modal.is_none() && self.confirmation.is_none()
+            && self.setup.is_none() && !self.attachment_picker_visible
+            && !self.help_visible && !self.theme_picker_visible
+            && !self.show_startup_warnings && self.remove_account_confirmation.is_none()
+            && self.composer.as_ref().is_none_or(|c| !c.sending && !c.confirm_send
+                && !c.exit_prompt && !c.help_visible && !c.attachment_manager_open
+                && c.file_picker.is_none() && !c.advanced_headers_open) {
+            self.open_contacts();
+            return;
+        }
+        if self.contacts_modal.is_some() {
+            self.handle_contacts_key(key);
             return;
         }
         // Account actions share Alt shortcuts. Ctrl-a remains available for
@@ -3317,6 +3630,41 @@ impl App {
                     account.pending_seen.clear();
                 }
                 account.last_scan_micros = Some(elapsed_micros);
+                // Learn only lightweight envelope addresses already fetched
+                // for normal browsing. Never scan bodies or junk folders.
+                let mailbox_role = account.mailboxes.iter()
+                    .find(|m| m.name == name).map(|m| &m.role);
+                let is_sent = matches!(mailbox_role, Some(&MailboxRole::Sent));
+                let is_inbox = matches!(mailbox_role, Some(&MailboxRole::Inbox));
+                if ((is_inbox && self.contacts_learn_inbox) || (is_sent && self.contacts_learn_sent))
+                    && self.contacts_writable {
+                    let mut changed = false;
+                    for message in account.messages.iter().take(200) {
+                        if is_inbox && !own_addresses.iter().any(|own|
+                            own.eq_ignore_ascii_case(&message.from_address)) {
+                            changed |= self.contacts.upsert(&message.from_name, &message.from_address, false)
+                                .unwrap_or(false);
+                        }
+                        if is_sent {
+                            for (person, address) in recipients(&message.to).into_iter()
+                                .chain(recipients(&message.cc)) {
+                                if !own_addresses.iter().any(|own| own.eq_ignore_ascii_case(&address)) {
+                                    changed |= self.contacts.upsert(&person, &address, false).unwrap_or(false);
+                                }
+                            }
+                        }
+                    }
+                    if changed {
+                        self.contacts_dirty = true;
+                        if self.contacts_save_due.is_none() {
+                            self.contacts_save_due = Some(Instant::now() + Duration::from_secs(3));
+                        }
+                        if let Some(modal) = self.contacts_modal.as_mut() {
+                            modal.matches = self.contacts.filtered(&modal.query);
+                            modal.ensure_visible(modal.matches.len());
+                        }
+                    }
+                }
                 account.persist_current_cache();
                 account.clamp_selection();
                 account.normalize_search_selection();
@@ -3571,6 +3919,22 @@ impl App {
                 sent_copy_warning,
                 sent_copy_disabled,
             } => {
+                if let Some(composer) = &self.composer {
+                    let mut changed = false;
+                    for field in [&composer.to, &composer.cc, &composer.bcc] {
+                        for (name, address) in recipients(field) {
+                            if !own_addresses.iter().any(|own| own.eq_ignore_ascii_case(&address)) {
+                                changed |= self.contacts.upsert(&name, &address, false).unwrap_or(false);
+                            }
+                        }
+                    }
+                    if changed {
+                        self.contacts_dirty = true;
+                        if self.contacts_save_due.is_none() {
+                            self.contacts_save_due = Some(Instant::now() + Duration::from_secs(3));
+                        }
+                    }
+                }
                 // A successful SMTP submission makes our mailbox snapshots stale even
                 // when the provider files Sent itself (Gmail), and especially when the
                 // message was addressed back to this account. Force the next visit to
@@ -3952,6 +4316,11 @@ impl App {
 
     #[must_use]
     pub fn animation_active(&self) -> bool {
+        if let Some(modal) = &self.contacts_modal {
+            // A modal pauses animations behind it. Otherwise an existing mail
+            // scroll could keep redrawing contacts at 100 FPS indefinitely.
+            return modal.smooth_target.is_some();
+        }
         (self.attachment_picker_visible && (self.attachment_smooth_target.is_some()
             || self.attachment_preview_due.is_some() || !self.attachment_preview_inflight.is_empty()
             || self.attachment_destination_picker.as_ref().is_some_and(|picker| picker.smooth_target.is_some())))
@@ -3969,6 +4338,11 @@ impl App {
     /// are positions inside the filtered list; mailbox targets deliberately do
     /// not open intermediate folders, so Ctrl-Shift-j/k stays responsive.
     pub fn advance_animation(&mut self) {
+        if let Some(modal) = self.contacts_modal.as_mut() {
+            let length = modal.matches.len();
+            modal.advance(length);
+            return;
+        }
         if self.attachment_picker_visible {
             if let Some(picker) = &mut self.attachment_destination_picker {
                 if picker.smooth_target.is_some() { picker.advance_smooth_scroll(); }
@@ -6561,6 +6935,44 @@ impl App {
     }
 
     fn handle_composer_key(&mut self, key: KeyEvent) {
+        let suggestions = self.contact_suggestions();
+        if !suggestions.is_empty() {
+            if matches!(key.code, KeyCode::Tab | KeyCode::Enter) {
+                let selected = self.composer.as_ref().map_or(0, |composer| composer.contact_suggestion);
+                let id = suggestions[selected.min(suggestions.len() - 1)];
+                self.accept_contact_suggestion(id);
+                return;
+            }
+            if let Some(composer) = self.composer.as_mut() {
+                match key.code {
+                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        composer.contact_suggestion = (composer.contact_suggestion + 1) % suggestions.len();
+                        return;
+                    }
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        composer.contact_suggestion = (composer.contact_suggestion + suggestions.len() - 1) % suggestions.len();
+                        return;
+                    }
+                    KeyCode::Down => {
+                        composer.contact_suggestion = (composer.contact_suggestion + 1) % suggestions.len();
+                        return;
+                    }
+                    KeyCode::Up => {
+                        composer.contact_suggestion = (composer.contact_suggestion + suggestions.len() - 1) % suggestions.len();
+                        return;
+                    }
+                    KeyCode::Esc => {
+                        composer.dismissed_contact_query = Some(recipient_query(composer.field_value(), composer.cursor));
+                        return;
+                    }
+                    _ => {
+                        // A keystroke that edits the query will reset the popup
+                        // on the next frame, without any per-keystroke I/O.
+                        composer.contact_suggestion = 0;
+                    }
+                }
+            }
+        }
         let Some(composer) = self.composer.as_ref() else { return; };
         if composer.sending {
             if key.code == KeyCode::Esc {
@@ -7716,6 +8128,22 @@ mod tests {
     use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
     use std::path::PathBuf;
+
+    #[test]
+    fn editing_recipient_resets_autocomplete_dismissal() {
+        let mut composer = Composer::new();
+        composer.dismissed_contact_query = Some("Ja".into());
+        composer.insert_char('J');
+        assert!(composer.dismissed_contact_query.is_none());
+        composer.dismissed_contact_query = Some("J".into());
+        composer.switch_field(ComposeField::Cc);
+        assert!(composer.dismissed_contact_query.is_none());
+        assert_eq!(composer.contact_suggestion, 0);
+        composer.insert_char('J');
+        composer.dismissed_contact_query = Some("J".into());
+        composer.backspace();
+        assert!(composer.dismissed_contact_query.is_none());
+    }
 
     #[test]
     fn mail_search_matches_typos_as_subsequences_but_ranks_contiguous_first() {

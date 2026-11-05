@@ -30,7 +30,7 @@ pub fn run_tui(config: Config) -> Result<()> {
     let mut app = App::new(&config, workers);
     app.bootstrap();
     app.attach_setup_sender(runtime_tx.clone());
-    app.startup_warnings = configuration_warnings;
+    app.startup_warnings.extend(configuration_warnings);
     if !app.startup_warnings.is_empty() {
         app.status = crate::app::StatusLine::error(format!(
             "{} account configuration issue(s) — press ! for details", app.startup_warnings.len()
@@ -183,6 +183,7 @@ fn event_loop(
     let mut next_inbox_poll = Instant::now() + app.inbox_poll_interval();
 
     while !app.should_quit {
+        app.flush_contacts(false);
         let now = Instant::now();
         if now >= next_inbox_poll {
             app.poll_inboxes();
@@ -226,6 +227,7 @@ fn event_loop(
             next_inbox_poll
         };
         let deadline = if setup_busy { deadline.min(next_setup_spinner_frame) } else { deadline };
+        let deadline = app.contact_save_deadline().map_or(deadline, |due| deadline.min(due));
         let received = match runtime_rx.recv_timeout(
             deadline.saturating_duration_since(Instant::now())
         ) {
@@ -277,10 +279,11 @@ fn event_loop(
                 Ok((config, workers, warnings)) => {
                     // Old mail workers finish before we accept events from new
                     // account indices, preventing stale updates after reload.
+                    app.flush_contacts(true);
                     let mut fresh = App::new(&config, workers);
                     fresh.attach_setup_sender(runtime_tx.clone());
                     fresh.account_index = fresh.accounts.len().saturating_sub(1);
-                    fresh.startup_warnings = warnings;
+                    fresh.startup_warnings.extend(warnings);
                     let mut old = std::mem::replace(app, fresh);
                     app.inherit_image_runtime(&mut old);
                     drop(old);
@@ -323,6 +326,7 @@ fn event_loop(
         if background_update && app.animation_active() { continue; }
         render(terminal, app)?;
     }
+    app.flush_contacts(true);
     Ok(())
 }
 

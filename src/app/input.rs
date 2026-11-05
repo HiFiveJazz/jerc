@@ -38,6 +38,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Accounts", key: "Alt-n / Alt-p", description: "next / previous email account" },
     HelpEntry { category: "General", key: "!", description: "show account configuration warnings" },
     HelpEntry { category: "General", key: "?", description: "search command palette" },
+    HelpEntry { category: "General", key: "Alt-c", description: "open the native contacts manager" },
     HelpEntry { category: "General", key: "B", description: "toggle new-mail terminal bell" },
     HelpEntry { category: "General", key: "Ctrl-r", description: "refresh selected mailbox" },
     HelpEntry { category: "General", key: "n", description: "toggle desktop new-mail notifications (and sound)" },
@@ -103,6 +104,9 @@ pub const PICKER_HELP_ENTRIES: &[HelpEntry] = &[
 /// Compose-specific, searchable modal shortcuts. Do not clutter the editor.
 pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Compose", key: "?", description: "search compose shortcuts" },
+    HelpEntry { category: "Compose", key: "Alt-c", description: "open contacts; Enter inserts selected recipient" },
+    HelpEntry { category: "Compose", key: "Ctrl-n / Ctrl-p", description: "next / previous contact suggestion" },
+    HelpEntry { category: "Compose", key: "Tab / Enter (suggestion)", description: "accept suggested recipient" },
     HelpEntry { category: "Compose", key: "Ctrl-a", description: "open attachment file picker" },
     HelpEntry { category: "Compose", key: "Ctrl-d", description: "manage attached files" },
     HelpEntry { category: "Compose", key: "Ctrl-o", description: "open advanced options for custom email headers" },

@@ -66,6 +66,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.setup.is_some() {
         draw_setup_wizard(frame, app);
     }
+    if app.contacts_modal.is_some() {
+        draw_contacts(frame, app);
+    } else if app.composer.is_some() {
+        draw_contact_suggestions(frame, app);
+    }
 }
 
 fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -2486,6 +2491,209 @@ fn draw_compose_help(frame: &mut Frame<'_>, app: &App) {
         .style(theme.muted()), chunks[2]);
 }
 
+/// Contacts are overlays over the *terminal* surface, not an opaque gray
+/// popup. Match the message list and reader; reserve selected backgrounds for
+/// the currently highlighted row only.
+fn contact_surface_style(theme: &Theme) -> Style {
+    theme.text()
+}
+
+/// Autocomplete is an overlay, not a new compose field: users keep their
+/// normal Vim cursor, and Tab/Enter accept the highlighted address.
+fn draw_contact_suggestions(frame: &mut Frame<'_>, app: &App) {
+    let ids = app.contact_suggestions();
+    if ids.is_empty() { return; }
+    let Some(composer) = app.composer.as_ref() else { return; };
+    let field = match composer.field {
+        ComposeField::To => 0,
+        ComposeField::Cc => 1,
+        ComposeField::Bcc => 2,
+        _ => return,
+    };
+    let theme = app.theme();
+    let compose = centered_rect(frame.area(), 96, 82);
+    let inner_x = compose.x.saturating_add(1);
+    let inner_y = compose.y.saturating_add(1);
+    let width = compose.width.saturating_sub(8).min(68);
+    let height = (ids.len() as u16 + 3).min(frame.area().height.saturating_sub(2));
+    if width < 12 || height < 4 { return; }
+    let x = inner_x.saturating_add(9).min(frame.area().right().saturating_sub(width));
+    let y = inner_y.saturating_add(field as u16 + 1).min(frame.area().bottom().saturating_sub(height));
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().title(" Contacts · suggestions ")
+        .borders(Borders::ALL).border_style(theme.border()).style(contact_surface_style(theme)), area);
+    for (position, id) in ids.iter().enumerate() {
+        let contact = &app.contacts.entries[*id];
+        let content = format!("{}  {}", if contact.favorite { "★" } else { " " }, contact.display());
+        let truncated = truncate_display_width(&content, usize::from(width.saturating_sub(4)));
+        let style = if position == composer.contact_suggestion.min(ids.len() - 1) {
+            theme.selected()
+        } else { theme.text() };
+        frame.render_widget(Paragraph::new(format!(" {truncated}"))
+            .style(style), Rect::new(area.x + 1, area.y + 1 + position as u16, width - 2, 1));
+    }
+    frame.render_widget(Paragraph::new(" Ctrl-n/p navigate · Tab/Enter accept · Esc close ")
+        .style(theme.muted()),
+        Rect::new(area.x + 1, area.bottom() - 2, width.saturating_sub(2), 1));
+}
+
+const CONTACT_KEYS: &[(&str, &str)] = &[
+    ("/", "search contacts, fuzzy"),
+    ("a", "add a new contact"),
+    ("e", "edit highlighted contact"),
+    ("Enter", "edit or insert into compose recipient"),
+    ("p", "favorite or unfavorite"),
+    ("d", "delete (requires confirmation)"),
+    ("j/k, 5j/5k", "move by row or count"),
+    ("gg / G", "first / last contact"),
+    ("H / M / L", "top / middle / bottom visible row"),
+    ("Ctrl-j / Ctrl-k", "smooth scroll"),
+    ("PageUp / PageDown", "page navigation"),
+    ("?", "search these shortcuts"),
+    ("Esc / q", "close contacts"),
+];
+
+fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
+    let theme = app.theme().clone();
+    let Some(modal) = app.contacts_modal.as_mut() else { return; };
+    let area = centered_rect(frame.area(), 116, 88);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().title(" Contacts ").borders(Borders::ALL)
+        .style(contact_surface_style(&theme)).border_style(theme.border()), area);
+    let inner = Rect::new(area.x.saturating_add(2), area.y.saturating_add(1),
+        area.width.saturating_sub(4), area.height.saturating_sub(2));
+    if inner.width < 5 || inner.height < 4 { return; }
+    let rows = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let count = app.contacts.entries.len();
+    let search = if modal.searching { format!("/{}▏", modal.query) }
+        else if modal.query.is_empty() { "/ search".to_owned() }
+        else { format!("/ {}", modal.query) };
+    let title = format!("{search}                                      {count} contacts");
+    frame.render_widget(Paragraph::new(truncate_display_width(&title, usize::from(rows[0].width)))
+        .style(if modal.searching { theme.accent() } else { theme.muted() }), rows[0]);
+    let left_width = (rows[1].width.saturating_mul(47) / 100).max(12).min(rows[1].width);
+    let left = Rect::new(rows[1].x, rows[1].y, left_width, rows[1].height);
+    let right = Rect::new(left.right(), rows[1].y,
+        rows[1].width.saturating_sub(left_width), rows[1].height);
+    frame.render_widget(Block::default().borders(Borders::RIGHT)
+        .border_style(theme.border()), left);
+    let list_width = left.width.saturating_sub(1);
+    if left.height == 0 { return; }
+    modal.view_height = usize::from(left.height);
+    let item_count = modal.matches.len();
+    modal.ensure_visible(item_count);
+    let items = &modal.matches;
+    for (visual, &id) in items.iter().enumerate().skip(modal.scroll).take(modal.view_height) {
+        let contact = &app.contacts.entries[id];
+        let active = visual == modal.selected;
+        let number = if active { (visual + 1).to_string() }
+            else { visual.abs_diff(modal.selected).to_string() };
+        let number_width = (items.len().max(1).to_string().len() + 1).max(3);
+        let kind = if contact.favorite { "★ " } else if contact.saved { "● " } else { "  " };
+        let label = if contact.name.is_empty() { &contact.email } else { &contact.name };
+        let max_label = usize::from(list_width).saturating_sub(number_width + 3);
+        let text = format!("{number:>number_width$} {}{}", kind, truncate_display_width(label, max_label));
+        frame.render_widget(Paragraph::new(text).style(if active { theme.selected() } else { theme.text() }),
+            Rect::new(left.x, left.y + (visual - modal.scroll) as u16, list_width, 1));
+    }
+    if items.is_empty() {
+        frame.render_widget(Paragraph::new(if modal.query.is_empty() {
+            " No contacts yet · press a to add one"
+        } else { " No matching contacts" }).style(theme.muted()),
+            Rect::new(left.x, left.y, list_width, 1));
+    }
+    if right.width > 5 {
+        let x = right.x.saturating_add(2);
+        let width = right.width.saturating_sub(3);
+        if let Some(&id) = items.get(modal.selected) {
+            let contact = &app.contacts.entries[id];
+            let details = [
+                ("Name", contact.name.as_str()),
+                ("Email", contact.email.as_str()),
+                ("Source", if contact.saved { "Saved locally" } else { "Learned from mail" }),
+                ("Favorite", if contact.favorite { "Yes" } else { "No" }),
+            ];
+            for (pos, (label, value)) in details.iter().enumerate() {
+                let y = right.y.saturating_add((pos * 3) as u16);
+                if y + 1 >= right.bottom() { break; }
+                frame.render_widget(Paragraph::new(*label).style(theme.accent()), Rect::new(x, y, width, 1));
+                frame.render_widget(Paragraph::new(truncate_display_width(value, width as usize))
+                    .style(theme.text()), Rect::new(x, y + 1, width, 1));
+            }
+        } else {
+            frame.render_widget(Paragraph::new("Type / to find a contact").style(theme.muted()),
+                Rect::new(x, right.y, width, 1));
+        }
+    }
+    let footer = if modal.searching { "Enter finish search · Esc close search" }
+        else { "a add · e edit · p favorite · d delete · ? keybindings · q close" };
+    frame.render_widget(Paragraph::new(truncate_display_width(footer, usize::from(rows[2].width)))
+        .style(theme.muted()), rows[2]);
+
+    if modal.help {
+        let help_area = centered_rect(frame.area(), 70, 74);
+        frame.render_widget(Clear, help_area);
+        frame.render_widget(Block::default().title(" Contacts · keybindings ")
+            .borders(Borders::ALL).border_style(theme.border()).style(contact_surface_style(&theme)), help_area);
+        let width = help_area.width.saturating_sub(4);
+        frame.render_widget(Paragraph::new(format!("/ {}", modal.help_query))
+            .style(theme.accent()), Rect::new(help_area.x + 2, help_area.y + 1, width, 1));
+        let needle = modal.help_query.to_lowercase();
+        for (line, (key, description)) in CONTACT_KEYS.iter()
+            .filter(|(key, desc)| format!("{key} {desc}").to_lowercase().contains(&needle))
+            .take(help_area.height.saturating_sub(4) as usize).enumerate() {
+            let text = format!("{key:<20} {description}");
+            frame.render_widget(Paragraph::new(truncate_display_width(&text, width as usize))
+                .style(theme.text()), Rect::new(help_area.x + 2, help_area.y + 3 + line as u16, width, 1));
+        }
+        return;
+    }
+    if modal.confirm_delete {
+        let confirm = centered_rect(frame.area(), 54, 18);
+        frame.render_widget(Clear, confirm);
+        frame.render_widget(Block::default().title(" Delete contact? ").borders(Borders::ALL)
+            .border_style(theme.error()).style(contact_surface_style(&theme)), confirm);
+        if confirm.height > 3 {
+            frame.render_widget(Paragraph::new("y / Enter delete · n / Esc cancel")
+                .style(theme.text()), Rect::new(confirm.x + 2, confirm.y + 2, confirm.width.saturating_sub(4), 1));
+        }
+        return;
+    }
+    if let Some(edit) = &modal.edit {
+        let edit_area = centered_rect(frame.area(), 74, 35);
+        frame.render_widget(Clear, edit_area);
+        frame.render_widget(Block::default().title(if edit.original_email.is_some() { " Edit contact " } else { " New contact " })
+            .borders(Borders::ALL).border_style(theme.border()).style(contact_surface_style(&theme)), edit_area);
+        let width = edit_area.width.saturating_sub(4);
+        let name_y = edit_area.y.saturating_add(2);
+        let email_y = name_y.saturating_add(2);
+        for (is_email, value, y, label) in [(false, edit.name.as_str(), name_y, "Name"),
+            (true, edit.email.as_str(), email_y, "Email")] {
+            if y >= edit_area.bottom().saturating_sub(1) { continue; }
+            let label_text = format!("{label}: {value}");
+            frame.render_widget(Paragraph::new(truncate_display_width(&label_text, width as usize))
+                .style(if edit.active_email == is_email { theme.current_line() } else { theme.text() }),
+                Rect::new(edit_area.x + 2, y, width, 1));
+            if edit.active_email == is_email {
+                let prefix = UnicodeWidthStr::width(format!("{label}: ").as_str());
+                let before: String = value.chars().take(edit.cursor).collect();
+                let offset = prefix + UnicodeWidthStr::width(before.as_str());
+                if offset < width as usize {
+                    frame.set_cursor_position((edit_area.x + 2 + offset as u16, y));
+                }
+            }
+        }
+        if edit_area.height > 8 {
+            frame.render_widget(Paragraph::new("Tab switch fields · Enter next/save · Esc cancel")
+                .style(theme.muted()), Rect::new(edit_area.x + 2,
+                edit_area.bottom().saturating_sub(2), width, 1));
+        }
+    }
+}
+
 fn draw_composer(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme().clone();
     let Some(composer) = app.composer.as_ref() else {
@@ -2859,6 +3067,14 @@ mod tests {
     use crate::theme::load_themes;
     use ratatui::style::Color;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn contact_modals_use_the_terminal_background() {
+        let theme = load_themes().into_iter().next().expect("theme");
+        let style = super::contact_surface_style(&theme);
+        assert_eq!(style.bg, None, "contact UI must not force popup gray");
+        assert_eq!(style.fg, theme.text().fg);
+    }
 
     #[test]
     fn active_diff_row_gets_a_distinct_highlight() {
