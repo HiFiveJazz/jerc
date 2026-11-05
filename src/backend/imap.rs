@@ -606,7 +606,7 @@ fn summary_from_fetch(items: &[MessageDataItem<'_>],
     uid_validity: Option<u32>) -> Option<crate::model::MessageSummary> {
     let (mut uid, mut flags, mut size) = (None, MessageFlags::empty(), 0u64);
     let mut headers = None;
-    let mut attachment_names = Vec::new();
+    let mut attachment_hints = Vec::new();
     for item in items {
         match item {
             MessageDataItem::Uid(value) => uid = Some(value.get()),
@@ -615,7 +615,7 @@ fn summary_from_fetch(items: &[MessageDataItem<'_>],
             MessageDataItem::Rfc822Header(value) =>
                 headers = value.clone().into_option().map(Cow::into_owned),
             MessageDataItem::BodyStructure(structure) =>
-                collect_bodystructure_attachments(structure, &mut attachment_names),
+                collect_bodystructure_attachments(structure, &mut attachment_hints),
             _ => {}
         }
     }
@@ -625,6 +625,14 @@ fn summary_from_fetch(items: &[MessageDataItem<'_>],
         None => MessageId(format!("imap-uid:{uid}")),
     };
     let mut summary = parse_summary(id, &headers, size, flags).ok()?;
+    // BODYSTRUCTURE provides no decoded bytes. Prefer named .ics over an
+    // additional unnamed calendar alternative in the summary, and let the
+    // full MIME parser decide by byte comparison when the email is opened.
+    let has_named_calendar = attachment_hints.iter().any(|(name, _)|
+        name.to_ascii_lowercase().ends_with(".ics"));
+    let attachment_names = attachment_hints.into_iter()
+        .filter(|(_, unnamed_calendar)| !(has_named_calendar && *unnamed_calendar))
+        .map(|(name, _)| name).collect::<Vec<_>>();
     summary.has_attachment_hint |= !attachment_names.is_empty();
     summary.attachment_names_hint = attachment_names;
     Some(summary)
@@ -1081,7 +1089,7 @@ fn run_credential_command(command: &str) -> Result<String> {
 /// wrapper alone is not proof of any attachment. Only parts with an attachment
 /// disposition, or a genuine filename/name parameter, count. This deliberately
 /// does not count remote <img> URLs or CID inline images with no filename.
-fn collect_bodystructure_attachments(structure: &BodyStructure<'_>, names: &mut Vec<String>) {
+fn collect_bodystructure_attachments(structure: &BodyStructure<'_>, names: &mut Vec<(String, bool)>) {
     match structure {
         BodyStructure::Multi { bodies, .. } => {
             for part in bodies.as_ref().iter() { collect_bodystructure_attachments(part, names); }
@@ -1118,10 +1126,19 @@ fn collect_bodystructure_attachments(structure: &BodyStructure<'_>, names: &mut 
                     bytes.eq_ignore_ascii_case(b"image")
                 });
             if is_file || (filename.is_some() && !(inline && inline_image)) {
+                let unnamed = filename.is_none();
                 let name = filename.unwrap_or_else(|| format!("attachment-{}", names.len() + 1));
                 // Never treat MIME filenames as filesystem paths.
                 let safe = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(&name);
-                names.push(safe.to_owned());
+                // An unnamed text/calendar part often duplicates a named
+                // .ics part (Google Calendar). Keep the type information to
+                // avoid inventing a second filename in the initial summary.
+                let unnamed_calendar = unnamed && matches!(&body.specific,
+                    SpecificFields::Text { subtype, .. } if {
+                        let sub: &[u8] = subtype.as_ref();
+                        sub.eq_ignore_ascii_case(b"calendar")
+                    });
+                names.push((safe.to_owned(), unnamed_calendar));
             }
         }
     }

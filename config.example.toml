@@ -82,9 +82,12 @@ mailbox_width_percent = 22
 # Saved to ~/.config/aerc-rs/preview-width after an adjustment.
 preview_width_percent = 57
 
-# Active theme. Press `t` in the TUI to preview/switch themes live; the chosen
+# Active theme. Press `T` in the TUI to preview/switch themes live; the chosen
 # theme is saved back into [ui].theme in this config.toml.
 theme = "default"
+# Message-list / search: fuzzy subsequence matches by default; use strict
+# for the previous case-insensitive substring filter.
+search_mode = "fuzzy" # "fuzzy" or "strict"
 # Remote images can disclose your IP/read time to senders. Press I to toggle in-session.
 remote_images = false
 # Check Inbox counts in the background every 20 seconds. (IMAP IDLE can
@@ -102,6 +105,10 @@ new_mail_bell = false
 # Press N or click the footer bell to toggle desktop alerts and their sound
 # for the current session; the configured value is restored on restart.
 new_mail_notifications = true
+# Fallback symbols always work: ● enabled, ○ muted, ● 3 = three new
+# arrivals observed since launching aerc-rs (not total unread mail).
+# Use "nerd" if your terminal uses a Nerd Font: 󰂚 enabled, 󰂛 muted.
+notification_icon_style = "unicode" # "unicode" or "nerd"
 new_mail_sound_name = "message-new-email"
 # Optional direct sound if your notification daemon ignores sound-name hints.
 # Requires `pw-play` (PipeWire) or `paplay` (PulseAudio), absolute file path.

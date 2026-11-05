@@ -1,5 +1,6 @@
-/// Fixed cell width reserved for the right-aligned new-mail bell (🔔 / 🔕).
-pub(crate) const NOTIFICATION_INDICATOR_WIDTH: u16 = 4;
+/// Fixed cell width for the clickable notification glyph and new-mail badge.
+/// Leave room for a three-digit capped count (99+) in either icon style.
+pub(crate) const NOTIFICATION_INDICATOR_WIDTH: u16 = 8;
 
 mod render;
 
@@ -37,7 +38,9 @@ pub(crate) fn attachment_regions(viewport: ratatui::layout::Rect) -> (
         viewport.y + viewport.height.saturating_sub(height)/2, width, height);
     let inner = Rect::new(popup.x.saturating_add(1), popup.y.saturating_add(1),
         popup.width.saturating_sub(2), popup.height.saturating_sub(2));
-    let content_height = inner.height.saturating_sub(2);
+    // The received-attachment viewer exposes commands through `?`, not a
+    // permanent two-line legend. Give the preview all available height.
+    let content_height = inner.height;
     let left_width = ((u32::from(inner.width) * 42 / 100) as u16)
         .max(16).min(inner.width.saturating_sub(1));
     let list = Rect::new(inner.x, inner.y, left_width, content_height);
@@ -109,6 +112,6 @@ mod layout_tests {
         let (_, list, preview, footer) = attachment_regions(ratatui::layout::Rect::new(0, 0, 120, 40));
         assert_eq!(list.x + list.width, preview.x);
         assert_eq!(preview.y + preview.height, footer.y);
-        assert!(footer.height >= 1);
+        assert_eq!(footer.height, 0);
     }
 }

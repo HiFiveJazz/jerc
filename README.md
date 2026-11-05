@@ -9,15 +9,15 @@ A Rust terminal email client inspired by aerc's backend/worker model and lazygit
 - **Fast mailbox switching:** `J/K` changes folders, while `Ctrl-Shift-j/Ctrl-Shift-k` smoothly moves the folder cursor without loading every intermediate folder.
 - **Neovim-style message scrolling:** `j/k`, counts, `Ctrl-j/Ctrl-k`, `Ctrl-d/Ctrl-u`, `g/G`, and a four-row scrolloff. The renderer owns the visible slice, avoiding Ratatui offset artifacts and stale gutter contents.
 - **Visual selection:** `v` starts an inclusive message range; `Esc` exits visual mode. Bulk archive/delete operates on the selected range.
-- **Mail actions:** `d` confirms delete/trash, `D` performs the same action immediately, and `a` archives. Read/unread toggles update optimistically in the UI while IMAP confirms them in the background. Successful mutations update the current cache locally rather than reloading the mailbox tree or jumping back to INBOX.
+- **Mail actions:** `d` confirms delete/trash, `D` performs the same action immediately, `a` archives, and `s` moves mail to Junk (or back to Inbox when already in Junk). A `!` marker identifies mail while browsing Junk. Read/unread toggles update optimistically in the UI while IMAP confirms them in the background. Successful mutations update the current cache locally rather than reloading the mailbox tree or jumping back to INBOX.
 - **Search/filter:** `/` edits a case-insensitive filter over the current mailbox. If the loaded cache does not contain enough matches, older pages continue loading progressively.
 - **Layout controls:** `b` hides/shows the mailbox sidebar; `P` toggles a vertical message preview. `Enter` still opens the full-screen reader.
-- **Rich HTML mail by default:** the HTML renderer is now the primary view whenever a real HTML part exists; `T` always switches to a plain view (including a generated fallback for HTML-only mail). Layout-table noise, literal Markdown-style heading markers, generic image labels and broken open table edges are normalized while semantic receipt/data tables remain boxed. Sender CSS colours never override the terminal theme.
+- **Rich HTML mail by default:** the HTML renderer is now the primary view whenever a real HTML part exists; `t` always switches to a plain view (including a generated fallback for HTML-only mail). Layout-table noise, literal Markdown-style heading markers, generic image labels and broken open table edges are normalized while semantic receipt/data tables remain boxed. Sender CSS colours never override the terminal theme.
 - **Terminal images:** `ratatui-image` supports Kitty, Sixel and iTerm2 graphics with a half-block fallback. The first meaningful remote image is shown in the reader when remote images are enabled. Tracking pixels are filtered, downloads are bounded and happen on a background worker. Remote images default off for privacy; press `I` to toggle them for the session or set `ui.remote_images = true`.
-- **Compose polish:** `j/k` in Normal mode moves through To/Cc/Bcc/Subject and enters Body, where Vim motions remain unchanged. The attachment picker now matches lazygitrs's three-pane Parent/Files/Preview layout with themed full-row selection, relative line numbers, file text previews, count motions and Ctrl-j/k smooth scrolling. `Space` selects files, `Ctrl+A` opens the picker (listed in `?`, not the footer). Attachments wrap to three rows before ellipsizing; empty fields are muted and filled ones use theme accents. `Enter` in Normal opens a full outgoing-message review with headers, recipients, attachments and body; `T` toggles HTML/plain for inline HTML forwards, `O` opens the outgoing HTML in a browser, `j/k` scroll, `Enter` sends and `Esc` edits.
+- **Compose polish:** `j/k` in Normal mode moves through To/Cc/Bcc/Subject and enters Body, where Vim motions remain unchanged. The attachment picker now matches lazygitrs's three-pane Parent/Files/Preview layout with themed full-row selection, relative line numbers, file text previews, count motions and Ctrl-j/k smooth scrolling. `Space` selects files, `Ctrl+A` opens the picker (listed in `?`, not the footer). Attachments wrap to three rows before ellipsizing; empty fields are muted and filled ones use theme accents. `Enter` in Normal opens a full outgoing-message review with headers, recipients, attachments and body; `t` toggles HTML/plain for inline HTML forwards, `O` opens the outgoing HTML in a browser, `j/k` scroll, `Enter` sends and `Esc` edits.
 - **Modal compose/reply/forward:** the composer has NORMAL, INSERT, and VISUAL modes, with lazygitrs-style filled mode badges (blue, light green, and purple) in its bottom-right footer, white block cursor outside Insert mode, relative body line numbers, expanded Vim motions/text objects/undo, and a searchable compose `?` keymap plus concise footer hints. `Tab`/`Shift-Tab` cycles To → Cc → Bcc → Subject → Body. `Ctrl+A` opens a directory picker where Space/Enter adds or removes files; `Ctrl+O` opens advanced options for custom headers. `Enter` from NORMAL opens a centered send-confirmation popup; Ctrl-S is not used. `r` replies without quoted text, `R` uses an aerc-style dated attribution plus gray quoted text, `A` replies to all (minus own identities), `L` replies to List-Post, and `f` forwards with a Gmail-style original From/Date/Subject/To/Cc attribution and the original plain/HTML contents inline with MIME attachments preserved instead of attaching `forwarded.eml`. The original MIME bytes remain available to the composer for drafts and extraction.
 - **Compose attachments:** selected files are kept with postponed local drafts and sent as normal MIME attachments (16 MiB per file). Files with spaces or semicolons in their names are supported. The three-pane picker uses j/k, h/l, Backspace, Space/Enter and Esc, and does not depend on an external file manager. Press `v`, move with counted motions (such as `5j`), and use Enter to attach or `x` to detach the highlighted range; `Space` also detaches a visual range when all its files are already attached (folders are skipped); the selection has a blue side marker. Press `/` to search folders in the current directory (or files when no folder matches), Down/Up to cycle suggestions, Enter to finish searching on the selected item, Tab to open a matching folder, and Esc to leave search. Space advances except on the last row. Press `?` inside the picker for its full searchable keymap. `Ctrl+D` in compose opens a separate list of attachments from all directories; j/k moves, `x` or `d` detaches, and Esc closes it. PNG/JPEG/GIF/WebP images preview inside the picker; first-page PDF thumbnails require Poppler's `pdftoppm` (package `poppler` on Arch Linux). PDF thumbnails now render asynchronously after a short debounce and are cached during the picker session, so fast navigation does not wait for Poppler. Other file types retain the text/binary preview.
-- **Received attachments:** IMAP headers are fetched with BODYSTRUCTURE so filenames and the separate theme-yellow `⧉` marker appear in the message browser without opening the email; rows with attachments show a second, muted filename line. The MIME parser remains authoritative after a body is loaded. `z` opens the received-attachment browser: a left-side list with relative line numbers, Space marks and `v`/`V` range selection, and a right-side automatic image/text preview. `o`/Enter opens the highlighted file with the system handler. `s` prompts for a save directory, and saves every marked file (or just the highlighted one), without overwriting existing files and without trusting MIME filename paths. PDF/binary attachments show metadata and an Open action; received PDF thumbnails are not yet inlined. Terminal graphics decode is cached per selection instead of repeated on every frame.
+- **Received attachments:** IMAP headers are fetched with BODYSTRUCTURE so filenames and the separate theme-yellow `⧉` marker appear in the message browser without opening the email; rows with attachments show a second, muted filename line. The MIME parser remains authoritative after a body is loaded; duplicate unnamed calendar MIME parts are hidden when an identical named `.ics` attachment exists. `Ctrl-a` opens the received-attachment browser: a left-side list with relative line numbers, Space marks and `v`/`V` range selection, and a right-side automatic image/text preview. `o`/Enter opens the highlighted file with the system handler. `s` prompts for a save directory, and saves every marked file (or just the highlighted one), without overwriting existing files and without trusting MIME filename paths. PDF/binary attachments show metadata and an Open action; received PDF thumbnails are not yet inlined. Terminal graphics decode is cached per selection instead of repeated on every frame.
 - **Mailing-list patches:** unified Git diff additions, deletions, headers and hunk ranges are styled distinctly, including `> `-quoted patches.
 - **New-mail updates:** Inbox STATUS is checked by background mail workers every 20 seconds by default, without blocking navigation. Desktop notifications are enabled by default using `notify-send`, with a `message-new-email` freedesktop sound-name hint for COSMIC or other configured sound themes (actual audio playback depends on the notification daemon). When the known Inbox count rises, its cache is invalidated and the visible Inbox is refreshed. `B` toggles an optional terminal bell (off by default); the terminal determines whether the BEL control character makes a sound. This is a lightweight polling fallback, not IMAP IDLE; if new and deleted mail cancel out in a single interval, a count-only poll may miss the arrival.
 - **Reader envelope:** displays Date, To, and any Cc/Bcc headers physically present in the mail. Bcc must not be guessed in recipient copies.
@@ -31,7 +31,7 @@ A Rust terminal email client inspired by aerc's backend/worker model and lazygit
 - Typing in **Insert** mode uses the real terminal bar cursor, without adding
   a fake `▏` character that shifts text until returning to Normal.
 - Closing an unsent compose with `q` or `Esc` in **Normal** asks whether to save
-  a local postponed draft (**Y/Enter**), discard (**N**), or keep editing (**Esc**).
+  a local postponed draft (**y/Enter**), discard (**d/n**), or keep editing (**Esc**).
   `Ctrl+P` still postpones immediately. Empty new messages close normally.
 - PDF conversion remains asynchronous, and `Ctrl+J/K` now updates the file
   preview only at the end of its smooth motion. Intermediate files are not read,
@@ -172,7 +172,7 @@ For other providers, specify `imap_host` and `smtp_host` (and optional
 and credential commands remain supported. The shorthand never stores a token.
 Run `aerc-rs --oauth-login Personal` once for browser OAuth accounts.
 
-`page_size` controls interactive pagination. Existing `max_messages` settings are retained for compatibility/headless checks and no longer make the TUI wait for one giant initial fetch. Add more `[[accounts]]` blocks to the same config to use multiple accounts. `Alt-n`/`Alt-p` cycles accounts; `Alt-1` through `Alt-9` jumps directly to an account. `[ / ]` and Ctrl-PageUp/Ctrl-PageDown also switch accounts; click an account in the top tab bar to select it. Account switches preserve each account's mailbox and cached state.
+`page_size` controls interactive pagination. Existing `max_messages` settings are retained for compatibility/headless checks and no longer make the TUI wait for one giant initial fetch. Add more `[[accounts]]` blocks to the same config to use multiple accounts. `Alt-n`/`Alt-p` cycles accounts; `Alt-1` through `Alt-9` jumps directly to an account. Ctrl-PageUp/Ctrl-PageDown also switch accounts; click an account in the top tab bar to select it. Account switches preserve each account's mailbox and cached state.
 
 Invalid `outgoing` URLs no longer prevent startup: receiving remains available on that account, but sending is disabled until you fix its SMTP configuration. An invalid incoming `source` causes only that account to be skipped, provided another account is usable. Look for the persistent configuration-issues indicator in the top tab bar and press `!` for actionable, credential-redacted warnings. If **every** incoming account is invalid, startup still fails with a safe error.
 
@@ -185,9 +185,9 @@ Press `?` for the searchable complete map. Common controls:
 - `d` confirmed trash/delete; `D` immediate trash/delete; `a` archive; `U` restore an archived message to INBOX.
 - `/` filter current mailbox; `b` sidebar; `P` vertical preview; `Enter` full reader.
 - `r` reply without quote; `R` reply with quote; `A` reply all; `L` list reply; `f` inline forward; `c` compose.
-- HTML reader/preview: rich HTML is default; `T` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser. `m` toggles expanded recipients (Cc/Bcc) and Message-ID; the reader starts in compact-header mode. `z` opens received attachments with automatic previews; `j/k` moves, Space marks and advances, `v` selects a range then Space marks it, `a` marks/unmarks all, `o`/Enter opens, and `s` saves marked files to an entered directory. Clicking a filename previews it; footer Open/Save/Mark actions are mouse-clickable. The mailbox divider can be dragged to resize, or use Alt-h/Alt-l to adjust it from the keyboard.
+- HTML reader/preview: rich HTML is default; `t` toggles rich/plain, `I` toggles remote images, `o` opens the link directly under the reader cursor, and `O` opens the original HTML in the browser. `m` toggles email addresses and Message-ID while leaving From/To/Cc/Bcc names visible; the reader starts in compact-header mode. `Ctrl-a` opens received attachments with automatic previews; `j/k` moves, Space marks and advances, `v` selects a range then Space marks it, `a` marks/unmarks all, `o`/Enter opens, and `s` saves marked files through the directory picker. Press `?` in the attachment viewer for searchable actions; clicking a filename previews it. Navigation hints are hidden. The mailbox divider can be dragged to resize, or use Alt-h/Alt-l to adjust it from the keyboard.
 - In composer, Tab/Shift-Tab visits To, Cc, Bcc, Subject and Body. Ctrl+A opens an internal multi-select attachment picker (Space/Enter toggles files, h/Backspace moves to parent, l enters folders, . shows hidden files, Esc closes). Ctrl+O edits optional custom headers in advanced options (`X-Header: value; ...`). In NORMAL press `?` for the searchable compose-only shortcuts (`gg/G`, `w/W/b/B/e/E`, `vi` text objects, `dd/dw`, `f/F`, `o/O`, `u/Ctrl-r`, Visual and more). Enter shows a centered send confirmation; Ctrl-p postpones locally; Ctrl-n resumes the active account’s postponed draft. These are local files, not IMAP Drafts synchronization.
-- `Alt-n`/`Alt-p` next/previous account; `Alt-1`–`Alt-9` direct account selection; `[ / ]` and Ctrl-PageUp/PageDown also navigate, or click the top account tabs. `!` reviews configuration warnings; `Ctrl-r` refreshes the current mailbox; `B` toggles the optional terminal bell. `N` toggles desktop new-mail notifications (and their sound) for this session, or click the rightmost footer bell (🔔 enabled / 🔕 muted). The initial state comes from `ui.new_mail_notifications`.
+- `Alt-n`/`Alt-p` next/previous account; `Alt-1`–`Alt-9` direct account selection; Ctrl-PageUp/PageDown also navigate, or click the top account tabs. `!` reviews configuration warnings; `Ctrl-r` refreshes the current mailbox; `B` toggles the optional terminal bell. `N` toggles desktop new-mail notifications (and their sound) for this session, or click the rightmost footer bell (● enabled / ○ muted; set `ui.notification_icon_style = "nerd"` for Nerd Font bells). The initial state comes from `ui.new_mail_notifications`.
 
 ## Themes
 
@@ -206,7 +206,7 @@ Built-ins live in `themes/*.json`. Custom themes use the same flat semantic pale
 }
 ```
 
-Put the file in `~/.config/aerc-rs/themes/my-theme.json`, set `[ui] theme = "my-theme"` in `config.toml`, or select it with `t`. The picker writes the selected theme back into `config.toml`; old standalone `theme` state files no longer override that setting.
+Put the file in `~/.config/aerc-rs/themes/my-theme.json`, set `[ui] theme = "my-theme"` in `config.toml`, or select it with `T`. The picker writes the selected theme back into `config.toml`; old standalone `theme` state files no longer override that setting.
 
 ## Validate and benchmark
 
@@ -315,7 +315,7 @@ benchmarking the uncached behavior without deleting previously saved data.
 
 ### Received attachment browser (PDF thumbnails and save destinations)
 
-In the reader, `z` opens received attachments. The left list uses full-width
+In the reader, `Ctrl-a` opens received attachments. The left list uses full-width
 current-line highlighting, relative line numbers, `5j`/`5k`, `gg`/`G`, and
 100 FPS Ctrl-j/Ctrl-k smooth navigation. Space marks files and advances; `v`
 starts a visual range; Space marks the range; `a` marks all. `o` opens the
@@ -553,7 +553,7 @@ authentication.
 ### Interactive account setup (first-run and add-account)
 
 Start `aerc-rs` with no mail accounts configured to open the setup wizard
-immediately. With existing accounts, press **Ctrl-a** from the mailbox screen.
+immediately. With existing accounts, press **Alt-a** from the mailbox screen.
 The wizard now starts with just **account name** and **email address**. Press
 **Enter** (or Tab from the email field) to discover settings on a background
 thread. A spinner indicates that discovery is in progress.
@@ -651,7 +651,7 @@ misrepresent the requesting application.
 
 ### Account wizard: Microsoft aliases and local removal
 
-The in-app wizard (`Ctrl-a`) starts with account name and visible email. For
+The in-app wizard (`Alt-a`) starts with account name and visible email. For
 Microsoft 365 accounts discovered without a verified login username, it runs the
 browser OAuth sign-in *before* presenting the editable server settings. The
 OAuth username claim is a **suggestion**, not an authoritative mailbox ID:
@@ -668,3 +668,17 @@ While browsing mail, `Alt-d` opens a confirmation to remove the current **local
 account** from `config.toml`. It does not delete any remote IMAP mailbox,
 folder, messages or provider account, and does not revoke stored OAuth grants.
 If you remove the final configured account, the first-run wizard opens again.
+
+### Mailbox search
+
+Message-list `/` uses fuzzy matching by default, ranking ordered character
+matches in subjects, senders, addresses and dates. To restore the previous
+case-insensitive substring filter, add to `config.toml`:
+
+```toml
+[ui]
+search_mode = "strict"  # or "fuzzy" (default)
+```
+
+The search only ranks messages already fetched for the current mailbox; older
+pages are fetched progressively as before.

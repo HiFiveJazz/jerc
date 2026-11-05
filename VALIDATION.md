@@ -34,7 +34,7 @@ Run `./scripts/validate.sh` after applying it. Any compiler or API error from th
 - Toggle read/unread with `u`; the list marker and mailbox unread count should update immediately, before the server round trip completes.
 - Start `/` search and verify the editable query appears once (in the search row), not again in the status bar.
 - Open a quoted reply with `R`; the attribution should read `On <weekday> <month> <day>, <year> at <time> <zone>, <author> wrote:` and quoted `>` lines should be gray in both reader and composer.
-- Add two `[[accounts]]` blocks and rotate with `[` / `]`; the active tab and status should change without restarting.
+- Add two `[[accounts]]` blocks and rotate with `Alt-p` / `Alt-n`; the active tab and status should change without restarting.
 
 ## Mail correctness regression suite (tests-first milestone)
 

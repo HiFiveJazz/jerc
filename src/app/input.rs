@@ -32,18 +32,17 @@ pub struct HelpEntry {
 /// Searchable action palette, intentionally excluding generic Vim motions.
 /// Categories and the leading shortcut within each category sort alphabetically.
 pub const HELP_ENTRIES: &[HelpEntry] = &[
-    HelpEntry { category: "Accounts", key: "[ / ]", description: "previous / next account" },
     HelpEntry { category: "Accounts", key: "Alt-1 … Alt-9", description: "switch directly to an email account" },
+    HelpEntry { category: "Accounts", key: "Alt-a", description: "add an account with editable setup wizard" },
     HelpEntry { category: "Accounts", key: "Alt-d", description: "remove current account locally (confirm; mailbox view)" },
     HelpEntry { category: "Accounts", key: "Alt-n / Alt-p", description: "next / previous email account" },
-    HelpEntry { category: "Accounts", key: "Ctrl-a", description: "add an account with editable setup wizard" },
     HelpEntry { category: "General", key: "!", description: "show account configuration warnings" },
     HelpEntry { category: "General", key: "?", description: "search command palette" },
     HelpEntry { category: "General", key: "B", description: "toggle new-mail terminal bell" },
     HelpEntry { category: "General", key: "Ctrl-r", description: "refresh selected mailbox" },
-    HelpEntry { category: "General", key: "N", description: "toggle desktop new-mail notifications (and sound)" },
+    HelpEntry { category: "General", key: "n", description: "toggle desktop new-mail notifications (and sound)" },
     HelpEntry { category: "General", key: "q / Ctrl-c", description: "quit aerc-rs" },
-    HelpEntry { category: "General", key: "t", description: "open theme picker" },
+    HelpEntry { category: "General", key: "T", description: "open theme picker" },
     HelpEntry { category: "Mail actions", key: "a", description: "archive selected message" },
     HelpEntry { category: "Mail actions", key: "A", description: "reply to all recipients" },
     HelpEntry { category: "Mail actions", key: "c", description: "compose new email" },
@@ -51,17 +50,18 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Mail actions", key: "f", description: "forward message" },
     HelpEntry { category: "Mail actions", key: "L", description: "reply to mailing list" },
     HelpEntry { category: "Mail actions", key: "r / R", description: "reply / reply with quotation" },
+    HelpEntry { category: "Mail actions", key: "s", description: "mark as spam / restore from Junk" },
     HelpEntry { category: "Mail actions", key: "u", description: "mark read or unread" },
     HelpEntry { category: "Mail actions", key: "U", description: "restore archived message to INBOX" },
+    HelpEntry { category: "Message", key: "Ctrl-a", description: "open received attachments" },
     HelpEntry { category: "Message", key: "e / E", description: "export original RFC 5322 message" },
     HelpEntry { category: "Message", key: "Esc", description: "close the reader / exit selection" },
     HelpEntry { category: "Message", key: "I", description: "toggle remote images for this session" },
-    HelpEntry { category: "Message", key: "m", description: "show full recipients and Message-ID" },
+    HelpEntry { category: "Message", key: "m", description: "toggle email addresses in From/To/Cc/Bcc and Message-ID" },
     HelpEntry { category: "Message", key: "o", description: "open link under cursor" },
     HelpEntry { category: "Message", key: "O", description: "open original HTML in browser" },
-    HelpEntry { category: "Message", key: "T", description: "toggle HTML / plain-text reader" },
+    HelpEntry { category: "Message", key: "t", description: "toggle HTML / plain-text reader" },
     HelpEntry { category: "Message", key: "y", description: "copy selected text" },
-    HelpEntry { category: "Message", key: "z", description: "open received attachments" },
     HelpEntry { category: "Navigation", key: "/", description: "filter current mailbox" },
     HelpEntry { category: "Navigation", key: "Ctrl-Shift-j / Ctrl-Shift-k", description: "smooth mailbox list scrolling" },
     HelpEntry { category: "Navigation", key: "Enter", description: "open selected email" },
@@ -70,6 +70,19 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "View", key: "Alt-Shift-h / Alt-Shift-l", description: "resize message preview" },
     HelpEntry { category: "View", key: "b", description: "show / hide mailbox sidebar" },
     HelpEntry { category: "View", key: "p", description: "show / hide split preview" },
+];
+
+/// Shortcuts specific to the received-attachment viewer. Navigation uses
+/// normal Vim motions; it does not need a permanent on-screen legend.
+pub const ATTACHMENT_HELP_ENTRIES: &[HelpEntry] = &[
+    HelpEntry { category: "Attachments", key: "?", description: "search attachment shortcuts" },
+    HelpEntry { category: "Attachments", key: "o / Enter", description: "open selected attachment externally" },
+    HelpEntry { category: "Attachments", key: "s", description: "browse folders and save selected or marked attachments" },
+    HelpEntry { category: "Attachments", key: "Space", description: "mark or unmark an attachment" },
+    HelpEntry { category: "Attachments", key: "a", description: "mark or unmark all attachments" },
+    HelpEntry { category: "Attachments", key: "v / V", description: "select a visual range of attachments" },
+    HelpEntry { category: "Attachments", key: "p", description: "refresh the selected attachment preview" },
+    HelpEntry { category: "Attachments", key: "Esc / q", description: "close the viewer or exit visual selection" },
 ];
 
 /// Searchable help for the attachment picker; intentionally not duplicated
@@ -95,10 +108,10 @@ pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Compose", key: "Ctrl-o", description: "open advanced options for custom email headers" },
     HelpEntry { category: "Compose", key: "Ctrl-p", description: "save locally and in the account Drafts folder" },
     HelpEntry { category: "Compose", key: "Enter (normal)", description: "preview outgoing email before sending" },
-    HelpEntry { category: "Compose", key: "Esc / q (normal)", description: "ask to save an unsent email in Drafts before closing" },
+    HelpEntry { category: "Compose", key: "Esc / q (normal)", description: "ask to save an unsent email in Drafts before closing (y save, d/n discard)" },
     HelpEntry { category: "Compose", key: "Tab / Shift-Tab", description: "next / previous recipient, subject or body field" },
     HelpEntry { category: "Send preview", key: "Enter / Esc", description: "send email / return to editor" },
-    HelpEntry { category: "Send preview", key: "T / O", description: "toggle HTML/plain, open browser preview" },
+    HelpEntry { category: "Send preview", key: "t / O", description: "toggle HTML/plain, open browser preview" },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +136,7 @@ pub enum Command {
     DeleteImmediate,
     Archive,
     Unarchive,
+    ToggleSpam,
     Attachments,
     Search,
     ToggleSidebar,
@@ -179,6 +193,7 @@ pub fn command_for_key(key: KeyEvent) -> Command {
             KeyCode::Char('j') => Command::SmoothDown,
             KeyCode::Char('k') => Command::SmoothUp,
             KeyCode::Char('r') => Command::Refresh,
+            KeyCode::Char('a') => Command::Attachments,
             KeyCode::PageDown => Command::NextAccount,
             KeyCode::PageUp => Command::PreviousAccount,
             _ => Command::None,
@@ -202,7 +217,7 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('D') => Command::DeleteImmediate,
         KeyCode::Char('a') => Command::Archive,
         KeyCode::Char('U') => Command::Unarchive,
-        KeyCode::Char('z') => Command::Attachments,
+        KeyCode::Char('s') => Command::ToggleSpam,
         KeyCode::Char('/') => Command::Search,
         KeyCode::Char('b') => Command::ToggleSidebar,
         KeyCode::Char('p') => Command::TogglePreviewSplit,
@@ -211,15 +226,13 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('A') => Command::ReplyAll,
         KeyCode::Char('L') => Command::ReplyList,
         KeyCode::Char('f') => Command::Forward,
-        KeyCode::Char(']') => Command::NextAccount,
-        KeyCode::Char('[') => Command::PreviousAccount,
-        KeyCode::Char('t') => Command::ToggleThemePicker,
+        KeyCode::Char('T') => Command::ToggleThemePicker,
         KeyCode::Char('e') | KeyCode::Char('E') => Command::ExportRaw,
         KeyCode::Char('?') => Command::ToggleHelp,
-        KeyCode::Char('T') => Command::ToggleHtml,
+        KeyCode::Char('t') => Command::ToggleHtml,
         KeyCode::Char('I') => Command::ToggleImages,
         KeyCode::Char('B') => Command::ToggleBell,
-        KeyCode::Char('N') => Command::ToggleNotifications,
+        KeyCode::Char('n') => Command::ToggleNotifications,
         KeyCode::Char('O') => Command::OpenOriginal,
         KeyCode::Char('y') => Command::Yank,
         KeyCode::Char('c') => Command::Compose,
@@ -243,7 +256,8 @@ mod tests {
         assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)), Command::SelectAccount(0));
         assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT)), Command::SelectAccount(2));
         assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT)), Command::SelectAccount(8));
-        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)), Command::NextAccount);
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)), Command::None);
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)), Command::None);
     }
 
     #[test]
@@ -263,10 +277,18 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_n_toggles_desktop_notifications() {
+    fn lowercase_n_toggles_desktop_notifications() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            Command::ToggleNotifications
+        );
+    }
+
+    #[test]
+    fn uppercase_n_does_not_toggle_notifications() {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
-            Command::ToggleNotifications
+            Command::None
         );
     }
 
@@ -349,7 +371,7 @@ mod tests {
             Command::ExportRaw
         );
         assert_eq!(
-            command_for_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
+            command_for_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)),
             Command::ToggleHtml
         );
         assert_eq!(
@@ -409,6 +431,16 @@ mod tests {
         assert_eq!(keys, sorted);
         assert!(!HELP_ENTRIES.iter().any(|entry| entry.category == "Vim"));
         assert!(!HELP_ENTRIES.iter().any(|entry| entry.key.contains("vi")));
+    }
+
+    #[test]
+    fn spam_attachment_and_theme_shortcuts_do_not_conflict() {
+        let key = |ch, modifiers| command_for_key(KeyEvent::new(KeyCode::Char(ch), modifiers));
+        assert_eq!(key('s', KeyModifiers::NONE), Command::ToggleSpam);
+        assert_eq!(key('a', KeyModifiers::CONTROL), Command::Attachments);
+        assert_eq!(key('z', KeyModifiers::NONE), Command::None);
+        assert_eq!(key('t', KeyModifiers::NONE), Command::ToggleHtml);
+        assert_eq!(key('T', KeyModifiers::SHIFT), Command::ToggleThemePicker);
     }
 
     #[test]

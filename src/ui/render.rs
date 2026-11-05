@@ -10,7 +10,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, ComposeField, ComposeMode, COMPOSE_HELP_ENTRIES, PICKER_HELP_ENTRIES, HELP_ENTRIES, ReaderSelection,
+    App, ComposeField, ComposeMode, ATTACHMENT_HELP_ENTRIES, COMPOSE_HELP_ENTRIES, PICKER_HELP_ENTRIES, HELP_ENTRIES, ReaderSelection,
 };
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
 use crate::theme::Theme;
@@ -25,9 +25,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_main(frame, app, outer[1]);
     draw_status(frame, app, outer[2]);
 
-    if app.help_visible {
-        draw_help(frame, app);
-    }
     if app.show_startup_warnings {
         draw_startup_warnings(frame, app);
     }
@@ -36,6 +33,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         if app.attachment_destination_picker.is_some() {
             draw_attachment_destination_picker(frame, app);
         }
+    }
+    if app.help_visible {
+        // Above the attachment viewer; otherwise `?` was hidden behind it.
+        draw_help(frame, app);
     }
     if app.theme_picker_visible {
         draw_theme_picker(frame, app);
@@ -129,7 +130,7 @@ fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
         let saved_regions = Layout::default().direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
             .split(content);
-        let mut lines = vec![
+        let lines = vec![
             Line::styled("✓ Account saved successfully", setup_success_style()),
             Line::raw(""),
             Line::styled(format!("{}  ·  {}", wizard.fields[NAME], wizard.fields[EMAIL]), theme.text()),
@@ -525,7 +526,7 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let number_width = relative_number_width(visible.len());
     let message_columns = [
         Constraint::Length(number_width),
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Percentage(28),
         Constraint::Min(12),
         Constraint::Length(6),
@@ -545,16 +546,20 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let visual_selected = app.message_is_visual_selected(*index);
         let current = absolute_position == current_position;
         let unread_mark = if visual_selected { "✓" } else if message.flags.contains(MessageFlags::SEEN) { " " } else { "●" };
+        let in_junk = account.current_mailbox.as_ref().is_some_and(|source|
+            account.mailboxes.iter().any(|mailbox|
+                mailbox.name == *source && mailbox.role == crate::model::MailboxRole::Junk));
         let attachment_mark = message.has_attachment(account.bodies.get(&message.id));
         // A separate box glyph in the mark column, never embedded in the
         // subject where it could be mistaken for part of the title.
         let mark = Line::from(vec![
             Span::raw(unread_mark),
+            if in_junk {
+                Span::styled("!", Style::default().fg(theme.error).add_modifier(Modifier::BOLD))
+            } else { Span::raw(" ") },
             if attachment_mark {
                 Span::styled("⧉", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))
-            } else {
-                Span::raw(" ")
-            },
+            } else { Span::raw(" ") },
         ]);
         let sender = if message.from_name.is_empty() {
             &message.from_address
@@ -576,9 +581,10 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             truncate_display_width(&subject_for_list(&message.subject), subject_width)
         )];
         if attachment_mark {
-            let names: &[String] = account.bodies.get(&message.id)
-                .map_or(message.attachment_names_hint.as_slice(), |body| body.attachment_names.as_slice());
-            let subtitle = attachment_subtitle(names);
+            let names = account.bodies.get(&message.id)
+                .map_or_else(|| crate::mail::visible_attachment_hints(&message.attachment_names_hint),
+                    |body| body.attachment_names.clone());
+            let subtitle = attachment_subtitle(&names);
             subject_lines.push(Line::styled(truncate_display_width(&subtitle, subject_width), theme.muted()));
         }
         Row::new(vec![
@@ -605,25 +611,106 @@ fn attachment_subtitle(names: &[String]) -> String {
     else { names.iter().take(2).map(String::as_str).collect::<Vec<_>>().join(" · ") }
 }
 
-#[cfg(test)]
-mod compact_address_header_tests {
-    use super::compact_address_header;
-
-    #[test]
-    fn short_recipient_stays_intact_and_long_recipient_collapses() {
-        assert_eq!(compact_address_header("a@example.com", 30), "a@example.com");
-        let long = compact_address_header("áβγ-long-address@example.com", 5);
-        assert!(long.starts_with("áβγ-l…"));
-        assert!(long.contains("[m: details]"));
+/// In compact mode only the sender email address is hidden when a display
+/// name is available. Mail with no sender display name must remain identifiable.
+fn sender_header_value(from_name: &str, from_address: &str, show_details: bool) -> String {
+    if from_name.is_empty() {
+        from_address.to_owned()
+    } else if from_address.is_empty() || !show_details {
+        from_name.to_owned()
+    } else {
+        format!("{from_name} <{from_address}>")
     }
 }
 
-// Compact mode avoids making large list conversations consume the reader.
-// Never truncate the underlying recipient data used for reply/reply-all.
-fn compact_address_header(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let compact = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() { format!("{compact}…  [m: details]") } else { compact }
+/// Preserve all To/Cc/Bcc header rows in compact mode while hiding each
+/// mailbox's address when it has a readable display name. Bare addresses
+/// remain visible instead of turning a header into an empty label. Commas
+/// inside quoted names or angle addresses are not recipient separators.
+fn compact_recipient_header(value: &str) -> String {
+    let mut recipients = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut angle_depth = 0usize;
+    for (index, ch) in value.char_indices() {
+        if escaped { escaped = false; continue; }
+        if ch == '\\' && quoted { escaped = true; continue; }
+        if ch == '"' { quoted = !quoted; continue; }
+        if quoted { continue; }
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            ',' if angle_depth == 0 => {
+                recipients.push(compact_recipient(value[start..index].trim()));
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    recipients.push(compact_recipient(value[start..].trim()));
+    recipients.join(", ")
+}
+
+fn compact_recipient(value: &str) -> String {
+    let Some(start) = value.rfind('<') else { return value.to_owned(); };
+    let Some(end) = value[start..].find('>').map(|end| start + end) else { return value.to_owned(); };
+    if !value[start + 1..end].contains('@') { return value.to_owned(); }
+    // Only discard the address when we have an actual name to show. Leave
+    // e.g. <someone@example.com> and malformed input untouched.
+    let name = value[..start].trim();
+    if name.is_empty() { return value.to_owned(); }
+    let unquoted = name.strip_prefix('"').and_then(|name| name.strip_suffix('"'));
+    let name = unquoted.unwrap_or(name);
+    let trailing = value[end + 1..].trim();
+    format!("{name}{trailing}")
+}
+
+/// Only addresses and Message-ID collapse with `m`. From, To, Cc and Bcc
+/// stay visible, as do all display names, subjects and dates.
+fn reader_header_lines(
+    message: &crate::model::MessageSummary,
+    show_details: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let from = sender_header_value(&message.from_name, &message.from_address, show_details);
+    let mut lines = vec![
+        Line::from(vec![Span::styled("From: ", theme.accent()), Span::raw(from)]),
+        Line::from(vec![Span::styled("Date: ", theme.accent()), Span::raw(
+            if message.timestamp > 0 {
+                chrono::DateTime::<chrono::Utc>::from_timestamp(message.timestamp, 0)
+                    .map(|date| date.with_timezone(&chrono::Local)
+                        .format("%a, %b %-d, %Y at %-I:%M %p %Z").to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            } else { "unknown".to_owned() }
+        )]),
+        Line::from(vec![Span::styled("To: ", theme.accent()), Span::raw(
+            if message.to.is_empty() { "(not supplied)".to_owned() }
+            else if show_details { message.to.clone() }
+            else { compact_recipient_header(&message.to) }
+        )]),
+        Line::from(vec![
+            Span::styled("Subject: ", theme.accent()),
+            Span::raw(message.subject.clone()),
+        ]),
+    ];
+    if !message.cc.is_empty() {
+        lines.push(Line::from(vec![Span::styled("Cc: ", theme.accent()), Span::raw(if show_details { message.cc.clone() }
+            else { compact_recipient_header(&message.cc) })]));
+    }
+    if !message.bcc.is_empty() {
+        lines.push(Line::from(vec![Span::styled("Bcc: ", theme.accent()), Span::raw(if show_details { message.bcc.clone() }
+            else { compact_recipient_header(&message.bcc) })]));
+    }
+    if show_details {
+        if let Some(message_id) = &message.message_id {
+            lines.push(Line::from(vec![
+                Span::styled("Message-ID: ", theme.accent()),
+                Span::raw(format!("<{message_id}>")),
+            ]));
+        }
+    }
+    lines
 }
 
 fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -644,7 +731,7 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Paragraph::new("No message selected").style(theme.muted()),
             content_area,
         );
-        app.set_reader_layout(0, 0, usize::from(content_area.height.max(1)), 0);
+        app.set_reader_layout(0, usize::from(content_area.height.max(1)), 0, None);
         return;
     }
 
@@ -684,51 +771,7 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let account = app.account().expect("account exists");
         let message = account.selected_message().expect("message checked above");
 
-        let from = if message.from_name.is_empty() {
-            message.from_address.clone()
-        } else if message.from_address.is_empty() {
-            message.from_name.clone()
-        } else {
-            format!("{} <{}>", message.from_name, message.from_address)
-        };
-        let mut lines = vec![
-            Line::from(vec![Span::styled("From: ", theme.accent()), Span::raw(from)]),
-            Line::from(vec![Span::styled("Date: ", theme.accent()), Span::raw(
-                if message.timestamp > 0 {
-                    chrono::DateTime::<chrono::Utc>::from_timestamp(message.timestamp, 0)
-                        .map(|date| date.with_timezone(&chrono::Local)
-                            .format("%a, %b %-d, %Y at %-I:%M %p %Z").to_string())
-                        .unwrap_or_else(|| "unknown".to_owned())
-                } else { "unknown".to_owned() }
-            )]),
-            Line::from(vec![Span::styled("To: ", theme.accent()), Span::raw(
-                if message.to.is_empty() { "(not supplied)".to_owned() }
-                else if app.show_header_details { message.to.clone() }
-                else { compact_address_header(&message.to, 95) }
-            )]),
-            Line::from(vec![
-                Span::styled("Subject: ", theme.accent()),
-                Span::raw(message.subject.clone()),
-            ]),
-        ];
-        if app.show_header_details {
-            if !message.cc.is_empty() {
-                lines.push(Line::from(vec![Span::styled("Cc: ", theme.accent()), Span::raw(message.cc.clone())]));
-            }
-            if !message.bcc.is_empty() {
-                lines.push(Line::from(vec![Span::styled("Bcc: ", theme.accent()), Span::raw(message.bcc.clone())]));
-            }
-        } else if !message.cc.is_empty() || !message.bcc.is_empty() {
-            lines.push(Line::from(Span::styled("Recipients hidden · m: show details", theme.muted())));
-        }
-        if app.show_header_details {
-            if let Some(message_id) = &message.message_id {
-                lines.push(Line::from(vec![
-                    Span::styled("Message-ID: ", theme.accent()),
-                    Span::raw(format!("<{message_id}>")),
-                ]));
-            }
-        }
+        let mut lines = reader_header_lines(message, app.show_header_details, &theme);
         if let Some(body) = account.selected_body() {
             if body.attachment_count > 0 {
                 let preview = body.attachment_names.iter().take(2).cloned().collect::<Vec<_>>().join("  ·  ");
@@ -741,13 +784,14 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 lines.push(Line::from(vec![
                     Span::styled("⧉  ", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
                     Span::styled(label, theme.text()),
-                    Span::styled("   z: view", theme.muted()),
+                    Span::styled("   Ctrl-a: view", theme.muted()),
                 ]));
             }
         } else if message.has_attachment_hint {
-            let names = message.attachment_names_hint.iter().take(2).cloned().collect::<Vec<_>>().join("  ·  ");
+            let names = crate::mail::visible_attachment_hints(&message.attachment_names_hint)
+                .into_iter().take(2).collect::<Vec<_>>().join("  ·  ");
             lines.push(Line::from(vec![Span::styled("⧉  ", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
-                Span::styled(if names.is_empty() { "Attachments (z: browse)".to_owned() } else { names }, theme.text())]));
+                Span::styled(if names.is_empty() { "Attachments (Ctrl-a: browse)".to_owned() } else { names }, theme.text())]));
         }
         lines.push(Line::styled(
             "─".repeat(usize::from(content_area.width)),
@@ -767,6 +811,10 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             if showing_html {
                 if let Some(html_lines) = &body.html_lines {
                     body_line_count = html_lines.len();
+                    let rendered = html_lines.iter().map(|line| line.spans.iter()
+                        .map(|span| span.text.as_str()).collect::<String>()).collect::<Vec<_>>();
+                    let texts = rendered.iter().map(String::as_str).collect::<Vec<_>>();
+                    let diff_lines = classify_patch_lines(&texts);
                     lines.extend(html_lines.iter().enumerate().map(|(line_index, line)| {
                         rich_html_line(
                             line,
@@ -778,12 +826,14 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             reader_visual,
                             reader_active,
                             &theme,
+                            diff_lines[line_index],
                             reader_illuminate.as_deref(),
                         )
                     }));
                 } else {
                     let rendered = body.display_text(true).lines().collect::<Vec<_>>();
                     body_line_count = rendered.len();
+                    let diff_lines = classify_patch_lines(&rendered);
                     lines.extend(rendered.into_iter().enumerate().map(|(line_index, line)| {
                         plain_reader_line(
                             line,
@@ -795,6 +845,7 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             reader_visual,
                             reader_active,
                             &theme,
+                            diff_lines[line_index],
                             reader_illuminate.as_deref(),
                         )
                     }));
@@ -802,6 +853,7 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } else {
                 let rendered = body.display_text(false).lines().collect::<Vec<_>>();
                 body_line_count = rendered.len();
+                let diff_lines = classify_patch_lines(&rendered);
                 lines.extend(rendered.into_iter().enumerate().map(|(line_index, line)| {
                     plain_reader_line(
                         line,
@@ -813,6 +865,7 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         reader_visual,
                         reader_active,
                         &theme,
+                        diff_lines[line_index],
                         reader_illuminate.as_deref(),
                     )
                 }));
@@ -832,6 +885,20 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .wrap(Wrap { trim: false })
             .line_count(content_area.width.max(1))
     });
+    // Cursor motions address logical message lines, but Paragraph wraps those
+    // lines into *terminal rows*. Using body_start + reader_cursor for the
+    // scroll position loses all preceding wraps and eventually leaves the
+    // cursor below the viewport. Measure the row with Paragraph's own layout.
+    let visual_cursor_row = if reader_active && body_line_count > 0
+        && app.reader_needs_scroll_follow()
+    {
+        reader_visual_cursor_row(
+            &lines,
+            body_start,
+            reader_cursor.min(body_line_count - 1),
+            content_area.width,
+        )
+    } else { None };
     let paragraph = Paragraph::new(Text::from(lines))
         .style(theme.text())
         .wrap(Wrap { trim: false });
@@ -839,7 +906,7 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let viewport_height = usize::from(content_area.height.max(1));
     let max_scroll =
         u16::try_from(visual_lines.saturating_sub(viewport_height)).unwrap_or(u16::MAX);
-    app.set_reader_layout(body_start, body_line_count, viewport_height, max_scroll);
+    app.set_reader_layout(body_line_count, viewport_height, max_scroll, visual_cursor_row);
     let scroll = app.account().map_or(0, |account| account.preview_scroll);
     frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
 
@@ -866,25 +933,163 @@ fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
-/// Git unified diff styling. Email quoting (`> `) is ignored while
-/// classifying the patch, so reviewing a mailed patch resembles lazygitrs.
-fn diff_line_style(line: &str, theme: &Theme) -> Option<Style> {
-    let mut text = line;
+/// Physical terminal row containing the Vim cursor, including wrapped headers,
+/// images, long body lines and the portion of the active line before the cursor.
+/// Use exactly the same word-wrap settings as the reader itself.
+fn reader_visual_cursor_row(
+    lines: &[Line<'_>], body_start: usize, cursor_line: usize, width: u16,
+) -> Option<usize> {
+    let index = body_start.checked_add(cursor_line)?;
+    let current = lines.get(index)?;
+    let width = width.max(1);
+    let preceding_rows = if index == 0 { 0 } else {
+        Paragraph::new(Text::from(lines[..index].to_vec()))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+    };
+
+    // The rendered block cursor is a white-on-black cell. Measuring the prefix
+    // up to that cell follows the cursor even when a single logical line spans
+    // several screen rows. When no cursor cell is present, use its first row.
+    let mut prefix = Vec::new();
+    for span in &current.spans {
+        if span.style == reader_cursor_style() { break; }
+        prefix.push(span.clone());
+    }
+    let within_line = if prefix.is_empty() { 0 } else {
+        Paragraph::new(Line::from(prefix))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .saturating_sub(1)
+    };
+    Some(preceding_rows.saturating_add(within_line))
+}
+
+/// Only color *real patch hunks*. An email quote containing `-EIO`, a
+/// Markdown `---` divider, or a plain `+text` line is not a Git diff.
+/// Classify the entire body at once so hunk ranges and quoted patches are
+/// recognized without falsely coloring nearby prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchLineKind { Meta, Hunk, Add, Remove }
+
+fn strip_mail_quotes(mut text: &str) -> &str {
     while let Some(after) = text.strip_prefix('>') {
         text = after.strip_prefix(' ').unwrap_or(after);
     }
-    if text.starts_with("diff --git ") || text.starts_with("index ")
-        || text.starts_with("--- ") || text.starts_with("+++ ")
-        || text.starts_with("new file mode ") || text.starts_with("deleted file mode ")
-    {
-        Some(theme.accent())
-    } else if text.starts_with("@@") || text.starts_with("\\ No newline at end of file") {
-        Some(Style::default().fg(Color::Rgb(122, 162, 247)).add_modifier(Modifier::BOLD))
-    } else if text.starts_with('+') {
-        Some(Style::default().fg(Color::Rgb(158, 206, 106)))
-    } else if text.starts_with('-') {
-        Some(Style::default().fg(Color::Rgb(247, 118, 142)))
-    } else { None }
+    text
+}
+
+fn patch_hunk_counts(line: &str) -> Option<(usize, usize)> {
+    let text = line.strip_prefix("@@ -")?;
+    let (old, tail) = text.split_once(" +")?;
+    let (new, _) = tail.split_once(" @@")?;
+    fn parse_range(spec: &str) -> Option<usize> {
+        let (start, count) = spec.split_once(',').unwrap_or((spec, "1"));
+        start.parse::<usize>().ok()?;
+        count.parse::<usize>().ok()
+    }
+    Some((parse_range(old)?, parse_range(new)?))
+}
+
+fn is_patch_source(text: &str) -> bool {
+    text.starts_with("--- a/") || text == "--- /dev/null"
+}
+fn is_patch_target(text: &str) -> bool {
+    text.starts_with("+++ b/") || text == "+++ /dev/null"
+}
+
+fn classify_patch_lines(lines: &[&str]) -> Vec<Option<PatchLineKind>> {
+    let mut result = Vec::with_capacity(lines.len());
+    let mut in_patch = false;
+    let mut in_hunk = false;
+    let (mut old_left, mut new_left) = (0usize, 0usize);
+    for (index, line) in lines.iter().enumerate() {
+        let text = strip_mail_quotes(line);
+        let next_is_target = lines.get(index + 1)
+            .is_some_and(|next| is_patch_target(strip_mail_quotes(next)));
+        let kind = if text.starts_with("diff --git ")
+            || is_patch_source(text) && next_is_target
+        {
+            in_patch = true;
+            in_hunk = false;
+            Some(PatchLineKind::Meta)
+        } else if !in_patch {
+            None
+        } else if text.starts_with("index ") || is_patch_source(text)
+            || is_patch_target(text) || text.starts_with("new file mode ")
+            || text.starts_with("deleted file mode ")
+            || text.starts_with("old mode ") || text.starts_with("new mode ")
+            || text.starts_with("similarity index ")
+            || text.starts_with("rename from ") || text.starts_with("rename to ")
+        {
+            in_hunk = false;
+            Some(PatchLineKind::Meta)
+        } else if let Some((old, new)) = patch_hunk_counts(text) {
+            old_left = old;
+            new_left = new;
+            in_hunk = old > 0 || new > 0;
+            Some(PatchLineKind::Hunk)
+        } else if in_hunk && text.starts_with('!') {
+            // Combined diffs and context diffs have different formats. They
+            // need explicit support, not arbitrary +/- colorization.
+            in_hunk = false;
+            None
+        } else if in_hunk {
+            let kind = if text.starts_with('+') && new_left > 0 {
+                new_left -= 1;
+                Some(PatchLineKind::Add)
+            } else if text.starts_with('-') && old_left > 0 {
+                old_left -= 1;
+                Some(PatchLineKind::Remove)
+            } else if text.starts_with(' ') && old_left > 0 && new_left > 0 {
+                old_left -= 1;
+                new_left -= 1;
+                None
+            } else if text.starts_with("\\ No newline at end of file") {
+                Some(PatchLineKind::Meta)
+            } else {
+                // A reply is allowed to contain prose immediately after a
+                // quoted patch. Stop highlighting on malformed hunk content.
+                in_hunk = false;
+                None
+            };
+            if old_left == 0 && new_left == 0 { in_hunk = false; }
+            kind
+        } else {
+            if !text.trim().is_empty() && !text.starts_with("\\ No newline") {
+                in_patch = false;
+            }
+            None
+        };
+        result.push(kind);
+    }
+    result
+}
+
+/// The active diff row uses the same neutral gray as every other Vim row.
+/// Normal diff rows keep their red/green backgrounds, while the selected row
+/// keeps the diff foreground and uses the theme's current-line background.
+fn reader_active_diff_bg(theme: &Theme, _diff_bg: Color) -> Color {
+    theme.popup_bg
+}
+
+fn diff_line_style(kind: PatchLineKind, theme: &Theme) -> Style {
+    // Blend the addition/removal background with the active theme's surface.
+    // Preserves readability on light and dark themes, including TokyoNight.
+    let bg = |fg: Color| match (theme.popup_bg, fg) {
+        (Color::Rgb(sr, sg, sb), Color::Rgb(fr, fg, fb)) => Color::Rgb(
+            mix_channel(sr, fr, 23),
+            mix_channel(sg, fg, 23),
+            mix_channel(sb, fb, 23),
+        ),
+        _ => theme.popup_bg,
+    };
+    match kind {
+        PatchLineKind::Meta => theme.accent(),
+        PatchLineKind::Hunk => Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        PatchLineKind::Add => Style::default().fg(theme.unread).bg(bg(theme.unread)),
+        PatchLineKind::Remove => Style::default().fg(theme.error).bg(bg(theme.error)),
+    }
 }
 
 fn plain_reader_line(
@@ -897,9 +1102,11 @@ fn plain_reader_line(
     reader_visual: Option<ReaderSelection>,
     reader_active: bool,
     theme: &crate::theme::Theme,
+    diff_kind: Option<PatchLineKind>,
     illuminate_word: Option<&str>,
 ) -> Line<'static> {
-    let base = diff_line_style(text, theme).unwrap_or_else(|| {
+    let diff = diff_kind.map(|kind| diff_line_style(kind, theme));
+    let base = diff.unwrap_or_else(|| {
         if is_quoted_line(text) { Style::default().fg(theme.muted) }
         else { theme.text() }
     });
@@ -936,6 +1143,7 @@ fn plain_reader_line(
         reader_visual,
         reader_active,
         theme,
+        diff.and_then(|style| style.bg),
     );
     Line::from(spans)
 }
@@ -950,6 +1158,7 @@ fn rich_html_line(
     reader_visual: Option<ReaderSelection>,
     reader_active: bool,
     theme: &crate::theme::Theme,
+    diff_kind: Option<PatchLineKind>,
     illuminate_word: Option<&str>,
 ) -> Line<'static> {
     let mut spans = reader_gutter(
@@ -973,11 +1182,14 @@ fn rich_html_line(
         .map(|word| word_match_ranges(&line_text, word))
         .unwrap_or_default();
     let quoted = is_quoted_line(&line_text);
-    let diff = diff_line_style(&line_text, theme);
+    let diff = diff_kind.map(|kind| diff_line_style(kind, theme));
     let mut column = 0usize;
     for span in &line.spans {
         let mut style = rich_html_style(&span.style, &span.text, theme);
-        if let Some(diff) = diff { style = style.fg(diff.fg.unwrap_or(theme.foreground)); }
+        if let Some(diff) = diff {
+            style = style.fg(diff.fg.unwrap_or(theme.foreground));
+            if let Some(bg) = diff.bg { style = style.bg(bg); }
+        }
         else if quoted { style = style.fg(theme.muted); }
         spans.extend(reader_fragments(
             &span.text,
@@ -1004,6 +1216,7 @@ fn rich_html_line(
         reader_visual,
         reader_active,
         theme,
+        diff.and_then(|style| style.bg),
     );
     Line::from(spans)
 }
@@ -1085,9 +1298,12 @@ fn reader_fragments(
         }
         let mut fragment_style = style;
         if reader_active && line_index == reader_cursor {
-            fragment_style = fragment_style
-                .bg(theme.popup_bg)
-                .add_modifier(Modifier::BOLD);
+            // Diff semantics remain tinted, but selection gets a stronger
+            // background than ordinary additions/removals.
+            let bg = fragment_style.bg
+                .map(|diff_bg| reader_active_diff_bg(theme, diff_bg))
+                .unwrap_or(theme.popup_bg);
+            fragment_style = fragment_style.bg(bg).add_modifier(Modifier::BOLD);
         }
         if illuminate_ranges
             .iter()
@@ -1205,8 +1421,9 @@ fn pad_reader_line(
     reader_visual: Option<ReaderSelection>,
     reader_active: bool,
     theme: &crate::theme::Theme,
+    diff_background: Option<Color>,
 ) {
-    if !reader_active {
+    if !reader_active && diff_background.is_none() {
         return;
     }
     let visual_line_selected = reader_visual.is_some_and(|selection| {
@@ -1215,12 +1432,17 @@ fn pad_reader_line(
     let linewise_visual = reader_visual.is_some_and(|selection| {
         selection.start.column == 0 && selection.end.column == usize::MAX
     });
-    if line_index != reader_cursor && !visual_line_selected {
+    if (line_index != reader_cursor || !reader_active) && !visual_line_selected
+        && diff_background.is_none() {
         return;
     }
-    let mut style = theme.text().add_modifier(Modifier::BOLD);
-    if line_index == reader_cursor {
-        style = style.bg(theme.popup_bg);
+    let mut style = theme.text();
+    if let Some(bg) = diff_background { style = style.bg(bg); }
+    if reader_active && line_index == reader_cursor {
+        style = style.bg(diff_background
+            .map(|bg| reader_active_diff_bg(theme, bg))
+            .unwrap_or(theme.popup_bg))
+            .add_modifier(Modifier::BOLD);
     }
     if visual_line_selected && (linewise_visual || content_len == 0) {
         style = theme.selected();
@@ -1385,17 +1607,31 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let status_area = Rect::new(area.x, area.y, area.width - indicator_width, area.height);
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.status()), status_area);
     if indicator_width == super::NOTIFICATION_INDICATOR_WIDTH {
-        let (glyph, style) = if app.notifications_enabled() {
-            (" 🔔 ", theme.accent())
-        } else {
-            (" 🔕 ", theme.muted())
-        };
+        let (glyph, style) = notification_indicator(app, &theme);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(glyph, style)))
+                .alignment(Alignment::Right)
                 .style(theme.status()),
             Rect::new(area.right().saturating_sub(indicator_width), area.y, indicator_width, area.height),
         );
     }
+}
+
+/// Never guess whether the terminal has a Nerd Font installed. Users opt in
+/// with `ui.notification_icon_style = "nerd"`; Unicode is the safe default.
+fn notification_indicator(app: &App, theme: &Theme) -> (String, Style) {
+    let enabled = app.notifications_enabled();
+    let glyph = match (app.notification_icon_style(), enabled) {
+        (crate::config::NotificationIconStyle::Nerd, true) => "󰂚",
+        (crate::config::NotificationIconStyle::Nerd, false) => "󰂛",
+        (crate::config::NotificationIconStyle::Unicode, true) => "●",
+        (crate::config::NotificationIconStyle::Unicode, false) => "○",
+    };
+    let count = if enabled { app.new_mail_count() } else { 0 };
+    let label = if count > 99 { format!("{glyph} 99+") }
+        else if count > 0 { format!("{glyph} {count}") }
+        else { glyph.to_owned() };
+    (format!(" {label} "), if enabled { theme.accent() } else { theme.muted() })
 }
 
 fn draw_search_header(frame: &mut Frame<'_>, area: Rect, query: &str, app: &App) {
@@ -1413,10 +1649,11 @@ fn draw_search_header(frame: &mut Frame<'_>, area: Rect, query: &str, app: &App)
 
 fn draw_help(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme().clone();
+    let attachment_help = app.attachment_picker_visible;
     let area = centered_rect(frame.area(), 86, 70);
     frame.render_widget(Clear, area);
     let block = Block::default()
-        .title(" Keybindings ")
+        .title(if attachment_help { " Attachment keybindings " } else { " Keybindings " })
         .borders(Borders::ALL)
         .border_style(theme.accent());
     let inner = block.inner(area);
@@ -1437,7 +1674,8 @@ fn draw_help(frame: &mut Frame<'_>, app: &App) {
         frame.render_widget(Paragraph::new(" No matching keybindings").style(theme.muted()), chunks[1]);
     } else {
         let rows = shown.iter().map(|index| {
-            let entry = HELP_ENTRIES[*index];
+            let entry = if attachment_help { ATTACHMENT_HELP_ENTRIES[*index] }
+                else { HELP_ENTRIES[*index] };
             Row::new(vec![
                 Cell::from(entry.category),
                 Cell::from(entry.key),
@@ -1528,7 +1766,7 @@ fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
 /// left, automatic inline preview on the right, mouse/keyboard actions below.
 fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
     let theme = app.theme().clone();
-    let (area, list_area, preview_area, footer) = super::attachment_regions(frame.area());
+    let (area, list_area, preview_area, _) = super::attachment_regions(frame.area());
     frame.render_widget(Clear, area);
     let count = app.attachment_files.len();
     let mark_count = app.attachment_marked.len();
@@ -1562,7 +1800,7 @@ fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
         let available = usize::from(list_area.width.saturating_sub(1))
             .saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
         let name = truncate_display_width(&attachment_display_name(&file.filename), available);
-        let style = if active { theme.current_line().add_modifier(Modifier::BOLD) }
+        let style = if active { theme.selected() }
             else if visual { theme.selected() }
             else if marked { theme.unread() } else { theme.text() };
         // Paragraph background fills the entire row instead of ending at the
@@ -1582,7 +1820,10 @@ fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
     // happens at most once per selection and viewport size, not every frame.
     let preview_w = preview_area.width.saturating_sub(3);
     let preview_h = preview_area.height.saturating_sub(6);
-    app.ensure_attachment_preview(preview_w, preview_h);
+    // Kitty graphics are terminal-side resources. Do not draw the image
+    // underneath a help popup whose Clear can erase it without invalidating
+    // ratatui-image's cached protocol. Rebuild when help closes instead.
+    if !app.help_visible { app.ensure_attachment_preview(preview_w, preview_h); }
     let pleft = preview_area.x.saturating_add(2);
     let pwidth = preview_area.width.saturating_sub(3);
     if let Some(file) = app.attachment_files.get(selected) {
@@ -1592,7 +1833,7 @@ fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
             .style(theme.muted()), Rect::new(pleft, preview_area.y.saturating_add(1), pwidth, 1));
         let content = Rect::new(pleft, preview_area.y.saturating_add(3), pwidth,
             preview_area.height.saturating_sub(4));
-        if let Some(protocol) = app.attachment_preview() {
+        if let Some(protocol) = (!app.help_visible).then(|| app.attachment_preview()).flatten() {
             let size = protocol.size();
             if size.width <= content.width && size.height <= content.height {
                 let rect = Rect::new(content.x + content.width.saturating_sub(size.width)/2,
@@ -1627,12 +1868,6 @@ fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
             .style(theme.muted()), preview_area);
     }
 
-    let footer_first = Rect::new(footer.x, footer.y, footer.width, footer.height.min(1));
-    let footer_second = Rect::new(footer.x, footer.y.saturating_add(1), footer.width, footer.height.saturating_sub(1));
-    frame.render_widget(Paragraph::new(" [o] Open    [s] Browse & save    [Space] Mark")
-        .style(theme.accent()), footer_first);
-    frame.render_widget(Paragraph::new(" j/k · 5j/5k · gg/G · Ctrl-j/k smooth · v visual · a all · Esc close")
-        .style(theme.muted()), footer_second);
 }
 
 /// Save received attachments into a browsed directory (same Yazi-like
@@ -1748,9 +1983,9 @@ fn draw_compose_exit_prompt(frame: &mut Frame<'_>, app: &App) {
         Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1)),
     );
     let footer = Line::from(vec![
-        Span::styled("Y / Enter", theme.accent()), Span::styled(" Save    ", theme.text()),
-        Span::styled("D / N", theme.accent()), Span::styled(" Discard    ", theme.text()),
-        Span::styled("Esc", theme.accent()), Span::styled(" Keep editing", theme.text()),
+        Span::styled("y", theme.accent()), Span::styled("  Save draft    ", theme.text()),
+        Span::styled("d / n", theme.accent()), Span::styled("  Discard    ", theme.text()),
+        Span::styled("Esc", theme.accent()), Span::styled("  Keep editing", theme.text()),
     ]);
     frame.render_widget(Paragraph::new(footer),
         Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1));
@@ -1861,7 +2096,7 @@ fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
         Span::styled(" Enter ", Style::default().bg(theme.accent).fg(Color::Black).add_modifier(Modifier::BOLD)),
         Span::styled(" Send   ", theme.text()),
         Span::styled("Esc", theme.accent()), Span::styled(" Edit   ", theme.muted()),
-        Span::styled("T", theme.accent()), Span::styled(format!(" {mode}   "), theme.muted()),
+        Span::styled("t", theme.accent()), Span::styled(format!(" {mode}   "), theme.muted()),
         Span::styled("O", theme.accent()), Span::styled(" Browser   ", theme.muted()),
         Span::styled("j/k", theme.accent()), Span::styled(" Scroll", theme.muted()),
     ]);
@@ -2020,13 +2255,20 @@ fn draw_compose_file_picker(frame: &mut Frame<'_>, app: &mut App) {
             crate::app::ComposeFilePreview::Patch(patch) => {
                 use crate::patch_preview::PatchTone;
                 let mut lines: Vec<Line<'static>> = patch.lines.iter().map(|fragments| {
-                    let spans = fragments.iter().map(|fragment| {
-                        let style = match fragment.tone {
+                    // Apply a consistent row background even where tree-sitter
+                    // overlays source syntax colors on added code.
+                    let patch_background = match fragments.first().map(|f| f.tone) {
+                        Some(PatchTone::Add) => diff_line_style(PatchLineKind::Add, &theme).bg,
+                        Some(PatchTone::Remove) => diff_line_style(PatchLineKind::Remove, &theme).bg,
+                        _ => None,
+                    };
+                    let mut spans = fragments.iter().map(|fragment| {
+                        let mut style = match fragment.tone {
                             PatchTone::Default => theme.text(),
                             PatchTone::Meta => theme.accent().add_modifier(Modifier::BOLD),
                             PatchTone::Hunk => theme.accent().add_modifier(Modifier::BOLD),
-                            PatchTone::Add => theme.unread(),
-                            PatchTone::Remove => theme.error(),
+                            PatchTone::Add => diff_line_style(PatchLineKind::Add, &theme),
+                            PatchTone::Remove => diff_line_style(PatchLineKind::Remove, &theme),
                             PatchTone::Keyword => Style::default().fg(theme.visual),
                             PatchTone::String => Style::default().fg(theme.warning),
                             PatchTone::Comment => theme.muted(),
@@ -2034,8 +2276,18 @@ fn draw_compose_file_picker(frame: &mut Frame<'_>, app: &mut App) {
                             PatchTone::Function => theme.accent(),
                             PatchTone::Type => theme.accent(),
                         };
+                        if let Some(bg) = patch_background { style = style.bg(bg); }
                         Span::styled(fragment.text.clone(), style)
                     }).collect::<Vec<_>>();
+                    if let Some(bg) = patch_background {
+                        let used = fragments.iter()
+                            .map(|fragment| UnicodeWidthStr::width(fragment.text.as_str()))
+                            .sum::<usize>();
+                        let padding = usize::from(preview.width).saturating_sub(used);
+                        if padding > 0 {
+                            spans.push(Span::styled(" ".repeat(padding), Style::default().bg(bg)));
+                        }
+                    }
                     Line::from(spans)
                 }).collect();
                 if patch.truncated { lines.push(Line::styled("… truncated …", theme.muted())); }
@@ -2569,6 +2821,112 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     #[test]
+    fn active_diff_row_gets_a_distinct_highlight() {
+        use super::{PatchLineKind, diff_line_style, plain_reader_line};
+        let theme = load_themes().into_iter().next().expect("theme");
+        let diff = diff_line_style(PatchLineKind::Remove, &theme);
+        let normal = plain_reader_line("- old text", 0, 10, 40, 9, 0, None, true, &theme,
+            Some(PatchLineKind::Remove), None);
+        let active = plain_reader_line("- old text", 0, 10, 40, 0, 0, None, true, &theme,
+            Some(PatchLineKind::Remove), None);
+        assert_eq!(normal.spans.last().and_then(|s| s.style.bg), diff.bg);
+        assert_eq!(active.spans.last().and_then(|s| s.style.bg), theme.current_line().bg);
+        assert!(active.spans.last().is_some_and(|s|
+            s.style.add_modifier.contains(ratatui::style::Modifier::BOLD)));
+
+        let added = plain_reader_line("+ new text", 0, 10, 40, 0, 0, None, true,
+            &theme, Some(PatchLineKind::Add), None);
+        assert_eq!(added.spans.last().and_then(|s| s.style.bg), theme.current_line().bg);
+    }
+
+    #[test]
+    fn wrapped_body_line_cursor_row_matches_paragraph_layout() {
+        use super::reader_visual_cursor_row;
+        use ratatui::text::{Line, Span, Text};
+        use ratatui::widgets::{Paragraph, Wrap};
+        let theme = load_themes().into_iter().next().expect("theme");
+        let lines = vec![
+            Line::raw("From: Sender"),
+            Line::raw("first body line that wraps through several screen rows"),
+            Line::from(vec![
+                Span::raw("a very long body line with "),
+                Span::styled("X", super::reader_cursor_style()),
+                Span::raw(" trailing content"),
+            ]),
+        ];
+        let preceding_rows = Paragraph::new(Text::from(lines[..2].to_vec()))
+            .wrap(Wrap { trim: false }).line_count(20);
+        let cursor_row = reader_visual_cursor_row(&lines, 1, 1, 20).unwrap();
+        assert!(cursor_row >= preceding_rows);
+        assert!(cursor_row > 2, "wrapped rows must contribute to the scroll position");
+        assert_eq!(super::reader_active_diff_bg(&theme, theme.error), theme.popup_bg);
+    }
+
+    #[test]
+    fn compact_headers_hide_addresses_but_preserve_all_recipient_names() {
+        use crate::model::{MessageFlags, MessageId, MessageSummary};
+        let theme = load_themes().into_iter().next().expect("theme");
+        let message = MessageSummary {
+            id: MessageId("local-id".into()),
+            message_id: Some("message@example.org".into()),
+            in_reply_to: None,
+            references: vec![],
+            from_name: "Alex Sender".into(),
+            from_address: "alex@example.org".into(),
+            to: "Recipient One <one@example.org>, Recipient Two <two@example.org>".into(),
+            cc: "CC Person <cc@example.org>".into(),
+            bcc: "BCC Person <bcc@example.org>".into(),
+            subject: "Hello".into(),
+            timestamp: 0,
+            date_label: String::new(),
+            size: 0,
+            flags: MessageFlags::empty(),
+            has_attachment_hint: false,
+            attachment_names_hint: vec![],
+        };
+        let text = |show_details| super::reader_header_lines(&message, show_details, &theme)
+            .into_iter()
+            .map(|line| line.spans.into_iter().map(|span| span.content.into_owned()).collect::<String>())
+            .collect::<Vec<_>>().join("\n");
+        let compact = text(false);
+        let expanded = text(true);
+        assert!(compact.contains("From: Alex Sender\n"));
+        assert!(!compact.contains("alex@example.org"));
+        assert!(!compact.contains("Message-ID:"));
+        for header in [
+            "To: Recipient One, Recipient Two",
+            "Cc: CC Person",
+            "Bcc: BCC Person",
+            "Subject: Hello",
+            "Date: unknown",
+        ] {
+            assert!(compact.contains(header), "missing compact header: {header}");
+        }
+        for address in ["one@example.org", "two@example.org", "cc@example.org", "bcc@example.org"] {
+            assert!(!compact.contains(address), "leaked address: {address}");
+            assert!(expanded.contains(address), "missing expanded address: {address}");
+        }
+        assert!(expanded.contains("From: Alex Sender <alex@example.org>"));
+        assert!(expanded.contains("Message-ID: <message@example.org>"));
+    }
+
+    #[test]
+    fn compact_recipients_support_quoted_commas_and_bare_addresses() {
+        assert_eq!(super::compact_recipient_header(
+            "\"Doe, Jane\" <jane@example.com>, bare@example.com, <only@example.com>"),
+            "Doe, Jane, bare@example.com, <only@example.com>");
+        assert_eq!(super::compact_recipient_header("Research Team <team@example.com>;"),
+            "Research Team;");
+    }
+
+    #[test]
+    fn missing_sender_name_keeps_address_even_when_compact() {
+        assert_eq!(super::sender_header_value("", "nobody@example.org", false), "nobody@example.org");
+        assert_eq!(super::sender_header_value("Alex", "alex@example.org", false), "Alex");
+        assert_eq!(super::sender_header_value("Alex", "alex@example.org", true), "Alex <alex@example.org>");
+    }
+
+    #[test]
     fn message_attachment_subtitle_has_no_extra_indentation() {
         let names = vec!["config.example.toml".to_owned(), "LICENSE".to_owned()];
         assert_eq!(super::attachment_subtitle(&names), "config.example.toml · LICENSE");
@@ -2589,17 +2947,64 @@ mod tests {
     }
 
     #[test]
-    fn mailed_diff_add_remove_and_hunk_have_distinct_styles() {
-        use super::diff_line_style;
+    fn notification_indicator_has_unicode_fallback_and_nerd_opt_in() {
+        let config: crate::config::Config = toml::from_str(
+            "[ui]\nnew_mail_notifications = true\nnotification_icon_style = \"unicode\""
+        ).unwrap();
+        let app = crate::app::App::new(&config, vec![]);
         let theme = load_themes().into_iter().next().unwrap();
-        let add = diff_line_style("+new", &theme).unwrap();
-        let quoted_add = diff_line_style("> +new", &theme).unwrap();
-        let remove = diff_line_style("-old", &theme).unwrap();
-        let hunk = diff_line_style("@@ -1,2 +1,3 @@", &theme).unwrap();
-        assert_eq!(add.fg, quoted_add.fg);
+        assert!(super::notification_indicator(&app, &theme).0.contains('●'));
+        let nerd_config: crate::config::Config = toml::from_str(
+            "[ui]\nnew_mail_notifications = true\nnotification_icon_style = \"nerd\""
+        ).unwrap();
+        let nerd_app = crate::app::App::new(&nerd_config, vec![]);
+        assert!(super::notification_indicator(&nerd_app, &theme).0.contains("󰂚"));
+    }
+
+    #[test]
+    fn mailed_diff_only_colors_real_hunks_with_backgrounds() {
+        use super::{PatchLineKind, classify_patch_lines, diff_line_style};
+        let theme = load_themes().into_iter().next().unwrap();
+        let lines = [
+            "On Tue, Takashi wrote:",
+            "> > This results in -EIO.",
+            "> ---",
+            "> --",
+            "> -EIO",
+            "> diff --git a/card.c b/card.c",
+            "> index 123..456 100644",
+            "> --- a/card.c",
+            "> +++ b/card.c",
+            "> @@ -1,2 +1,2 @@",
+            ">  context",
+            "> -old",
+            "> +new",
+            "> This is ordinary follow-up prose, -EIO should stay plain.",
+        ];
+        let kinds = classify_patch_lines(&lines);
+        assert!(kinds[..5].iter().all(Option::is_none));
+        assert_eq!(kinds[5], Some(PatchLineKind::Meta));
+        assert_eq!(kinds[9], Some(PatchLineKind::Hunk));
+        assert_eq!(kinds[11], Some(PatchLineKind::Remove));
+        assert_eq!(kinds[12], Some(PatchLineKind::Add));
+        assert_eq!(kinds[13], None);
+        let add = diff_line_style(PatchLineKind::Add, &theme);
+        let remove = diff_line_style(PatchLineKind::Remove, &theme);
         assert_ne!(add.fg, remove.fg);
-        assert_ne!(hunk.fg, add.fg);
-        assert!(diff_line_style("normal prose", &theme).is_none());
+        assert!(add.bg.is_some());
+        assert!(remove.bg.is_some());
+        assert_ne!(add.bg, remove.bg);
+    }
+
+    #[test]
+    fn adjacent_unified_headers_allow_non_git_patches() {
+        use super::{PatchLineKind, classify_patch_lines};
+        let lines = ["--- a/foo", "+++ b/foo", "@@ -1 +1 @@", "-before", "+after", "--", "-EIO"];
+        let kinds = classify_patch_lines(&lines);
+        assert_eq!(kinds[3], Some(PatchLineKind::Remove));
+        assert_eq!(kinds[4], Some(PatchLineKind::Add));
+        assert_eq!(kinds[5], None);
+        assert_eq!(kinds[6], None);
     }
 
     #[test]
@@ -2755,7 +3160,7 @@ mod tests {
     fn reader_cursor_remains_visible_on_blank_lines() {
         let theme = load_themes().into_iter().next().expect("theme");
         let mut spans = Vec::new();
-        pad_reader_line(&mut spans, 0, 8, 2, 2, 0, None, true, &theme);
+        pad_reader_line(&mut spans, 0, 8, 2, 2, 0, None, true, &theme, None);
 
         assert!(!spans.is_empty());
         assert_eq!(spans[0].content.as_ref(), " ");

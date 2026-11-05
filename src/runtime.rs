@@ -251,7 +251,9 @@ fn event_loop(
                 app.handle_key(key);
             }
             RuntimeEvent::Input(event::Event::Key(_)) => continue,
-            RuntimeEvent::Input(event::Event::Resize(_, _)) => {}
+            RuntimeEvent::Input(event::Event::Resize(_, _)) => {
+                app.invalidate_attachment_preview_layout();
+            }
             RuntimeEvent::Input(event::Event::Mouse(mouse)) => {
                 let size = terminal.size()?;
                 app.handle_mouse(mouse, size.width, size.height);

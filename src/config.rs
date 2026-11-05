@@ -161,6 +161,26 @@ impl std::fmt::Debug for AccountConfig {
     }
 }
 
+/// Glyph choice cannot be inferred reliably from a terminal's font. Default
+/// to universally available Unicode and let Nerd Font users opt in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationIconStyle {
+    Nerd,
+    #[default]
+    Unicode,
+}
+
+/// How `/` filters messages in the mail list. Fuzzy matching ranks ordered
+/// character matches first, while strict preserves the original substring filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MailSearchMode {
+    #[default]
+    Fuzzy,
+    Strict,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UiConfig {
     /// Legacy milestone-3 setting. Kept so existing config files continue to
@@ -196,6 +216,12 @@ pub struct UiConfig {
     /// Desktop notification on a new Inbox count (after baseline is known).
     #[serde(default = "default_true")]
     pub new_mail_notifications: bool,
+    /// `unicode` (●/○, default) or `nerd` (Material Design bell glyphs).
+    #[serde(default)]
+    pub notification_icon_style: NotificationIconStyle,
+    /// Message-list `/` matching: `fuzzy` (default) or `strict` (substring).
+    #[serde(default)]
+    pub search_mode: MailSearchMode,
     /// freedesktop sound theme name; COSMIC-installed themes can provide this.
     #[serde(default = "default_mail_sound_name")]
     pub new_mail_sound_name: String,
@@ -217,6 +243,8 @@ impl Default for UiConfig {
             inbox_poll_seconds: default_inbox_poll_seconds(),
             new_mail_bell: false,
             new_mail_notifications: true,
+            notification_icon_style: NotificationIconStyle::default(),
+            search_mode: MailSearchMode::default(),
             new_mail_sound_name: default_mail_sound_name(),
             new_mail_sound_file: None,
         }
@@ -550,6 +578,12 @@ mod tests {
     use super::Config;
 
     #[test]
+    fn notification_icon_style_parses_nerd_fonts_explicitly() {
+        let config: Config = toml::from_str("[ui]\nnotification_icon_style = \"nerd\"").unwrap();
+        assert_eq!(config.ui.notification_icon_style, super::NotificationIconStyle::Nerd);
+    }
+
+    #[test]
     fn parses_account_config() {
         let config: Config = toml::from_str(
             r#"
@@ -575,7 +609,19 @@ mod tests {
         assert_eq!(config.ui.inbox_poll_seconds, 20);
         assert!(!config.ui.new_mail_bell);
         assert!(config.ui.new_mail_notifications);
+        assert_eq!(config.ui.notification_icon_style, super::NotificationIconStyle::Unicode);
+        assert_eq!(config.ui.search_mode, super::MailSearchMode::Fuzzy);
         assert_eq!(config.ui.new_mail_sound_name, "message-new-email");
+    }
+
+    #[test]
+    fn mailbox_search_mode_is_fuzzy_unless_configured_strict() {
+        let default: super::Config = toml::from_str("[ui]\ntheme = \"tokyo-night\"").unwrap();
+        assert_eq!(default.ui.search_mode, super::MailSearchMode::Fuzzy);
+        let strict: super::Config = toml::from_str("[ui]\nsearch_mode = \"strict\"").unwrap();
+        assert_eq!(strict.ui.search_mode, super::MailSearchMode::Strict);
+        let invalid = toml::from_str::<super::Config>("[ui]\nsearch_mode = \"approximate\"");
+        assert!(invalid.is_err());
     }
 
     #[test]

@@ -205,18 +205,59 @@ fn visible_mime_attachment(part: &mail_parser::MessagePart<'_>) -> bool {
     true
 }
 
+/// Some calendar providers include identical invitation bytes twice: an unnamed
+/// `text/calendar` alternative and a named `invite.ics` attachment. Show the
+/// named file only, but preserve unique or explicitly attached calendar parts.
+fn attachment_parts<'msg>(message: &'msg mail_parser::Message<'_>) -> Vec<mail_parser::MessagePart<'msg>> {
+    let parts: Vec<_> = message.attachments()
+        .filter(|part| visible_mime_attachment(part)).collect();
+    parts.iter().filter(|part| {
+        if !part.is_content_type("text", "calendar")
+            || part.attachment_name().is_some_and(|name| !name.trim().is_empty())
+            || part.content_disposition().is_some_and(|disposition| disposition.is_attachment())
+        {
+            return true;
+        }
+        !parts.iter().any(|named| {
+            named.attachment_name().is_some_and(|name| name.to_ascii_lowercase().ends_with(".ics"))
+                && named.decoded().as_ref() == part.decoded().as_ref()
+        })
+    }).copied().collect()
+}
+
+fn attachment_display_name(part: &mail_parser::MessagePart<'_>, index: usize) -> String {
+    let raw_name = part.attachment_name().unwrap_or("");
+    let name = raw_name.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("").trim();
+    if name.is_empty() || name == "." || name == ".." {
+        if part.is_content_type("text", "calendar") { "invite.ics".into() }
+        else { format!("attachment-{}", index + 1) }
+    } else { name.to_owned() }
+}
+
+/// Cached IMAP summary hints predate the calendar MIME deduplication fix.
+/// Until the message body is fetched, hide a single generic placeholder when
+/// a named calendar invite is also advertised. The decoded MIME parts remain
+/// authoritative: distinct invitations are still available after opening.
+pub fn visible_attachment_hints(hints: &[String]) -> Vec<String> {
+    let has_ics = hints.iter().any(|name| name.to_ascii_lowercase().ends_with(".ics"));
+    let generic_count = hints.iter().filter(|name| {
+        name.strip_prefix("attachment-").is_some_and(|suffix|
+            !suffix.is_empty() && suffix.bytes().all(|ch| ch.is_ascii_digit()))
+    }).count();
+    // Only the exact legacy two-chip case is unambiguous enough to
+    // collapse without decoded MIME bytes. Keep larger/mixed lists intact.
+    if !has_ics || generic_count != 1 || hints.len() != 2 { return hints.to_vec(); }
+    hints.iter().filter(|name| !name.strip_prefix("attachment-").is_some_and(|suffix|
+        !suffix.is_empty() && suffix.bytes().all(|ch| ch.is_ascii_digit())))
+        .cloned().collect()
+}
+
 pub fn extract_attachments(raw: &[u8]) -> Result<Vec<OutgoingAttachment>> {
     let parsed = MessageParser::new().parse(raw)
         .ok_or_else(|| anyhow!("unable to parse MIME attachments"))?;
     let mut results = Vec::new();
-    for (index, part) in parsed.attachments().filter(|part| visible_mime_attachment(part)).enumerate() {
-        let raw_name = part.attachment_name().unwrap_or("");
-        let name = raw_name.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("").trim();
-        let filename = if name.is_empty() || name == "." || name == ".." {
-            format!("attachment-{}", index + 1)
-        } else {
-            name.to_owned()
-        };
+    for (index, part) in attachment_parts(&parsed).into_iter().enumerate() {
+        let filename = attachment_display_name(&part, index);
         let data = part.decoded().into_owned();
         results.push(OutgoingAttachment {
             content_type: guessed_attachment_type(&filename, &data).to_owned(),
@@ -242,6 +283,7 @@ fn guessed_attachment_type(name: &str, bytes: &[u8]) -> &'static str {
         Some("txt" | "patch" | "diff" | "log" | "md") => "text/plain",
         Some("csv") => "text/csv",
         Some("json") => "application/json",
+        Some("ics") => "text/calendar",
         Some("svg") => "image/svg+xml",
         _ => "application/octet-stream",
     }
@@ -286,16 +328,8 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         .map(|(text, lines, renderer)| (Some(text), Some(lines), Some(renderer)))
         .unwrap_or((None, None, None));
 
-    let attachment_names: Vec<String> = message.attachments()
-        .filter(|part| visible_mime_attachment(part))
-        .enumerate()
-        .map(|(index, part)| {
-            let raw = part.attachment_name().unwrap_or("");
-            let name = raw.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("").trim();
-            if name.is_empty() || name == "." || name == ".." {
-                format!("attachment-{}", index + 1)
-            } else { name.to_owned() }
-        }).collect();
+    let attachment_names: Vec<String> = attachment_parts(&message).into_iter()
+        .enumerate().map(|(index, part)| attachment_display_name(&part, index)).collect();
     Ok(MessageBody {
         id,
         plain_text,
@@ -1115,6 +1149,51 @@ References: <root@example.com>\r\n\t<cover@example.com>\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 Hello from the body.\r\n";
+
+    #[test]
+    fn old_cached_calendar_hints_are_collapsed_for_list_and_reader() {
+        let hints = vec!["attachment-1".into(), "invite.ics".into()];
+        assert_eq!(super::visible_attachment_hints(&hints), vec!["invite.ics"]);
+        assert_eq!(hints.len(), 2, "do not mutate cached source data");
+        assert_eq!(super::visible_attachment_hints(&["attachment-1".into()]),
+            vec!["attachment-1"]);
+        assert_eq!(super::visible_attachment_hints(&[
+            "attachment-1".into(), "invite.ics".into(), "report.pdf".into(),
+        ]).len(), 3, "never guess about larger multipart messages");
+    }
+
+    #[test]
+    fn duplicate_calendar_part_shows_only_named_ics_attachment() {
+        // Matches the structure of Google Calendar invitations: a calendar
+        // alternate alongside the exact same bytes named invite.ics.
+        let raw = b"From: sender@example.org\r\nSubject: Event\r\n\
+MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
+--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n\
+--inner\r\nContent-Type: text/plain\r\n\r\nInvitation\r\n\
+--inner--\r\n\
+--outer\r\nContent-Type: text/calendar\r\n\r\nBEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n\
+--outer\r\nContent-Type: application/ics; name=invite.ics\r\n\
+Content-Disposition: attachment; filename=invite.ics\r\n\r\n\
+BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n\
+--outer--\r\n";
+        let attachments = super::extract_attachments(raw).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "invite.ics");
+        let body = parse_body(MessageId("calendar".into()), raw).unwrap();
+        assert_eq!(body.attachment_names, vec!["invite.ics"]);
+    }
+
+    #[test]
+    fn standalone_calendar_part_still_appears_as_invite_ics() {
+        let raw = b"From: sender@example.org\r\nSubject: Event\r\n\
+MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
+--outer\r\nContent-Type: text/plain\r\n\r\nBody\r\n\
+--outer\r\nContent-Type: text/calendar\r\n\r\nBEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n\
+--outer--\r\n";
+        let files = super::extract_attachments(raw).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "invite.ics");
+    }
 
     #[test]
     fn header_reader_stops_before_body() {

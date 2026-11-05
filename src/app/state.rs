@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use ratatui::layout::Size;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
-use crate::app::{Command, Focus, HELP_ENTRIES, command_for_key};
+use crate::app::{ATTACHMENT_HELP_ENTRIES, Command, Focus, HELP_ENTRIES, command_for_key};
 use crate::setup::{SetupWizard, WizardAction};
 use crate::cache::{self, CachedMailbox};
 use crate::backend::MailboxSyncHint;
@@ -1580,6 +1580,33 @@ struct PendingCompose {
 }
 
 
+/// Match a query as an ordered, case-insensitive subsequence. Consecutive
+/// characters, word boundaries and exact substrings rank ahead of scattered
+/// matches; no external search dependency or indexing is required for a page.
+fn mail_fuzzy_score(field: &str, query_lower: &str) -> Option<i64> {
+    let lower = field.to_lowercase();
+    let hay = lower.chars().collect::<Vec<_>>();
+    let needle = query_lower.chars().collect::<Vec<_>>();
+    if needle.is_empty() { return Some(0); }
+    let mut at = 0usize;
+    let mut previous = None;
+    let mut score = 0i64;
+    for wanted in needle {
+        let position = (at..hay.len()).find(|&index| hay[index] == wanted)?;
+        score += 10;
+        if position == 0 || !hay[position - 1].is_alphanumeric() { score += 9; }
+        if let Some(prev) = previous {
+            if position == prev + 1 { score += 12; }
+            else { score -= i64::try_from(position - prev - 1).unwrap_or(100).min(12); }
+        }
+        previous = Some(position);
+        at = position + 1;
+    }
+    if lower.contains(query_lower) { score += 80; }
+    score -= i64::try_from(hay.len() / 20).unwrap_or(10).min(10);
+    Some(score)
+}
+
 pub struct AccountState {
     pub name: String,
     pub default_mailbox: String,
@@ -1617,6 +1644,7 @@ pub struct AccountState {
     unverified_mailboxes: HashSet<String>,
     pub search_query: String,
     pub search_editing: bool,
+    pub search_mode: crate::config::MailSearchMode,
     pub bodies: HashMap<MessageId, MessageBody>,
     pub pending_bodies: HashSet<MessageId>,
     pub pending_seen: HashSet<MessageId>,
@@ -1678,21 +1706,30 @@ impl AccountState {
 
     #[must_use]
     pub fn visible_message_indices(&self) -> Vec<usize> {
-        let query = self.search_query.trim().to_ascii_lowercase();
+        let query = self.search_query.trim().to_lowercase();
         if query.is_empty() {
             return (0..self.messages.len()).collect();
         }
-        self.messages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| {
-                let matches = message.subject.to_ascii_lowercase().contains(&query)
-                    || message.from_name.to_ascii_lowercase().contains(&query)
-                    || message.from_address.to_ascii_lowercase().contains(&query)
-                    || message.date_label.to_ascii_lowercase().contains(&query);
-                matches.then_some(index)
-            })
-            .collect()
+        let mut matches = self.messages.iter().enumerate().filter_map(|(index, message)| {
+            let fields = [
+                message.subject.as_str(), message.from_name.as_str(),
+                message.from_address.as_str(), message.date_label.as_str(),
+            ];
+            match self.search_mode {
+                crate::config::MailSearchMode::Strict => {
+                    fields.iter().any(|field| field.to_lowercase().contains(&query))
+                        .then_some((index, 0i64))
+                }
+                crate::config::MailSearchMode::Fuzzy => fields.iter()
+                    .filter_map(|field| mail_fuzzy_score(field, &query))
+                    .max().map(|score| (index, score)),
+            }
+        }).collect::<Vec<_>>();
+        if self.search_mode == crate::config::MailSearchMode::Fuzzy {
+            // Stable for ties; keep server date order whenever scores agree.
+            matches.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        }
+        matches.into_iter().map(|(index, _)| index).collect()
     }
 
     #[must_use]
@@ -2146,6 +2183,8 @@ pub struct App {
     new_mail_bell_enabled: bool,
     new_mail_bell_pending: bool,
     new_mail_notifications_enabled: bool,
+    notification_icon_style: crate::config::NotificationIconStyle,
+    new_mail_since_launch: usize,
     new_mail_sound_name: String,
     new_mail_sound_file: Option<String>,
     new_mail_notices: VecDeque<NewMailNotice>,
@@ -2164,9 +2203,11 @@ pub struct App {
     reader_preferred_column: Option<usize>,
     reader_pending_g: bool,
     reader_pending_inner_object: bool,
-    reader_body_start: usize,
     reader_line_count: usize,
     reader_view_height: usize,
+    /// Follow the Vim cursor after the renderer measures wrapped terminal rows.
+    /// Mouse/independent preview scrolling should not snap back on idle redraws.
+    reader_scroll_follow_pending: bool,
     image_picker: Option<Picker>,
     image_loader: Option<MailImageLoader>,
     reader_image: Option<ReaderImage>,
@@ -2224,6 +2265,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: &Config, workers: Vec<WorkerHandle>) -> Self {
+        let app_search_mode = config.ui.search_mode;
         let accounts = config
             .accounts
             .iter()
@@ -2277,6 +2319,7 @@ impl App {
                 unverified_mailboxes,
                 search_query: String::new(),
                 search_editing: false,
+                search_mode: app_search_mode,
                 bodies: HashMap::new(),
                 pending_bodies: HashSet::new(),
                 pending_seen: HashSet::new(),
@@ -2322,6 +2365,8 @@ impl App {
             new_mail_bell_enabled: config.ui.new_mail_bell,
             new_mail_bell_pending: false,
             new_mail_notifications_enabled: config.ui.new_mail_notifications,
+            notification_icon_style: config.ui.notification_icon_style,
+            new_mail_since_launch: 0,
             new_mail_sound_name: config.ui.new_mail_sound_name.clone(),
             new_mail_sound_file: config.ui.new_mail_sound_file.clone(),
             new_mail_notices: VecDeque::new(),
@@ -2340,9 +2385,9 @@ impl App {
             reader_preferred_column: None,
             reader_pending_g: false,
             reader_pending_inner_object: false,
-            reader_body_start: 0,
             reader_line_count: 0,
             reader_view_height: 1,
+            reader_scroll_follow_pending: false,
             image_picker: None,
             image_loader: None,
             reader_image: None,
@@ -2442,6 +2487,14 @@ impl App {
 
     /// Desktop banners and their associated sound; independent of the terminal BEL setting.
     pub fn notifications_enabled(&self) -> bool { self.new_mail_notifications_enabled }
+
+    pub fn notification_icon_style(&self) -> crate::config::NotificationIconStyle {
+        self.notification_icon_style
+    }
+
+    /// Count only arrivals detected during this session; older unread mail is
+    /// not incorrectly presented as a new notification.
+    pub fn new_mail_count(&self) -> usize { self.new_mail_since_launch }
 
     pub fn new_mail_sound_name(&self) -> &str { &self.new_mail_sound_name }
     pub fn new_mail_sound_file(&self) -> Option<&str> { self.new_mail_sound_file.as_deref() }
@@ -2632,8 +2685,9 @@ impl App {
             self.handle_setup_key(key);
             return;
         }
-        // Ctrl-a opens account setup outside compose and other modal contexts.
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('a')
+        // Account actions share Alt shortcuts. Ctrl-a remains available for
+        // the compose attachment picker, not the account setup wizard.
+        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('a')
             && self.composer.is_none() && self.confirmation.is_none()
             && !self.help_visible && !self.theme_picker_visible
             && !self.attachment_picker_visible
@@ -2832,10 +2886,6 @@ impl App {
                 self.toggle_header_details();
                 true
             }
-            KeyCode::Char('z') => {
-                self.open_attachment_picker();
-                true
-            }
             KeyCode::Char('0') if self.count_prefix.is_none() => {
                 self.reader_column = 0;
                 self.reader_preferred_column = None;
@@ -2966,7 +3016,7 @@ impl App {
                 );
                 true
             }
-            KeyCode::Char('T') => {
+            KeyCode::Char('t') => {
                 self.count_prefix = None;
                 self.toggle_html();
                 true
@@ -3064,6 +3114,9 @@ impl App {
                     mailbox.counts_known = true;
                 }
                 if new_count > 0 {
+                    if self.new_mail_notifications_enabled {
+                        self.new_mail_since_launch = self.new_mail_since_launch.saturating_add(new_count);
+                    }
                     // Keep the UID-keyed header cache on new arrivals. The
                     // next SELECT validates UIDVALIDITY and obtains a current
                     // UID+FLAGS page before we reuse any old summary. Dropping
@@ -3713,6 +3766,10 @@ impl App {
                 self.count_prefix = None;
                 self.unarchive_selected();
             }
+            Command::ToggleSpam => {
+                self.count_prefix = None;
+                self.toggle_spam_selected();
+            }
             Command::Attachments => {
                 self.count_prefix = None;
                 self.open_attachment_picker();
@@ -3769,6 +3826,7 @@ impl App {
                     // Prevent previously queued messages from appearing after mute.
                     self.new_mail_notices.clear();
                     self.new_mail_bell_pending = false;
+                    self.new_mail_since_launch = 0;
                 }
                 self.status = StatusLine::temporary(
                     if self.new_mail_notifications_enabled { "new-mail notifications enabled" }
@@ -4202,6 +4260,12 @@ impl App {
         account.keep_message_cursor_visible();
     }
 
+    /// True only after a Vim cursor motion. Measuring the wrapped cursor row
+    /// on every idle redraw would be expensive for large HTML emails.
+    pub fn reader_needs_scroll_follow(&self) -> bool {
+        self.reader_scroll_follow_pending
+    }
+
     /// Called by the renderer after laying out the current message. Keeping the
     /// reader cursor and scroll bounds together makes normal/visual reader
     /// motions deterministic even when the message body is shorter than the
@@ -4240,12 +4304,11 @@ impl App {
     /// viewport.
     pub fn set_reader_layout(
         &mut self,
-        body_start: usize,
         line_count: usize,
         view_height: usize,
         max_scroll: u16,
+        cursor_visual_row: Option<usize>,
     ) {
-        self.reader_body_start = body_start;
         self.reader_line_count = line_count;
         self.reader_view_height = view_height.max(1);
         if line_count == 0 {
@@ -4275,6 +4338,9 @@ impl App {
             self.clamp_reader_column();
         }
 
+        let follow_cursor = self.reader_scroll_follow_pending && line_count > 0;
+        self.reader_scroll_follow_pending = false;
+        let cursor_at_start = self.reader_cursor == 0;
         let Some(account) = self.account_mut() else {
             return;
         };
@@ -4284,6 +4350,17 @@ impl App {
             .smooth_preview_target
             .map(|target| target.min(max_scroll))
             .filter(|target| *target != account.preview_scroll);
+        if follow_cursor {
+            if cursor_at_start {
+                // Keep the real header and hero image visible at the top.
+                account.preview_scroll = 0;
+            } else if let Some(row) = cursor_visual_row {
+                account.preview_scroll = u16::try_from(reader_scroll_for_visual_cursor(
+                    usize::from(account.preview_scroll), row, view_height.max(1),
+                    usize::from(max_scroll),
+                )).unwrap_or(u16::MAX);
+            }
+        }
     }
 
     fn reader_display_text(&self) -> Option<&str> {
@@ -4418,48 +4495,12 @@ impl App {
     }
 
     fn keep_reader_cursor_visible(&mut self) {
-        let body_start = self.reader_body_start;
-        let cursor_row = body_start.saturating_add(self.reader_cursor);
-        let view_height = self.reader_view_height.max(1);
-        let total_rows = body_start
-            .saturating_add(self.reader_line_count)
-            .max(view_height);
-
-        let reader_cursor = self.reader_cursor;
-        let Some(account) = self.account_mut() else {
-            return;
-        };
-        account.smooth_preview_target = None;
-
-        // When Vim/neoscroll returns to the first body line, restore the true
-        // top of the message as well. The image sits between the headers and the
-        // body, so leaving scrolloff anchored at `body_start` kept the cursor
-        // visible while the header image remained scrolled away permanently.
-        if reader_cursor == 0 {
-            account.preview_scroll = 0;
-            return;
+        // The renderer knows the actual wrapped row; logical body-line numbers
+        // do not. Defer scrolloff until it has measured the current paragraph.
+        self.reader_scroll_follow_pending = true;
+        if let Some(account) = self.account_mut() {
+            account.smooth_preview_target = None;
         }
-
-        let current_offset = usize::from(account.preview_scroll);
-        let scrolloff = READER_SCROLL_OFF.min(view_height.saturating_sub(1) / 2);
-        let max_offset = total_rows.saturating_sub(view_height);
-        let upper_guard = current_offset.saturating_add(scrolloff);
-        let lower_guard = current_offset
-            .saturating_add(view_height.saturating_sub(scrolloff + 1));
-        let mut next_offset = current_offset.min(max_offset);
-
-        if cursor_row < upper_guard {
-            next_offset = cursor_row.saturating_sub(scrolloff);
-        } else if cursor_row > lower_guard {
-            next_offset = cursor_row
-                .saturating_add(scrolloff + 1)
-                .saturating_sub(view_height)
-                .min(max_offset);
-        }
-
-        account.preview_scroll = u16::try_from(next_offset)
-            .unwrap_or(u16::MAX)
-            .min(account.preview_max_scroll);
     }
 
     fn start_smooth_scroll(&mut self, delta: isize) {
@@ -4591,7 +4632,6 @@ impl App {
                 self.reader_smooth_target = None;
                 self.reader_pending_g = false;
                 self.reader_pending_inner_object = false;
-                self.reader_body_start = 0;
                 self.reader_line_count = 0;
                 self.reader_image = None;
                 self.reader_image_pending = None;
@@ -4619,7 +4659,6 @@ impl App {
         self.reader_smooth_target = None;
         self.reader_pending_g = false;
         self.reader_pending_inner_object = false;
-        self.reader_body_start = 0;
         self.reader_line_count = 0;
         self.reader_image = None;
         self.reader_image_pending = None;
@@ -4969,6 +5008,35 @@ impl App {
         self.start_mutation(source, ids, kind);
     }
 
+    /// Toggle spam by moving the selected message(s) to Junk, or back to Inbox.
+    /// Use discovered mailbox roles rather than guessing Gmail or Outlook paths.
+    fn toggle_spam_selected(&mut self) {
+        let ids = self.selected_message_ids();
+        if ids.is_empty() { return; }
+        let Some(account) = self.account() else { return; };
+        let Some(source) = account.current_mailbox.clone() else { return; };
+        let in_junk = account.mailboxes.iter().any(|mailbox|
+            mailbox.name == source && mailbox.role == MailboxRole::Junk);
+        let target_role = if in_junk { MailboxRole::Inbox } else { MailboxRole::Junk };
+        let destination = account.mailboxes.iter()
+            .find(|mailbox| mailbox.role == target_role && mailbox.name != source)
+            .map(|mailbox| mailbox.name.clone());
+        let Some(destination) = destination else {
+            self.status = StatusLine::error(if in_junk {
+                "cannot mark as not spam: no Inbox mailbox found"
+            } else { "cannot mark as spam: no Junk/Spam mailbox found" });
+            return;
+        };
+        // Move is the existing IMAP worker operation, which already updates
+        // the source list and invalidates the destination cache.
+        self.start_mutation(source, ids, MutationKind::Move { destination });
+        if !self.status.is_error {
+            self.status = StatusLine::temporary(if in_junk {
+                "moved out of Spam to Inbox"
+            } else { "marked as Spam" }, Duration::from_secs(2));
+        }
+    }
+
     fn unarchive_selected(&mut self) {
         let ids = self.selected_message_ids();
         if ids.is_empty() { return; }
@@ -5288,8 +5356,9 @@ impl App {
     #[must_use]
     pub fn help_matches(&self) -> Vec<usize> {
         let query = self.help_query.trim().to_ascii_lowercase();
-        HELP_ENTRIES
-            .iter()
+        let entries = if self.attachment_picker_visible { ATTACHMENT_HELP_ENTRIES }
+            else { HELP_ENTRIES };
+        entries.iter()
             .enumerate()
             .filter(|(_, entry)| {
                 query.is_empty()
@@ -5316,6 +5385,9 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') if key.modifiers.is_empty() => {
                 self.help_visible = false;
+                // Kitty graphics can be erased by a modal's Clear even when the
+                // attachment selection and geometry have not changed.
+                self.invalidate_attachment_preview_layout();
             }
             KeyCode::Down if key.modifiers.is_empty() => {
                 self.move_help_selection(1);
@@ -5577,7 +5649,7 @@ impl App {
     fn toggle_header_details(&mut self) {
         self.show_header_details = !self.show_header_details;
         self.status = StatusLine::temporary(
-            if self.show_header_details { "message details expanded" } else { "message details collapsed" },
+            if self.show_header_details { "email addresses and Message-ID shown" } else { "email addresses and Message-ID hidden" },
             Duration::from_secs(2),
         );
     }
@@ -5634,6 +5706,7 @@ impl App {
     }
 
     fn dismiss_attachment_picker(&mut self) {
+        self.help_visible = false;
         self.attachment_picker_visible = false;
         self.attachment_pending = None;
         self.attachment_files = Arc::new(Vec::new());
@@ -5807,6 +5880,16 @@ impl App {
     }
 
     fn handle_attachment_picker_key(&mut self, key: KeyEvent) {
+        if self.help_visible {
+            self.handle_help_key(key);
+            return;
+        }
+        if self.attachment_destination_picker.is_none()
+            && key.code == KeyCode::Char('?')
+            && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) {
+            self.open_help();
+            return;
+        }
         if self.attachment_destination_picker.is_some() {
             self.handle_attachment_destination_key(key);
             return;
@@ -5876,6 +5959,16 @@ impl App {
             KeyCode::Enter | KeyCode::Char('o') => self.open_attachment(),
             KeyCode::Char('s') => self.prompt_attachment_save(),
             _ => {}
+        }
+    }
+
+    /// Invalidate the terminal-side protocol, not the decoded thumbnail cache.
+    /// Resize events and closing `?` can clear Kitty graphics independently
+    /// of their selection/size identity. The next draw re-uploads the image.
+    pub fn invalidate_attachment_preview_layout(&mut self) {
+        if self.attachment_picker_visible {
+            self.attachment_preview_identity = None;
+            self.attachment_preview = None;
         }
     }
 
@@ -6051,6 +6144,7 @@ impl App {
             }
         }
         if self.attachment_picker_visible {
+            if self.help_visible { return; }
             if self.attachment_destination_picker.is_some() {
                 let (_, _, files, _, footer) = crate::ui::attachment_destination_regions(
                     ratatui::layout::Rect::new(0, 0, width, height));
@@ -6094,7 +6188,7 @@ impl App {
                 }
                 return;
             }
-            let (_, list, _, footer) = crate::ui::attachment_regions(ratatui::layout::Rect::new(0, 0, width, height));
+            let (_, list, _, _) = crate::ui::attachment_regions(ratatui::layout::Rect::new(0, 0, width, height));
             let inside_list = mouse.column >= list.x && mouse.column < list.x.saturating_add(list.width)
                 && mouse.row > list.y && mouse.row < list.y.saturating_add(list.height);
             if inside_list && matches!(mouse.kind,
@@ -6106,18 +6200,6 @@ impl App {
             match mouse.kind {
                 MouseEventKind::ScrollDown => self.move_attachment_selection(self.attachment_selection.saturating_add(3)),
                 MouseEventKind::ScrollUp => self.move_attachment_selection(self.attachment_selection.saturating_sub(3)),
-                MouseEventKind::Down(MouseButton::Left)
-                    if mouse.row == footer.y && mouse.column >= footer.x => {
-                    let x = usize::from(mouse.column - footer.x);
-                    if (1..=11).contains(&x) { self.open_attachment(); }
-                    else if (13..=26).contains(&x) { self.prompt_attachment_save(); }
-                    else if (28..=42).contains(&x) {
-                        if !self.attachment_files.is_empty() {
-                            let index = self.attachment_selection;
-                            if !self.attachment_marked.insert(index) { self.attachment_marked.remove(&index); }
-                        }
-                    }
-                }
                 _ => {}
             }
             return;
@@ -6462,7 +6544,7 @@ impl App {
                     if let Some(composer) = self.composer.as_mut() { composer.exit_prompt = false; }
                     self.postpone_composer();
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') => {
+                KeyCode::Char('d') | KeyCode::Char('n') => {
                     self.composer = None;
                     self.resumed_draft_account = None;
                     self.status = StatusLine::temporary("unsent email discarded", Duration::from_secs(2));
@@ -6484,7 +6566,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     if let Some(composer) = self.composer.as_mut() { composer.confirm_send = false; }
                 }
-                KeyCode::Char('T') => {
+                KeyCode::Char('t') => {
                     if let Some(composer) = self.composer.as_mut() {
                         composer.preview_html = !composer.preview_html;
                         composer.preview_scroll = 0;
@@ -7560,6 +7642,30 @@ fn bounded_index(current: usize, len: usize, delta: isize) -> usize {
     current.saturating_add_signed(delta).min(len - 1)
 }
 
+/// Scrolloff in *rendered terminal rows* (not logical message lines). A long
+/// wrapped line may occupy many rows, which must count toward the viewport.
+fn reader_scroll_for_visual_cursor(
+    current: usize,
+    cursor_row: usize,
+    view_height: usize,
+    max_scroll: usize,
+) -> usize {
+    let view_height = view_height.max(1);
+    let current = current.min(max_scroll);
+    let scrolloff = READER_SCROLL_OFF.min(view_height.saturating_sub(1) / 2);
+    let upper_guard = current.saturating_add(scrolloff);
+    let lower_guard = current.saturating_add(view_height.saturating_sub(scrolloff + 1));
+    if cursor_row < upper_guard {
+        cursor_row.saturating_sub(scrolloff).min(max_scroll)
+    } else if cursor_row > lower_guard {
+        cursor_row.saturating_add(scrolloff + 1)
+            .saturating_sub(view_height)
+            .min(max_scroll)
+    } else {
+        current
+    }
+}
+
 fn offset_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -7573,12 +7679,90 @@ mod tests {
     use super::{
         ComposeField, ComposeMode, Composer, ReaderPosition, ReaderSelection, ReaderWordMotion,
         bounded_index, inner_text_object_range, message_view_offset, offset_index,
+        reader_scroll_for_visual_cursor,
         preview_neighbor_positions, preview_travel_positions, reader_image_target_size, reader_selection_text,
         reader_word_target, reply_attribution, url_at_cursor,
     };
     use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
     use std::path::PathBuf;
+
+    #[test]
+    fn mail_search_matches_typos_as_subsequences_but_ranks_contiguous_first() {
+        let query = "calinv";
+        assert!(super::mail_fuzzy_score("Calendar invitation", query).is_some());
+        assert!(super::mail_fuzzy_score("Invoice", query).is_none());
+        assert!(super::mail_fuzzy_score("calendar", "cal")
+            > super::mail_fuzzy_score("c a l service", "cal"));
+        assert!(super::mail_fuzzy_score("Patch from Takashi", "pft").is_some());
+    }
+
+    #[test]
+    fn reader_scroll_follows_wrapped_visual_rows_not_logical_lines() {
+        // Forty logical lines can occupy 140 physical rows after wrapping.
+        // Each j motion must keep the resulting terminal row on screen.
+        let view_height = 15;
+        let max_scroll = 160;
+        let mut scroll = 0;
+        for visual_cursor_row in 12..145 {
+            scroll = reader_scroll_for_visual_cursor(
+                scroll, visual_cursor_row, view_height, max_scroll,
+            );
+            assert!(visual_cursor_row >= scroll,
+                "cursor scrolled above viewport at row {visual_cursor_row}");
+            assert!(visual_cursor_row < scroll + view_height,
+                "cursor disappeared below viewport at row {visual_cursor_row}");
+        }
+        for visual_cursor_row in (12..145).rev() {
+            scroll = reader_scroll_for_visual_cursor(
+                scroll, visual_cursor_row, view_height, max_scroll,
+            );
+            assert!(visual_cursor_row >= scroll && visual_cursor_row < scroll + view_height);
+        }
+    }
+
+    #[test]
+    fn reader_scroll_respects_short_viewports_and_end_of_document() {
+        assert_eq!(reader_scroll_for_visual_cursor(0, 5, 1, 20), 5);
+        assert_eq!(reader_scroll_for_visual_cursor(0, 19, 10, 10), 10);
+        assert_eq!(reader_scroll_for_visual_cursor(8, 4, 10, 20), 1);
+    }
+
+    #[test]
+    fn alt_a_opens_account_setup_without_stealing_compose_ctrl_a() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str(
+            "[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\""
+        ).unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        assert!(app.setup.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(app.setup.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert!(app.setup.is_some());
+    }
+
+    #[test]
+    fn received_attachment_help_is_searchable_and_keeps_viewer_open() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str(
+            "[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\""
+        ).unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        app.attachment_picker_visible = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
+        assert!(app.help_visible);
+        assert!(app.attachment_picker_visible);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.help_query, "s");
+        assert!(app.help_matches().iter().any(|&index|
+            super::ATTACHMENT_HELP_ENTRIES[index].description.contains("save")));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.help_visible);
+        assert!(app.attachment_picker_visible);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.attachment_picker_visible);
+    }
 
     #[test]
     fn mute_toggle_drops_queued_alerts_and_restores_desktop_notifications() {
@@ -7591,10 +7775,12 @@ mod tests {
             subject: "test".into(), excerpt: String::new(),
         });
         app.new_mail_bell_pending = true;
+        app.new_mail_since_launch = 3;
         app.handle_command(super::Command::ToggleNotifications);
         assert!(!app.notifications_enabled());
         assert!(app.take_new_mail_notice().is_none());
         assert!(!app.take_new_mail_bell());
+        assert_eq!(app.new_mail_count(), 0);
         app.handle_command(super::Command::ToggleNotifications);
         assert!(app.notifications_enabled());
     }
