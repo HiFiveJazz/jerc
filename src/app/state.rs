@@ -2138,6 +2138,7 @@ pub struct App {
     pub should_quit: bool,
     /// In-app first-run or add-account setup, modal over normal mail UI.
     pub setup: Option<SetupWizard>,
+    pub remove_account_confirmation: Option<String>,
     pub setup_config_path: PathBuf,
     pub setup_reload_requested: bool,
     setup_sender: Option<SyncSender<RuntimeEvent>>,
@@ -2312,6 +2313,7 @@ impl App {
             show_startup_warnings: false,
             should_quit: false,
             setup: config.accounts.is_empty().then(|| SetupWizard::new(true)),
+            remove_account_confirmation: None,
             setup_config_path: config.config_path.clone()
                 .unwrap_or_else(crate::config::default_config_path),
             setup_reload_requested: false,
@@ -2465,13 +2467,19 @@ impl App {
     }
 
     pub fn setup_discovered(&mut self, email: String, result: Result<crate::discovery::MailConfiguration, String>) {
-        if let Some(wizard) = self.setup.as_mut() {
-            if !wizard.discovering || wizard.authenticating || wizard.saved ||
-                !wizard.fields[crate::setup::EMAIL].trim().eq_ignore_ascii_case(&email) { return; }
-            match result {
-                Ok(config) => wizard.apply_discovery(config),
-                Err(error) => wizard.discovery_failed(&error),
-            }
+        let Some(wizard) = self.setup.as_mut() else { return; };
+        if !wizard.discovering || wizard.authenticating || wizard.saved ||
+            !wizard.fields[crate::setup::EMAIL].trim().eq_ignore_ascii_case(&email) { return; }
+        match result {
+            Ok(config) => wizard.apply_discovery(config),
+            Err(error) => wizard.discovery_failed(&error),
+        }
+        // An alias doesn't establish which Exchange mailbox identity to use
+        // for SMTP. Authenticate first, then offer the login UPN for review.
+        if self.setup.as_ref().is_some_and(|wizard|
+            wizard.step == crate::setup::SetupStep::Authenticating)
+        {
+            self.start_setup_oauth();
         }
     }
 
@@ -2481,12 +2489,63 @@ impl App {
                 Ok(login) => wizard.suggest_login(login),
                 Err(error) => {
                     wizard.authenticating = false;
+                    wizard.step = crate::setup::SetupStep::Settings;
+                    wizard.selected = crate::setup::PROVIDER;
                     wizard.login_failed = true;
                     wizard.error = true;
                     wizard.message = format!(
                         "OAuth failed: {error}. Ctrl-S/F6 retry; F7 saves offline."
                     );
                 }
+            }
+        }
+    }
+
+    /// Start a browser login after validating generated server settings.
+    /// Used both for a Microsoft alias (before settings review) and for the
+    /// explicit Continue action in the settings step.
+    fn start_setup_oauth(&mut self) {
+        let Some(wizard) = self.setup.as_mut() else { return; };
+        if wizard.authenticating || wizard.authenticated { return; }
+        match wizard.preview_account() {
+            Ok(account) => {
+                // OAuth tokens are keyed by account name, so never let wizard
+                // setup overwrite a configured account's credentials.
+                let duplicate = self.accounts.iter().any(|existing| existing.name == account.name)
+                    || crate::config::Config::load_or_empty(Some(&self.setup_config_path))
+                        .is_ok_and(|config| config.accounts.iter().any(|existing| existing.name == account.name));
+                if duplicate {
+                    wizard.step = crate::setup::SetupStep::Settings;
+                    wizard.error = true;
+                    wizard.message = "This account name is already in use. Choose another before signing in.".into();
+                    return;
+                }
+                let Some(sender) = self.setup_sender.clone() else {
+                    wizard.step = crate::setup::SetupStep::Settings;
+                    wizard.error = true;
+                    wizard.message = "OAuth runtime unavailable".into();
+                    return;
+                };
+                wizard.begin_authentication();
+                std::thread::spawn(move || {
+                    let name = account.name.clone();
+                    let result = crate::oauth::login_account_quiet(&[account.clone()], &name)
+                        .and_then(|()| {
+                            let settings = crate::oauth::OAuthSettings::for_account(&account)?
+                                .ok_or_else(|| anyhow::anyhow!("OAuth is not configured"))?;
+                            if settings.provider == "microsoft" {
+                                settings.suggested_login_username()
+                            } else { Ok(None) }
+                        })
+                        .map_err(|error| format!("{}", error.root_cause()));
+                    let _ = sender.send(RuntimeEvent::SetupLoginFinished(result));
+                });
+            }
+            Err(error) => {
+                wizard.step = crate::setup::SetupStep::Settings;
+                wizard.selected = crate::setup::PROVIDER;
+                wizard.error = true;
+                wizard.message = format!("Check settings: {error:#}. F3 opens advanced OAuth settings.");
             }
         }
     }
@@ -2535,8 +2594,8 @@ impl App {
                     Ok(_) => {
                         wizard.saved = true;
                         wizard.error = false;
-                        wizard.message = "Account saved without OAuth. Run --oauth-login later before using mail.".into();
-                        self.setup_reload_requested = true;
+                        // Confirmation already explains the offline account state.
+                        wizard.message.clear();
                     }
                     Err(error) => {
                         wizard.error = true;
@@ -2545,64 +2604,19 @@ impl App {
                 }
             }
             WizardAction::Save => {
-                let Some(wizard) = self.setup.as_mut() else { return; };
-                if wizard.saved { return; }
-                // First Ctrl-S authorizes OAuth. The browser session can
-                // suggest a real login UPN (which may differ from an alias).
-                // The user gets another chance to review before anything is
-                // appended to their configuration file.
-                if !wizard.authenticated {
-                    match wizard.preview_account() {
-                        Ok(account) => {
-                            // Validate names before OAuth: token filenames are
-                            // keyed by account name, so a duplicate could
-                            // overwrite another account's refresh token.
-                            let duplicate = self.accounts.iter().any(|existing| existing.name == account.name)
-                                || crate::config::Config::load_or_empty(Some(&self.setup_config_path))
-                                    .is_ok_and(|config| config.accounts.iter().any(|existing| existing.name == account.name));
-                            if duplicate {
-                                wizard.error = true;
-                                wizard.message = "This account name is already in use. Choose another before signing in.".into();
-                                return;
-                            }
-                            wizard.authenticating = true;
-                            wizard.login_failed = false;
-                            wizard.error = false;
-                            wizard.spinner_frame = 0;
-                            wizard.message = "Waiting for browser sign-in…".into();
-                            let Some(sender) = self.setup_sender.clone() else {
-                                wizard.authenticating = false;
-                                wizard.error = true;
-                                wizard.message = "OAuth runtime unavailable".into();
-                                return;
-                            };
-                            std::thread::spawn(move || {
-                                let name = account.name.clone();
-                                let result = crate::oauth::login_account_quiet(&[account.clone()], &name)
-                                    .and_then(|()| {
-                                        let settings = crate::oauth::OAuthSettings::for_account(&account)?
-                                            .ok_or_else(|| anyhow::anyhow!("OAuth is not configured"))?;
-                                        if settings.provider == "microsoft" {
-                                            settings.suggested_login_username()
-                                        } else { Ok(None) }
-                                    })
-                                    .map_err(|error| format!("{}", error.root_cause()));
-                                let _ = sender.send(RuntimeEvent::SetupLoginFinished(result));
-                            });
-                        }
-                        Err(error) => {
-                            wizard.error = true;
-                            wizard.message = format!("Check settings: {error:#}");
-                        }
-                    }
+                if self.setup.as_ref().is_some_and(|wizard| wizard.saved) { return; }
+                if self.setup.as_ref().is_some_and(|wizard| !wizard.authenticated) {
+                    self.start_setup_oauth();
                     return;
                 }
+                let Some(wizard) = self.setup.as_mut() else { return; };
                 match wizard.save(&self.setup_config_path) {
                     Ok(_) => {
                         wizard.saved = true;
                         wizard.error = false;
-                        wizard.message = "Account saved; opening mailbox…".into();
-                        self.setup_reload_requested = true;
+                        // The confirmation page and its centered action provide
+                        // the success feedback without a duplicate status line.
+                        wizard.message.clear();
                     }
                     Err(error) => {
                         wizard.error = true;
@@ -2672,6 +2686,10 @@ impl App {
                 return;
             }
         }
+        if self.remove_account_confirmation.is_some() {
+            self.handle_remove_account_confirmation_key(key);
+            return;
+        }
         if self.confirmation.is_some() {
             self.handle_confirmation_key(key);
             return;
@@ -2690,6 +2708,16 @@ impl App {
         }
         if self.account().is_some_and(|account| account.search_editing) {
             self.handle_search_key(key);
+            return;
+        }
+        // Alt-d removes the currently selected *local account*, never a remote
+        // IMAP folder. Only available from the mailbox browser, with a prompt.
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d')
+            && !self.message_open && self.sidebar_visible
+        {
+            if let Some(account) = self.account() {
+                self.remove_account_confirmation = Some(account.name.clone());
+            }
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
@@ -5005,6 +5033,30 @@ impl App {
         }
     }
 
+    fn handle_remove_account_confirmation_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                let Some(name) = self.remove_account_confirmation.take() else { return; };
+                match crate::setup::remove_account(&self.setup_config_path, &name) {
+                    Ok(()) => {
+                        self.status = StatusLine::info(format!("Removed {name:?} from local config; server mail untouched"));
+                        self.setup_reload_requested = true;
+                    }
+                    Err(error) => {
+                        self.status = StatusLine::error(format!("Cannot remove account: {error:#}"));
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.remove_account_confirmation = None;
+                self.status = StatusLine::temporary("account removal cancelled", Duration::from_secs(2));
+            }
+            _ => {}
+        }
+    }
+
     fn handle_confirmation_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
@@ -5913,34 +5965,58 @@ impl App {
                 let (popup_width, popup_height) = wizard.popup_size(width, height);
                 let popup_y = height.saturating_sub(popup_height) / 2;
                 let popup_x = width.saturating_sub(popup_width) / 2;
-                let header_height = if wizard.step == crate::setup::SetupStep::Identity { 2 } else { 3 };
-                let list_y = popup_y.saturating_add(1 + header_height);
-                let list_height = usize::from(popup_height.saturating_sub(5 + header_height));
-                let fields = wizard.visible_fields();
-                let selected_pos = fields.iter().position(|field| *field == wizard.selected)
+                let header_height = if wizard.step == crate::setup::SetupStep::Identity { 1 } else { 3 };
+                let list_y = popup_y.saturating_add(1 + crate::setup::PROGRESS_ROWS + header_height);
+                let list_height = usize::from(popup_height.saturating_sub(5 + crate::setup::PROGRESS_ROWS + header_height));
+                let rows = wizard.display_rows();
+                let selected_pos = rows.iter().position(|row|
+                    matches!(row, crate::setup::SetupDisplayRow::Field(index) if *index == wizard.selected))
                     .unwrap_or(0);
                 let first = selected_pos.saturating_sub(list_height.saturating_sub(1))
-                    .min(fields.len().saturating_sub(list_height));
+                    .min(rows.len().saturating_sub(list_height));
                 if mouse.column > popup_x && mouse.column < popup_x.saturating_add(popup_width) {
                     if mouse.row >= list_y && usize::from(mouse.row - list_y) < list_height
                         && !wizard.authenticating && !wizard.discovering {
-                        if let Some(field) = fields.get(first + usize::from(mouse.row - list_y)) {
+                        if let Some(crate::setup::SetupDisplayRow::Field(field)) = rows.get(first + usize::from(mouse.row - list_y)) {
                             wizard.selected = *field;
                         }
                     }
                     // The last interior row presents the primary Continue action.
-                    if mouse.row == popup_y.saturating_add(popup_height).saturating_sub(2)
-                        && !wizard.authenticating && !wizard.discovering && !wizard.saved {
+                    let button_y = if wizard.saved {
+                        // Confirmation button occupies the penultimate inner row.
+                        popup_y.saturating_add(popup_height).saturating_sub(3)
+                    } else {
+                        // Primary button occupies the last inner row.
+                        popup_y.saturating_add(popup_height).saturating_sub(2)
+                    };
+                    let label = if wizard.saved { "Open account" }
+                        else if wizard.step == crate::setup::SetupStep::Identity { "Continue" }
+                        else if wizard.authenticated { "Save and open account" }
+                        else if wizard.login_failed { "Retry sign-in" }
+                        else { "Continue to Browser Sign-In" };
+                    let button_width = (if wizard.saved { 26 }
+                        else { (label.chars().count() as u16).saturating_add(6) })
+                        .min(popup_width.saturating_sub(2));
+                    let button_x = popup_x.saturating_add(1)
+                        .saturating_add(popup_width.saturating_sub(2).saturating_sub(button_width) / 2);
+                    if mouse.row == button_y && mouse.column >= button_x
+                        && mouse.column < button_x.saturating_add(button_width)
+                        && !wizard.authenticating && !wizard.discovering {
                         continue_clicked = true;
                     }
                 }
             }
             if continue_clicked {
-                self.handle_setup_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+                let key = if self.setup.as_ref().is_some_and(|wizard| wizard.saved) {
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                } else {
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+                };
+                self.handle_setup_key(key);
             }
             return;
         }
-        if self.show_startup_warnings { return; }
+        if self.show_startup_warnings || self.remove_account_confirmation.is_some() { return; }
         // The rightmost footer bell is an action as well as a status indicator.
         // Never steal clicks from compose, confirmation, or other open dialogs.
         if height > 0 && width >= crate::ui::NOTIFICATION_INDICATOR_WIDTH

@@ -11,6 +11,9 @@ use crate::config::{AccountConfig, Config};
 use crate::discovery::MailConfiguration;
 
 pub const FIELD_COUNT: usize = 12;
+/// The stage progress now lives in the popup border title, so no
+/// additional content rows are reserved above the wizard body.
+pub const PROGRESS_ROWS: u16 = 0;
 pub const EMAIL: usize = 0;
 pub const NAME: usize = 1;
 pub const PROVIDER: usize = 2;
@@ -34,8 +37,17 @@ pub const LABELS: [&str; FIELD_COUNT] = [
 pub enum SetupStep {
     /// Only the account name and visible email address are needed initially.
     Identity,
-    /// Discovered settings are editable before any OAuth request is made.
+    /// Discovered settings are editable; the sign-in order depends on provider.
     Settings,
+    /// Microsoft alias accounts authenticate before their mailbox UPN is known.
+    Authenticating,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupDisplayRow {
+    Field(usize),
+    BoxTop(&'static str),
+    BoxBottom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +62,7 @@ pub enum WizardAction {
 pub struct SetupWizard {
     pub fields: [String; FIELD_COUNT],
     pub step: SetupStep,
+    pub advanced: bool,
     pub spinner_frame: usize,
     pub edited: [bool; FIELD_COUNT],
     pub selected: usize,
@@ -72,6 +85,7 @@ impl SetupWizard {
         Self {
             fields,
             step: SetupStep::Identity,
+            advanced: false,
             spinner_frame: 0,
             edited: [false; FIELD_COUNT],
             selected: NAME,
@@ -95,27 +109,70 @@ impl SetupWizard {
         }
     }
 
-    /// The rows visible at each step, in navigation order. Hidden provider-only
-    /// fields are not part of the tab sequence.
+    /// Advanced OAuth details are hidden unless the user explicitly requests them.
+    /// Most people only need to confirm their incoming/outgoing mail identity.
     pub fn visible_fields(&self) -> Vec<usize> {
-        if self.step == SetupStep::Identity {
-            return vec![NAME, EMAIL];
-        }
+        if self.step == SetupStep::Identity { return vec![NAME, EMAIL]; }
+        if self.step == SetupStep::Authenticating { return Vec::new(); }
         let mut fields = vec![PROVIDER, IMAP_HOST, IMAP_PORT, IMAP_LOGIN,
-            SMTP_HOST, SMTP_PORT, SMTP_LOGIN, CLIENT_ID];
-        match self.provider_hint() {
-            "microsoft" => fields.push(TENANT),
-            "google" => fields.push(GOOGLE_SECRET),
-            _ => { fields.push(TENANT); fields.push(GOOGLE_SECRET); }
+            SMTP_HOST, SMTP_PORT, SMTP_LOGIN];
+        if self.advanced {
+            fields.push(CLIENT_ID);
+            match self.provider_hint() {
+                "microsoft" => fields.push(TENANT),
+                "google" => fields.push(GOOGLE_SECRET),
+                _ => { fields.push(TENANT); fields.push(GOOGLE_SECRET); }
+            }
         }
         fields
     }
 
-    /// Keep the first screen compact; the editable settings screen can grow.
+    pub fn display_rows(&self) -> Vec<SetupDisplayRow> {
+        use SetupDisplayRow::{Field, BoxTop, BoxBottom};
+        match self.step {
+            SetupStep::Identity => return vec![Field(NAME), Field(EMAIL)],
+            SetupStep::Authenticating => return Vec::new(),
+            SetupStep::Settings => {}
+        }
+        let mut rows = vec![Field(PROVIDER),
+            BoxTop("Incoming · IMAP"), Field(IMAP_HOST), Field(IMAP_PORT),
+            Field(IMAP_LOGIN), BoxBottom,
+            BoxTop("Outgoing · SMTP"), Field(SMTP_HOST), Field(SMTP_PORT),
+            Field(SMTP_LOGIN), BoxBottom];
+        if self.advanced {
+            rows.push(BoxTop("Advanced OAuth settings"));
+            rows.push(Field(CLIENT_ID));
+            match self.provider_hint() {
+                "microsoft" => rows.push(Field(TENANT)),
+                "google" => rows.push(Field(GOOGLE_SECRET)),
+                _ => { rows.push(Field(TENANT)); rows.push(Field(GOOGLE_SECRET)); }
+            }
+            rows.push(BoxBottom);
+        }
+        rows
+    }
+
     pub fn popup_size(&self, screen_width: u16, screen_height: u16) -> (u16, u16) {
-        let max_height = if self.step == SetupStep::Identity { 13 } else { 24 };
+        let max_height = match self.step {
+            SetupStep::Identity | SetupStep::Authenticating => 13,
+            SetupStep::Settings if self.advanced => 28,
+            SetupStep::Settings => 23,
+        };
         (screen_width.saturating_sub(2).min(96).max(1),
          screen_height.saturating_sub(2).min(max_height).max(1))
+    }
+
+    /// The active stage on the fixed four-part setup progress header.
+    /// Microsoft can sign in before showing the editable settings, so the
+    /// indicator represents the actual screen rather than a monotonic counter.
+    pub fn progress_stage(&self) -> usize {
+        if self.saved { 3 } else {
+            match self.step {
+                SetupStep::Identity => 0,
+                SetupStep::Settings => 1,
+                SetupStep::Authenticating => 2,
+            }
+        }
     }
 
     pub fn spinner(&self) -> &'static str {
@@ -137,6 +194,9 @@ impl SetupWizard {
     }
 
     pub fn key(&mut self, key: KeyEvent) -> WizardAction {
+        // The confirmation page is read-only; Enter is handled by App to
+        // reload the newly configured account.
+        if self.saved { return WizardAction::Nothing; }
         // Do not allow an in-flight browser sign-in to mutate the identity or
         // settings from which its OAuth state was created.
         if self.authenticating {
@@ -147,6 +207,12 @@ impl SetupWizard {
                 self.discovering = false;
                 self.message = "Discovery cancelled. Edit the address or press Enter to retry.".into();
             }
+            return WizardAction::Nothing;
+        }
+        if self.step == SetupStep::Authenticating { return WizardAction::Nothing; }
+        if self.step == SetupStep::Settings && key.code == KeyCode::F(3) {
+            self.advanced = !self.advanced;
+            if !self.visible_fields().contains(&self.selected) { self.selected = PROVIDER; }
             return WizardAction::Nothing;
         }
         if self.step == SetupStep::Settings && self.login_failed {
@@ -165,14 +231,6 @@ impl SetupWizard {
             return match key.code {
                 KeyCode::Esc => WizardAction::Close,
                 KeyCode::F(5) => WizardAction::Discover,
-                KeyCode::F(2) => {
-                    self.step = SetupStep::Settings;
-                    self.selected = PROVIDER;
-                    self.source = None;
-                    self.error = false;
-                    self.message = "Manual configuration: fill in the servers, then continue.".into();
-                    WizardAction::Nothing
-                }
                 KeyCode::Up | KeyCode::BackTab => {
                     self.selected = NAME;
                     WizardAction::Nothing
@@ -284,16 +342,37 @@ impl SetupWizard {
             }
         }
         self.source = Some(format!("{} ({})", proposal.provider, proposal.source));
-        self.step = SetupStep::Settings;
+        let unknown_microsoft_login = microsoft && !self.edited[IMAP_LOGIN] && !self.edited[SMTP_LOGIN]
+            && !self.authenticated;
+        self.step = if unknown_microsoft_login {
+            SetupStep::Authenticating
+        } else { SetupStep::Settings };
         self.selected = PROVIDER;
-        self.message = "Account settings found. Review the settings, then Enter to sign in.".into();
+        self.message = if unknown_microsoft_login {
+            "Microsoft 365 found. Sign in to identify your actual mailbox login…".into()
+        } else {
+            String::new()
+        };
         self.discovering = false;
         self.error = false;
+    }
+
+    /// Enter the dedicated browser sign-in stage for any OAuth provider.
+    /// The completion handler returns to the editable settings review.
+    pub fn begin_authentication(&mut self) {
+        self.step = SetupStep::Authenticating;
+        self.authenticating = true;
+        self.login_failed = false;
+        self.error = false;
+        self.spinner_frame = 0;
+        self.message = "Waiting for browser sign-in…".into();
     }
 
     /// OAuth may reveal a different UPN after the user signs in. Never replace
     /// a username that was edited by hand: show the suggestion for review.
     pub fn suggest_login(&mut self, login: Option<String>) {
+        self.step = SetupStep::Settings;
+        self.selected = IMAP_LOGIN;
         self.authenticated = true;
         self.authenticating = false;
         self.login_failed = false;
@@ -301,9 +380,11 @@ impl SetupWizard {
             for index in [IMAP_LOGIN, SMTP_LOGIN] {
                 if !self.edited[index] { self.fields[index] = login.clone(); }
             }
-            self.message = "OAuth succeeded. Verify the suggested login UPN, then Ctrl-S saves.".into();
+            self.message = "Signed in. Review both suggested mailbox usernames, then Enter saves.".into();
+        } else if self.provider_hint() == "microsoft" {
+            self.message = "Signed in, but Microsoft did not return a username hint. Verify both logins before saving.".into();
         } else {
-            self.message = "OAuth succeeded. Confirm both login usernames, then Ctrl-S saves.".into();
+            self.message = "Signed in successfully. Review the detected settings, then Enter saves.".into();
         }
         self.error = false;
     }
@@ -311,8 +392,12 @@ impl SetupWizard {
     pub fn discovery_failed(&mut self, message: &str) {
         self.discovering = false;
         self.error = true;
-        self.step = SetupStep::Identity;
-        self.message = format!("No account settings found: {message}. F5 retries; F2 opens manual setup.");
+        // Discovery failures should remain recoverable without a hidden
+        // F2 shortcut: display editable manual settings in the review step.
+        self.step = SetupStep::Settings;
+        self.selected = PROVIDER;
+        self.source = None;
+        self.message = format!("Automatic discovery failed: {message}. Enter the server settings manually, or F4 to change the email address.");
     }
 
     fn validate(&self) -> Result<String> {
@@ -440,6 +525,60 @@ impl SetupWizard {
     }
 }
 
+/// Remove an account from the *local* config, never an IMAP folder or any
+/// server-side mail. Preserve unrelated sections, comments and private mode.
+/// Refuse ambiguous config layouts rather than risk deleting another account.
+pub fn remove_account(path: &Path, name: &str) -> Result<()> {
+    let destination = if path.exists() { path.canonicalize()? } else { path.to_owned() };
+    let raw = fs::read_to_string(&destination)
+        .with_context(|| format!("reading {}", destination.display()))?;
+    let config: Config = toml::from_str(&raw).context("parsing account config before removal")?;
+    ensure!(config.accounts.iter().filter(|account| account.name == name).count() == 1,
+        "expected exactly one locally configured account with that name");
+    let target = config.accounts.iter().position(|account| account.name == name)
+        .ok_or_else(|| anyhow!("account not found"))?;
+
+    let mut sections: Vec<(usize, &str)> = Vec::new();
+    let mut offset = 0;
+    for line in raw.split_inclusive('\n') {
+        let heading = line.trim();
+        if heading.starts_with('[') && heading.ends_with(']') {
+            sections.push((offset, heading));
+        }
+        offset += line.len();
+    }
+    let accounts: Vec<usize> = sections.iter()
+        .filter_map(|(at, heading)| (*heading == "[[accounts]]").then_some(*at))
+        .collect();
+    ensure!(accounts.len() == config.accounts.len(),
+        "account table layout is ambiguous; edit config.toml manually");
+    let start = accounts[target];
+    let end = sections.iter().filter(|(at, _)| *at > start)
+        .find(|(_, heading)| *heading == "[[accounts]]"
+            || (!heading.starts_with("[accounts.") && !heading.starts_with("[[accounts.")))
+        .map(|(at, _)| *at).unwrap_or(raw.len());
+    let mut result = raw.clone();
+    result.replace_range(start..end, "");
+    // Do not discard formatting or comments outside the removed account.
+    // Validate the resulting TOML *before* touching disk.
+    let parsed: Config = toml::from_str(&result).context("checking config after account removal")?;
+    ensure!(parsed.accounts.len() + 1 == config.accounts.len()
+        && parsed.accounts.iter().all(|account| account.name != name),
+        "account removal would alter unexpected account entries");
+    let parent = destination.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&destination)?.permissions().mode() & 0o600;
+        tmp.as_file().set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    tmp.write_all(result.as_bytes())?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&destination).map_err(|error| anyhow!("saving account removal: {}", error.error))?;
+    Ok(())
+}
+
 fn quoted(text: &str) -> String { toml::Value::String(text.to_owned()).to_string() }
 fn valid_mailbox_name(text: &str) -> bool {
     let Some((local, domain)) = text.split_once('@') else { return false; };
@@ -456,6 +595,20 @@ fn valid_hostname(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wizard_progress_matches_view_and_confirmation() {
+        let mut wizard = SetupWizard::new(false);
+        assert_eq!(wizard.progress_stage(), 0);
+        wizard.step = SetupStep::Settings;
+        assert_eq!(wizard.progress_stage(), 1);
+        wizard.step = SetupStep::Authenticating;
+        assert_eq!(wizard.progress_stage(), 2);
+        wizard.step = SetupStep::Settings;
+        wizard.saved = true;
+        assert_eq!(wizard.progress_stage(), 3);
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)), WizardAction::Nothing);
+    }
+
     #[test]
     fn generated_config_keeps_alias_separate_from_login() {
         let mut wizard = SetupWizard::new(true);
@@ -572,8 +725,10 @@ mod tests {
         assert_eq!(wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), WizardAction::Discover);
         let discovered = crate::discovery::discover_with_provider("alias@example.edu", "microsoft").unwrap();
         wizard.apply_discovery(discovered);
-        assert_eq!(wizard.step, SetupStep::Settings);
+        assert_eq!(wizard.step, SetupStep::Authenticating);
         assert_eq!(wizard.fields[IMAP_HOST], "outlook.office365.com");
+        wizard.suggest_login(Some("netid@example.edu".into()));
+        assert_eq!(wizard.step, SetupStep::Settings);
         assert_eq!(wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), WizardAction::Save);
         wizard.authenticating = true;
         assert_eq!(wizard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)), WizardAction::Nothing);
@@ -583,14 +738,34 @@ mod tests {
     }
 
     #[test]
-    fn invalid_address_does_not_start_discovery_and_manual_path_is_available() {
+    fn google_sign_in_uses_its_own_stage_before_returning_to_review() {
+        let mut wizard = SetupWizard::new(false);
+        wizard.fields[PROVIDER] = "Google".into();
+        wizard.step = SetupStep::Settings;
+        assert_eq!(wizard.progress_stage(), 1);
+        wizard.begin_authentication();
+        assert_eq!(wizard.progress_stage(), 2);
+        assert_eq!(wizard.step, SetupStep::Authenticating);
+        assert!(wizard.authenticating);
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), WizardAction::Nothing);
+        wizard.suggest_login(None);
+        assert_eq!(wizard.step, SetupStep::Settings);
+        assert!(wizard.authenticated);
+        assert!(!wizard.message.contains("Microsoft"));
+    }
+
+    #[test]
+    fn invalid_address_is_rejected_and_discovery_failure_offers_manual_editing() {
         let mut wizard = SetupWizard::new(true);
         wizard.fields[NAME] = "Campus".into();
         wizard.fields[EMAIL] = "not-an-address".into();
         assert!(wizard.discovery_ready().is_err());
-        wizard.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(wizard.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)), WizardAction::Nothing);
+        assert_eq!(wizard.step, SetupStep::Identity);
+        wizard.discovery_failed("no autoconfig records");
         assert_eq!(wizard.step, SetupStep::Settings);
         assert_eq!(wizard.selected, PROVIDER);
+        assert!(wizard.error);
     }
 
     #[test]
@@ -599,6 +774,7 @@ mod tests {
         wizard.fields[PROVIDER] = "Google".into();
         wizard.step = SetupStep::Settings;
         wizard.selected = CLIENT_ID;
+        wizard.advanced = true;
         wizard.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(wizard.selected, GOOGLE_SECRET);
         assert!(!wizard.visible_fields().contains(&TENANT));
@@ -627,6 +803,50 @@ mod tests {
         let config = Config::load_or_empty(Some(&path)).unwrap();
         assert!(config.accounts.is_empty());
         assert_eq!(config.ui.theme, "nord");
+    }
+
+
+    #[test]
+    fn microsoft_discovery_authenticates_before_review_and_preserves_alias() {
+        let mut wizard = SetupWizard::new(false);
+        wizard.fields[NAME] = "Campus".into();
+        wizard.fields[EMAIL] = "alias@example.edu".into();
+        wizard.apply_discovery(crate::discovery::discover_with_provider(
+            "alias@example.edu", "microsoft").unwrap());
+        assert_eq!(wizard.step, SetupStep::Authenticating);
+        assert!(wizard.visible_fields().is_empty());
+        wizard.suggest_login(Some("netid@example.edu".into()));
+        assert_eq!(wizard.step, SetupStep::Settings);
+        assert_eq!(wizard.fields[EMAIL], "alias@example.edu");
+        assert_eq!(wizard.fields[IMAP_LOGIN], "netid@example.edu");
+        assert_eq!(wizard.fields[SMTP_LOGIN], "netid@example.edu");
+        assert!(!wizard.visible_fields().contains(&CLIENT_ID));
+        wizard.key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(wizard.visible_fields().contains(&CLIENT_ID));
+        assert!(wizard.display_rows().iter().any(|row|
+            matches!(row, SetupDisplayRow::BoxTop("Incoming · IMAP"))));
+    }
+    #[test]
+    fn removing_only_local_account_preserves_other_accounts_and_theme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("config.toml");
+        fs::write(&file, concat!(
+            "# keep this header\n[ui]\ntheme = \"nord\"\n",
+            "[[accounts]]\nname = \"First\"\nemail = \"a@example.com\"\n",
+            "source = \"imap\"\n[accounts.oauth]\nprovider = \"microsoft\"\n",
+            "[[accounts]]\nname = \"Second\"\nemail = \"b@example.com\"\n",
+            "source = \"imap\"\n[accounts.oauth]\nprovider = \"google\"\n",
+        )).unwrap();
+        remove_account(&file, "First").unwrap();
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(saved.contains("# keep this header"));
+        assert!(saved.contains("theme = \"nord\""));
+        assert!(!saved.contains("name = \"First\""));
+        assert!(saved.contains("name = \"Second\""));
+        assert_eq!(Config::load_or_empty(Some(&file)).unwrap().accounts.len(), 1);
+        remove_account(&file, "Second").unwrap();
+        assert!(Config::load_or_empty(Some(&file)).unwrap().accounts.is_empty());
+        assert!(fs::read_to_string(&file).unwrap().contains("theme = \"nord\""));
     }
 
 }

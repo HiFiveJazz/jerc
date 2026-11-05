@@ -265,7 +265,7 @@ fn event_loop(
         }
 
         if std::mem::take(&mut app.setup_reload_requested) {
-            let result = Config::load(Some(&app.setup_config_path))
+            let result = Config::load_or_empty(Some(&app.setup_config_path))
                 .and_then(validate_account_configuration)
                 .and_then(|(config, warnings)| {
                     let workers = create_workers(&config, runtime_tx.clone())?;

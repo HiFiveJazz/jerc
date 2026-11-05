@@ -617,3 +617,23 @@ The provider's registered client identity must be yours or one whose publisher
 has authorized you to use it. This project does not bundle Thunderbird's OAuth
 client identities; copying an unrelated publisher's registration can fail or
 misrepresent the requesting application.
+
+### Account wizard: Microsoft aliases and local removal
+
+The in-app wizard (`Ctrl-a`) starts with account name and visible email. For
+Microsoft 365 accounts discovered without a verified login username, it runs the
+browser OAuth sign-in *before* presenting the editable server settings. The
+OAuth username claim is a **suggestion**, not an authoritative mailbox ID:
+review the separately shown IMAP and SMTP usernames before saving, especially
+if you sign in with an alias. The visible From address remains unchanged.
+Google and manually configured accounts can review server settings first.
+
+The settings review groups Incoming (IMAP) and Outgoing (SMTP) vertically.
+OAuth application ID, Microsoft tenant and Google desktop secret are hidden
+unless `F3` opens Advanced. They still require an authorized application
+registration, supplied by the publisher build or explicitly configured.
+
+While browsing mail, `Alt-d` opens a confirmation to remove the current **local
+account** from `config.toml`. It does not delete any remote IMAP mailbox,
+folder, messages or provider account, and does not revoke stored OAuth grants.
+If you remove the final configured account, the first-run wizard opens again.
