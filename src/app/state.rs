@@ -1794,13 +1794,26 @@ impl AccountState {
     }
 
     fn persist_current_cache(&mut self) {
-        self.save_current_cache();
         let Some(name) = self.current_mailbox.as_ref() else { return; };
-        if let (Some(writer), Some(cached)) = (&self.cache_writer, self.mailbox_cache.get(name)) {
-            if cached.uid_validity.is_some() && !self.unverified_mailboxes.contains(name) {
-                writer.send(cache::Change::Folder(name.clone(), cached.clone()));
-            }
-        }
+        let Some(writer) = &self.cache_writer else { return; };
+        // Don't clone 80 warm preview bodies into the in-session cache and
+        // then clone them *again* for a disk writer that can only keep 12.
+        // In-session snapshots are captured separately when changing folders.
+        let Some(uid_validity) = self.uid_validities.get(name).copied() else { return; };
+        if self.unverified_mailboxes.contains(name) { return; }
+        let truncated = self.messages.len() > cache::MAX_MESSAGES_PER_FOLDER;
+        writer.send(cache::Change::Folder(name.clone(), CachedMailbox {
+            messages: self.messages.iter().take(cache::MAX_MESSAGES_PER_FOLDER)
+                .cloned().collect(),
+            bodies: cache::persistable_bodies(&self.messages, &self.bodies),
+            message_index: self.message_index,
+            message_view_offset: self.message_view_offset,
+            next_page_offset: if truncated { cache::MAX_MESSAGES_PER_FOLDER }
+                else { self.next_page_offset },
+            has_more: truncated || self.has_more,
+            uid_validity: Some(uid_validity),
+            uid_next: self.uid_nexts.get(name).copied(),
+        }));
     }
 
     fn remove_persistent_folder(&self, name: &str) {
@@ -1810,7 +1823,9 @@ impl AccountState {
     }
 
     fn restore_cached_mailbox(&mut self, name: &str) -> bool {
-        let Some(cached) = self.mailbox_cache.get(name).cloned() else {
+        // Once selected, the live vectors own the folder. Moving them avoids
+        // duplicating potentially megabytes of HTML previews on every switch.
+        let Some(cached) = self.mailbox_cache.remove(name) else {
             return false;
         };
         self.current_mailbox = Some(name.to_owned());
@@ -1883,13 +1898,24 @@ impl AccountState {
         let pending_name = name.clone();
         // Give the worker only cached headers (never MIME bodies). It must
         // validate UIDVALIDITY with the server before reusing even one row.
-        let hint = (offset == 0).then(|| self.mailbox_cache.get(&name))
-            .flatten()
-            .and_then(|folder| folder.uid_validity.map(|uid_validity| MailboxSyncHint {
+        let hint = if offset != 0 {
+            None
+        } else if self.current_mailbox.as_deref() == Some(name.as_str()) {
+            // The active folder is no longer duplicated in mailbox_cache.
+            // Use its most recent live headers for IMAP incremental sync.
+            self.uid_validities.get(&name).copied().map(|uid_validity| MailboxSyncHint {
                 uid_validity,
-                uid_next: folder.uid_next,
-                messages: folder.messages.clone(),
-            }));
+                uid_next: self.uid_nexts.get(&name).copied(),
+                messages: self.messages.clone(),
+            })
+        } else {
+            self.mailbox_cache.get(&name)
+                .and_then(|folder| folder.uid_validity.map(|uid_validity| MailboxSyncHint {
+                    uid_validity,
+                    uid_next: folder.uid_next,
+                    messages: folder.messages.clone(),
+                }))
+        };
         if let Ok(request_id) = self.worker.post(ActionKind::OpenMailbox {
             name,
             offset,
@@ -4114,6 +4140,8 @@ impl App {
     fn select_account(&mut self, index: usize) {
         if index >= self.accounts.len() || index == self.account_index { return; }
         if let Some(account) = self.account_mut() {
+            // Each account retains its own live mailbox while inactive; do
+            // not copy its preview bodies into an additional in-memory cache.
             account.persist_current_cache();
         }
         self.count_prefix = None;
@@ -4197,13 +4225,13 @@ impl App {
         let Some(account) = self.account_mut() else {
             return;
         };
+        let previous = account.mailbox_index;
+        let next = bounded_index(previous, account.mailboxes.len(), delta);
+        if next == previous { return; }
+        account.save_current_cache();
         account.persist_current_cache();
         account.smooth_mailbox_target = None;
-        let previous = account.mailbox_index;
-        account.mailbox_index = bounded_index(account.mailbox_index, account.mailboxes.len(), delta);
-        if account.mailbox_index == previous {
-            return;
-        }
+        account.mailbox_index = next;
         account.keep_mailbox_cursor_visible();
         Self::activate_selected_mailbox(account, preview_split);
     }
@@ -4288,10 +4316,12 @@ impl App {
         {
             return;
         }
-        let Some(source) = body.html_source.clone() else {
+        // Only the derived layout is replaced. Borrow the MIME HTML source
+        // instead of cloning potentially megabytes of markup on each reflow.
+        let Some(source) = body.html_source.as_deref() else {
             return;
         };
-        let (html_text, html_lines, html_renderer) = render_html_for_terminal(&source, width);
+        let (html_text, html_lines, html_renderer) = render_html_for_terminal(source, width);
         body.html_text = Some(html_text);
         body.html_lines = Some(html_lines);
         body.html_renderer = Some(html_renderer);

@@ -7,6 +7,12 @@ description = "A fast, backend-oriented terminal email client inspired by aerc"
 license = "MIT"
 publish = false
 
+# Normal release builds retain full syntax-aware patch previews.
+# Use --no-default-features to omit the Tree-sitter grammars for a smaller binary.
+[features]
+default = ["patch-syntax"]
+patch-syntax = ["dep:tree-sitter", "dep:tree-sitter-c", "dep:tree-sitter-rust"]
+
 [dependencies]
 html2text = { version = "0.17.4", features = ["css"] }
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
@@ -27,10 +33,10 @@ ring = "0.17.4" # already used transitively by TLS; PKCE SHA-256 and secure rand
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tree-sitter = "0.27.1"
-tree-sitter-c = "0.24.2"
-tree-sitter-rust = "0.24.2"
-toml = "1.2.0+spec-1.1.0"
+tree-sitter = { version = "0.27.1", optional = true }
+tree-sitter-c = { version = "0.24.2", optional = true }
+tree-sitter-rust = { version = "0.24.2", optional = true }
+toml = "1.2.0"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
 ureq = { version = "3.5.1", features = ["json"] }
@@ -42,14 +48,16 @@ crossterm = { version = "0.29", default-features = false, features = ["use-dev-t
 [target.'cfg(windows)'.dependencies]
 crossterm = { version = "0.29", default-features = false, features = ["windows"] }
 
-[dev-dependencies]
-tempfile = "3.27.0"
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
 
 [lints.rust]
 unsafe_code = "forbid"

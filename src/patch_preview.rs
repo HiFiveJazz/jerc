@@ -4,7 +4,9 @@
 //! Git diff structure separately. Only the preview's short text sample is parsed,
 //! and no parsing happens in the terminal's drawing or smooth-scroll loop.
 
+#[cfg(feature = "patch-syntax")]
 use std::path::Path;
+#[cfg(feature = "patch-syntax")]
 use tree_sitter::{Node, Parser};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,9 +36,11 @@ pub struct PatchPreview {
     pub truncated: bool,
 }
 
+#[cfg(feature = "patch-syntax")]
 #[derive(Debug, Clone, Copy)]
 enum SourceLanguage { Rust, C }
 
+#[cfg(feature = "patch-syntax")]
 fn language_for_file(name: &str) -> Option<SourceLanguage> {
     match Path::new(name).extension().and_then(|ext| ext.to_str())? {
         "rs" => Some(SourceLanguage::Rust),
@@ -45,6 +49,7 @@ fn language_for_file(name: &str) -> Option<SourceLanguage> {
     }
 }
 
+#[cfg(feature = "patch-syntax")]
 fn syntax_tone(kind: &str, parent_kind: &str) -> Option<PatchTone> {
     if kind.contains("comment") { return Some(PatchTone::Comment); }
     if kind.contains("string") || kind.contains("char_literal") { return Some(PatchTone::String); }
@@ -70,6 +75,7 @@ fn syntax_tone(kind: &str, parent_kind: &str) -> Option<PatchTone> {
 /// Map byte ranges from one reconstituted source buffer to the patch rows from
 /// which they came. `+` lines and context lines are new-source text; `-` lines
 /// are old-source text and retain their diff color for clarity.
+#[cfg(feature = "patch-syntax")]
 fn source_highlights(
     lines: &[&str], row_start: usize, language: SourceLanguage,
     out: &mut [Vec<(usize, usize, PatchTone)>],
@@ -109,6 +115,7 @@ fn source_highlights(
     }
 }
 
+#[cfg(feature = "patch-syntax")]
 fn record_range(
     node: Node<'_>, tone: PatchTone,
     positions: &[(usize, usize, usize)],
@@ -164,22 +171,31 @@ fn build_line(line: &str, tokens: &[(usize, usize, PatchTone)]) -> Vec<PatchFrag
 pub fn highlight_patch(text: &str, truncated: bool) -> PatchPreview {
     // The file picker has already bounded text reads to 24 KiB and 180 rows.
     let lines: Vec<_> = text.lines().take(180).collect();
+    #[cfg(feature = "patch-syntax")]
     let mut spans: Vec<Vec<(usize, usize, PatchTone)>> = vec![vec![]; lines.len()];
-    let mut section_start: Option<(usize, SourceLanguage)> = None;
-    for (index, line) in lines.iter().enumerate() {
-        if let Some(filename) = line.strip_prefix("diff --git ") {
-            if let Some((start, language)) = section_start.take() {
-                source_highlights(&lines[start..index], start, language, &mut spans);
+    #[cfg(feature = "patch-syntax")]
+    {
+        let mut section_start: Option<(usize, SourceLanguage)> = None;
+        for (index, line) in lines.iter().enumerate() {
+            if let Some(filename) = line.strip_prefix("diff --git ") {
+                if let Some((start, language)) = section_start.take() {
+                    source_highlights(&lines[start..index], start, language, &mut spans);
+                }
+                let filename = filename.rsplit_once(" b/").map_or(filename, |(_, file)| file);
+                section_start = language_for_file(filename).map(|lang| (index, lang));
             }
-            let filename = filename.rsplit_once(" b/").map_or(filename, |(_, file)| file);
-            section_start = language_for_file(filename).map(|lang| (index, lang));
+        }
+        if let Some((start, language)) = section_start {
+            source_highlights(&lines[start..], start, language, &mut spans);
         }
     }
-    if let Some((start, language)) = section_start {
-        source_highlights(&lines[start..], start, language, &mut spans);
-    }
     PatchPreview {
-        lines: lines.iter().enumerate().map(|(i, line)| build_line(line, &spans[i])).collect(),
+        lines: lines.iter().enumerate().map(|(i, line)| {
+            #[cfg(feature = "patch-syntax")]
+            { build_line(line, &spans[i]) }
+            #[cfg(not(feature = "patch-syntax"))]
+            { let _ = i; build_line(line, &[]) }
+        }).collect(),
         truncated: truncated || text.lines().count() > 180,
     }
 }
@@ -188,6 +204,7 @@ pub fn highlight_patch(text: &str, truncated: bool) -> PatchPreview {
 mod tests {
     use super::{highlight_patch, PatchTone};
 
+    #[cfg(feature = "patch-syntax")]
     #[test]
     fn syntax_highlighting_keeps_git_diff_structure_and_source_intact() {
         let text = "diff --git a/src/main.rs b/src/main.rs\nindex 001..002 100644\n@@ -1 +1 @@\n-fn main() {}\n+fn main() { let answer = 42; }\n";
@@ -198,6 +215,17 @@ mod tests {
         assert!(preview.lines[4].iter().any(|frag| frag.tone == PatchTone::Keyword));
         assert_eq!(preview.lines[4].iter().map(|frag| frag.text.as_str()).collect::<String>(), "+fn main() { let answer = 42; }");
     }
+    #[cfg(not(feature = "patch-syntax"))]
+    #[test]
+    fn minimal_build_keeps_diff_structure_without_syntax_parsing() {
+        let text = "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let preview = highlight_patch(text, false);
+        assert_eq!(preview.lines.len(), 4);
+        assert_eq!(preview.lines[1][0].tone, PatchTone::Hunk);
+        assert_eq!(preview.lines[2][0].tone, PatchTone::Remove);
+        assert_eq!(preview.lines[3][0].tone, PatchTone::Add);
+    }
+
     #[test]
     fn no_grammar_still_highlights_additions_and_deletions() {
         let text = "diff --git a/s.txt b/s.txt\n-old\n+new";

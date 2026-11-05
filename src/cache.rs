@@ -19,7 +19,7 @@ use crate::model::{Mailbox, MessageBody, MessageId, MessageSummary};
 const VERSION: u8 = 1;
 const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_FOLDERS: usize = 256;
-const MAX_MESSAGES_PER_FOLDER: usize = 400;
+pub(crate) const MAX_MESSAGES_PER_FOLDER: usize = 400;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_BODIES_PER_FOLDER: usize = 12;
 
@@ -58,6 +58,30 @@ struct CacheFile {
 struct CacheFileRef<'a> {
     version: u8,
     snapshot: &'a Snapshot,
+}
+
+/// Copy only the bodies the on-disk cache can actually keep. The active
+/// reader may hold up to 80 bodies (including large rich HTML layouts), but
+/// disk persistence only retains the first 12 eligible bodies among the first
+/// 400 message headers. Avoid cloning the full working set on every update.
+pub(crate) fn persistable_bodies(
+    messages: &[MessageSummary],
+    bodies: &HashMap<MessageId, MessageBody>,
+) -> HashMap<MessageId, MessageBody> {
+    let mut selected = HashMap::with_capacity(MAX_BODIES_PER_FOLDER.min(bodies.len()));
+    for message in messages.iter().take(MAX_MESSAGES_PER_FOLDER) {
+        if selected.len() >= MAX_BODIES_PER_FOLDER {
+            break;
+        }
+        let Some(body) = bodies.get(&message.id) else { continue; };
+        let bytes = body.plain_text.as_deref().unwrap_or_default().len()
+            .saturating_add(body.html_source.as_deref().unwrap_or_default().len())
+            .saturating_add(body.html_text.as_deref().unwrap_or_default().len());
+        if bytes <= MAX_BODY_BYTES {
+            selected.insert(message.id.clone(), body.clone());
+        }
+    }
+    selected
 }
 
 pub(crate) enum Change {
@@ -397,6 +421,49 @@ mod tests {
         assert!(cached.has_more);
         assert_eq!(cached.bodies.len(), 1);
         assert_eq!(cached.bodies[&first_id].plain_text.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn persistence_clones_only_bodies_that_survive_disk_limits() {
+        let messages = (1..=MAX_MESSAGES_PER_FOLDER as u32 + 2)
+            .map(|uid| summary(7, uid)).collect::<Vec<_>>();
+        let mut live_bodies = HashMap::new();
+        for message in &messages {
+            let id = message.id.clone();
+            live_bodies.insert(id.clone(), body(id, "cached"));
+        }
+        // This oversized body is skipped, allowing the next eligible body in.
+        let large_id = messages[0].id.clone();
+        live_bodies.insert(large_id.clone(), body(large_id.clone(), &"x".repeat(MAX_BODY_BYTES + 1)));
+        let disk_bodies = persistable_bodies(&messages, &live_bodies);
+        assert_eq!(disk_bodies.len(), MAX_BODIES_PER_FOLDER);
+        assert!(!disk_bodies.contains_key(&large_id));
+        assert!(disk_bodies.contains_key(&messages[1].id));
+        assert!(disk_bodies.contains_key(&messages[MAX_BODIES_PER_FOLDER].id));
+        assert!(!disk_bodies.contains_key(&messages[MAX_MESSAGES_PER_FOLDER].id));
+        // Producing the snapshot must never consume or trim the warm reader cache.
+        assert_eq!(live_bodies.len(), messages.len());
+
+        // The existing writer's validation should produce exactly the same
+        // persisted set as cloning the entire working set before filtering.
+        let mut expected = Snapshot::default();
+        apply(&mut expected, Change::Folder("INBOX".into(), CachedMailbox {
+            messages: messages.clone(), bodies: live_bodies,
+            message_index: 0, message_view_offset: 0, next_page_offset: messages.len(),
+            has_more: false, uid_validity: Some(7), uid_next: None,
+        }));
+        let mut reduced = Snapshot::default();
+        apply(&mut reduced, Change::Folder("INBOX".into(), CachedMailbox {
+            messages: messages.iter().take(MAX_MESSAGES_PER_FOLDER).cloned().collect(),
+            bodies: disk_bodies,
+            message_index: 0, message_view_offset: 0,
+            next_page_offset: MAX_MESSAGES_PER_FOLDER, has_more: true,
+            uid_validity: Some(7), uid_next: None,
+        }));
+        assert_eq!(
+            serde_json::to_value(&expected).unwrap(),
+            serde_json::to_value(&reduced).unwrap()
+        );
     }
 
     #[test]
