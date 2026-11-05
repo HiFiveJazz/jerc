@@ -463,65 +463,47 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         draw_search_header(frame, chunks[0], &search_query, app);
     }
 
-    let (visible, current_position, offset, loading, current_mailbox) = {
-        let account = app.account().expect("account exists");
-        let visible = account.visible_message_indices();
-        let current_position = visible
-            .iter()
-            .position(|index| *index == account.message_index);
-        (
-            visible,
-            current_position,
-            account.message_view_offset,
-            account.messages_loading,
-            account
-                .current_mailbox
-                .clone()
-                .unwrap_or_else(|| "mailbox".to_owned()),
-        )
-    };
-
     app.set_message_view_height(usize::from(list_area.height.max(1)));
+    let account = app.account().expect("account exists");
+    let visible = account.visible_message_indices();
+    let selected_position = visible
+        .iter()
+        .position(|&index| index == account.message_index);
 
     if visible.is_empty() {
-        let message = if loading {
+        let message = if account.messages_loading {
             " Loading messages…".to_owned()
         } else if !search_query.is_empty() {
             format!(" No loaded messages match /{search_query}")
         } else {
-            format!(" No messages in {current_mailbox}.")
+            format!(" No messages in {}.", account.current_mailbox.as_deref().unwrap_or("mailbox"))
         };
         frame.render_widget(Paragraph::new(message).style(theme.muted()), list_area);
         return;
     }
 
     let height = usize::from(list_area.height.max(1));
-    let current_position = current_position.unwrap_or(0);
-    // A message with files has two display lines, like Gmail's filename chips.
-    // Compute the viewport in terminal rows rather than assuming every email
-    // consumes one line (which clipped selected rows at the bottom).
-    let row_heights = {
-        let account = app.account().expect("account exists");
-        visible.iter().map(|&index| {
+    let current_position = selected_position.unwrap_or(0);
+    // Inspect only the few rows around the viewport. The old code allocated a
+    // height vector and checked attachments for every loaded message per draw.
+    let (start, end) = message_list_viewport(
+        &visible,
+        account.message_view_offset,
+        current_position,
+        height,
+        |index| {
             let message = &account.messages[index];
-            if message.has_attachment(account.bodies.get(&message.id)) { 2usize } else { 1 }
-        }).collect::<Vec<_>>()
-    };
-    let mut start = offset.min(visible.len().saturating_sub(1));
-    if current_position < start { start = current_position; }
-    let mut cursor_window_rows = row_heights[start..=current_position].iter().sum::<usize>();
-    while start < current_position && cursor_window_rows > height {
-        cursor_window_rows -= row_heights[start];
-        start += 1;
-    }
-    let mut end = start;
-    let mut used = 0usize;
-    while end < visible.len() && used + row_heights[end] <= height {
-        used += row_heights[end];
-        end += 1;
-    }
-    if end == start { end = (start + 1).min(visible.len()); }
-    if let Some(account) = app.account_mut() { account.message_view_offset = start; }
+            if message.has_attachment(account.bodies.get(&message.id)) { 2 } else { 1 }
+        },
+    );
+    // Resolve the visual range once; calling message_is_visual_selected() for
+    // every row previously rebuilt and searched the entire filtered index list.
+    let visual_range = message_list_visual_range(&visible, app.visual_anchor, selected_position);
+    let in_junk = account.current_mailbox.as_ref().is_some_and(|source| {
+        account.mailboxes.iter().any(|mailbox| {
+            mailbox.name == *source && mailbox.role == crate::model::MailboxRole::Junk
+        })
+    });
     let shown = &visible[start..end];
     let number_width = relative_number_width(visible.len());
     let message_columns = [
@@ -534,24 +516,18 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let column_areas = Layout::horizontal(message_columns.clone())
         .spacing(1)
         .split(list_area);
-    // Use the *actual* subject column width. The old two-cell safety gutter
-    // and forced U+FE0E presentation selectors clipped Apple Color Emoji even
-    // when the remaining cells were empty.
+    // Use the actual subject width to preserve wide emoji graphemes.
     let subject_width = column_areas.get(3).map_or(0, |area| usize::from(area.width));
-    let rows = shown.iter().enumerate().map(|(row_position, index)| {
-        let account = app.account().expect("account exists");
-        let message = &account.messages[*index];
+    let rows = shown.iter().enumerate().map(|(row_position, &index)| {
+        let message = &account.messages[index];
         let absolute_position = start + row_position;
         let number = relative_number(absolute_position, current_position);
-        let visual_selected = app.message_is_visual_selected(*index);
+        let visual_selected = visual_range.is_some_and(|(first, last)| {
+            (first..=last).contains(&absolute_position)
+        });
         let current = absolute_position == current_position;
         let unread_mark = if visual_selected { "✓" } else if message.flags.contains(MessageFlags::SEEN) { " " } else { "●" };
-        let in_junk = account.current_mailbox.as_ref().is_some_and(|source|
-            account.mailboxes.iter().any(|mailbox|
-                mailbox.name == *source && mailbox.role == crate::model::MailboxRole::Junk));
         let attachment_mark = message.has_attachment(account.bodies.get(&message.id));
-        // A separate box glyph in the mark column, never embedded in the
-        // subject where it could be mistaken for part of the title.
         let mark = Line::from(vec![
             Span::raw(unread_mark),
             if in_junk {
@@ -562,9 +538,9 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } else { Span::raw(" ") },
         ]);
         let sender = if message.from_name.is_empty() {
-            &message.from_address
+            message.from_address.as_str()
         } else {
-            &message.from_name
+            message.from_name.as_str()
         };
         let style = if visual_selected {
             theme.selected()
@@ -577,32 +553,88 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             theme.text()
         };
-        let mut subject_lines = vec![Line::raw(
-            truncate_display_width(&subject_for_list(&message.subject), subject_width)
-        )];
-        if attachment_mark {
-            let names = account.bodies.get(&message.id)
-                .map_or_else(|| crate::mail::visible_attachment_hints(&message.attachment_names_hint),
-                    |body| body.attachment_names.clone());
-            let subtitle = attachment_subtitle(&names);
-            subject_lines.push(Line::styled(truncate_display_width(&subtitle, subject_width), theme.muted()));
-        }
+        // Borrow unchanged subjects and strings from the message. Own text
+        // only when normalization or display-width truncation actually changes it.
+        let subject_line = match subject_for_list_cow(&message.subject) {
+            std::borrow::Cow::Borrowed(subject) =>
+                Line::raw(truncate_display_width_cow(subject, subject_width)),
+            std::borrow::Cow::Owned(normalized) =>
+                Line::raw(truncate_display_width_cow(&normalized, subject_width).into_owned()),
+        };
+        let subject_cell = if attachment_mark {
+            let subtitle = account.bodies.get(&message.id).map_or_else(
+                || attachment_subtitle(&crate::mail::visible_attachment_hints(&message.attachment_names_hint)),
+                |body| attachment_subtitle(&body.attachment_names),
+            );
+            Cell::from(Text::from(vec![
+                subject_line,
+                Line::styled(truncate_display_width(&subtitle, subject_width), theme.muted()),
+            ]))
+        } else {
+            Cell::from(subject_line)
+        };
         Row::new(vec![
             Cell::from(number),
             Cell::from(mark),
-            Cell::from(sender.clone()),
-            Cell::from(Text::from(subject_lines)),
-            Cell::from(message.date_label.clone()),
+            Cell::from(sender),
+            subject_cell,
+            Cell::from(message.date_label.as_str()),
         ])
         .height(if attachment_mark { 2 } else { 1 })
         .style(style)
     });
 
     let table = Table::new(rows, message_columns)
-    .style(theme.text())
-    .column_spacing(1);
+        .style(theme.text())
+        .column_spacing(1);
     frame.render_widget(table, list_area);
+    if let Some(account) = app.account_mut() {
+        account.message_view_offset = start;
+    }
+}
 
+/// Compute the same terminal-row-aware viewport as the original list without
+/// allocating a row-height vector or visiting messages far from the viewport.
+fn message_list_viewport(
+    visible: &[usize],
+    offset: usize,
+    current_position: usize,
+    height: usize,
+    mut row_height: impl FnMut(usize) -> usize,
+) -> (usize, usize) {
+    if visible.is_empty() { return (0, 0); }
+    let current = current_position.min(visible.len() - 1);
+    let min_start = offset.min(visible.len() - 1).min(current);
+    let mut start = current;
+    let mut used = row_height(visible[current]);
+    while start > min_start {
+        let previous = row_height(visible[start - 1]);
+        if used.saturating_add(previous) > height { break; }
+        used += previous;
+        start -= 1;
+    }
+    let mut end = start;
+    used = 0;
+    while end < visible.len() {
+        let next = row_height(visible[end]);
+        if used.saturating_add(next) > height { break; }
+        used += next;
+        end += 1;
+    }
+    if end == start { end = (start + 1).min(visible.len()); }
+    (start, end)
+}
+
+/// Positions are indices in the filtered/sorted view, not message IDs.
+fn message_list_visual_range(
+    visible: &[usize],
+    anchor: Option<usize>,
+    current_position: Option<usize>,
+) -> Option<(usize, usize)> {
+    let anchor = anchor?;
+    let current_position = current_position?;
+    let anchor_position = visible.iter().position(|&index| index == anchor)?;
+    Some((anchor_position.min(current_position), anchor_position.max(current_position)))
 }
 
 /// Attachment chips share the same left edge as the first subject character.
@@ -2724,29 +2756,27 @@ fn mailbox_row_text(name: &str, count: &str, width: usize) -> String {
 }
 
 fn truncate_display_width(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(text) <= width {
-        return text.to_owned();
-    }
-    if width == 1 {
-        return "…".to_owned();
-    }
+    truncate_display_width_cow(text, width).into_owned()
+}
+
+/// Keep borrowed mail-list text when it fits rather than allocating every row.
+fn truncate_display_width_cow(text: &str, width: usize) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if width == 0 { return Cow::Borrowed(""); }
+    if UnicodeWidthStr::width(text) <= width { return Cow::Borrowed(text); }
+    if width == 1 { return Cow::Borrowed("…"); }
 
     let budget = width.saturating_sub(1);
     let mut used = 0usize;
     let mut out = String::new();
     for grapheme in UnicodeSegmentation::graphemes(text, true) {
         let grapheme_width = UnicodeWidthStr::width(grapheme);
-        if used.saturating_add(grapheme_width) > budget {
-            break;
-        }
+        if used.saturating_add(grapheme_width) > budget { break; }
         out.push_str(grapheme);
         used = used.saturating_add(grapheme_width);
     }
     out.push('…');
-    out
+    Cow::Owned(out)
 }
 
 fn truncate_chars(text: &str, width: usize) -> String {
@@ -2765,27 +2795,37 @@ fn truncate_chars(text: &str, width: usize) -> String {
     out
 }
 
+#[cfg(test)]
 fn subject_for_list(subject: &str) -> String {
-    // Prefer monochrome text presentation ONLY where the character has a known
-    // text-style glyph. Do not rewrite emoji-only characters such as 👋, flags,
-    // skin-tone variants or joined sequences: the old blanket FE0E insertion
-    // made the terminal paint half a wide glyph over the next cell. This keeps
-    // full-width subject cells and one terminal row per message.
-    let mut output = String::with_capacity(subject.len());
-    for cluster in UnicodeSegmentation::graphemes(subject, true) {
+    subject_for_list_cow(subject).into_owned()
+}
+
+fn subject_for_list_cow(subject: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    // Preserve the original bytes unless a text-capable emoji needs FE0E.
+    // This avoids allocating for the overwhelming majority of mail subjects.
+    let mut output: Option<String> = None;
+    let mut copied_to = 0usize;
+    for (offset, cluster) in UnicodeSegmentation::grapheme_indices(subject, true) {
         let mut chars = cluster.chars();
-        let base = chars.next();
-        if let Some(base) = base {
+        if let Some(base) = chars.next() {
             let simple = chars.all(|ch| ch == '\u{fe0e}' || ch == '\u{fe0f}');
             if simple && supports_safe_text_presentation(base) {
-                output.push(base);
-                output.push('\u{fe0e}');
-                continue;
+                let out = output.get_or_insert_with(|| String::with_capacity(subject.len()));
+                out.push_str(&subject[copied_to..offset]);
+                out.push(base);
+                out.push('\u{fe0e}');
+                copied_to = offset + cluster.len();
             }
         }
-        output.push_str(cluster);
     }
-    output
+    match output {
+        Some(mut out) => {
+            out.push_str(&subject[copied_to..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(subject),
+    }
 }
 
 /// Unicode characters with established text/emoji variants whose *text*
@@ -3005,6 +3045,63 @@ mod tests {
         assert_eq!(kinds[4], Some(PatchLineKind::Add));
         assert_eq!(kinds[5], None);
         assert_eq!(kinds[6], None);
+    }
+
+    #[test]
+    fn message_viewport_matches_full_height_scan() {
+        // Reference: previous implementation, which scanned/allotted heights
+        // for the entire mailbox on every terminal redraw.
+        fn old_viewport(heights: &[usize], offset: usize, current: usize, height: usize) -> (usize, usize) {
+            let mut start = offset.min(heights.len() - 1);
+            if current < start { start = current; }
+            let mut rows = heights[start..=current].iter().sum::<usize>();
+            while start < current && rows > height {
+                rows -= heights[start];
+                start += 1;
+            }
+            let mut end = start;
+            let mut used = 0;
+            while end < heights.len() && used + heights[end] <= height {
+                used += heights[end];
+                end += 1;
+            }
+            if end == start { end = (start + 1).min(heights.len()); }
+            (start, end)
+        }
+        for mask in 0..256usize {
+            let heights: Vec<_> = (0..8).map(|index| 1 + ((mask >> index) & 1)).collect();
+            let visible: Vec<_> = (0..heights.len()).collect();
+            for height in 1..=10 {
+                for offset in 0..=heights.len() {
+                    for current in 0..heights.len() {
+                        assert_eq!(
+                            super::message_list_viewport(&visible, offset, current, height, |index| heights[index]),
+                            old_viewport(&heights, offset, current, height),
+                            "mask={mask} height={height} offset={offset} current={current}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(super::message_list_viewport(&[], 0, 0, 1, |_| 1), (0, 0));
+    }
+
+    #[test]
+    fn visual_mail_selection_uses_view_positions_without_repeated_searches() {
+        let visible = [6, 2, 9, 1];
+        assert_eq!(super::message_list_visual_range(&visible, Some(9), Some(1)), Some((1, 2)));
+        assert_eq!(super::message_list_visual_range(&visible, Some(6), Some(3)), Some((0, 3)));
+        assert_eq!(super::message_list_visual_range(&visible, Some(8), Some(1)), None);
+        assert_eq!(super::message_list_visual_range(&visible, None, Some(1)), None);
+    }
+
+    #[test]
+    fn mail_list_borrows_unchanged_subjects_and_truncation() {
+        use std::borrow::Cow;
+        assert!(matches!(super::subject_for_list_cow("Hello 👋"), Cow::Borrowed(_)));
+        assert_eq!(super::subject_for_list_cow("❤️"), "❤\u{fe0e}");
+        assert!(matches!(super::truncate_display_width_cow("Hello", 10), Cow::Borrowed(_)));
+        assert_eq!(super::truncate_display_width_cow("Hello", 4), "Hel…");
     }
 
     #[test]
