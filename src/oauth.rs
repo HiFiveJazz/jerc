@@ -36,7 +36,16 @@ pub fn embedded_client_id(provider: &str) -> Option<&'static str> {
 
 #[must_use]
 pub fn embedded_google_client_secret() -> Option<&'static str> {
-    option_env!("AERC_RS_GOOGLE_CLIENT_SECRET").filter(|secret| !secret.is_empty())
+    option_env!("AERC_RS_GOOGLE_CLIENT_SECRET").filter(|secret| !secret.trim().is_empty())
+}
+
+/// Explicit nonempty account values override publisher defaults. Treat a
+/// blank field in an older generated config as absent, not as a request to
+/// disable the embedded registration. A release build can therefore work on
+/// a second machine without users supplying OAuth application IDs.
+fn account_or_embedded<'a>(account_value: Option<&'a str>, embedded: Option<&'a str>) -> Option<&'a str> {
+    account_value.filter(|value| !value.trim().is_empty())
+        .or_else(|| embedded.filter(|value| !value.trim().is_empty()))
 }
 
 /// Google Desktop application OAuth client IDs include this suffix verbatim.
@@ -250,15 +259,15 @@ impl OAuthSettings {
 
     fn from_config(name: &str, oauth: &OAuthConfig) -> Result<Self> {
         let provider = oauth.provider.trim().to_ascii_lowercase();
-        let client_id = oauth.client_id.clone()
-            .or_else(|| embedded_client_id(&provider).map(str::to_owned))
-            .filter(|id| !id.trim().is_empty()).ok_or_else(|| anyhow!(
+        let client_id = account_or_embedded(
+            oauth.client_id.as_deref(), embedded_client_id(&provider),
+        ).ok_or_else(|| anyhow!(
             "OAuth account {name:?} needs oauth.client_id or an app-publisher client ID at build time"
-        ))?;
-        let client_secret = oauth.client_secret.clone().or_else(|| {
-            (provider == "google").then(|| embedded_google_client_secret())
-                .flatten().map(str::to_owned)
-        });
+        ))?.to_owned();
+        let client_secret = account_or_embedded(
+            oauth.client_secret.as_deref(),
+            if provider == "google" { embedded_google_client_secret() } else { None },
+        ).map(str::to_owned);
         let (auth_endpoint, token_endpoint, scope) = match provider.as_str() {
             "google" => (
                 "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
@@ -756,6 +765,17 @@ pub fn login_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_publisher_defaults_respect_explicit_nonempty_overrides() {
+        assert_eq!(account_or_embedded(None, Some("embedded")), Some("embedded"));
+        assert_eq!(account_or_embedded(Some(""), Some("embedded")), Some("embedded"));
+        assert_eq!(account_or_embedded(Some("  "), Some("embedded")), Some("embedded"));
+        assert_eq!(account_or_embedded(Some("override"), Some("embedded")), Some("override"));
+        assert_eq!(account_or_embedded(Some("override"), None), Some("override"));
+        assert_eq!(account_or_embedded(None, None), None);
+        assert_eq!(account_or_embedded(Some(""), None), None);
+    }
     #[test]
     fn google_desktop_id_must_include_full_suffix() {
         assert!(valid_google_desktop_client_id("123-abc.apps.googleusercontent.com"));

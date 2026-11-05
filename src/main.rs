@@ -28,6 +28,11 @@ struct Cli {
     #[arg(long, value_name = "ACCOUNT_NAME")]
     oauth_login: Option<String>,
 
+    /// Check whether this executable contains publisher-configured OAuth
+    /// registrations (without revealing their values). No config is needed.
+    #[arg(long, conflicts_with_all = ["maildir", "oauth_login", "oauth_inspect", "oauth_probe", "discover_email", "headless_check"])]
+    oauth_build_info: bool,
+
     /// Show the account's OAuth redirect, permissions, and consent options
     /// without opening a browser or making a network request.
     #[arg(long, value_name = "ACCOUNT_NAME", conflicts_with = "oauth_login")]
@@ -69,6 +74,29 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.oauth_build_info {
+        // This works on a completely fresh machine; never print client IDs
+        // or Google desktop public secrets into terminal logs.
+        let google = aerc_rs::oauth::embedded_client_id("google");
+        let google_status = match google {
+            Some(id) if aerc_rs::oauth::valid_google_desktop_client_id(id) => "embedded",
+            Some(_) => "embedded, but not a valid Google desktop client ID",
+            None => "not embedded",
+        };
+        println!("Google OAuth client ID: {google_status}");
+        println!("Microsoft OAuth client ID: {}", if aerc_rs::oauth::embedded_client_id("microsoft").is_some() {
+            "embedded"
+        } else {
+            "not embedded"
+        });
+        println!("Google desktop public client secret: {}", if aerc_rs::oauth::embedded_google_client_secret().is_some() {
+            "embedded"
+        } else {
+            "not embedded (optional for some registrations)"
+        });
+        println!("These are compile-time settings. Account-specific OAuth values can override them.");
+        return Ok(());
+    }
     if let Some(email) = &cli.discover_email {
         let mut provider = cli.discover_provider.as_deref().unwrap_or("auto");
         let mut oauth_settings = None;

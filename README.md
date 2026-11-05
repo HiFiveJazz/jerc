@@ -604,6 +604,37 @@ requires it, set this publisher build-time value or the wizard's optional
 `Google desktop secret` field. Unlike a confidential server secret, a desktop
 client secret embedded in a public desktop executable is not private.
 
+To build a portable executable, provide the **authorized** application
+registrations on the same command that compiles the binary (these variables
+are **build-time inputs**, not launch arguments):
+
+```sh
+AERC_RS_GOOGLE_CLIENT_ID="YOUR_FULL_GOOGLE_ID.apps.googleusercontent.com" \
+AERC_RS_MICROSOFT_CLIENT_ID="YOUR_REGISTERED_MICROSOFT_CLIENT_ID" \
+cargo build --release
+```
+
+If your own Google desktop OAuth registration requires its issued public
+client secret, set `AERC_RS_GOOGLE_CLIENT_SECRET` on that build command too.
+When changing IDs between builds, run `cargo clean -p aerc-rs` first to make
+sure the application crate recompiles. No client-ID variables or special
+launch flags are needed **on the destination machine**. OAuth authorization
+and tenant consent are still evaluated by each provider.
+
+Before copying the binary, verify the actual artifact without exposing IDs:
+
+```sh
+./target/release/aerc-rs --oauth-build-info
+```
+
+Copy `target/release/aerc-rs` and run it normally on the second computer.
+The build-info check also works there with no config file. A check that reads
+`os.environ` in a separate shell can incorrectly report missing values when
+the build variables are no longer exported, even if the binary is correct.
+An old explicit account `client_id` remains an override; remove it (or make
+it empty) to use the embedded default. Browser redirects must match the
+publisher's registered desktop OAuth application.
+
 Google desktop client IDs must keep the complete
 `.apps.googleusercontent.com` suffix. Removing it does not create a valid
 short alias. A browser reporting "Authorization received" only confirms that
