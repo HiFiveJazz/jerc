@@ -127,7 +127,7 @@ fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
     // A single border title avoids the two titles overlapping at smaller widths.
     let block = Block::default()
         .title(Line::from(progress).centered())
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.accent());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.height < 7 || inner.width < 15 { return; }
@@ -216,13 +216,21 @@ fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
         let width = usize::from(row_area.width);
         match entry {
             SetupDisplayRow::BoxTop(title) => {
-                let start = format!("┌─ {title} ");
-                let line = format!("{}{}┐", start,
+                let (left, right) = match theme.border_type {
+                    ratatui::widgets::BorderType::Rounded => ('╭', '╮'),
+                    _ => ('┌', '┐'),
+                };
+                let start = format!("{left}─ {title} ");
+                let line = format!("{}{}{right}", start,
                     "─".repeat(width.saturating_sub(start.chars().count() + 1)));
                 frame.render_widget(Paragraph::new(Line::styled(line, theme.border())), row_area);
             }
             SetupDisplayRow::BoxBottom => {
-                let line = format!("└{}┘", "─".repeat(width.saturating_sub(2)));
+                let (left, right) = match theme.border_type {
+                    ratatui::widgets::BorderType::Rounded => ('╰', '╯'),
+                    _ => ('└', '┘'),
+                };
+                let line = format!("{left}{}{right}", "─".repeat(width.saturating_sub(2)));
                 frame.render_widget(Paragraph::new(Line::styled(line, theme.border())), row_area);
             }
             SetupDisplayRow::Field(index) => {
@@ -342,7 +350,7 @@ fn draw_startup_warnings(frame: &mut Frame<'_>, app: &App) {
     let area = centered_rect(frame.area(), 85, 55);
     frame.render_widget(Clear, area);
     let block = Block::default().title(" Account configuration warnings ")
-        .borders(Borders::ALL).border_style(theme.error());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.error());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let details = app.startup_warnings.iter().enumerate()
@@ -1846,7 +1854,7 @@ fn draw_help_palette(
     let area = centered_rect(frame.area(), 86, 70);
     frame.render_widget(Clear, area);
     let block = Block::default().title(title)
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::vertical([
@@ -1902,7 +1910,7 @@ fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(" Themes ")
-        .borders(Borders::ALL)
+        .borders(Borders::ALL).border_type(theme.border_type)
         .border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1959,7 +1967,7 @@ fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
     let mark_count = app.attachment_marked.len();
     let title = if mark_count == 0 { format!(" Attachments · {count} ") }
         else { format!(" Attachments · {count} · {mark_count} marked ") };
-    frame.render_widget(Block::default().title(title).borders(Borders::ALL)
+    frame.render_widget(Block::default().title(title).borders(Borders::ALL).border_type(theme.border_type)
         .border_style(theme.accent()), area);
 
     // Left pane: header row + viewport-centered rows, with relative line
@@ -2073,7 +2081,7 @@ fn draw_attachment_destination_picker(frame: &mut Frame<'_>, app: &App) {
     let count = if app.attachment_marked.is_empty() { usize::from(!app.attachment_files.is_empty()) }
         else { app.attachment_marked.len() };
     let block = Block::default().title(format!(" Save {count} attachment(s) · choose destination "))
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 12 || inner.height < 5 { return; }
@@ -2165,7 +2173,7 @@ fn draw_compose_exit_prompt(frame: &mut Frame<'_>, theme: &Theme) {
     );
     frame.render_widget(Clear, area);
     let block = Block::default().title(" Save unsent email? ")
-        .borders(Borders::ALL).border_style(theme.border());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.border());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 10 || inner.height < 3 { return; }
@@ -2184,7 +2192,7 @@ fn draw_remove_account_confirmation(frame: &mut Frame<'_>, app: &App) {
     let area = centered_rect(frame.area(), 72, 27);
     frame.render_widget(Clear, area);
     let block = Block::default().title(" Remove local email account ")
-        .borders(Borders::ALL).border_style(theme.error());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.error());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(format!(
@@ -2234,7 +2242,7 @@ fn draw_review_dialog(frame: &mut Frame<'_>, theme: &Theme, title: &str,
     let area = centered_rect(frame.area(), 86, 72);
     frame.render_widget(Clear, area);
     let block = Block::default().title(format!(" {title} "))
-        .borders(Borders::ALL).border_style(theme.error());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.error());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 10 || inner.height < 5 { return; }
@@ -2283,7 +2291,7 @@ fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
     let area = centered_rect(frame.area(), frame.area().width.saturating_sub(4).min(100), 88);
     frame.render_widget(Clear, area);
     let block = Block::default().title(" Review outgoing email ")
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height < 8 { return; }
@@ -2457,7 +2465,7 @@ fn draw_compose_file_picker(frame: &mut Frame<'_>, app: &mut App) {
     let theme = app.theme();
     frame.render_widget(Clear, area);
     let block = Block::default().title(format!(" Attach files · {} selected ", composer.attachment_count()))
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height < 5 || inner.width < 12 { return; }
@@ -2586,7 +2594,7 @@ fn draw_compose_file_picker_help(frame: &mut Frame<'_>, app: &App, picker: &crat
     let area = centered_rect(frame.area(), 83, 72);
     frame.render_widget(Clear, area);
     let block = Block::default().title(" File picker keybindings ")
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
@@ -2619,7 +2627,7 @@ fn draw_compose_attachment_manager(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(format!(" Attached files · {} ", composer.attachment_count()))
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 { return; }
@@ -2659,7 +2667,7 @@ fn draw_compose_advanced_options(frame: &mut Frame<'_>, app: &App) {
     let area = centered_rect(frame.area(), 82, 32);
     frame.render_widget(Clear, area);
     let block = Block::default().title(" Advanced compose options ")
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::vertical([
@@ -2690,7 +2698,7 @@ fn draw_compose_help(frame: &mut Frame<'_>, app: &App) {
     let area = centered_rect(frame.area(), 85, 73);
     frame.render_widget(Clear, area);
     let block = Block::default().title(" Compose keybindings ")
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::vertical([
@@ -2771,7 +2779,7 @@ fn draw_contact_suggestions(frame: &mut Frame<'_>, app: &App) {
     let y = inner_y.saturating_add(y_offset).min(frame.area().bottom().saturating_sub(height));
     let area = Rect::new(x, y, width, height);
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().borders(Borders::ALL)
+    frame.render_widget(Block::default().borders(Borders::ALL).border_type(theme.border_type)
         .border_style(theme.border()).style(contact_surface_style(theme)), area);
     for (position, id) in ids.iter().take(usize::from(height.saturating_sub(2))).enumerate() {
         let contact = &app.contacts.entries[*id];
@@ -2871,7 +2879,7 @@ fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
     let Some(modal) = app.contacts_modal.as_mut() else { return; };
     let area = centered_rect(frame.area(), 116, 88);
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().title(" Contacts ").borders(Borders::ALL)
+    frame.render_widget(Block::default().title(" Contacts ").borders(Borders::ALL).border_type(theme.border_type)
         .style(contact_surface_style(&theme)).border_style(theme.border()), area);
     let inner = Rect::new(area.x.saturating_add(2), area.y.saturating_add(1),
         area.width.saturating_sub(4), area.height.saturating_sub(2));
@@ -2972,7 +2980,7 @@ fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
         let edit_area = centered_rect(frame.area(), 74, 35);
         frame.render_widget(Clear, edit_area);
         frame.render_widget(Block::default().title(if edit.original_email.is_some() { " Edit contact " } else { " New contact " })
-            .borders(Borders::ALL).border_style(theme.border()).style(contact_surface_style(&theme)), edit_area);
+            .borders(Borders::ALL).border_type(theme.border_type).border_style(theme.border()).style(contact_surface_style(&theme)), edit_area);
         let width = edit_area.width.saturating_sub(4);
         let name_y = edit_area.y.saturating_add(2);
         let email_y = name_y.saturating_add(2);
@@ -3115,7 +3123,7 @@ fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(if composer.sending { " Compose • sending… " } else { " Compose " })
-        .borders(Borders::ALL)
+        .borders(Borders::ALL).border_type(theme.border_type)
         .border_style(theme.border());
     let inside = block.inner(area);
     frame.render_widget(block, area);
@@ -3570,6 +3578,27 @@ mod tests {
         assert_eq!(visual.style.fg, Some(theme.visual));
         assert_eq!(super::mail_gutter(&theme, false, false, true).content.as_ref(), " ");
         assert_eq!(super::mail_gutter(&theme, false, false, false).content.as_ref(), "▏");
+    }
+
+    #[test]
+    fn compose_exit_uses_configured_square_or_rounded_corners() {
+        use ratatui::{Terminal, backend::TestBackend, widgets::BorderType};
+        for (border_type, expected) in [
+            (BorderType::Plain, '┌'),
+            (BorderType::Rounded, '╭'),
+        ] {
+            let mut theme = load_themes().into_iter().next().unwrap();
+            theme.border_type = border_type;
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| super::draw_compose_exit_prompt(frame, &theme)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let actual = (0u16..24).flat_map(|y| (0u16..80).map(move |x| (x, y)))
+                .find_map(|(x, y)| {
+                    let symbol = buffer[(x, y)].symbol();
+                    matches!(symbol, "┌" | "╭").then(|| symbol.chars().next().unwrap())
+                });
+            assert_eq!(actual, Some(expected), "wrong corner for {border_type:?}");
+        }
     }
 
     #[test]

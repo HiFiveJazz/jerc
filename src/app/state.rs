@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
 use ratatui::layout::Size;
+use ratatui::widgets::BorderType;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
 use crate::app::{ATTACHMENT_HELP_ENTRIES, CONTACT_HELP_ENTRIES, Command, Focus, HELP_ENTRIES, command_for_key, ranked_help_matches};
 use crate::setup::{SetupWizard, WizardAction};
 use crate::cache::{self, CachedMailbox};
 use crate::backend::MailboxSyncHint;
-use crate::config::{Config, VisualSelectionStyle};
+use crate::config::{Config, UiBorderStyle, VisualSelectionStyle};
 use crate::contacts::{ContactBook, ContactsModal, ContactEdit, recipient_query, replace_recipient, replace_recipients, recipients};
 use crate::mail::{parse_body, render_html_for_terminal};
 use crate::outgoing::{ReplyAudience, reply_recipients, reply_subject, forward_subject, inline_forward_parts, forward_html, forward_attribution, FORWARD_SEPARATOR};
@@ -2557,7 +2558,14 @@ impl App {
                 account
             })
             .collect();
-        let themes = load_themes();
+        let mut themes = load_themes();
+        let border_type = match config.ui.border_style {
+            UiBorderStyle::Square => BorderType::Plain,
+            UiBorderStyle::Rounded => BorderType::Rounded,
+        };
+        for theme in &mut themes {
+            theme.border_type = border_type;
+        }
         let theme_index = theme_index(&themes, &config.ui.theme);
         let contacts_path = ContactBook::default_path();
         let loaded_contacts = ContactBook::load(&contacts_path);
@@ -8624,7 +8632,16 @@ mod tests {
     };
     use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
+use ratatui::widgets::BorderType;
     use std::path::PathBuf;
+
+    #[test]
+    fn rounded_borders_apply_to_every_theme() {
+        let config: crate::config::Config =
+            toml::from_str("[ui]\nborder_style = \"rounded\"").unwrap();
+        let app = super::App::new(&config, vec![]);
+        assert!(app.themes.iter().all(|theme| theme.border_type == BorderType::Rounded));
+    }
 
     #[test]
     fn space_marking_a_mail_range_is_idempotent_and_toggleable() {

@@ -214,6 +214,16 @@ pub enum VisualSelectionStyle {
     Gutter,
 }
 
+/// Shape of rectangular application and popup borders. Does not change
+/// column separators or the space reserved for any widget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiBorderStyle {
+    #[default]
+    Square,
+    Rounded,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UiConfig {
     /// Legacy milestone-3 setting. Kept so existing config files continue to
@@ -259,6 +269,9 @@ pub struct UiConfig {
     /// colors only their left-side marker (default).
     #[serde(default)]
     pub visual_selection_style: VisualSelectionStyle,
+    /// Outer borders: `square` (default) or `rounded`.
+    #[serde(default)]
+    pub border_style: UiBorderStyle,
     /// freedesktop sound theme name; COSMIC-installed themes can provide this.
     #[serde(default = "default_mail_sound_name")]
     pub new_mail_sound_name: String,
@@ -283,6 +296,7 @@ impl Default for UiConfig {
             notification_icon_style: NotificationIconStyle::default(),
             search_mode: MailSearchMode::default(),
             visual_selection_style: VisualSelectionStyle::default(),
+            border_style: UiBorderStyle::default(),
             new_mail_sound_name: default_mail_sound_name(),
             new_mail_sound_file: None,
         }
@@ -713,6 +727,17 @@ mod tests {
         assert!(!super::mailbox_is_excluded("Draftsmith", patterns));
         assert!(!super::mailbox_is_excluded("INBOX", &[String::new()]));
         assert!(super::mailbox_is_excluded("工作/草稿", &["工作/*".into()]));
+    }
+
+    #[test]
+    fn border_style_defaults_to_square_and_parses_rounded() {
+        let default: super::Config = toml::from_str("[ui]\n").unwrap();
+        assert_eq!(default.ui.border_style, super::UiBorderStyle::Square);
+        let rounded: super::Config = toml::from_str("[ui]\nborder_style = \"rounded\"").unwrap();
+        assert_eq!(rounded.ui.border_style, super::UiBorderStyle::Rounded);
+        let square: super::Config = toml::from_str("[ui]\nborder_style = \"square\"").unwrap();
+        assert_eq!(square.ui.border_style, super::UiBorderStyle::Square);
+        assert!(toml::from_str::<super::Config>("[ui]\nborder_style = \"circular\"").is_err());
     }
 
     #[test]

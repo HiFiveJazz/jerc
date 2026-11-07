@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::BorderType;
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -16,6 +17,8 @@ pub struct Theme {
     pub selected_fg: Color,
     pub selected_bg: Color,
     pub border: Color,
+    /// Border shape selected in [ui], applied to all built-in and custom themes.
+    pub border_type: BorderType,
     pub error: Color,
     pub warning: Color,
     pub visual: Color,
@@ -197,6 +200,7 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
         selected_fg,
         selected_bg,
         border,
+        border_type: BorderType::Plain,
         error,
         warning,
         visual,
@@ -233,6 +237,7 @@ fn fallback_theme() -> Theme {
         selected_fg: Color::Black,
         selected_bg: Color::Cyan,
         border: Color::DarkGray,
+        border_type: BorderType::Plain,
         error: Color::LightRed,
         warning: Color::Yellow,
         visual: Color::Magenta,

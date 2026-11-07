@@ -31,9 +31,9 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 ring = "0.17.4" # already used transitively by TLS; PKCE SHA-256 and secure random
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1"
-tempfile = "3"
-tree-sitter = { version = "0.27.1", optional = true }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+tree-sitter = { version = "0.27.2", optional = true }
 tree-sitter-c = { version = "0.24.2", optional = true }
 tree-sitter-rust = { version = "0.24.2", optional = true }
 toml = "1.2.0"
@@ -43,10 +43,10 @@ ureq = { version = "3.5.1", features = ["json"] }
 url = "2.5.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-crossterm = { version = "0.29", default-features = false, features = ["use-dev-tty"] }
+crossterm = { version = "0.29.0", default-features = false, features = ["use-dev-tty"] }
 
 [target.'cfg(windows)'.dependencies]
-crossterm = { version = "0.29", default-features = false, features = ["windows"] }
+crossterm = { version = "0.29.0", default-features = false, features = ["windows"] }
 
 [profile.release]
 lto = "thin"

@@ -102,6 +102,9 @@ search_mode = "fuzzy" # "fuzzy" or "strict"
 # colors only its thicker blue indicator. With the mailbox sidebar visible,
 # mail selection uses the existing mailbox/message divider as that indicator.
 visual_selection_style = "gutter" # "gutter" (default) or "row"
+# Rectangular popups, dialogs, and pane borders: "square" or "rounded".
+# Dividers between mailbox/list/preview remain straight.
+border_style = "square" # "square" (default) or "rounded"
 # Remote images can disclose your IP/read time to senders. Press I to toggle in-session.
 remote_images = false
 # Check Inbox counts in the background every 20 seconds. (IMAP IDLE can
