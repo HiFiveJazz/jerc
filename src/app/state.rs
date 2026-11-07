@@ -3509,7 +3509,7 @@ impl App {
                 self.toggle_html();
                 true
             }
-            KeyCode::Char('I') => {
+            KeyCode::Char('i') if self.reader_visual_anchor.is_none() => {
                 self.count_prefix = None;
                 self.toggle_remote_images();
                 true
@@ -5540,7 +5540,7 @@ impl App {
             .map_or_else(|| "(message no longer loaded)".to_owned(), |message| {
                 let subject = if message.subject.trim().is_empty() { "(no subject)" }
                     else { message.subject.as_str() };
-                subject.to_owned()
+                format!("{subject}  ·  {}", message.from_address)
             })).collect()
     }
 

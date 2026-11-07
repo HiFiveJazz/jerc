@@ -29,7 +29,7 @@ pub struct HelpEntry {
     pub description: &'static str,
 }
 
-/// Searchable action palette, intentionally excluding generic Vim motions.
+/// Searchable action palette, showing gg/G explicitly while omitting other Vim motions.
 /// Categories and the leading shortcut within each category sort alphabetically.
 pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Accounts", key: "Alt-1 … Alt-9", description: "switch directly to an email account" },
@@ -59,7 +59,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Message", key: "Ctrl-a", description: "open received attachments" },
     HelpEntry { category: "Message", key: "e / E", description: "export original RFC 5322 message" },
     HelpEntry { category: "Message", key: "Esc", description: "close the reader / exit selection" },
-    HelpEntry { category: "Message", key: "I", description: "toggle remote images for this session" },
+    HelpEntry { category: "Message", key: "i", description: "toggle remote images for this session (outside Visual mode)" },
     HelpEntry { category: "Message", key: "m", description: "toggle email addresses in From/To/Cc/Bcc and Message-ID" },
     HelpEntry { category: "Message", key: "o", description: "open link under cursor" },
     HelpEntry { category: "Message", key: "O", description: "open original HTML in browser" },
@@ -68,6 +68,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Navigation", key: "/", description: "filter current mailbox" },
     HelpEntry { category: "Navigation", key: "Ctrl-Shift-j / Ctrl-Shift-k", description: "smooth mailbox list scrolling" },
     HelpEntry { category: "Navigation", key: "Enter", description: "open selected email" },
+    HelpEntry { category: "Navigation", key: "gg / G", description: "jump to first / last email or reader line" },
     HelpEntry { category: "Navigation", key: "J / K", description: "next / previous mailbox" },
     HelpEntry { category: "View", key: "Alt-h / Alt-l", description: "resize mailbox sidebar" },
     HelpEntry { category: "View", key: "Alt-Shift-h / Alt-Shift-l", description: "resize message preview" },
@@ -292,7 +293,7 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('e') | KeyCode::Char('E') => Command::ExportRaw,
         KeyCode::Char('?') => Command::ToggleHelp,
         KeyCode::Char('t') => Command::ToggleHtml,
-        KeyCode::Char('I') => Command::ToggleImages,
+        KeyCode::Char('i') => Command::ToggleImages,
         KeyCode::Char('B') => Command::ToggleBell,
         KeyCode::Char('n') => Command::ToggleNotifications,
         KeyCode::Char('O') => Command::OpenOriginal,
@@ -447,6 +448,16 @@ mod tests {
     }
 
     #[test]
+    fn gg_and_g_are_searchable_in_main_help() {
+        assert!(HELP_ENTRIES.iter().any(|entry|
+            entry.key == "gg / G" && entry.category == "Navigation"));
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+            Command::Bottom);
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Command::Top);
+    }
+
+    #[test]
     fn reader_debug_export_and_html_toggle_have_non_motion_keys() {
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
@@ -457,9 +468,11 @@ mod tests {
             Command::ToggleHtml
         );
         assert_eq!(
-            command_for_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT)),
+            command_for_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
             Command::ToggleImages
         );
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT)),
+            Command::None);
         assert_eq!(
             command_for_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT)),
             Command::OpenOriginal

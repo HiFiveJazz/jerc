@@ -455,11 +455,18 @@ fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)).style(theme.text()), inner);
 }
 
-/// Selection paint is shared between mail and contacts. Gutter mode retains
-/// the dark gray cursor row and unread styling; row mode fills the selection.
+/// Visual ranges are purple, while persistent Space marks retain the theme's
+/// blue accent. In gutter mode the active row stays the usual dark gray.
+fn visual_row_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.selected_fg).bg(theme.visual)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn browser_row_style(theme: &Theme, mode: VisualSelectionStyle,
-    selected: bool, active: bool, unread: bool) -> Style {
-    if selected && mode == VisualSelectionStyle::Row {
+    visual: bool, marked: bool, active: bool, unread: bool) -> Style {
+    if mode == VisualSelectionStyle::Row && visual {
+        visual_row_style(theme)
+    } else if mode == VisualSelectionStyle::Row && marked {
         theme.selected()
     } else if active && unread {
         theme.unread().bg(theme.popup_bg)
@@ -472,16 +479,33 @@ fn browser_row_style(theme: &Theme, mode: VisualSelectionStyle,
     }
 }
 
-fn browser_gutter(theme: &Theme, selected: bool) -> Span<'static> {
-    Span::styled(if selected { "▍" } else { "▏" },
-        if selected { theme.accent() } else { theme.border() })
+fn selection_check_style(theme: &Theme, mode: VisualSelectionStyle,
+    visual: bool, marked: bool) -> Style {
+    if mode == VisualSelectionStyle::Row && (visual || marked) {
+        // On a filled row, retain contrast rather than purple-on-purple.
+        Style::default().fg(theme.selected_fg).add_modifier(Modifier::BOLD)
+    } else if visual {
+        Style::default().fg(theme.visual).add_modifier(Modifier::BOLD)
+    } else if marked {
+        theme.accent()
+    } else {
+        Style::default() // Keep the parent row's unread/current-line color.
+    }
 }
 
-/// The mail divider/standalone gutter needs to be more visible than the
-/// narrower contact/file-picker indicator, without adding a second column.
-fn mail_gutter(theme: &Theme, selected: bool) -> Span<'static> {
-    Span::styled(if selected { "▌" } else { "▏" },
-        if selected { theme.accent() } else { theme.border() })
+/// Shared thin selection marker for attachments and the mail number column.
+fn browser_gutter(theme: &Theme, visual: bool, marked: bool) -> Span<'static> {
+    Span::styled(if visual || marked { "▍" } else { "▏" },
+        if visual { Style::default().fg(theme.visual) }
+        else if marked { theme.accent() } else { theme.border() })
+}
+
+/// With the mailbox sidebar visible, the marker is on the *right* of its
+/// divider, in the message number column; unselected rows add no extra rule.
+fn mail_gutter(theme: &Theme, visual: bool, marked: bool, sidebar: bool) -> Span<'static> {
+    let mut marker = browser_gutter(theme, visual, marked);
+    if sidebar && !visual && !marked { marker.content = " ".into(); }
+    marker
 }
 
 fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -552,7 +576,7 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let shown = &visible[start..end];
     let number_width = relative_number_width(visible.len());
     let message_columns = [
-        Constraint::Length(number_width.saturating_add(u16::from(!app.sidebar_visible))),
+        Constraint::Length(number_width.saturating_add(1)),
         Constraint::Length(3),
         Constraint::Percentage(28),
         Constraint::Min(12),
@@ -576,7 +600,8 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let unread_mark = if is_selected { "✓" } else if message.flags.contains(MessageFlags::SEEN) { " " } else { "●" };
         let attachment_mark = message.has_attachment(account.bodies.get(&message.id));
         let mark = Line::from(vec![
-            Span::raw(unread_mark),
+            Span::styled(unread_mark, selection_check_style(&theme,
+                app.visual_selection_style, visual_selected, marked)),
             if in_junk {
                 Span::styled("!", Style::default().fg(theme.error).add_modifier(Modifier::BOLD))
             } else { Span::raw(" ") },
@@ -590,7 +615,7 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             message.from_name.as_str()
         };
         let style = browser_row_style(&theme, app.visual_selection_style,
-            is_selected, current, message.unread());
+            visual_selected, marked, current, message.unread());
         // Borrow unchanged subjects and strings from the message. Own text
         // only when normalization or display-width truncation actually changes it.
         let subject_line = match subject_for_list_cow(&message.subject) {
@@ -611,16 +636,15 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             Cell::from(subject_line)
         };
-        // The mailbox separator is our gutter when the sidebar is visible;
-        // don't add an unwanted second line beside every message.
-        let number_line = if app.sidebar_visible {
-            Line::raw(number)
-        } else {
-            Line::from(vec![mail_gutter(&theme, is_selected), Span::raw(number)])
-        };
+        // Keep the mailbox border intact. The thin purple selection marker
+        // occupies the first cell to its right, followed by aligned numbers.
+        let number_line = Line::from(vec![
+            mail_gutter(&theme, visual_selected, marked, app.sidebar_visible),
+            Span::raw(format!("{number:>width$}", width = usize::from(number_width))),
+        ]);
         let number_cell = if attachment_mark {
-            let subtitle_gutter = if app.sidebar_visible { Line::raw("") }
-                else { Line::from(mail_gutter(&theme, is_selected)) };
+            let subtitle_gutter = Line::from(mail_gutter(
+                &theme, visual_selected, marked, app.sidebar_visible));
             Cell::from(Text::from(vec![number_line, subtitle_gutter]))
         } else { Cell::from(number_line) };
         Row::new(vec![
@@ -637,19 +661,20 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let table = Table::new(rows, message_columns)
         .style(theme.text())
         .column_spacing(1);
-    // Table columns and their spacing can otherwise expose the background
-    // underneath row selections. Paint every selected *terminal row* first,
-    // including attachment subtitle rows, so the blue highlight is seamless.
+    // Paint every selected terminal row, including table gaps and attachment
+    // subtitles. Visual ranges are purple; independently marked rows are blue.
     if app.visual_selection_style == VisualSelectionStyle::Row {
         let mut y = list_area.y;
         for (row_position, &index) in shown.iter().enumerate() {
             let message = &account.messages[index];
             let position = start + row_position;
-            let selected = visual_range.is_some_and(|(first, last)|
-                (first..=last).contains(&position)) || app.message_marked.contains(&message.id);
+            let visual = visual_range.is_some_and(|(first, last)|
+                (first..=last).contains(&position));
+            let marked = app.message_marked.contains(&message.id);
             let row_height = if message.has_attachment(account.bodies.get(&message.id)) { 2 } else { 1 };
-            if selected && y < list_area.bottom() {
-                frame.render_widget(Block::default().style(theme.selected()),
+            if (visual || marked) && y < list_area.bottom() {
+                let style = if visual { visual_row_style(&theme) } else { theme.selected() };
+                frame.render_widget(Block::default().style(style),
                     Rect::new(list_area.x, y, list_area.width,
                         row_height.min(list_area.bottom().saturating_sub(y))));
             }
@@ -657,26 +682,6 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         }
     }
     frame.render_widget(table, list_area);
-    // Recolor the *existing* mailbox/message separator only for selected rows.
-    // This keeps the normal separator dark gray instead of adding a gutter
-    // between relative numbers and mail content. Includes attachment subtitles.
-    if app.sidebar_visible && list_area.x > frame.area().x {
-        let mut y = list_area.y;
-        for (row_position, &index) in shown.iter().enumerate() {
-            let message = &account.messages[index];
-            let position = start + row_position;
-            let selected = visual_range.is_some_and(|(first, last)|
-                (first..=last).contains(&position)) || app.message_marked.contains(&message.id);
-            let row_height = if message.has_attachment(account.bodies.get(&message.id)) { 2 } else { 1 };
-            if selected {
-                for line in y..y.saturating_add(row_height).min(list_area.bottom()) {
-                    frame.render_widget(Paragraph::new("▌").style(theme.accent()),
-                        Rect::new(list_area.x - 1, line, 1, 1));
-                }
-            }
-            y = y.saturating_add(row_height);
-        }
-    }
     if let Some(account) = app.account_mut() {
         account.message_view_offset = start;
     }
@@ -1941,18 +1946,23 @@ fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
             (anchor.min(selected)..=anchor.max(selected)).contains(&index));
         let number = if active { index + 1 } else { index.abs_diff(selected) };
         let selected = visual || marked;
-        let prefix = format!(" {:>digits$} {} ", number,
-            if marked { "✓" } else if file.content_type.starts_with("image/") { "▧" }
-                else if file.content_type == "application/pdf" { "▤" } else { "▫" });
+        let prefix = format!(" {:>digits$} ", number);
+        let mark = if selected { "✓" }
+            else if file.content_type.starts_with("image/") { "▧" }
+            else if file.content_type == "application/pdf" { "▤" } else { "▫" };
         let available = usize::from(list_area.width.saturating_sub(1))
-            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()) + 1);
+            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()) + 3);
         let name = truncate_display_width(&attachment_display_name(&file.filename), available);
-        let style = browser_row_style(&theme, app.visual_selection_style, selected, active, false);
+        let style = browser_row_style(&theme, app.visual_selection_style,
+            visual, marked, active, false);
         let rect = Rect::new(list_area.x, list_area.y.saturating_add(1 + (index - start) as u16),
             list_area.width.saturating_sub(1), 1);
         frame.render_widget(Paragraph::new(Line::from(vec![
-            browser_gutter(&theme, selected),
-            Span::raw(format!("{prefix}{name}")),
+            browser_gutter(&theme, visual, marked),
+            Span::raw(prefix),
+            Span::styled(mark, selection_check_style(&theme,
+                app.visual_selection_style, visual, marked)),
+            Span::raw(format!(" {name}")),
         ])).style(style), rect);
     }
     if start == end {
@@ -2385,13 +2395,13 @@ fn compose_picker_rows(
         let available = usize::from(rect.width).saturating_sub(left_width);
         let name = truncate_display_width(&entry.name, available);
         let line = Line::from(vec![
-            browser_gutter(theme, visually_selected),
+            browser_gutter(theme, visually_selected, false),
             Span::styled(number, if is_selected { theme.accent() } else { theme.muted() }),
             Span::styled(marker.to_owned(), style),
             Span::styled(name, style),
         ]);
         let item = ListItem::new(line).style(browser_row_style(theme, mode,
-            visually_selected, is_selected, false));
+            visually_selected, false, is_selected, false));
         items.push(item);
     }
     frame.render_widget(List::new(items), rect);
@@ -2588,13 +2598,13 @@ fn draw_compose_attachment_manager(frame: &mut Frame<'_>, app: &App) {
                 (anchor.min(selected)..=anchor.max(selected)).contains(&index));
             let marked = composer.attachment_manager_marked.contains(&index);
             let line = Line::from(vec![
-                browser_gutter(theme, visual || marked),
+                browser_gutter(theme, visual, marked),
                 Span::styled(if index == selected { "▸ " } else { "  " }, theme.accent()),
                 Span::styled(truncate_display_width(&name, name_width.min(32)), theme.text()),
                 Span::styled(format!("  {}", truncate_display_width(&parent, name_width.saturating_sub(32))), theme.muted()),
             ]);
             ListItem::new(line).style(browser_row_style(theme, app.visual_selection_style,
-                visual || marked, index == selected, false))
+                visual, marked, index == selected, false))
         }).collect();
     frame.render_widget(List::new(rows), inner);
 }
@@ -2756,6 +2766,9 @@ fn contact_status_spans(theme: &Theme, account_name: Option<&str>,
     let mut spans = vec![Span::styled(
         format!("[{}] ", account_name.unwrap_or("Contacts")), theme.accent())];
     spans.extend(contact_footer_mode(theme, modal));
+    if modal.searching {
+        spans.push(Span::styled(format!(" {} matches", modal.matches.len()), theme.muted()));
+    }
     spans
 }
 
@@ -2775,9 +2788,7 @@ fn contact_footer_mode(theme: &Theme, modal: &crate::contacts::ContactsModal) ->
 /// keeps the mode badge beside the account while the count remains centered.
 fn contact_footer_details(theme: &Theme, modal: &crate::contacts::ContactsModal) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if modal.searching {
-        spans.push(Span::styled(format!(" {} matches ", modal.matches.len()), theme.muted()));
-    } else if !modal.query.is_empty() {
+    if !modal.searching && !modal.query.is_empty() {
         spans.push(Span::styled(format!(" filter:/{} ", modal.query), theme.accent()));
     }
     if !modal.marked.is_empty() {
@@ -2853,15 +2864,17 @@ fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
             else { visual.abs_diff(modal.selected).to_string() };
         let kind = if contact.favorite { "★ " } else if contact.saved { "● " } else { "  " };
         let label = if contact.name.is_empty() { &contact.email } else { &contact.name };
-        let max_label = usize::from(list_width).saturating_sub(number_width + 4);
-        let is_selected = is_visual || is_marked;
+        let max_label = usize::from(list_width).saturating_sub(number_width + 5);
+        let check = if is_visual || is_marked { "✓ " } else { "  " };
         let line = Line::from(vec![
-            browser_gutter(&theme, is_selected),
-            Span::raw(format!("{number:>number_width$} {kind}")),
+            Span::raw(format!("{number:>number_width$} ")),
+            Span::styled(check, selection_check_style(&theme,
+                selection_style, is_visual, is_marked)),
+            Span::raw(kind),
             Span::raw(truncate_display_width(label, max_label)),
         ]);
         let row_style = browser_row_style(&theme, selection_style,
-            is_selected, active, false);
+            is_visual, is_marked, active, false);
         frame.render_widget(Paragraph::new(line).style(row_style),
             Rect::new(left.x, left.y + (visual - modal.scroll) as u16, list_width, 1));
     }
@@ -3389,32 +3402,37 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     #[test]
-    fn mail_and_contacts_share_visual_selection_styles() {
+    fn visual_ranges_are_purple_and_marks_remain_blue() {
         use crate::config::VisualSelectionStyle;
-        let theme = load_themes().into_iter().next().expect("theme");
+        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
         assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Gutter,
-            true, true, false), theme.current_line());
+            true, false, true, false), theme.current_line());
         assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Gutter,
-            true, false, false), theme.text());
+            true, false, false, false), theme.text());
         assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
-            true, false, false), theme.selected());
+            true, false, false, false).bg, Some(theme.visual));
         assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
-            true, true, false), theme.selected());
-        let selected = super::browser_gutter(&theme, true);
-        let normal = super::browser_gutter(&theme, false);
-        assert_eq!(selected.content.as_ref(), "▍");
-        assert_eq!(selected.style.fg, theme.accent().fg);
+            false, true, true, false), theme.selected());
+        let visual = super::browser_gutter(&theme, true, false);
+        assert_eq!(visual.content.as_ref(), "▍");
+        assert_eq!(visual.style.fg, Some(theme.visual));
+        let marked = super::browser_gutter(&theme, false, true);
+        assert_eq!(marked.style.fg, Some(theme.accent));
+        let normal = super::browser_gutter(&theme, false, false);
         assert_eq!(normal.content.as_ref(), "▏");
-        assert_eq!(normal.style.fg, theme.border().fg);
+        assert_eq!(normal.style.fg, Some(theme.border));
+        assert_eq!(super::selection_check_style(&theme, VisualSelectionStyle::Gutter,
+            true, false).fg, Some(theme.visual));
     }
 
     #[test]
-    fn mail_gutter_is_thicker_than_contacts_without_extra_column() {
+    fn mail_marker_is_thin_and_stays_right_of_sidebar_divider() {
         let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
-        let selected = super::mail_gutter(&theme, true);
-        assert_eq!(selected.content.as_ref(), "▌");
-        assert_eq!(selected.style.fg, Some(theme.accent));
-        assert_eq!(super::browser_gutter(&theme, true).content.as_ref(), "▍");
+        let visual = super::mail_gutter(&theme, true, false, true);
+        assert_eq!(visual.content.as_ref(), "▍");
+        assert_eq!(visual.style.fg, Some(theme.visual));
+        assert_eq!(super::mail_gutter(&theme, false, false, true).content.as_ref(), " ");
+        assert_eq!(super::mail_gutter(&theme, false, false, false).content.as_ref(), "▏");
     }
 
     #[test]
@@ -3454,10 +3472,11 @@ mod tests {
         assert_eq!(search[1].content.as_ref(), " SEARCH ");
         assert_eq!(search[1].style, super::search_mode_style(&theme));
         assert_eq!(search[1].style.bg, visual[1].style.bg);
+        assert_eq!(search[2].content.as_ref(), " 2 matches");
         assert!(!search.iter().any(|span| span.content.contains("/john")),
             "the editable query belongs above the contacts list");
         let details = super::contact_footer_details(&theme, &modal);
-        assert!(details[0].content.contains("2 matches"));
+        assert!(details.is_empty(), "matches belong beside SEARCH, not at mid-footer");
         modal.searching = false;
         assert_eq!(super::contact_status_spans(&theme, Some("Gmail"), &modal).len(), 2);
         let filtered = super::contact_footer_details(&theme, &modal);
