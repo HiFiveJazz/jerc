@@ -10,7 +10,7 @@ recipients are excluded, but your own email address can also be suggested. `Ctrl
 (or Up / Down) change the highlighted match. `Tab` or `Enter` inserts the full
 `Name <email>` recipient; `Esc` dismisses without leaving Insert mode. A second
 `Esc` returns to normal mode. Comma-separated recipients remain intact, including
-quoted display names containing commas. `Alt-c` opens the full contact manager
+quoted display names containing commas. Long recipient and subject fields soft-wrap on grapheme boundaries, expanding into the available composer space and vertically scrolling the active field as needed, with the insertion caret remaining visible. `Alt-c` opens the full contact manager
 from any composer field; `Enter` inserts a highlighted contact if To/Cc/Bcc is
 active.
 
@@ -23,7 +23,10 @@ or Esc to return to the list while keeping the filter. `?` opens searchable
 shortcuts. No persistent bottom-row keymap is needed in the regular mail view.
 
 - `j/k`, `5j`, `5k`, `gg`, `G`, `20G`, `H/M/L` — Vim-style list navigation.
-- `Ctrl-j/k` — animated scrolling, including while searching; PageUp/PageDown move by the viewport.
+- `Ctrl-j/k` — animated scrolling by **22 contact rows**, including while searching; PageUp/PageDown move by the viewport. The mailbox, reader, and attachment pickers also use 22 rows per neoscroll.
+- `v` or `V` — start Vim-style visual selection of whole contact rows. Extend or contract the range with `j/k`, counts such as `5j`, `gg/G`, `H/M/L`, and neoscroll. `Esc` exits visual mode without closing Contacts. Because a contact is a single list row, `v` and `V` both select whole contacts.
+- `Space` — toggle an individual marked contact (blue gutter) and advance one row. With a visual range active, Space converts the whole range into marks; pressing it on an already fully marked range unmarks that range. Visual ranges and marks use the same thicker blue gutter. Marks persist across filters and sorting, with their total count visible in the header. `[ui] visual_selection_style = "gutter"` (default) keeps rows dark gray while selecting via the gutter; `"row"` colors entire selected or marked rows. The option applies to both Contacts and the mail browser.
+- `d` / `p` — delete (after confirming the number of recipients) or favorite/unfavorite **the entire visual/marked selection**. `Enter` inserts all selected contacts in To/Cc/Bcc while composing; unselected Enter still edits a single contact outside compose.
 - `a` — create contact; `e` or Enter — edit contact (Enter instead inserts into
   a recipient field when opened from To/Cc/Bcc).
 - `p` — toggle favorite; `d` — delete with explicit confirmation.

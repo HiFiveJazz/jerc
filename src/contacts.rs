@@ -224,8 +224,17 @@ pub fn char_to_byte(text: &str, char_index: usize) -> usize {
 }
 
 pub fn replace_recipient(text: &mut String, cursor: usize, contact: &Contact) -> usize {
+    replace_recipients(text, cursor, &[contact])
+}
+
+/// Replace the active recipient with one or more contacts, leaving other
+/// comma-separated recipients intact. Useful for inserting a visual/marked
+/// range from the contacts manager without discarding To/Cc/Bcc text.
+pub fn replace_recipients(text: &mut String, cursor: usize, contacts: &[&Contact]) -> usize {
+    if contacts.is_empty() { return cursor; }
     let (start, end) = recipient_segment(text, cursor);
-    let mut formatted = contact.display();
+    let mut formatted = contacts.iter().map(|contact| contact.display())
+        .collect::<Vec<_>>().join(", ");
     // The segment starts immediately after a separator comma, so replacing it
     // also removes any existing indentation. Restore exactly one space.
     if start != 0 { formatted.insert(0, ' '); }
@@ -274,13 +283,89 @@ pub struct ContactsModal {
     pub pending_count: Option<usize>,
     pub pending_g: bool,
     pub smooth_target: Option<usize>,
+    /// Visual-mode anchor in the currently filtered/sorted list. Both v and V
+    /// select complete contact rows: there is no characterwise list selection.
+    pub visual_anchor: Option<usize>,
+    pub visual_linewise: bool,
+    /// Stable email identities, not row indices (favorites/search re-sort rows).
+    pub marked: HashSet<String>,
     pub edit: Option<ContactEdit>,
     pub confirm_delete: bool,
+    pub delete_review: crate::app::ReviewScroll,
     pub help: bool,
     pub help_query: String,
+    pub help_selected: usize,
+    pub help_scroll: usize,
 }
 
 impl ContactsModal {
+    #[must_use]
+    pub fn visual_range(&self) -> Option<(usize, usize)> {
+        self.visual_anchor.filter(|_| !self.matches.is_empty()).map(|anchor|
+            (anchor.min(self.selected), anchor.max(self.selected)))
+    }
+
+    #[must_use]
+    pub fn in_visual_range(&self, row: usize) -> bool {
+        self.visual_range().is_some_and(|(start, end)| (start..=end).contains(&row))
+    }
+
+    pub fn toggle_mark(&mut self, book: &ContactBook) {
+        if let Some(&id) = self.matches.get(self.selected)
+            && let Some(contact) = book.entries.get(id) {
+                let identity = contact.email.to_ascii_lowercase();
+                if !self.marked.remove(&identity) { self.marked.insert(identity); }
+                // Yazi-style marking: space also advances the cursor.
+                self.navigate(self.matches.len(), 1);
+            }
+    }
+
+    /// In visual mode, Space converts the whole range into persistent marks.
+    /// If every entry was already marked it clears them instead.
+    pub fn mark_visual_range(&mut self, book: &ContactBook) {
+        let Some((start, end)) = self.visual_range() else { return; };
+        let addresses: Vec<String> = self.matches[start..=end].iter()
+            .filter_map(|&id| book.entries.get(id))
+            .map(|contact| contact.email.to_ascii_lowercase()).collect();
+        let all_marked = addresses.iter().all(|email| self.marked.contains(email));
+        for address in addresses {
+            if all_marked { self.marked.remove(&address); }
+            else { self.marked.insert(address); }
+        }
+        self.visual_anchor = None;
+    }
+
+    /// A visual range plus independently marked rows form the action set.
+    /// Marks intentionally persist through search/filter changes, so users
+    /// can gather recipients in multiple searches. The UI displays their count.
+    #[must_use]
+    pub fn action_ids(&self, book: &ContactBook) -> Vec<usize> {
+        let range = self.visual_range();
+        let mut picked = Vec::new();
+        let mut seen = HashSet::new();
+        for (row, &id) in self.matches.iter().enumerate() {
+            let Some(contact) = book.entries.get(id) else { continue; };
+            if (range.is_some_and(|(start, end)| (start..=end).contains(&row))
+                || self.marked.contains(&contact.email.to_ascii_lowercase())) && seen.insert(id) {
+                picked.push(id);
+            }
+        }
+        for (id, contact) in book.entries.iter().enumerate() {
+            if self.marked.contains(&contact.email.to_ascii_lowercase()) && seen.insert(id) {
+                picked.push(id);
+            }
+        }
+        if picked.is_empty() && let Some(&id) = self.matches.get(self.selected) {
+            picked.push(id);
+        }
+        picked
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.visual_anchor = None;
+        self.marked.clear();
+    }
+
     pub fn navigate(&mut self, length: usize, delta: isize) {
         self.smooth_target = None;
         self.selected = self.selected.saturating_add_signed(delta).min(length.saturating_sub(1));
@@ -378,6 +463,55 @@ mod tests {
         let point = replace_recipient(&mut text, cursor, &contact);
         assert_eq!(text, "\"Doe, John\" <john@example.org>, \"Zoë, Jane\" <jane@example.org>, other@example.org");
         assert_eq!(point, "\"Doe, John\" <john@example.org>, \"Zoë, Jane\" <jane@example.org>".chars().count());
+    }
+
+    #[test]
+    fn marked_contacts_survive_favorite_sort_and_search() {
+        let mut book = ContactBook::default();
+        book.upsert("Alba", "alba@example.org", true).unwrap();
+        book.upsert("Bea", "bea@example.org", true).unwrap();
+        book.upsert("Cara", "cara@example.org", true).unwrap();
+        let mut modal = ContactsModal { matches: book.filtered(""), view_height: 3, ..Default::default() };
+        modal.toggle_mark(&book);
+        assert_eq!(modal.selected, 1);
+        assert!(modal.marked.contains("alba@example.org"));
+        book.entries[0].favorite = true;
+        modal.matches = book.filtered("");
+        modal.query = "bea".into();
+        modal.matches = book.filtered(&modal.query);
+        let ids = modal.action_ids(&book);
+        assert!(ids.contains(&0));
+    }
+
+    #[test]
+    fn visual_contact_range_uses_counted_and_smooth_motions() {
+        let mut book = ContactBook::default();
+        for id in 0..40 { book.upsert(&format!("Name{id:02}"), &format!("name{id:02}@example.org"), true).unwrap(); }
+        let mut modal = ContactsModal { matches: book.filtered(""), view_height: 8, ..Default::default() };
+        modal.visual_anchor = Some(2);
+        modal.selected = 2;
+        modal.navigate(40, 5);
+        assert_eq!(modal.visual_range(), Some((2, 7)));
+        assert_eq!(modal.action_ids(&book).len(), 6);
+        modal.smooth(40, 22);
+        for _ in 0..22 { modal.advance(40); }
+        assert_eq!(modal.selected, 29);
+        assert_eq!(modal.visual_range(), Some((2, 29)));
+        modal.mark_visual_range(&book);
+        assert_eq!(modal.marked.len(), 28);
+        assert_eq!(modal.visual_range(), None);
+        assert_eq!(modal.action_ids(&book).len(), 28);
+    }
+
+    #[test]
+    fn batch_recipient_insert_preserves_quoted_comma_and_other_addresses() {
+        let a = Contact { name: "Doe, Jane".into(), email: "jane@example.org".into(), saved: true, favorite: false };
+        let b = Contact { name: "Béa".into(), email: "bea@example.org".into(), saved: true, favorite: true };
+        let mut to = "existing@example.org, j, final@example.org".to_owned();
+        let cursor = "existing@example.org, j".chars().count();
+        let result = replace_recipients(&mut to, cursor, &[&a, &b]);
+        assert_eq!(to, "existing@example.org, \"Doe, Jane\" <jane@example.org>, Béa <bea@example.org>, final@example.org");
+        assert_eq!(result, "existing@example.org, \"Doe, Jane\" <jane@example.org>, Béa <bea@example.org>".chars().count());
     }
     #[test]
     fn learned_contacts_do_not_overwrite_saved_names() {

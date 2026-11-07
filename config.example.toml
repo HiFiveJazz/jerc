@@ -88,6 +88,11 @@ theme = "default"
 # Message-list / search: fuzzy subsequence matches by default; use strict
 # for the previous case-insensitive substring filter.
 search_mode = "fuzzy" # "fuzzy" or "strict"
+# Mail browser, Contacts and attachment lists (including Compose pickers):
+# "row" colors the entire selected row; "gutter" keeps the row dark gray and
+# colors only its thicker blue indicator. With the mailbox sidebar visible,
+# mail selection uses the existing mailbox/message divider as that indicator.
+visual_selection_style = "gutter" # "gutter" (default) or "row"
 # Remote images can disclose your IP/read time to senders. Press I to toggle in-session.
 remote_images = false
 # Check Inbox counts in the background every 20 seconds. (IMAP IDLE can

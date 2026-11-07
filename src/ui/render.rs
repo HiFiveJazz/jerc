@@ -10,9 +10,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, ComposeField, ComposeMode, ATTACHMENT_HELP_ENTRIES, COMPOSE_HELP_ENTRIES, PICKER_HELP_ENTRIES, HELP_ENTRIES, ReaderSelection,
+    App, ComposeField, ComposeMode, ATTACHMENT_HELP_ENTRIES, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, PICKER_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, ranked_help_matches, ReaderSelection,
 };
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
+use crate::config::VisualSelectionStyle;
 use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
@@ -70,6 +71,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_contacts(frame, app);
     } else if app.composer.is_some() {
         draw_contact_suggestions(frame, app);
+    }
+    if app.detach_confirmation.is_some() {
+        draw_detach_confirmation(frame, app);
     }
 }
 
@@ -326,6 +330,13 @@ fn setup_button_style(theme: &Theme) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+fn destructive_button_style(theme: &Theme) -> Style {
+    Style::default()
+        .fg(theme.selected_fg)
+        .bg(theme.error)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn draw_startup_warnings(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme().clone();
     let area = centered_rect(frame.area(), 85, 55);
@@ -444,6 +455,35 @@ fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)).style(theme.text()), inner);
 }
 
+/// Selection paint is shared between mail and contacts. Gutter mode retains
+/// the dark gray cursor row and unread styling; row mode fills the selection.
+fn browser_row_style(theme: &Theme, mode: VisualSelectionStyle,
+    selected: bool, active: bool, unread: bool) -> Style {
+    if selected && mode == VisualSelectionStyle::Row {
+        theme.selected()
+    } else if active && unread {
+        theme.unread().bg(theme.popup_bg)
+    } else if active {
+        theme.current_line()
+    } else if unread {
+        theme.unread()
+    } else {
+        theme.text()
+    }
+}
+
+fn browser_gutter(theme: &Theme, selected: bool) -> Span<'static> {
+    Span::styled(if selected { "▍" } else { "▏" },
+        if selected { theme.accent() } else { theme.border() })
+}
+
+/// The mail divider/standalone gutter needs to be more visible than the
+/// narrower contact/file-picker indicator, without adding a second column.
+fn mail_gutter(theme: &Theme, selected: bool) -> Span<'static> {
+    Span::styled(if selected { "▌" } else { "▏" },
+        if selected { theme.accent() } else { theme.border() })
+}
+
 fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let theme = app.theme().clone();
     frame.render_widget(Clear, area);
@@ -512,7 +552,7 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let shown = &visible[start..end];
     let number_width = relative_number_width(visible.len());
     let message_columns = [
-        Constraint::Length(number_width),
+        Constraint::Length(number_width.saturating_add(u16::from(!app.sidebar_visible))),
         Constraint::Length(3),
         Constraint::Percentage(28),
         Constraint::Min(12),
@@ -530,8 +570,10 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let visual_selected = visual_range.is_some_and(|(first, last)| {
             (first..=last).contains(&absolute_position)
         });
+        let marked = app.message_marked.contains(&message.id);
+        let is_selected = visual_selected || marked;
         let current = absolute_position == current_position;
-        let unread_mark = if visual_selected { "✓" } else if message.flags.contains(MessageFlags::SEEN) { " " } else { "●" };
+        let unread_mark = if is_selected { "✓" } else if message.flags.contains(MessageFlags::SEEN) { " " } else { "●" };
         let attachment_mark = message.has_attachment(account.bodies.get(&message.id));
         let mark = Line::from(vec![
             Span::raw(unread_mark),
@@ -547,17 +589,8 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             message.from_name.as_str()
         };
-        let style = if visual_selected {
-            theme.selected()
-        } else if current && message.unread() {
-            theme.unread().bg(theme.popup_bg)
-        } else if current {
-            theme.current_line()
-        } else if message.unread() {
-            theme.unread()
-        } else {
-            theme.text()
-        };
+        let style = browser_row_style(&theme, app.visual_selection_style,
+            is_selected, current, message.unread());
         // Borrow unchanged subjects and strings from the message. Own text
         // only when normalization or display-width truncation actually changes it.
         let subject_line = match subject_for_list_cow(&message.subject) {
@@ -578,8 +611,20 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             Cell::from(subject_line)
         };
+        // The mailbox separator is our gutter when the sidebar is visible;
+        // don't add an unwanted second line beside every message.
+        let number_line = if app.sidebar_visible {
+            Line::raw(number)
+        } else {
+            Line::from(vec![mail_gutter(&theme, is_selected), Span::raw(number)])
+        };
+        let number_cell = if attachment_mark {
+            let subtitle_gutter = if app.sidebar_visible { Line::raw("") }
+                else { Line::from(mail_gutter(&theme, is_selected)) };
+            Cell::from(Text::from(vec![number_line, subtitle_gutter]))
+        } else { Cell::from(number_line) };
         Row::new(vec![
-            Cell::from(number),
+            number_cell,
             Cell::from(mark),
             Cell::from(sender),
             subject_cell,
@@ -592,7 +637,46 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let table = Table::new(rows, message_columns)
         .style(theme.text())
         .column_spacing(1);
+    // Table columns and their spacing can otherwise expose the background
+    // underneath row selections. Paint every selected *terminal row* first,
+    // including attachment subtitle rows, so the blue highlight is seamless.
+    if app.visual_selection_style == VisualSelectionStyle::Row {
+        let mut y = list_area.y;
+        for (row_position, &index) in shown.iter().enumerate() {
+            let message = &account.messages[index];
+            let position = start + row_position;
+            let selected = visual_range.is_some_and(|(first, last)|
+                (first..=last).contains(&position)) || app.message_marked.contains(&message.id);
+            let row_height = if message.has_attachment(account.bodies.get(&message.id)) { 2 } else { 1 };
+            if selected && y < list_area.bottom() {
+                frame.render_widget(Block::default().style(theme.selected()),
+                    Rect::new(list_area.x, y, list_area.width,
+                        row_height.min(list_area.bottom().saturating_sub(y))));
+            }
+            y = y.saturating_add(row_height);
+        }
+    }
     frame.render_widget(table, list_area);
+    // Recolor the *existing* mailbox/message separator only for selected rows.
+    // This keeps the normal separator dark gray instead of adding a gutter
+    // between relative numbers and mail content. Includes attachment subtitles.
+    if app.sidebar_visible && list_area.x > frame.area().x {
+        let mut y = list_area.y;
+        for (row_position, &index) in shown.iter().enumerate() {
+            let message = &account.messages[index];
+            let position = start + row_position;
+            let selected = visual_range.is_some_and(|(first, last)|
+                (first..=last).contains(&position)) || app.message_marked.contains(&message.id);
+            let row_height = if message.has_attachment(account.bodies.get(&message.id)) { 2 } else { 1 };
+            if selected {
+                for line in y..y.saturating_add(row_height).min(list_area.bottom()) {
+                    frame.render_widget(Paragraph::new("▌").style(theme.accent()),
+                        Rect::new(list_area.x - 1, line, 1, 1));
+                }
+            }
+            y = y.saturating_add(row_height);
+        }
+    }
     if let Some(account) = app.account_mut() {
         account.message_view_offset = start;
     }
@@ -1590,23 +1674,29 @@ fn is_box_drawing_span(text: &str) -> bool {
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let theme = app.theme().clone();
     let mut spans = Vec::new();
-    if let Some(account) = app.account() {
-        spans.push(Span::styled(format!("[{}] ", account.name), theme.accent()));
-        if app.message_open {
-            let (label, style) = if app.reader_visual_anchor.is_some() {
-                (" VISUAL ", theme.selected())
-            } else {
-                (" NORMAL ", theme.accent())
-            };
-            spans.push(Span::styled(label, style));
-            spans.push(Span::raw(" "));
-        } else if app.visual_anchor.is_some() {
-            spans.push(Span::styled(" VISUAL ", theme.selected()));
-            spans.push(Span::raw(" "));
+    if let Some(composer) = app.composer.as_ref().filter(|_| app.contacts_modal.is_none()) {
+        spans.push(Span::styled(format!("[{}] ",
+            app.account().map_or("Compose", |account| account.name.as_str())), theme.accent()));
+        spans.push(Span::styled(format!(" {} ", composer.mode.label()),
+            compose_mode_style(composer.mode, &theme)));
+        spans.push(Span::raw(" "));
+        if !app.status.text.is_empty() {
+            spans.push(Span::styled(app.status.text.as_str(),
+                if app.status.is_error { theme.error() } else { theme.muted() }));
         }
+    } else if let Some(account) = app.account() {
+        spans.push(Span::styled(format!("[{}] ", account.name), theme.accent()));
+        let mode = if app.message_open {
+            if app.reader_visual_anchor.is_some() { "VISUAL" } else { "NORMAL" }
+        } else if account.search_editing {
+            "SEARCH"
+        } else if app.visual_anchor.is_some() {
+            "VISUAL"
+        } else { "NORMAL" };
+        spans.push(Span::styled(format!(" {mode} "), mode_style(mode, &theme)));
+        spans.push(Span::raw(" "));
         if account.search_editing {
             let matches = account.visible_message_indices().len();
-            spans.push(Span::styled(" SEARCH ", theme.accent()));
             spans.push(Span::styled(
                 format!("{matches} match{}  ", if matches == 1 { "" } else { "es" }),
                 theme.muted(),
@@ -1629,6 +1719,9 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             let style = if app.status.is_error { theme.error() } else { theme.text() };
             spans.push(Span::styled(app.status.text.as_str(), style));
         }
+        if !app.message_marked.is_empty() {
+            spans.push(Span::styled(format!("    {} marked", app.message_marked.len()), theme.accent()));
+        }
         if app.preview_split {
             spans.push(Span::styled("    SPLIT", theme.muted()));
         }
@@ -1642,7 +1735,18 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // notification state. The glyph can also be clicked to toggle alerts.
     let indicator_width = super::NOTIFICATION_INDICATOR_WIDTH.min(area.width);
     let status_area = Rect::new(area.x, area.y, area.width - indicator_width, area.height);
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.status()), status_area);
+    if let Some(modal) = app.contacts_modal.as_ref() {
+        // Contacts use the same global status row and mode slot as mail.
+        // The contact count belongs inside the Contacts window, not here.
+        let mode_spans = contact_status_spans(&theme,
+            app.account().map(|account| account.name.as_str()), modal);
+        frame.render_widget(Paragraph::new(Line::from(mode_spans)).style(theme.status()), status_area);
+        let (_, detail_area) = contacts_status_areas(frame.area(), status_area);
+        frame.render_widget(Paragraph::new(Line::from(contact_footer_details(&theme, modal)))
+            .style(theme.status()), detail_area);
+    } else {
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.status()), status_area);
+    }
     if indicator_width == super::NOTIFICATION_INDICATOR_WIDTH {
         let (glyph, style) = notification_indicator(app, &theme);
         frame.render_widget(
@@ -1672,7 +1776,12 @@ fn notification_indicator(app: &App, theme: &Theme) -> (String, Style) {
 }
 
 fn draw_search_header(frame: &mut Frame<'_>, area: Rect, query: &str, app: &App) {
-    let theme = app.theme().clone();
+    draw_search_prompt(frame, area, query, app.theme());
+}
+
+/// Reused by the mail browser and Contacts so / opens the same dedicated
+/// search row without borrowing App while the contacts modal is mutable.
+fn draw_search_prompt(frame: &mut Frame<'_>, area: Rect, query: &str, theme: &Theme) {
     let prompt = if query.is_empty() { "type to search…" } else { query };
     let style = if query.is_empty() { theme.muted() } else { theme.text() };
     frame.render_widget(
@@ -1685,65 +1794,66 @@ fn draw_search_header(frame: &mut Frame<'_>, area: Rect, query: &str, app: &App)
 }
 
 fn draw_help(frame: &mut Frame<'_>, app: &App) {
-    let theme = app.theme().clone();
     let attachment_help = app.attachment_picker_visible;
+    let entries = if attachment_help { ATTACHMENT_HELP_ENTRIES } else { HELP_ENTRIES };
+    let matches = app.help_matches();
+    draw_help_palette(frame, app.theme(),
+        if attachment_help { " Attachment keybindings " } else { " Keybindings " },
+        entries, &app.help_query, &matches, app.help_selected, app.help_scroll);
+}
+
+/// Identical help table, search field, highlighting and footer for mail and contacts.
+fn draw_help_palette(
+    frame: &mut Frame<'_>, theme: &Theme, title: &str, entries: &[HelpEntry],
+    query: &str, matches: &[usize], selected: usize, scroll: usize,
+) {
     let area = centered_rect(frame.area(), 86, 70);
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(if attachment_help { " Attachment keybindings " } else { " Keybindings " })
-        .borders(Borders::ALL)
-        .border_style(theme.accent());
+    let block = Block::default().title(title)
+        .borders(Borders::ALL).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let chunks = Layout::vertical([
+        Constraint::Length(2), Constraint::Min(1), Constraint::Length(1),
+    ]).split(inner);
+    let prompt = if query.is_empty() { "type to search…" } else { query };
+    frame.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled(" / ", theme.accent()),
+        Span::styled(prompt, if query.is_empty() { theme.muted() } else { theme.text() }),
+    ])), chunks[0]);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    draw_search_header(frame, chunks[0], &app.help_query, app);
-
-    let matches = app.help_matches();
     let visible = usize::from(chunks[1].height.max(1));
     let max_start = matches.len().saturating_sub(visible);
-    let start = app.help_scroll.min(max_start);
+    let selected_position = matches.iter().position(|&i| i == selected).unwrap_or(0);
+    let start = scroll.max(selected_position.saturating_sub(visible.saturating_sub(1)))
+        .min(selected_position).min(max_start);
     let shown: Vec<usize> = matches.iter().copied().skip(start).take(visible).collect();
     if shown.is_empty() {
         frame.render_widget(Paragraph::new(" No matching keybindings").style(theme.muted()), chunks[1]);
     } else {
-        let rows = shown.iter().map(|index| {
-            let entry = if attachment_help { ATTACHMENT_HELP_ENTRIES[*index] }
-                else { HELP_ENTRIES[*index] };
+        let rows = shown.iter().map(|&index| {
+            let entry = entries[index];
             Row::new(vec![
-                Cell::from(entry.category),
-                Cell::from(entry.key),
-                Cell::from(entry.description),
+                Cell::from(entry.category), Cell::from(entry.key), Cell::from(entry.description),
             ])
         });
-        let table = Table::new(
-            rows,
-            [Constraint::Length(13), Constraint::Length(27), Constraint::Min(20)],
-        )
-        .style(theme.text())
-        .column_spacing(1)
-        .row_highlight_style(theme.selected());
-        let selected = shown.iter().position(|index| *index == app.help_selected);
+        let table = Table::new(rows, [
+            Constraint::Length(13), Constraint::Length(27), Constraint::Min(20),
+        ]).style(theme.text()).column_spacing(1).row_highlight_style(theme.selected());
+        let selected = shown.iter().position(|&index| index == selected);
         let mut state = TableState::default().with_selected(selected);
         frame.render_stateful_widget(table, chunks[1], &mut state);
     }
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ↑↓", theme.accent()),
-            Span::styled(" navigate   ", theme.muted()),
-            Span::styled("type", theme.accent()),
-            Span::styled(" filter   ", theme.muted()),
-            Span::styled("Backspace", theme.accent()),
-            Span::styled(" edit   ", theme.muted()),
-            Span::styled("Esc/?", theme.accent()),
-            Span::styled(" close", theme.muted()),
-        ])),
-        chunks[2],
-    );
+    frame.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled(" ↑↓", theme.accent()),
+        Span::styled(" navigate   ", theme.muted()),
+        Span::styled("type", theme.accent()),
+        Span::styled(" filter   ", theme.muted()),
+        Span::styled("Backspace", theme.accent()),
+        Span::styled(" edit   ", theme.muted()),
+        Span::styled("Esc/?", theme.accent()),
+        Span::styled(" close", theme.muted()),
+    ])), chunks[2]);
 }
 
 fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
@@ -1830,21 +1940,20 @@ fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
         let visual = app.attachment_visual_anchor.is_some_and(|anchor|
             (anchor.min(selected)..=anchor.max(selected)).contains(&index));
         let number = if active { index + 1 } else { index.abs_diff(selected) };
-        let prefix = format!("{} {:>digits$} {} ",
-            if visual { "▍" } else { " " }, number,
+        let selected = visual || marked;
+        let prefix = format!(" {:>digits$} {} ", number,
             if marked { "✓" } else if file.content_type.starts_with("image/") { "▧" }
                 else if file.content_type == "application/pdf" { "▤" } else { "▫" });
         let available = usize::from(list_area.width.saturating_sub(1))
-            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()) + 1);
         let name = truncate_display_width(&attachment_display_name(&file.filename), available);
-        let style = if active { theme.selected() }
-            else if visual { theme.selected() }
-            else if marked { theme.unread() } else { theme.text() };
-        // Paragraph background fills the entire row instead of ending at the
-        // filename. This matches the Vim/Yazi full-width cursor highlight.
+        let style = browser_row_style(&theme, app.visual_selection_style, selected, active, false);
         let rect = Rect::new(list_area.x, list_area.y.saturating_add(1 + (index - start) as u16),
             list_area.width.saturating_sub(1), 1);
-        frame.render_widget(Paragraph::new(Line::from(format!("{prefix}{name}"))).style(style), rect);
+        frame.render_widget(Paragraph::new(Line::from(vec![
+            browser_gutter(&theme, selected),
+            Span::raw(format!("{prefix}{name}")),
+        ])).style(style), rect);
     }
     if start == end {
         frame.render_widget(Paragraph::new(if app.attachment_pending_loading() {
@@ -1932,13 +2041,15 @@ fn draw_attachment_destination_picker(frame: &mut Frame<'_>, app: &App) {
         frame.render_widget(Block::default().borders(Borders::RIGHT).border_style(theme.border()), parent_area);
         compose_picker_rows(frame, Rect::new(parent_area.x, parent_area.y,
             parent_area.width.saturating_sub(1), parent_area.height),
-            &picker.parent_entries, Some(picker.parent_selected), false, &[], None, theme);
+            &picker.parent_entries, Some(picker.parent_selected), false, &[], None,
+            app.visual_selection_style, theme);
     }
     if files_area.width > 0 && files_area.height > 0 {
         frame.render_widget(Block::default().borders(Borders::RIGHT).border_style(theme.border()), files_area);
         compose_picker_rows(frame, Rect::new(files_area.x, files_area.y,
             files_area.width.saturating_sub(1), files_area.height),
-            &picker.entries, Some(picker.selected), true, &[], None, theme);
+            &picker.entries, Some(picker.selected), true, &[], None,
+            app.visual_selection_style, theme);
     }
     if preview_area.width > 2 && preview_area.height > 0 {
         let preview_rect = Rect::new(preview_area.x.saturating_add(1), preview_area.y,
@@ -2043,25 +2154,78 @@ fn draw_remove_account_confirmation(frame: &mut Frame<'_>, app: &App) {
         .style(theme.text()).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_confirmation(frame: &mut Frame<'_>, app: &App) {
-    let theme = app.theme().clone();
-    let Some(confirmation) = app.confirmation.as_ref() else {
-        return;
-    };
-    let area = centered_rect(frame.area(), 72, 24);
+/// Shared Yazi-style review: simple, aligned item numbers without a visual
+/// selection gutter. The list is for reviewing, not selecting, its contents.
+fn review_item_line(number: usize, digits: usize, item: &str, width: usize,
+    theme: &Theme) -> Line<'static> {
+    let prefix = format!(" {number:>digits$}  ");
+    let available = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    Line::from(vec![
+        Span::styled(prefix, theme.muted()),
+        Span::styled(truncate_display_width(item, available), theme.text()),
+    ])
+}
+
+/// Shared Yazi-style review: visible item list, scroll position, and the same
+/// filled action treatment as the setup wizard. No action is taken by drawing.
+fn draw_review_dialog(frame: &mut Frame<'_>, theme: &Theme, title: &str,
+    explanation: &str, items: &[String], scroll: usize) {
+    let area = centered_rect(frame.area(), 86, 72);
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Confirm mail action ")
-        .borders(Borders::ALL)
-        .border_style(theme.error());
+    let block = Block::default().title(format!(" {title} "))
+        .borders(Borders::ALL).border_style(theme.error());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(confirmation.prompt.as_str())
-            .style(theme.text())
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
+    if inner.width < 10 || inner.height < 5 { return; }
+    let chunks = Layout::vertical([
+        Constraint::Length(2), Constraint::Min(1),
+        Constraint::Length(1), Constraint::Length(2),
+    ]).split(inner);
+    frame.render_widget(Paragraph::new(truncate_display_width(explanation, usize::from(chunks[0].width)))
+        .style(theme.text()), chunks[0]);
+    let capacity = usize::from(chunks[1].height);
+    let start = scroll.min(items.len().saturating_sub(capacity));
+    let digits = items.len().max(1).to_string().len();
+    for (offset, item) in items.iter().skip(start).take(capacity).enumerate() {
+        let row = Rect::new(chunks[1].x, chunks[1].y + offset as u16, chunks[1].width, 1);
+        frame.render_widget(Paragraph::new(review_item_line(start + offset + 1, digits,
+            item, usize::from(row.width), theme)), row);
+    }
+    frame.render_widget(Paragraph::new(format!(
+        " {} items  ·  {}–{}",
+        items.len(), if items.is_empty() { 0 } else { start + 1 }, (start + capacity).min(items.len()),
+    )).style(theme.muted()), chunks[2]);
+    let buttons = chunks[3];
+    frame.render_widget(Paragraph::new("─".repeat(usize::from(buttons.width)))
+        .style(theme.border()), Rect::new(buttons.x, buttons.y, buttons.width, 1));
+    let gap = 3u16;
+    let yes_width = 11u16;
+    let no_width = 11u16;
+    let total = yes_width + no_width + gap;
+    let x = buttons.x + buttons.width.saturating_sub(total) / 2;
+    let y = buttons.y.saturating_add(1).min(buttons.bottom().saturating_sub(1));
+    frame.render_widget(Paragraph::new(" [Y]es ").alignment(Alignment::Center)
+        .style(destructive_button_style(theme)), Rect::new(x, y, yes_width.min(buttons.width), 1));
+    if buttons.width > yes_width + gap {
+        frame.render_widget(Paragraph::new(" [N]o ").alignment(Alignment::Center)
+            .style(theme.current_line()), Rect::new(x + yes_width + gap, y,
+                no_width.min(buttons.right().saturating_sub(x + yes_width + gap)), 1));
+    }
+}
+
+fn draw_confirmation(frame: &mut Frame<'_>, app: &App) {
+    let Some(confirmation) = app.confirmation.as_ref() else { return; };
+    draw_review_dialog(frame, app.theme(), "Review mail action", &confirmation.prompt,
+        &confirmation.items, confirmation.review.position);
+}
+
+fn draw_detach_confirmation(frame: &mut Frame<'_>, app: &App) {
+    let Some(confirmation) = app.detach_confirmation.as_ref() else { return; };
+    let names = confirmation.paths.iter().map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    draw_review_dialog(frame, app.theme(), "Detach attachments",
+        "Remove these attachments from the outgoing message?", &names,
+        confirmation.review.position);
 }
 
 // A full outgoing-message preview, using the same colored headers and rich
@@ -2190,7 +2354,7 @@ fn clipped_wrap_text(value: &str, width: usize, max_rows: usize) -> Vec<String> 
 fn compose_picker_rows(
     frame: &mut Frame<'_>, rect: Rect, entries: &[crate::app::ComposeFileEntry],
     selected: Option<usize>, show_numbers: bool, attachments: &[std::path::PathBuf],
-    visual: Option<(usize, usize)>, theme: &Theme,
+    visual: Option<(usize, usize)>, mode: VisualSelectionStyle, theme: &Theme,
 ) {
     if rect.width == 0 || rect.height == 0 { return; }
     if entries.is_empty() {
@@ -2221,13 +2385,13 @@ fn compose_picker_rows(
         let available = usize::from(rect.width).saturating_sub(left_width);
         let name = truncate_display_width(&entry.name, available);
         let line = Line::from(vec![
-            Span::styled(if visually_selected { "▍" } else { " " },
-                if visually_selected { Style::default().fg(theme.accent) } else { theme.muted() }),
+            browser_gutter(theme, visually_selected),
             Span::styled(number, if is_selected { theme.accent() } else { theme.muted() }),
             Span::styled(marker.to_owned(), style),
             Span::styled(name, style),
         ]);
-        let item = if is_selected { ListItem::new(line).style(theme.current_line()) } else { ListItem::new(line) };
+        let item = ListItem::new(line).style(browser_row_style(theme, mode,
+            visually_selected, is_selected, false));
         items.push(item);
     }
     frame.render_widget(List::new(items), rect);
@@ -2266,13 +2430,15 @@ fn draw_compose_file_picker(frame: &mut Frame<'_>, app: &mut App) {
     if parent_area.width > 0 {
         frame.render_widget(Block::default().borders(Borders::RIGHT).border_style(theme.border()), parent_area);
         compose_picker_rows(frame, Rect::new(parent_area.x, parent_area.y, parent_area.width.saturating_sub(1), parent_area.height),
-            &picker.parent_entries, Some(picker.parent_selected), false, &[], None, theme);
+            &picker.parent_entries, Some(picker.parent_selected), false, &[], None,
+            app.visual_selection_style, theme);
     }
     if files_area.width > 0 {
         frame.render_widget(Block::default().borders(Borders::RIGHT).border_style(theme.border()), files_area);
         compose_picker_rows(frame, Rect::new(files_area.x, files_area.y, files_area.width.saturating_sub(1), files_area.height),
             &picker.entries, Some(picker.selected), true, &composer.attachment_paths,
-            picker.visual_anchor.map(|anchor| (anchor, picker.selected)), theme);
+            picker.visual_anchor.map(|anchor| (anchor, picker.selected)),
+            app.visual_selection_style, theme);
     }
     if preview_area.width > 0 {
         let preview = Rect::new(preview_area.x + 1, preview_area.y,
@@ -2418,12 +2584,17 @@ fn draw_compose_attachment_manager(frame: &mut Frame<'_>, app: &App) {
             let name = file.file_name().unwrap_or(file.as_os_str()).to_string_lossy();
             let parent = file.parent().map_or_else(String::new, |path| path.display().to_string());
             let name_width = usize::from(inner.width).saturating_sub(5);
+            let visual = composer.attachment_manager_visual_anchor.is_some_and(|anchor|
+                (anchor.min(selected)..=anchor.max(selected)).contains(&index));
+            let marked = composer.attachment_manager_marked.contains(&index);
             let line = Line::from(vec![
+                browser_gutter(theme, visual || marked),
                 Span::styled(if index == selected { "▸ " } else { "  " }, theme.accent()),
                 Span::styled(truncate_display_width(&name, name_width.min(32)), theme.text()),
                 Span::styled(format!("  {}", truncate_display_width(&parent, name_width.saturating_sub(32))), theme.muted()),
             ]);
-            ListItem::new(line).style(if index == selected { theme.current_line() } else { theme.text() })
+            ListItem::new(line).style(browser_row_style(theme, app.visual_selection_style,
+                visual || marked, index == selected, false))
         }).collect();
     frame.render_widget(List::new(rows), inner);
 }
@@ -2453,9 +2624,9 @@ fn draw_compose_advanced_options(frame: &mut Frame<'_>, app: &App) {
 
 fn compose_mode_colors(mode: ComposeMode, theme: &Theme) -> (Color, Color) {
     match mode {
-        ComposeMode::Normal => (Color::Blue, Color::Black),
-        ComposeMode::Insert => (Color::LightGreen, Color::Black),
-        ComposeMode::Visual => (theme.visual, Color::Black),
+        ComposeMode::Normal => (theme.accent, theme.selected_fg),
+        ComposeMode::Insert => (theme.unread, theme.selected_fg),
+        ComposeMode::Visual => (theme.visual, theme.selected_fg),
     }
 }
 
@@ -2518,7 +2689,26 @@ fn draw_contact_suggestions(frame: &mut Frame<'_>, app: &App) {
     let height = (ids.len() as u16 + 3).min(frame.area().height.saturating_sub(2));
     if width < 12 || height < 4 { return; }
     let x = inner_x.saturating_add(9).min(frame.area().right().saturating_sub(width));
-    let y = inner_y.saturating_add(field as u16 + 1).min(frame.area().bottom().saturating_sub(height));
+    // Recipient fields may now occupy multiple wrapped rows. Anchor the
+    // suggestions below the active field rather than at a fixed line offset.
+    let composer_width = compose.width.saturating_sub(2);
+    let preview_theme = theme;
+    let requested = [
+        (ComposeField::To, "To", composer.to.as_str()),
+        (ComposeField::Cc, "Cc", composer.cc.as_str()),
+        (ComposeField::Bcc, "Bcc", composer.bcc.as_str()),
+        (ComposeField::Subject, "Subject", composer.subject.as_str()),
+    ].map(|(f, name, value)|
+        compose_header_display(f, name, value, composer, preview_theme, usize::from(composer_width)).lines.len());
+    let selected_names = compose_attachment_names(composer);
+    let attachment_label = format!("  Attachments ({}):", composer.attachment_count());
+    let summary = if selected_names.is_empty() { " none".to_owned() }
+        else { format!(" {}", selected_names.join("  ·  ")) };
+    let attachment_rows = clipped_wrap_text(&format!("{attachment_label}{summary}"),
+        usize::from(composer_width).max(1), 3).len().max(1) as u16;
+    let field_heights = compose_header_heights(requested, compose.height.saturating_sub(2), attachment_rows);
+    let y_offset: u16 = field_heights[..=field].iter().copied().sum();
+    let y = inner_y.saturating_add(y_offset).min(frame.area().bottom().saturating_sub(height));
     let area = Rect::new(x, y, width, height);
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().title(" Contacts · suggestions ")
@@ -2538,24 +2728,95 @@ fn draw_contact_suggestions(frame: &mut Frame<'_>, app: &App) {
         Rect::new(area.x + 1, area.bottom() - 2, width.saturating_sub(2), 1));
 }
 
-const CONTACT_KEYS: &[(&str, &str)] = &[
-    ("/", "search contacts, fuzzy"),
-    ("a", "add a new contact"),
-    ("e", "edit highlighted contact"),
-    ("Enter", "edit or insert into compose recipient"),
-    ("p", "favorite or unfavorite"),
-    ("d", "delete (requires confirmation)"),
-    ("j/k, 5j/5k", "move by row or count"),
-    ("gg / G", "first / last contact"),
-    ("H / M / L", "top / middle / bottom visible row"),
-    ("Ctrl-j / Ctrl-k", "smooth scroll"),
-    ("PageUp / PageDown", "page navigation"),
-    ("?", "search these shortcuts"),
-    ("Esc / q", "close contacts"),
-];
+/// SEARCH uses the theme's visual/purple color, while VISUAL uses its
+/// selected/blue color. Both badges occupy the same mode slot in the footer.
+fn search_mode_style(theme: &Theme) -> Style {
+    mode_style("SEARCH", theme)
+}
+
+/// The mode color is the same in the reader, message list, Contacts and Compose.
+/// Normal = blue, Visual/Search = purple, Insert = green.
+fn mode_style(label: &str, theme: &Theme) -> Style {
+    let bg = match label {
+        "VISUAL" | "SEARCH" => theme.visual,
+        "INSERT" => theme.unread,
+        _ => theme.accent,
+    };
+    Style::default().fg(theme.selected_fg).bg(bg).add_modifier(Modifier::BOLD)
+}
+
+fn compose_mode_style(mode: ComposeMode, theme: &Theme) -> Style {
+    mode_style(mode.label(), theme)
+}
+
+/// Prefix for the shared bottom status row when Contacts is open. Keep the
+/// account label and mode position identical to the mail browser.
+fn contact_status_spans(theme: &Theme, account_name: Option<&str>,
+    modal: &crate::contacts::ContactsModal) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        format!("[{}] ", account_name.unwrap_or("Contacts")), theme.accent())];
+    spans.extend(contact_footer_mode(theme, modal));
+    spans
+}
+
+/// Contact mode badges rendered in the shared bottom status bar. The query
+/// itself lives in the dedicated search row above the contacts list.
+fn contact_footer_mode(theme: &Theme, modal: &crate::contacts::ContactsModal) -> Vec<Span<'static>> {
+    if modal.searching {
+        vec![Span::styled(" SEARCH ", search_mode_style(theme))]
+    } else if modal.visual_anchor.is_some() {
+        vec![Span::styled(" VISUAL ", mode_style("VISUAL", theme))]
+    } else {
+        vec![Span::styled(" NORMAL ", mode_style("NORMAL", theme))]
+    }
+}
+
+/// Counts, filters and marks go after the left contact-count region. That
+/// keeps the mode badge beside the account while the count remains centered.
+fn contact_footer_details(theme: &Theme, modal: &crate::contacts::ContactsModal) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if modal.searching {
+        spans.push(Span::styled(format!(" {} matches ", modal.matches.len()), theme.muted()));
+    } else if !modal.query.is_empty() {
+        spans.push(Span::styled(format!(" filter:/{} ", modal.query), theme.accent()));
+    }
+    if !modal.marked.is_empty() {
+        spans.push(Span::styled(format!(" {} marked ", modal.marked.len()), theme.accent()));
+    }
+    spans
+}
+
+/// Place the contact count under the center of the left-hand contacts list
+/// without overwriting the account name or the SEARCH/VISUAL indicator.
+/// On narrow terminals, prioritize the account/mode text over the count.
+fn contacts_status_areas(frame_area: Rect, status_area: Rect) -> (Rect, Rect) {
+    let popup = centered_rect(frame_area, 116, 88);
+    let inner_width = popup.width.saturating_sub(4);
+    let list_x = popup.x.saturating_add(2).min(status_area.right());
+    let list_width = contacts_list_width(inner_width)
+        .min(status_area.right().saturating_sub(list_x));
+    let count = Rect::new(list_x, status_area.y, list_width, status_area.height);
+    let details_x = count.right().saturating_add(1).min(status_area.right());
+    let details = Rect::new(details_x, status_area.y,
+        status_area.right().saturating_sub(details_x), status_area.height);
+    (count, details)
+}
+
+/// Contacts get the same extra top search row as the message list, only while
+/// actively editing a search. Normal browsing gets the full list height.
+fn contacts_search_layout(inner: Rect, searching: bool) -> (Option<Rect>, Rect) {
+    if !searching || inner.height <= 1 { return (None, inner); }
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+    (Some(chunks[0]), chunks[1])
+}
+
+fn contacts_list_width(inner_width: u16) -> u16 {
+    (inner_width.saturating_mul(47) / 100).max(12).min(inner_width)
+}
 
 fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
     let theme = app.theme().clone();
+    let selection_style = app.visual_selection_style;
     let Some(modal) = app.contacts_modal.as_mut() else { return; };
     let area = centered_rect(frame.area(), 116, 88);
     frame.render_widget(Clear, area);
@@ -2564,20 +2825,16 @@ fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
     let inner = Rect::new(area.x.saturating_add(2), area.y.saturating_add(1),
         area.width.saturating_sub(4), area.height.saturating_sub(2));
     if inner.width < 5 || inner.height < 4 { return; }
-    let rows = Layout::default().direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let count = app.contacts.entries.len();
-    let search = if modal.searching { format!("/{}▏", modal.query) }
-        else if modal.query.is_empty() { "/ search".to_owned() }
-        else { format!("/ {}", modal.query) };
-    let title = format!("{search}                                      {count} contacts");
-    frame.render_widget(Paragraph::new(truncate_display_width(&title, usize::from(rows[0].width)))
-        .style(if modal.searching { theme.accent() } else { theme.muted() }), rows[0]);
-    let left_width = (rows[1].width.saturating_mul(47) / 100).max(12).min(rows[1].width);
-    let left = Rect::new(rows[1].x, rows[1].y, left_width, rows[1].height);
-    let right = Rect::new(left.right(), rows[1].y,
-        rows[1].width.saturating_sub(left_width), rows[1].height);
+    // Reserve a quiet internal count row. It never uses the global status bar.
+    let content_bounds = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1));
+    let (search_row, content) = contacts_search_layout(content_bounds, modal.searching);
+    if let Some(search_row) = search_row {
+        draw_search_prompt(frame, search_row, &modal.query, &theme);
+    }
+    let left_width = contacts_list_width(content.width);
+    let left = Rect::new(content.x, content.y, left_width, content.height);
+    let right = Rect::new(left.right(), content.y,
+        content.width.saturating_sub(left_width), content.height);
     frame.render_widget(Block::default().borders(Borders::RIGHT)
         .border_style(theme.border()), left);
     let list_width = left.width.saturating_sub(1);
@@ -2586,22 +2843,31 @@ fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
     let item_count = modal.matches.len();
     modal.ensure_visible(item_count);
     let items = &modal.matches;
+    let number_width = (items.len().max(1).to_string().len() + 1).max(3);
     for (visual, &id) in items.iter().enumerate().skip(modal.scroll).take(modal.view_height) {
         let contact = &app.contacts.entries[id];
         let active = visual == modal.selected;
+        let is_visual = modal.in_visual_range(visual);
+        let is_marked = modal.marked.contains(&contact.email.to_ascii_lowercase());
         let number = if active { (visual + 1).to_string() }
             else { visual.abs_diff(modal.selected).to_string() };
-        let number_width = (items.len().max(1).to_string().len() + 1).max(3);
         let kind = if contact.favorite { "★ " } else if contact.saved { "● " } else { "  " };
         let label = if contact.name.is_empty() { &contact.email } else { &contact.name };
-        let max_label = usize::from(list_width).saturating_sub(number_width + 3);
-        let text = format!("{number:>number_width$} {}{}", kind, truncate_display_width(label, max_label));
-        frame.render_widget(Paragraph::new(text).style(if active { theme.selected() } else { theme.text() }),
+        let max_label = usize::from(list_width).saturating_sub(number_width + 4);
+        let is_selected = is_visual || is_marked;
+        let line = Line::from(vec![
+            browser_gutter(&theme, is_selected),
+            Span::raw(format!("{number:>number_width$} {kind}")),
+            Span::raw(truncate_display_width(label, max_label)),
+        ]);
+        let row_style = browser_row_style(&theme, selection_style,
+            is_selected, active, false);
+        frame.render_widget(Paragraph::new(line).style(row_style),
             Rect::new(left.x, left.y + (visual - modal.scroll) as u16, list_width, 1));
     }
     if items.is_empty() {
         frame.render_widget(Paragraph::new(if modal.query.is_empty() {
-            " No contacts yet · press a to add one"
+            " No contacts yet"
         } else { " No matching contacts" }).style(theme.muted()),
             Rect::new(left.x, left.y, list_width, 1));
     }
@@ -2624,42 +2890,30 @@ fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
                     .style(theme.text()), Rect::new(x, y + 1, width, 1));
             }
         } else {
-            frame.render_widget(Paragraph::new("Type / to find a contact").style(theme.muted()),
+            frame.render_widget(Paragraph::new("No contact selected").style(theme.muted()),
                 Rect::new(x, right.y, width, 1));
         }
     }
-    let footer = if modal.searching { "Enter finish search · Esc close search" }
-        else { "a add · e edit · p favorite · d delete · ? keybindings · q close" };
-    frame.render_widget(Paragraph::new(truncate_display_width(footer, usize::from(rows[2].width)))
-        .style(theme.muted()), rows[2]);
-
+    let count = app.contacts.entries.len();
+    let count_label = if modal.query.is_empty() { format!("{count} contacts") }
+        else { format!("{} of {count} contacts", modal.matches.len()) };
+    let count_rect = Rect::new(inner.x, inner.bottom().saturating_sub(1),
+        inner.width, 1);
+    frame.render_widget(Paragraph::new(count_label).alignment(Alignment::Right)
+        .style(theme.muted()), count_rect);
     if modal.help {
-        let help_area = centered_rect(frame.area(), 70, 74);
-        frame.render_widget(Clear, help_area);
-        frame.render_widget(Block::default().title(" Contacts · keybindings ")
-            .borders(Borders::ALL).border_style(theme.border()).style(contact_surface_style(&theme)), help_area);
-        let width = help_area.width.saturating_sub(4);
-        frame.render_widget(Paragraph::new(format!("/ {}", modal.help_query))
-            .style(theme.accent()), Rect::new(help_area.x + 2, help_area.y + 1, width, 1));
-        let needle = modal.help_query.to_lowercase();
-        for (line, (key, description)) in CONTACT_KEYS.iter()
-            .filter(|(key, desc)| format!("{key} {desc}").to_lowercase().contains(&needle))
-            .take(help_area.height.saturating_sub(4) as usize).enumerate() {
-            let text = format!("{key:<20} {description}");
-            frame.render_widget(Paragraph::new(truncate_display_width(&text, width as usize))
-                .style(theme.text()), Rect::new(help_area.x + 2, help_area.y + 3 + line as u16, width, 1));
-        }
+        let matches = ranked_help_matches(CONTACT_HELP_ENTRIES, &modal.help_query);
+        draw_help_palette(frame, &theme, " Contacts keybindings ", CONTACT_HELP_ENTRIES,
+            &modal.help_query, &matches, modal.help_selected, modal.help_scroll);
         return;
     }
     if modal.confirm_delete {
-        let confirm = centered_rect(frame.area(), 54, 18);
-        frame.render_widget(Clear, confirm);
-        frame.render_widget(Block::default().title(" Delete contact? ").borders(Borders::ALL)
-            .border_style(theme.error()).style(contact_surface_style(&theme)), confirm);
-        if confirm.height > 3 {
-            frame.render_widget(Paragraph::new("y / Enter delete · n / Esc cancel")
-                .style(theme.text()), Rect::new(confirm.x + 2, confirm.y + 2, confirm.width.saturating_sub(4), 1));
-        }
+        let ids = modal.action_ids(&app.contacts);
+        let names = ids.iter().filter_map(|&id| app.contacts.entries.get(id))
+            .map(|contact| contact.display()).collect::<Vec<_>>();
+        draw_review_dialog(frame, &theme, "Delete contacts",
+            "Delete these contacts from your local address book?", &names,
+            modal.delete_review.position);
         return;
     }
     if let Some(edit) = &modal.edit {
@@ -2694,6 +2948,112 @@ fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+/// Layout of a single composer header. We wrap on grapheme boundaries
+/// rather than relying on Paragraph word-wrap, so the visual caret position
+/// cannot drift when a recipient contains spaces, wide characters or emoji.
+struct ComposeHeaderDisplay {
+    lines: Vec<Line<'static>>,
+    cursor_row: usize,
+    cursor_col: usize,
+    active: bool,
+}
+
+fn compose_header_display(
+    field: ComposeField, name: &str, value: &str, composer: &crate::app::Composer,
+    theme: &Theme, width: usize,
+) -> ComposeHeaderDisplay {
+    let active = composer.field == field;
+    let marker = if active { "▸ " } else { "  " };
+    let prefix = truncate_display_width(&format!("{marker}{name}: "), width);
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+    let prefix_style = if active || !value.trim().is_empty() { theme.accent() } else { theme.muted() };
+    // Leave room for a wide (two-cell) grapheme even in narrow terminals.
+    let continuation = prefix_width.min(width.saturating_sub(2));
+    let spans = editor_spans(value, composer, active, theme);
+    let mut lines = Vec::new();
+    let mut row = vec![Span::styled(prefix, prefix_style)];
+    let mut column = prefix_width;
+    let mut cursor_row = 0;
+    let mut cursor_col = column;
+    let mut index = 0usize;
+
+    for grapheme in UnicodeSegmentation::graphemes(value, true) {
+        let glyph_width = UnicodeWidthStr::width(grapheme);
+        if grapheme == "\n" || (width > 0 && column > continuation
+            && column.saturating_add(glyph_width) > width) {
+            lines.push(Line::from(std::mem::take(&mut row)));
+            row.push(Span::raw(" ".repeat(continuation)));
+            column = continuation;
+        }
+        if index == composer.cursor && active {
+            cursor_row = lines.len();
+            cursor_col = column;
+        }
+        if grapheme != "\n" {
+            let n = grapheme.chars().count();
+            row.extend(spans[index..index + n].iter().cloned());
+            column = column.saturating_add(glyph_width);
+        }
+        index += grapheme.chars().count();
+    }
+    // A caret after the last character also needs an on-screen cell. The
+    // normal-mode block at EOF is already included in editor_spans().
+    if active && composer.cursor >= index {
+        if width > 0 && column >= width {
+            lines.push(Line::from(std::mem::take(&mut row)));
+            row.push(Span::raw(" ".repeat(continuation)));
+            column = continuation;
+        }
+        cursor_row = lines.len();
+        cursor_col = column;
+    }
+    if spans.len() > index { row.extend(spans[index..].iter().cloned()); }
+    lines.push(Line::from(row));
+    ComposeHeaderDisplay { lines, cursor_row, cursor_col, active }
+}
+
+/// Reserve space for the message body and distribute remaining header rows
+/// fairly. When a header is taller than its assigned height, its active caret
+/// stays in view via vertical scrolling inside that field.
+fn compose_header_heights(requested: [usize; 4], height: u16, attachment_rows: u16) -> [u16; 4] {
+    let reserved = attachment_rows.saturating_add(1 + 3); // body label and body; footer is global
+    let budget = height.saturating_sub(reserved).max(4) as usize;
+    let mut heights = [1u16; 4];
+    while heights.iter().map(|&h| usize::from(h)).sum::<usize>() < budget {
+        let mut increased = false;
+        for (i, desired) in requested.iter().copied().enumerate() {
+            if usize::from(heights[i]) < desired &&
+                heights.iter().map(|&h| usize::from(h)).sum::<usize>() < budget {
+                heights[i] += 1;
+                increased = true;
+            }
+        }
+        if !increased { break; }
+    }
+    heights
+}
+
+fn render_compose_header(frame: &mut Frame<'_>, area: Rect,
+    display: ComposeHeaderDisplay, composer: &crate::app::Composer, theme: &Theme) {
+    if area.width == 0 || area.height == 0 { return; }
+    let scroll = if display.active {
+        display.cursor_row.saturating_sub(usize::from(area.height).saturating_sub(1))
+    } else { 0 };
+    frame.render_widget(Paragraph::new(display.lines)
+        .style(if display.active { theme.current_line() } else { theme.text() })
+        .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)), area);
+    if display.active && composer.mode == ComposeMode::Insert
+        && composer.file_picker.is_none() && !composer.attachment_manager_open
+        && !composer.advanced_headers_open && !composer.help_visible
+        && !composer.confirm_send && !composer.exit_prompt {
+        let visual_row = display.cursor_row.saturating_sub(scroll);
+        if visual_row < usize::from(area.height) && display.cursor_col < usize::from(area.width) {
+            frame.set_cursor_position((area.x + display.cursor_col as u16,
+                area.y + visual_row as u16));
+        }
+    }
+}
+
 fn draw_composer(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme().clone();
     let Some(composer) = app.composer.as_ref() else {
@@ -2715,19 +3075,30 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
     let width = usize::from(inside.width).max(1);
     let attachment_lines = clipped_wrap_text(&format!("{attachments_label}{summary}"), width, 3);
     let attachment_rows = attachment_lines.len().max(1) as u16;
+    let header_specs = [
+        (ComposeField::To, "To", composer.to.as_str()),
+        (ComposeField::Cc, "Cc", composer.cc.as_str()),
+        (ComposeField::Bcc, "Bcc", composer.bcc.as_str()),
+        (ComposeField::Subject, "Subject", composer.subject.as_str()),
+    ];
+    let headers = header_specs.into_iter().map(|(field, name, value)|
+        compose_header_display(field, name, value, composer, &theme, width))
+        .collect::<Vec<_>>();
+    let requested = std::array::from_fn(|i| headers[i].lines.len());
+    let header_heights = compose_header_heights(requested, inside.height, attachment_rows);
     let fields = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), Constraint::Length(1), Constraint::Length(1),
-            Constraint::Length(1), Constraint::Length(attachment_rows),
-            Constraint::Length(1), Constraint::Min(3), Constraint::Length(1),
+            Constraint::Length(header_heights[0]), Constraint::Length(header_heights[1]),
+            Constraint::Length(header_heights[2]), Constraint::Length(header_heights[3]),
+            Constraint::Length(attachment_rows),
+            Constraint::Length(1), Constraint::Min(3),
         ])
         .split(inside);
 
-    draw_compose_field(frame, fields[0], "To", ComposeField::To, composer, app);
-    draw_compose_field(frame, fields[1], "Cc", ComposeField::Cc, composer, app);
-    draw_compose_field(frame, fields[2], "Bcc", ComposeField::Bcc, composer, app);
-    draw_compose_field(frame, fields[3], "Subject", ComposeField::Subject, composer, app);
+    for (i, header) in headers.into_iter().enumerate() {
+        render_compose_header(frame, fields[i], header, composer, &theme);
+    }
     let attachments_style = if selected_names.is_empty() { theme.muted() } else { theme.text() };
     let attachment_text = attachment_lines.into_iter().enumerate().map(|(i, line)| {
         if i == 0 && line.starts_with(&attachments_label) {
@@ -2790,60 +3161,9 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
             if x < fields[6].right() { frame.set_cursor_position((x, y)); }
         }
     }
-    // Same compact, filled mode indicator as the lazygitrs commit editor.
-    // The compose keymap is searchable with `?`, not repeated in this footer.
-    let label = format!(" {} ", composer.mode.label());
-    let width = (UnicodeWidthStr::width(label.as_str()) as u16).min(fields[7].width);
-    let mode_area = Rect::new(fields[7].right().saturating_sub(width), fields[7].y, width, 1);
-    let (bg, fg) = compose_mode_colors(composer.mode, &theme);
-    frame.render_widget(Paragraph::new(label)
-        .style(Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD)), mode_area);
-    let hint_width = fields[7].width.saturating_sub(width + 1);
-    let footer = if app.status.is_error { app.status.text.as_str() }
-        else { "? keybindings" };
-    frame.render_widget(Paragraph::new(footer)
-        .style(if app.status.is_error { theme.error() } else { theme.muted() }),
-        Rect::new(fields[7].x, fields[7].y, hint_width, 1));
+    // Mode and status are rendered in draw_status(), the application-wide
+    // bottom bar. Compose no longer creates a second competing footer.
 
-}
-
-fn draw_compose_field(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    name: &str,
-    field: ComposeField,
-    composer: &crate::app::Composer,
-    app: &App,
-) {
-    let theme = app.theme().clone();
-    let active = composer.field == field;
-    let marker = if active { "▸ " } else { "  " };
-    let value = match field {
-        ComposeField::To => &composer.to,
-        ComposeField::Cc => &composer.cc,
-        ComposeField::Bcc => &composer.bcc,
-        ComposeField::Subject => &composer.subject,
-        ComposeField::Attachments => &composer.attachments,
-        ComposeField::Headers => &composer.headers,
-        ComposeField::Body => &composer.body,
-    };
-    let mut spans = vec![Span::styled(
-        format!("{marker}{name}: "),
-        if active || !value.trim().is_empty() { theme.accent() } else { theme.muted() },
-    )];
-    spans.extend(editor_spans(value, composer, active, &theme));
-    frame.render_widget(Paragraph::new(Line::from(spans))
-        .style(if active { theme.current_line() } else { theme.text() }), area);
-    if active && composer.mode == ComposeMode::Insert && area.width > 0 && area.height > 0
-        && composer.file_picker.is_none() && !composer.attachment_manager_open
-        && !composer.advanced_headers_open && !composer.help_visible
-        && !composer.confirm_send && !composer.exit_prompt {
-        let prefix = UnicodeWidthStr::width(format!("{marker}{name}: ").as_str());
-        let before = value.chars().take(composer.cursor).collect::<String>();
-        let column = prefix.saturating_add(UnicodeWidthStr::width(before.as_str()));
-        let x = area.x.saturating_add(u16::try_from(column).unwrap_or(u16::MAX));
-        if x < area.right() { frame.set_cursor_position((x, area.y)); }
-    }
 }
 
 fn editor_spans(
@@ -3069,6 +3389,128 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     #[test]
+    fn mail_and_contacts_share_visual_selection_styles() {
+        use crate::config::VisualSelectionStyle;
+        let theme = load_themes().into_iter().next().expect("theme");
+        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Gutter,
+            true, true, false), theme.current_line());
+        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Gutter,
+            true, false, false), theme.text());
+        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
+            true, false, false), theme.selected());
+        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
+            true, true, false), theme.selected());
+        let selected = super::browser_gutter(&theme, true);
+        let normal = super::browser_gutter(&theme, false);
+        assert_eq!(selected.content.as_ref(), "▍");
+        assert_eq!(selected.style.fg, theme.accent().fg);
+        assert_eq!(normal.content.as_ref(), "▏");
+        assert_eq!(normal.style.fg, theme.border().fg);
+    }
+
+    #[test]
+    fn mail_gutter_is_thicker_than_contacts_without_extra_column() {
+        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let selected = super::mail_gutter(&theme, true);
+        assert_eq!(selected.content.as_ref(), "▌");
+        assert_eq!(selected.style.fg, Some(theme.accent));
+        assert_eq!(super::browser_gutter(&theme, true).content.as_ref(), "▍");
+    }
+
+    #[test]
+    fn delete_review_names_align_for_single_and_double_digit_indices() {
+        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let one = super::review_item_line(1, 2, "First", 40, &theme);
+        let ten = super::review_item_line(10, 2, "Tenth", 40, &theme);
+        assert_eq!(one.spans.len(), 2); // no colored selection gutter
+        assert_eq!(ten.spans.len(), 2);
+        assert_eq!(one.spans[0].content.as_ref(), "  1  ");
+        assert_eq!(ten.spans[0].content.as_ref(), " 10  ");
+        assert_eq!(one.spans[1].content.as_ref(), "First");
+        assert_eq!(ten.spans[1].content.as_ref(), "Tenth");
+        assert_eq!(super::destructive_button_style(&theme).bg, Some(theme.error));
+    }
+
+    #[test]
+    fn contacts_status_uses_account_and_same_mode_slot_as_mail() {
+        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let mut modal = crate::contacts::ContactsModal::default();
+        let normal = super::contact_status_spans(&theme, Some("Gmail"), &modal);
+        assert_eq!(normal.len(), 2);
+        assert_eq!(normal[0].content.as_ref(), "[Gmail] ");
+        assert_eq!(normal[1].content.as_ref(), " NORMAL ");
+        assert_eq!(normal[1].style.bg, Some(theme.accent));
+        modal.visual_anchor = Some(0);
+        let visual = super::contact_status_spans(&theme, Some("Gmail"), &modal);
+        assert_eq!(visual[0].content.as_ref(), "[Gmail] ");
+        assert_eq!(visual[1].content.as_ref(), " VISUAL ");
+        assert_eq!(visual[1].style.bg, Some(theme.visual));
+        modal.visual_anchor = None;
+        modal.searching = true;
+        modal.query = "john".to_owned();
+        modal.matches = vec![0, 1];
+        let search = super::contact_status_spans(&theme, Some("Gmail"), &modal);
+        assert_eq!(search[0].content.as_ref(), "[Gmail] ");
+        assert_eq!(search[1].content.as_ref(), " SEARCH ");
+        assert_eq!(search[1].style, super::search_mode_style(&theme));
+        assert_eq!(search[1].style.bg, visual[1].style.bg);
+        assert!(!search.iter().any(|span| span.content.contains("/john")),
+            "the editable query belongs above the contacts list");
+        let details = super::contact_footer_details(&theme, &modal);
+        assert!(details[0].content.contains("2 matches"));
+        modal.searching = false;
+        assert_eq!(super::contact_status_spans(&theme, Some("Gmail"), &modal).len(), 2);
+        let filtered = super::contact_footer_details(&theme, &modal);
+        assert!(filtered[0].content.contains("filter:/john"));
+    }
+
+    #[test]
+    fn searching_contacts_opens_same_extra_row_as_message_search() {
+        use ratatui::layout::Rect;
+        let inner = Rect::new(2, 3, 70, 19);
+        let (search, list) = super::contacts_search_layout(inner, true);
+        assert_eq!(search, Some(Rect::new(2, 3, 70, 1)));
+        assert_eq!(list, Rect::new(2, 4, 70, 18));
+        let (search, list) = super::contacts_search_layout(inner, false);
+        assert!(search.is_none());
+        assert_eq!(list, inner);
+        let tiny = Rect::new(0, 0, 10, 1);
+        assert_eq!(super::contacts_search_layout(tiny, true), (None, tiny));
+    }
+
+    #[test]
+    fn mail_and_contacts_use_same_purple_search_badge() {
+        for theme in load_themes() {
+            let badge = super::search_mode_style(&theme);
+            assert_eq!(badge.bg, Some(theme.visual));
+            assert_eq!(badge.fg, Some(theme.selected_fg));
+        }
+    }
+
+    #[test]
+    fn contact_count_is_not_part_of_global_status_mode() {
+        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let modal = crate::contacts::ContactsModal::default();
+        let spans = super::contact_status_spans(&theme, Some("Gmail"), &modal);
+        assert!(spans.iter().all(|span| !span.content.contains("contacts")));
+        assert_eq!(spans[1].content.as_ref(), " NORMAL ");
+    }
+
+    #[test]
+    fn contact_status_areas_remain_clipped_on_narrow_terminals() {
+        use ratatui::layout::Rect;
+        for width in 1..=30 {
+            let frame = Rect::new(0, 0, width, 8);
+            let status = Rect::new(0, 7, width.saturating_sub(2), 1);
+            let (count, mode) = super::contacts_status_areas(frame, status);
+            assert!(count.right() <= status.right(), "width {width}");
+            assert!(mode.right() <= status.right(), "width {width}");
+            assert_eq!(count.y, status.y);
+            assert_eq!(mode.y, status.y);
+        }
+    }
+
+    #[test]
     fn contact_modals_use_the_terminal_background() {
         let theme = load_themes().into_iter().next().expect("theme");
         let style = super::contact_surface_style(&theme);
@@ -3187,6 +3629,60 @@ mod tests {
         let names = vec!["config.example.toml".to_owned(), "LICENSE".to_owned()];
         assert_eq!(super::attachment_subtitle(&names), "config.example.toml · LICENSE");
         assert_eq!(super::attachment_subtitle(&[]), "Attachment");
+    }
+
+    #[test]
+    fn composer_recipient_headers_wrap_without_truncating_or_losing_cursor() {
+        use crate::app::{ComposeField, ComposeMode, Composer};
+        let mut composer = Composer::new();
+        composer.field = ComposeField::To;
+        composer.mode = ComposeMode::Insert;
+        composer.to = "Jane Doe <jane@example.org>, Björk <bjork@example.org>, Zoe <zoe@example.org>".into();
+        composer.cursor = composer.to.chars().count();
+        let theme = load_themes().into_iter().next().unwrap();
+        let display = super::compose_header_display(ComposeField::To, "To", &composer.to, &composer, &theme, 24);
+        assert!(display.lines.len() > 2);
+        // Strip only layout indentation, never characters from the input.
+        let mut reconstructed = String::new();
+        for (row_number, line) in display.lines.iter().enumerate() {
+            let text = line.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+            if row_number == 0 { reconstructed.push_str(text.strip_prefix("▸ To: ").unwrap()); }
+            else { reconstructed.push_str(text.strip_prefix("      ").unwrap()); }
+        }
+        assert_eq!(reconstructed, composer.to);
+        assert!(display.cursor_row > 0);
+        assert!(display.cursor_col < 24);
+        for row in &display.lines {
+            let text = row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+            assert!(UnicodeWidthStr::width(text.as_str()) <= 24, "overflow: {text:?}");
+        }
+    }
+
+    #[test]
+    fn composer_wrap_keeps_emoji_grapheme_intact() {
+        use crate::app::{ComposeField, ComposeMode, Composer};
+        let mut composer = Composer::new();
+        composer.field = ComposeField::Subject;
+        composer.mode = ComposeMode::Insert;
+        composer.subject = "Hello 👨\u{200d}💻 Zoe".into();
+        composer.cursor = composer.subject.chars().count();
+        let theme = load_themes().into_iter().next().unwrap();
+        let display = super::compose_header_display(ComposeField::Subject, "Subject", &composer.subject, &composer, &theme, 15);
+        assert!(display.lines.len() >= 2);
+        let rows = display.lines.iter().map(|line| line.spans.iter()
+            .map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row.contains("👨\u{200d}💻")));
+        assert!(rows.iter().all(|row| UnicodeWidthStr::width(row.as_str()) <= 15));
+    }
+
+    #[test]
+    fn compose_header_budget_preserves_body_space_and_shares_rows() {
+        let heights = super::compose_header_heights([8, 7, 1, 2], 22, 2);
+        assert!(heights.iter().all(|&height| height >= 1));
+        assert!(heights.iter().copied().sum::<u16>() <= 16);
+        assert!(heights[0] > 1);
+        assert!(heights[1] > 1);
+        assert_eq!(heights[2], 1);
     }
 
     #[test]
@@ -3380,11 +3876,22 @@ mod tests {
         let insert = super::compose_mode_colors(ComposeMode::Insert, &theme);
         let visual = super::compose_mode_colors(ComposeMode::Visual, &theme);
         assert_eq!(visual.0, theme.visual);
-        assert_eq!(normal, (Color::Blue, Color::Black));
-        assert_eq!(insert, (Color::LightGreen, Color::Black));
+        assert_eq!(normal, (theme.accent, theme.selected_fg));
+        assert_eq!(insert, (theme.unread, theme.selected_fg));
         assert_ne!(visual.0, normal.0);
         assert_ne!(visual.0, insert.0);
-        assert_eq!(visual.1, Color::Black);
+        assert_eq!(visual.1, theme.selected_fg);
+    }
+
+    #[test]
+    fn mode_badges_are_consistent_in_browser_contacts_and_compose() {
+        for theme in load_themes() {
+            assert_eq!(super::mode_style("NORMAL", &theme).bg, Some(theme.accent));
+            assert_eq!(super::mode_style("VISUAL", &theme).bg, Some(theme.visual));
+            assert_eq!(super::mode_style("SEARCH", &theme).bg, Some(theme.visual));
+            assert_eq!(super::mode_style("INSERT", &theme).bg, Some(theme.unread));
+            assert_eq!(super::compose_mode_style(crate::app::ComposeMode::Insert, &theme).bg, Some(theme.unread));
+        }
     }
 
     #[test]

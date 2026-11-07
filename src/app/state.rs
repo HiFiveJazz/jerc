@@ -11,12 +11,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use ratatui::layout::Size;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
-use crate::app::{ATTACHMENT_HELP_ENTRIES, Command, Focus, HELP_ENTRIES, command_for_key};
+use crate::app::{ATTACHMENT_HELP_ENTRIES, CONTACT_HELP_ENTRIES, Command, Focus, HELP_ENTRIES, command_for_key, ranked_help_matches};
 use crate::setup::{SetupWizard, WizardAction};
 use crate::cache::{self, CachedMailbox};
 use crate::backend::MailboxSyncHint;
-use crate::config::Config;
-use crate::contacts::{ContactBook, ContactsModal, ContactEdit, recipient_query, replace_recipient, recipients};
+use crate::config::{Config, VisualSelectionStyle};
+use crate::contacts::{ContactBook, ContactsModal, ContactEdit, recipient_query, replace_recipient, replace_recipients, recipients};
 use crate::mail::{parse_body, render_html_for_terminal};
 use crate::outgoing::{ReplyAudience, reply_recipients, reply_subject, forward_subject, inline_forward_parts, forward_html, forward_attribution, FORWARD_SEPARATOR};
 use crate::mail_image::{MailImageEvent, MailImageLoader};
@@ -28,7 +28,7 @@ use crate::theme::{Theme, load_themes, theme_index};
 use crate::worker::{ActionKind, RuntimeEvent, WorkerEvent, WorkerEventKind, WorkerHandle};
 
 const SMOOTH_SCROLL_ROWS: isize = 22;
-const SMOOTH_MAILBOX_ROWS: isize = 5;
+const SMOOTH_MAILBOX_ROWS: isize = SMOOTH_SCROLL_ROWS;
 const MAX_COUNT_PREFIX: usize = 99_999;
 const MESSAGE_SCROLL_OFF: usize = 4;
 const READER_SCROLL_OFF: usize = 3;
@@ -663,6 +663,10 @@ pub struct Composer {
     pub attachment_manager_open: bool,
     #[serde(skip)]
     pub attachment_manager_selected: usize,
+    #[serde(skip)]
+    pub attachment_manager_visual_anchor: Option<usize>,
+    #[serde(skip)]
+    pub attachment_manager_marked: HashSet<usize>,
     /// Undo stack for detach operations in Ctrl+D; deliberately independent of text undo.
     #[serde(skip)]
     removed_attachments: Vec<RemovedAttachment>,
@@ -738,6 +742,8 @@ impl Composer {
             file_picker: None,
             attachment_manager_open: false,
             attachment_manager_selected: 0,
+            attachment_manager_visual_anchor: None,
+            attachment_manager_marked: HashSet::new(),
             removed_attachments: Vec::new(),
             advanced_headers_open: false,
             advanced_previous: None,
@@ -806,6 +812,8 @@ impl Composer {
             file_picker: None,
             attachment_manager_open: false,
             attachment_manager_selected: 0,
+            attachment_manager_visual_anchor: None,
+            attachment_manager_marked: HashSet::new(),
             removed_attachments: Vec::new(),
             advanced_headers_open: false,
             advanced_previous: None,
@@ -839,6 +847,7 @@ impl Composer {
             to: String::new(), cc: String::new(), bcc: String::new(),
             attachments: String::new(), attachment_paths: Vec::new(), headers: String::new(),
             file_picker: None, attachment_manager_open: false, attachment_manager_selected: 0,
+            attachment_manager_visual_anchor: None, attachment_manager_marked: HashSet::new(),
             removed_attachments: Vec::new(),
             advanced_headers_open: false, advanced_previous: None,
             subject, body,
@@ -2118,12 +2127,46 @@ enum MutationKind {
     Unarchive { destination: String },
 }
 
+/// One-row-per-frame, 22-row target scrolling shared by delete previews.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewScroll {
+    pub position: usize,
+    target: Option<usize>,
+}
+
+impl ReviewScroll {
+    pub fn queue(&mut self, count: usize, delta: isize) {
+        let origin = self.target.unwrap_or(self.position);
+        let next = origin.saturating_add_signed(delta).min(count.saturating_sub(1));
+        self.target = (next != self.position).then_some(next);
+    }
+
+    pub fn active(&self) -> bool { self.target.is_some() }
+
+    pub fn advance(&mut self) {
+        if let Some(target) = self.target {
+            self.position = self.position.saturating_add_signed(
+                if target > self.position { 1 } else { -1 });
+            if self.position == target { self.target = None; }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MutationConfirmation {
     pub prompt: String,
+    pub items: Vec<String>,
+    pub review: ReviewScroll,
     source: String,
     ids: Vec<MessageId>,
     kind: MutationKind,
+}
+
+/// An attachment is only detached after the user accepts the review.
+#[derive(Debug, Clone)]
+pub struct DetachConfirmation {
+    pub paths: Vec<PathBuf>,
+    pub review: ReviewScroll,
 }
 
 struct ReaderImage {
@@ -2299,7 +2342,12 @@ pub struct App {
     theme_before_picker: usize,
     pub count_prefix: Option<usize>,
     pub visual_anchor: Option<usize>,
+    /// Session-only marks for the active account/mailbox. Stable IDs survive
+    /// sorting, searching, and pagination; changing folders clears them.
+    pub message_marked: HashSet<MessageId>,
+    pub visual_selection_style: VisualSelectionStyle,
     pub confirmation: Option<MutationConfirmation>,
+    pub detach_confirmation: Option<DetachConfirmation>,
     pub composer: Option<Composer>,
     pub contacts: ContactBook,
     pub contacts_modal: Option<ContactsModal>,
@@ -2490,7 +2538,10 @@ impl App {
             theme_before_picker: theme_index,
             count_prefix: None,
             visual_anchor: None,
+            message_marked: HashSet::new(),
+            visual_selection_style: config.ui.visual_selection_style,
             confirmation: None,
+            detach_confirmation: None,
             composer: None,
             contacts,
             contacts_modal: None,
@@ -2575,6 +2626,21 @@ impl App {
         composer.dismissed_contact_query = Some(recipient_query(composer.field_value(), composer.cursor));
     }
 
+    /// The contacts manager can insert a whole visual/marked selection in a
+    /// single undoable composer edit. The active unfinished recipient is the
+    /// only segment replaced; other To/Cc/Bcc entries remain unchanged.
+    fn accept_contacts_from_manager(&mut self, ids: &[usize]) {
+        let Some(composer) = &mut self.composer else { return; };
+        if !matches!(composer.field, ComposeField::To | ComposeField::Cc | ComposeField::Bcc) { return; }
+        let contacts: Vec<_> = ids.iter().filter_map(|&id| self.contacts.entries.get(id)).collect();
+        if contacts.is_empty() { return; }
+        composer.remember_edit();
+        let cursor = composer.cursor;
+        composer.cursor = replace_recipients(composer.field_mut(), cursor, &contacts);
+        composer.contact_suggestion = 0;
+        composer.dismissed_contact_query = Some(recipient_query(composer.field_value(), composer.cursor));
+    }
+
     fn open_contacts(&mut self) {
         self.contacts_modal = Some(ContactsModal { view_height: 15,
             matches: self.contacts.filtered(""), ..ContactsModal::default() });
@@ -2592,9 +2658,42 @@ impl App {
     fn handle_contacts_modal_key(&mut self, modal: &mut ContactsModal, key: KeyEvent) -> bool {
         if modal.help {
             match key.code {
-                KeyCode::Esc => { modal.help = false; modal.help_query.clear(); }
-                KeyCode::Backspace => { modal.help_query.pop(); }
-                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => modal.help_query.push(ch),
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    modal.help = false;
+                    modal.help_query.clear();
+                }
+                KeyCode::Backspace => {
+                    modal.help_query.pop();
+                    modal.help_selected = ranked_help_matches(CONTACT_HELP_ENTRIES, &modal.help_query)
+                        .first().copied().unwrap_or(0);
+                    modal.help_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
+                    if key.modifiers.is_empty() => {
+                    let matches = ranked_help_matches(CONTACT_HELP_ENTRIES, &modal.help_query);
+                    if !matches.is_empty() {
+                        let current = matches.iter().position(|&i| i == modal.help_selected).unwrap_or(0);
+                        let next = match key.code {
+                            KeyCode::Up => current.saturating_sub(1),
+                            KeyCode::Down => (current + 1).min(matches.len() - 1),
+                            KeyCode::Home => 0,
+                            KeyCode::End => matches.len() - 1,
+                            _ => current,
+                        };
+                        modal.help_selected = matches[next];
+                        // Keep the selected shortcut in the visible palette.
+                        if next < modal.help_scroll { modal.help_scroll = next; }
+                        if next >= modal.help_scroll.saturating_add(12) {
+                            modal.help_scroll = next.saturating_sub(11);
+                        }
+                    }
+                }
+                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                    modal.help_query.push(ch);
+                    modal.help_selected = ranked_help_matches(CONTACT_HELP_ENTRIES, &modal.help_query)
+                        .first().copied().unwrap_or(0);
+                    modal.help_scroll = 0;
+                }
                 _ => {}
             }
             return true;
@@ -2627,22 +2726,35 @@ impl App {
             return true;
         }
         if modal.confirm_delete {
+            let count = modal.action_ids(&self.contacts).len();
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('j') => modal.delete_review.queue(count, SMOOTH_SCROLL_ROWS),
+                    KeyCode::Char('k') => modal.delete_review.queue(count, -SMOOTH_SCROLL_ROWS),
+                    _ => {}
+                }
+                return true;
+            }
             match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
+                KeyCode::Char('j') | KeyCode::Down => modal.delete_review.queue(count, 1),
+                KeyCode::Char('k') | KeyCode::Up => modal.delete_review.queue(count, -1),
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
                     if !self.contacts_writable {
                         self.status = StatusLine::error("contacts are read-only: fix the contacts.json load error");
                     } else {
-                        let matches = self.contacts.filtered(&modal.query);
-                        if let Some(&id) = matches.get(modal.selected) {
-                            self.contacts.entries.remove(id);
-                            self.mark_contacts_dirty();
-                        }
+                        let mut ids = modal.action_ids(&self.contacts);
+                        // Remove highest indices first so earlier indices stay valid.
+                        ids.sort_unstable_by(|a, b| b.cmp(a));
+                        for id in &ids { self.contacts.entries.remove(*id); }
+                        if !ids.is_empty() { self.mark_contacts_dirty(); }
+                        modal.clear_selection();
                         modal.matches = self.contacts.filtered(&modal.query);
                         modal.ensure_visible(modal.matches.len());
+                        self.status = StatusLine::temporary(format!("deleted {} contact(s)", ids.len()), Duration::from_secs(2));
                     }
                     modal.confirm_delete = false;
                 }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => modal.confirm_delete = false,
+                KeyCode::Esc | KeyCode::Char('n' | 'N') | KeyCode::Char('q') => modal.confirm_delete = false,
                 _ => {}
             }
             return true;
@@ -2652,8 +2764,8 @@ impl App {
             // input. This mirrors Ctrl-j/k in the normal contacts view.
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
-                    KeyCode::Char('j' | 'J') | KeyCode::Enter => modal.smooth(modal.matches.len(), 10),
-                    KeyCode::Char('k' | 'K') => modal.smooth(modal.matches.len(), -10),
+                    KeyCode::Char('j' | 'J') | KeyCode::Enter => modal.smooth(modal.matches.len(), SMOOTH_SCROLL_ROWS),
+                    KeyCode::Char('k' | 'K') => modal.smooth(modal.matches.len(), -SMOOTH_SCROLL_ROWS),
                     _ => {}
                 }
                 return true;
@@ -2668,6 +2780,7 @@ impl App {
             }
             modal.smooth_target = None;
             modal.matches = self.contacts.filtered(&modal.query);
+            modal.visual_anchor = None;
             modal.ensure_visible(modal.matches.len());
             return true;
         }
@@ -2676,45 +2789,75 @@ impl App {
             match key.code {
                 // Some enhanced keyboard protocols report Ctrl-J as
                 // Ctrl+Enter instead of Ctrl+Char('j').
-                KeyCode::Char('j' | 'J') | KeyCode::Enter => modal.smooth(len, 10),
-                KeyCode::Char('k' | 'K') => modal.smooth(len, -10),
+                KeyCode::Char('j' | 'J') | KeyCode::Enter => modal.smooth(len, SMOOTH_SCROLL_ROWS),
+                KeyCode::Char('k' | 'K') => modal.smooth(len, -SMOOTH_SCROLL_ROWS),
                 _ => {}
             }
             return true;
         }
         let mut preserve_count = false;
         match key.code {
+            KeyCode::Esc if modal.visual_anchor.is_some() => { modal.visual_anchor = None; }
             KeyCode::Esc | KeyCode::Char('q') => return false,
-            KeyCode::Char('?') => { modal.help = true; modal.help_query.clear(); }
-            KeyCode::Char('/') => { modal.searching = true; }
+            KeyCode::Char('v' | 'V') if len > 0 => {
+                let linewise = key.code == KeyCode::Char('V');
+                if modal.visual_anchor.is_some() && modal.visual_linewise == linewise {
+                    modal.visual_anchor = None;
+                } else {
+                    if modal.visual_anchor.is_none() { modal.visual_anchor = Some(modal.selected); }
+                    modal.visual_linewise = linewise;
+                }
+            }
+            KeyCode::Char(' ') => {
+                if modal.visual_anchor.is_some() { modal.mark_visual_range(&self.contacts); }
+                else { modal.toggle_mark(&self.contacts); }
+            }
+            KeyCode::Char('?') => { modal.help = true; modal.help_query.clear(); modal.help_selected = 0; modal.help_scroll = 0; }
+            KeyCode::Char('/') => { modal.searching = true; modal.visual_anchor = None; }
             KeyCode::Char('a') => modal.edit = Some(ContactEdit::new(None)),
             KeyCode::Char('e') => {
                 modal.edit = modal.matches.get(modal.selected).map(|&i| ContactEdit::new(Some(&self.contacts.entries[i])));
             }
             KeyCode::Enter => {
-                if let Some(id) = modal.matches.get(modal.selected).copied() {
-                    if self.composer.as_ref().is_some_and(|c|
-                        matches!(c.field, ComposeField::To | ComposeField::Cc | ComposeField::Bcc)) {
-                        self.accept_contact_suggestion(id);
+                let ids = modal.action_ids(&self.contacts);
+                if self.composer.as_ref().is_some_and(|c|
+                    matches!(c.field, ComposeField::To | ComposeField::Cc | ComposeField::Bcc)) {
+                    if !ids.is_empty() {
+                        self.accept_contacts_from_manager(&ids);
                         return false;
                     }
-                    modal.edit = Some(ContactEdit::new(Some(&self.contacts.entries[id])));
+                } else if ids.len() == 1 {
+                    modal.edit = ids.first().map(|&id| ContactEdit::new(Some(&self.contacts.entries[id])));
+                } else if ids.len() > 1 {
+                    self.status = StatusLine::temporary("Open compose To/Cc/Bcc to insert multiple contacts", Duration::from_secs(3));
                 }
             }
             KeyCode::Char('p') => {
                 if !self.contacts_writable {
                     self.status = StatusLine::error("contacts are read-only: fix the contacts.json load error");
-                } else if let Some(&id) = modal.matches.get(modal.selected) {
-                    self.contacts.entries[id].favorite = !self.contacts.entries[id].favorite;
-                    self.mark_contacts_dirty();
-                    modal.matches = self.contacts.filtered(&modal.query);
-                    if let Some(position) = modal.matches.iter().position(|&i| i == id) {
-                        modal.selected = position;
+                } else {
+                    let ids = modal.action_ids(&self.contacts);
+                    if !ids.is_empty() {
+                        let focused = modal.matches.get(modal.selected).copied();
+                        let all_favorite = ids.iter().all(|&id| self.contacts.entries[id].favorite);
+                        for &id in &ids { self.contacts.entries[id].favorite = !all_favorite; }
+                        self.mark_contacts_dirty();
+                        modal.clear_selection();
+                        modal.matches = self.contacts.filtered(&modal.query);
+                        if let Some(position) = focused.and_then(|id| modal.matches.iter().position(|&row_id| row_id == id)) {
+                            modal.selected = position;
+                        }
                         modal.ensure_visible(modal.matches.len());
                     }
                 }
             }
-            KeyCode::Char('d') => { if len > 0 { modal.confirm_delete = true; } }
+            KeyCode::Char('d') => {
+                if !modal.action_ids(&self.contacts).is_empty() {
+                    modal.confirm_delete = true;
+                    modal.smooth_target = None;
+                    modal.delete_review = ReviewScroll::default();
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 modal.navigate(len, modal.pending_count.unwrap_or(1).min(9999) as isize);
             }
@@ -2766,6 +2909,12 @@ impl App {
                 self.flush_contacts(true);
                 modal.edit = None;
                 modal.matches = self.contacts.filtered(&modal.query);
+                if let Some(old) = editor.original_email.as_deref() {
+                    if modal.marked.remove(&old.to_ascii_lowercase()) {
+                        modal.marked.insert(editor.email.to_ascii_lowercase());
+                    }
+                }
+                modal.visual_anchor = None;
                 if let Some(id) = self.contacts.find(&editor.email) {
                     if let Some(position) = modal.matches.iter().position(|i| *i == id) {
                         modal.selected = position;
@@ -4136,6 +4285,15 @@ impl App {
                 self.count_prefix = None;
                 self.toggle_visual();
             }
+            Command::ToggleMark => {
+                self.count_prefix = None;
+                if self.message_open {
+                    // Preserve the old reader Space navigation behavior.
+                    self.move_selection(10);
+                } else {
+                    self.toggle_message_mark();
+                }
+            }
             Command::ToggleSeen => {
                 self.count_prefix = None;
                 self.toggle_seen();
@@ -4316,7 +4474,14 @@ impl App {
 
     #[must_use]
     pub fn animation_active(&self) -> bool {
+        if let Some(confirmation) = &self.detach_confirmation {
+            return confirmation.review.active();
+        }
+        if let Some(confirmation) = &self.confirmation {
+            return confirmation.review.active();
+        }
         if let Some(modal) = &self.contacts_modal {
+            if modal.confirm_delete { return modal.delete_review.active(); }
             // A modal pauses animations behind it. Otherwise an existing mail
             // scroll could keep redrawing contacts at 100 FPS indefinitely.
             return modal.smooth_target.is_some();
@@ -4338,7 +4503,19 @@ impl App {
     /// are positions inside the filtered list; mailbox targets deliberately do
     /// not open intermediate folders, so Ctrl-Shift-j/k stays responsive.
     pub fn advance_animation(&mut self) {
+        if let Some(confirmation) = self.detach_confirmation.as_mut() {
+            confirmation.review.advance();
+            return;
+        }
+        if let Some(confirmation) = self.confirmation.as_mut() {
+            confirmation.review.advance();
+            return;
+        }
         if let Some(modal) = self.contacts_modal.as_mut() {
+            if modal.confirm_delete {
+                modal.delete_review.advance();
+                return;
+            }
             let length = modal.matches.len();
             modal.advance(length);
             return;
@@ -4524,6 +4701,7 @@ impl App {
         self.reader_visual_linewise = false;
         self.pending_compose = None;
         self.visual_anchor = None;
+        self.message_marked.clear();
         self.confirmation = None;
         self.focus = Focus::Messages;
         self.account_index = index;
@@ -4591,10 +4769,12 @@ impl App {
     }
 
     fn move_mailbox_list(&mut self, delta: isize) {
-        if self.message_open {
-            return;
-        }
+        if self.message_open { return; }
+        let will_change = self.account().is_some_and(|account|
+            bounded_index(account.mailbox_index, account.mailboxes.len(), delta) != account.mailbox_index);
+        if !will_change { return; }
         self.visual_anchor = None;
+        self.message_marked.clear();
         let preview_split = self.preview_split;
         let Some(account) = self.account_mut() else {
             return;
@@ -4951,10 +5131,9 @@ impl App {
     }
 
     fn start_smooth_mailbox_scroll(&mut self, delta: isize) {
-        if self.message_open {
-            return;
-        }
+        if self.message_open { return; }
         self.visual_anchor = None;
+        self.message_marked.clear();
         let Some(account) = self.account_mut() else {
             return;
         };
@@ -5191,6 +5370,28 @@ impl App {
         }
     }
 
+    /// Space toggles the current message, then advances one visible row
+    /// (without wrapping past the last message). In visual mode it toggles
+    /// the whole range as a set and exits visual mode without moving.
+    fn toggle_message_mark(&mut self) {
+        let visual_range = self.visual_range();
+        let Some(account) = self.account() else { return; };
+        let ids = if let Some((first, last)) = visual_range {
+            account.visible_message_indices()[first..=last].iter()
+                .map(|&index| account.messages[index].id.clone()).collect::<Vec<_>>()
+        } else {
+            account.selected_message().map(|m| vec![m.id.clone()]).unwrap_or_default()
+        };
+        if ids.is_empty() { return; }
+        toggle_message_marks(&mut self.message_marked, &ids);
+        self.visual_anchor = None;
+        if visual_range.is_none() {
+            // Reuse normal navigation for filtered order, viewport scroll,
+            // preview updates, and pagination/prefetch near the list end.
+            self.move_selection(1);
+        }
+    }
+
     fn toggle_visual(&mut self) {
         if self.focus == Focus::Preview && self.message_open {
             if self.reader_line_count == 0 {
@@ -5305,21 +5506,42 @@ impl App {
     }
 
     fn selected_message_ids(&self) -> Vec<MessageId> {
-        let Some(account) = self.account() else {
-            return Vec::new();
-        };
+        let Some(account) = self.account() else { return Vec::new(); };
+        let visible = account.visible_message_indices();
+        let mut selected = Vec::new();
+        let mut seen = HashSet::new();
         if let Some((start, end)) = self.visual_range() {
-            let visible = account.visible_message_indices();
-            return visible[start..=end]
-                .iter()
-                .filter_map(|index| account.messages.get(*index))
-                .map(|message| message.id.clone())
-                .collect();
+            for &index in &visible[start..=end] {
+                let id = &account.messages[index].id;
+                if seen.insert(id.clone()) { selected.push(id.clone()); }
+            }
         }
-        account
-            .selected_message()
-            .map(|message| vec![message.id.clone()])
-            .unwrap_or_default()
+        // Marks survive filtering, and can be combined with a fresh visual
+        // range. Only messages still in the active mailbox may be acted on.
+        for message in &account.messages {
+            if self.message_marked.contains(&message.id) && seen.insert(message.id.clone()) {
+                selected.push(message.id.clone());
+            }
+        }
+        if selected.is_empty() {
+            return account.selected_message().map(|m| vec![m.id.clone()]).unwrap_or_default();
+        }
+        selected
+    }
+
+    /// Snapshot visible names for confirmation. The preview must match the
+    /// identities that will be sent to the worker even if the list changes.
+    fn message_review_items(&self, ids: &[MessageId]) -> Vec<String> {
+        let Some(account) = self.account() else { return Vec::new(); };
+        // Build one lookup instead of scanning a large mailbox for every mark.
+        let by_id: HashMap<&MessageId, &MessageSummary> = account.messages.iter()
+            .map(|message| (&message.id, message)).collect();
+        ids.iter().map(|id| by_id.get(id)
+            .map_or_else(|| "(message no longer loaded)".to_owned(), |message| {
+                let subject = if message.subject.trim().is_empty() { "(no subject)" }
+                    else { message.subject.as_str() };
+                subject.to_owned()
+            })).collect()
     }
 
     fn delete_selected(&mut self) {
@@ -5327,6 +5549,7 @@ impl App {
         if ids.is_empty() {
             return;
         }
+        let items = self.message_review_items(&ids);
         let Some(account) = self.account() else {
             return;
         };
@@ -5346,6 +5569,8 @@ impl App {
                     "Permanently delete {count} message{}? This cannot be undone. [y/N]",
                     if count == 1 { "" } else { "s" }
                 ),
+                items,
+                review: ReviewScroll::default(),
                 source,
                 ids,
                 kind: MutationKind::Delete,
@@ -5364,6 +5589,8 @@ impl App {
                     "Move {count} message{} to Trash? [y/N]",
                     if count == 1 { "" } else { "s" }
                 ),
+                items,
+                review: ReviewScroll::default(),
                 source,
                 ids,
                 kind: MutationKind::Move { destination: trash },
@@ -5374,6 +5601,8 @@ impl App {
                     "Delete {count} message{}? This server has no Trash mailbox. [y/N]",
                     if count == 1 { "" } else { "s" }
                 ),
+                items,
+                review: ReviewScroll::default(),
                 source,
                 ids,
                 kind: MutationKind::Delete,
@@ -5496,7 +5725,10 @@ impl App {
             && (destination.to_ascii_lowercase().starts_with("[gmail]/")
                 || destination.to_ascii_lowercase().starts_with("[googlemail]/"))
         {
+            let items = self.message_review_items(&ids);
             self.confirmation = Some(MutationConfirmation {
+                items,
+                review: ReviewScroll::default(),
                 prompt: format!("Archive {} Gmail message(s)? This uses IMAP expunge; check Gmail deletion settings first. [y/N]", ids.len()),
                 source, ids, kind: MutationKind::Archive { destination },
             });
@@ -5529,8 +5761,74 @@ impl App {
         }
     }
 
-    fn handle_confirmation_key(&mut self, key: KeyEvent) {
+    fn handle_detach_confirmation_key(&mut self, key: KeyEvent) {
+        let Some(review) = self.detach_confirmation.as_mut() else { return; };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('j') => review.review.queue(review.paths.len(), SMOOTH_SCROLL_ROWS),
+                KeyCode::Char('k') => review.review.queue(review.paths.len(), -SMOOTH_SCROLL_ROWS),
+                _ => {}
+            }
+            return;
+        }
         match key.code {
+            KeyCode::Char('j') | KeyCode::Down => review.review.queue(review.paths.len(), 1),
+            KeyCode::Char('k') | KeyCode::Up => review.review.queue(review.paths.len(), -1),
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => { self.detach_confirmation = None; }
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                let Some(confirmation) = self.detach_confirmation.take() else { return; };
+                let paths: HashSet<PathBuf> = confirmation.paths.into_iter().collect();
+                if let Some(composer) = self.composer.as_mut() {
+                    // Use the existing detach operation so its undo stack
+                    // continues to work for multi-selection as well.
+                    let names = composer.attachment_paths.iter().cloned()
+                        .chain(composer.attachments.split(';').map(str::trim)
+                            .filter(|part| !part.is_empty()).map(PathBuf::from))
+                        .collect::<Vec<_>>();
+                    let original_selected = composer.attachment_manager_selected;
+                    for index in (0..names.len()).rev() {
+                        if paths.contains(&names[index]) {
+                            composer.attachment_manager_selected = index;
+                            let _ = composer.remove_managed_attachment();
+                        }
+                    }
+                    composer.attachment_manager_visual_anchor = None;
+                    composer.attachment_manager_marked.clear();
+                    composer.attachment_manager_selected = original_selected
+                        .min(composer.attachment_count().saturating_sub(1));
+                    if let Some(picker) = composer.file_picker.as_mut() {
+                        picker.visual_anchor = None;
+                    }
+                }
+                self.status = StatusLine::temporary(format!("detached {} file(s)", paths.len()),
+                    Duration::from_secs(2));
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_confirmation_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(confirmation) = self.confirmation.as_mut() {
+                match key.code {
+                    KeyCode::Char('j') => confirmation.review.queue(confirmation.items.len(), SMOOTH_SCROLL_ROWS),
+                    KeyCode::Char('k') => confirmation.review.queue(confirmation.items.len(), -SMOOTH_SCROLL_ROWS),
+                    _ => {}
+                }
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(confirmation) = self.confirmation.as_mut() {
+                    confirmation.review.queue(confirmation.items.len(), 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(confirmation) = self.confirmation.as_mut() {
+                    confirmation.review.queue(confirmation.items.len(), -1);
+                }
+            }
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
@@ -5594,6 +5892,7 @@ impl App {
 
         self.remove_messages_locally(&source, &ids, &kind);
         self.visual_anchor = None;
+        self.message_marked.clear();
         if self.message_open {
             self.close_message();
         }
@@ -5759,19 +6058,9 @@ impl App {
 
     #[must_use]
     pub fn help_matches(&self) -> Vec<usize> {
-        let query = self.help_query.trim().to_ascii_lowercase();
         let entries = if self.attachment_picker_visible { ATTACHMENT_HELP_ENTRIES }
             else { HELP_ENTRIES };
-        entries.iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                query.is_empty()
-                    || entry.category.to_ascii_lowercase().contains(&query)
-                    || entry.key.to_ascii_lowercase().contains(&query)
-                    || entry.description.to_ascii_lowercase().contains(&query)
-            })
-            .map(|(index, _)| index)
-            .collect()
+        ranked_help_matches(entries, &self.help_query)
     }
 
     #[must_use]
@@ -6224,7 +6513,7 @@ impl App {
         }
         let Some(picker) = self.attachment_destination_picker.as_mut() else { return; };
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('j' | 'k')) {
-            let delta = if key.code == KeyCode::Char('j') { 12 } else { -12 };
+            let delta = if key.code == KeyCode::Char('j') { SMOOTH_SCROLL_ROWS } else { -SMOOTH_SCROLL_ROWS };
             picker.queue_smooth_scroll(delta);
             return;
         }
@@ -6299,7 +6588,7 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('j' | 'k')) {
-            let delta = if key.code == KeyCode::Char('j') { 12isize } else { -12isize };
+            let delta = if key.code == KeyCode::Char('j') { SMOOTH_SCROLL_ROWS } else { -SMOOTH_SCROLL_ROWS };
             let target = self.attachment_selection.saturating_add_signed(delta)
                 .min(self.attachment_files.len().saturating_sub(1));
             self.attachment_smooth_target = (target != self.attachment_selection).then_some(target);
@@ -6973,6 +7262,10 @@ impl App {
                 }
             }
         }
+        if self.detach_confirmation.is_some() {
+            self.handle_detach_confirmation_key(key);
+            return;
+        }
         let Some(composer) = self.composer.as_ref() else { return; };
         if composer.sending {
             if key.code == KeyCode::Esc {
@@ -7095,10 +7388,41 @@ impl App {
                     composer.help_selected = 0;
                     composer.help_scroll = 0;
                 }
+                KeyCode::Char('v' | 'V') => {
+                    if composer.attachment_manager_visual_anchor.take().is_none() {
+                        composer.attachment_manager_visual_anchor = Some(composer.attachment_manager_selected);
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(anchor) = composer.attachment_manager_visual_anchor.take() {
+                        let (first, last) = (anchor.min(composer.attachment_manager_selected),
+                            anchor.max(composer.attachment_manager_selected));
+                        for index in first..=last { composer.attachment_manager_marked.insert(index); }
+                    } else {
+                        let index = composer.attachment_manager_selected;
+                        if !composer.attachment_manager_marked.insert(index) {
+                            composer.attachment_manager_marked.remove(&index);
+                        }
+                        composer.attachment_manager_selected = index.saturating_add(1)
+                            .min(composer.attachment_count().saturating_sub(1));
+                    }
+                }
                 KeyCode::Char('x' | 'd') | KeyCode::Delete | KeyCode::Backspace => {
-                    if let Some(path) = composer.remove_managed_attachment() {
-                        self.status = StatusLine::temporary(
-                            format!("detached {}", path.display()), Duration::from_secs(2));
+                    let files = composer.attachment_paths.iter().cloned()
+                        .chain(composer.attachments.split(';').map(str::trim)
+                            .filter(|part| !part.is_empty()).map(PathBuf::from))
+                        .collect::<Vec<_>>();
+                    let selected = composer.attachment_manager_selected;
+                    let anchor = composer.attachment_manager_visual_anchor;
+                    let paths = files.into_iter().enumerate().filter(|(index, _)| {
+                        composer.attachment_manager_marked.contains(index)
+                            || anchor.is_some_and(|anchor| (anchor.min(selected)..=anchor.max(selected)).contains(index))
+                            || (composer.attachment_manager_marked.is_empty() && anchor.is_none() && *index == selected)
+                    }).map(|(_, path)| path).collect::<Vec<_>>();
+                    if !paths.is_empty() {
+                        self.detach_confirmation = Some(DetachConfirmation {
+                            paths, review: ReviewScroll::default(),
+                        });
                     }
                 }
                 KeyCode::Char('u') => {
@@ -7120,12 +7444,32 @@ impl App {
                 let picker = self.composer.as_mut().and_then(|composer| composer.file_picker.as_mut());
                 if let Some(picker) = picker {
                     match key.code {
-                        KeyCode::Char('j') => picker.queue_smooth_scroll(8),
-                        KeyCode::Char('k') => picker.queue_smooth_scroll(-8),
+                        KeyCode::Char('j') => picker.queue_smooth_scroll(SMOOTH_SCROLL_ROWS),
+                        KeyCode::Char('k') => picker.queue_smooth_scroll(-SMOOTH_SCROLL_ROWS),
                         _ => {}
                     }
                 }
                 return;
+            }
+            if key.code == KeyCode::Char('x') {
+                let composer = self.composer.as_ref().expect("composer exists");
+                if let Some(picker) = composer.file_picker.as_ref() {
+                    let (first, last) = picker.visual_anchor.map(|anchor|
+                        (anchor.min(picker.selected), anchor.max(picker.selected)))
+                        .unwrap_or((picker.selected, picker.selected));
+                    let paths = picker.entries.iter().skip(first).take(last - first + 1)
+                        .filter(|entry| !entry.is_directory)
+                        .map(|entry| entry.path.clone())
+                        .filter(|path| composer.attachment_paths.contains(path) ||
+                            composer.attachments.split(';').map(str::trim).any(|part| Path::new(part) == path.as_path()))
+                        .collect::<Vec<_>>();
+                    if !paths.is_empty() {
+                        self.detach_confirmation = Some(DetachConfirmation {
+                            paths, review: ReviewScroll::default(),
+                        });
+                        return;
+                    }
+                }
             }
             match self.composer.as_mut().expect("composer exists").file_picker_key(key.code) {
                 Ok(Some(message)) => self.status = StatusLine::temporary(message, Duration::from_secs(2)),
@@ -8077,6 +8421,14 @@ fn display_sender(message: &MessageSummary) -> String {
     }
 }
 
+/// A range is marked as a group: if fully marked, Space unmarks all of it.
+fn toggle_message_marks(marked: &mut HashSet<MessageId>, ids: &[MessageId]) {
+    let all_marked = ids.iter().all(|id| marked.contains(id));
+    for id in ids {
+        if all_marked { marked.remove(id); } else { marked.insert(id.clone()); }
+    }
+}
+
 fn bounded_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -8120,6 +8472,7 @@ fn offset_index(current: usize, len: usize, delta: isize) -> usize {
 mod tests {
     use super::{
         ComposeField, ComposeMode, Composer, ReaderPosition, ReaderSelection, ReaderWordMotion,
+        SMOOTH_SCROLL_ROWS,
         bounded_index, inner_text_object_range, message_view_offset, offset_index,
         reader_scroll_for_visual_cursor,
         preview_neighbor_positions, preview_travel_positions, reader_image_target_size, reader_selection_text,
@@ -8128,6 +8481,78 @@ mod tests {
     use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
     use std::path::PathBuf;
+
+    #[test]
+    fn space_marking_a_mail_range_is_idempotent_and_toggleable() {
+        let ids = [MessageId("1".into()), MessageId("2".into()), MessageId("3".into())];
+        let mut marked = std::collections::HashSet::new();
+        super::toggle_message_marks(&mut marked, &ids[0..1]);
+        assert!(marked.contains(&ids[0]));
+        super::toggle_message_marks(&mut marked, &ids[0..2]);
+        assert_eq!(marked.len(), 2);
+        super::toggle_message_marks(&mut marked, &ids[0..2]);
+        assert!(marked.is_empty());
+        super::toggle_message_marks(&mut marked, &ids);
+        assert_eq!(marked.len(), 3);
+    }
+
+    #[test]
+    fn contacts_help_is_searchable_and_navigable_without_closing_contacts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut modal = crate::contacts::ContactsModal::default();
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        app.handle_contacts_modal_key(&mut modal, key('?'));
+        assert!(modal.help);
+        for ch in "favorite".chars() {
+            app.handle_contacts_modal_key(&mut modal, key(ch));
+        }
+        assert_eq!(modal.help_query, "favorite");
+        let matches = crate::app::ranked_help_matches(crate::app::CONTACT_HELP_ENTRIES, &modal.help_query);
+        assert!(!matches.is_empty());
+        assert!(crate::app::CONTACT_HELP_ENTRIES[matches[0]].description.contains("favorite"));
+        app.handle_contacts_modal_key(&mut modal,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!modal.help);
+        assert!(app.contacts_modal.is_none());
+    }
+
+    #[test]
+    fn contacts_visual_and_space_marks_support_bulk_actions() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        app.contacts_writable = true;
+        app.contacts.entries.clear();
+        for index in 0..30 {
+            app.contacts.upsert(&format!("Name{index:02}"),
+                &format!("name{index:02}@example.org"), true).unwrap();
+        }
+        let mut modal = crate::contacts::ContactsModal {
+            matches: app.contacts.filtered(""), view_height: 10, ..Default::default()
+        };
+        let key = |ch, modifiers| KeyEvent::new(KeyCode::Char(ch), modifiers);
+        app.handle_contacts_modal_key(&mut modal, key('V', KeyModifiers::SHIFT));
+        app.handle_contacts_modal_key(&mut modal, key('3', KeyModifiers::NONE));
+        app.handle_contacts_modal_key(&mut modal, key('j', KeyModifiers::NONE));
+        assert_eq!(modal.visual_range(), Some((0, 3)));
+        app.handle_contacts_modal_key(&mut modal, key(' ', KeyModifiers::NONE));
+        assert!(modal.visual_range().is_none());
+        assert_eq!(modal.marked.len(), 4);
+        app.handle_contacts_modal_key(&mut modal, key('p', KeyModifiers::NONE));
+        assert_eq!(app.contacts.entries.iter().filter(|c| c.favorite).count(), 4);
+        assert!(modal.marked.is_empty());
+        app.handle_contacts_modal_key(&mut modal, key('v', KeyModifiers::NONE));
+        app.handle_contacts_modal_key(&mut modal, key('2', KeyModifiers::NONE));
+        app.handle_contacts_modal_key(&mut modal, key('j', KeyModifiers::NONE));
+        assert_eq!(modal.action_ids(&app.contacts).len(), 3);
+        app.handle_contacts_modal_key(&mut modal, key('d', KeyModifiers::NONE));
+        assert!(modal.confirm_delete);
+        app.handle_contacts_modal_key(&mut modal, key('y', KeyModifiers::NONE));
+        assert_eq!(app.contacts.entries.len(), 27);
+        assert!(modal.visual_anchor.is_none());
+    }
 
     #[test]
     fn editing_recipient_resets_autocomplete_dismissal() {
@@ -8346,6 +8771,47 @@ mod tests {
     }
 
     #[test]
+    fn delete_review_scroll_advances_one_row_per_frame() {
+        let mut review = super::ReviewScroll::default();
+        review.queue(80, super::SMOOTH_SCROLL_ROWS);
+        assert!(review.active());
+        assert_eq!(review.position, 0);
+        review.advance();
+        assert_eq!(review.position, 1);
+        for _ in 1..22 { review.advance(); }
+        assert_eq!(review.position, 22);
+        assert!(!review.active());
+        review.queue(80, -super::SMOOTH_SCROLL_ROWS);
+        for _ in 0..22 { review.advance(); }
+        assert_eq!(review.position, 0);
+        assert!(!review.active());
+    }
+
+    #[test]
+    fn detach_confirmation_can_restore_multiple_attachments() {
+        use std::path::PathBuf;
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = super::Composer::new();
+        composer.attachment_paths = ["first.png", "second.pdf", "third.txt"]
+            .into_iter().map(PathBuf::from).collect();
+        composer.attachment_manager_open = true;
+        app.composer = Some(composer);
+        app.detach_confirmation = Some(super::DetachConfirmation {
+            paths: vec![PathBuf::from("first.png"), PathBuf::from("third.txt")],
+            review: super::ReviewScroll::default(),
+        });
+        app.handle_detach_confirmation_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('y'), crossterm::event::KeyModifiers::NONE));
+        let composer = app.composer.as_mut().unwrap();
+        assert_eq!(composer.attachment_paths, vec![PathBuf::from("second.pdf")]);
+        composer.undo_managed_attachment();
+        composer.undo_managed_attachment();
+        assert_eq!(composer.attachment_paths, vec![
+            PathBuf::from("first.png"), PathBuf::from("second.pdf"), PathBuf::from("third.txt")]);
+    }
+
+    #[test]
     fn attachment_manager_detach_can_be_undone_in_original_order() {
         let mut composer = Composer::new();
         let a = PathBuf::from("/tmp/a.txt");
@@ -8389,7 +8855,7 @@ mod tests {
     #[test]
     fn smooth_picker_scroll_only_refreshes_preview_at_destination() {
         let temp = tempfile::tempdir().unwrap();
-        for index in 0..12 {
+        for index in 0..30 {
             std::fs::write(temp.path().join(format!("file-{index:02}.txt")),
                 format!("file content {index}")).unwrap();
         }
@@ -8398,13 +8864,17 @@ mod tests {
             super::ComposeFilePreview::Text { lines, .. } => lines.clone(),
             other => panic!("expected text, got {other:?}"),
         };
-        picker.queue_smooth_scroll(8);
-        for _ in 0..7 { picker.advance_smooth_scroll(); }
-        assert!(picker.smooth_target.is_some());
-        assert!(matches!(&picker.preview,
-            super::ComposeFilePreview::Text { lines, .. } if lines == &first));
+        picker.queue_smooth_scroll(SMOOTH_SCROLL_ROWS);
+        assert_eq!(picker.smooth_target, Some(SMOOTH_SCROLL_ROWS as usize));
+        // Preview I/O is deferred through every intermediate animation frame.
+        for _ in 0..(SMOOTH_SCROLL_ROWS as usize - 1) {
+            picker.advance_smooth_scroll();
+            assert!(picker.smooth_target.is_some());
+            assert!(matches!(&picker.preview,
+                super::ComposeFilePreview::Text { lines, .. } if lines == &first));
+        }
         picker.advance_smooth_scroll();
-        assert_eq!(picker.selected, 8);
+        assert_eq!(picker.selected, SMOOTH_SCROLL_ROWS as usize);
         assert!(picker.smooth_target.is_none());
         assert!(matches!(&picker.preview,
             super::ComposeFilePreview::Text { lines, .. } if lines != &first));

@@ -198,6 +198,16 @@ pub enum MailSearchMode {
     Strict,
 }
 
+/// How visually selected or marked rows are painted in mail and contacts lists.
+/// The active cursor row remains dark gray in gutter mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VisualSelectionStyle {
+    Row,
+    #[default]
+    Gutter,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UiConfig {
     /// Legacy milestone-3 setting. Kept so existing config files continue to
@@ -239,6 +249,10 @@ pub struct UiConfig {
     /// Message-list `/` matching: `fuzzy` (default) or `strict` (substring).
     #[serde(default)]
     pub search_mode: MailSearchMode,
+    /// `row` colors entire visual/marked mail and contacts rows; `gutter`
+    /// colors only their left-side marker (default).
+    #[serde(default)]
+    pub visual_selection_style: VisualSelectionStyle,
     /// freedesktop sound theme name; COSMIC-installed themes can provide this.
     #[serde(default = "default_mail_sound_name")]
     pub new_mail_sound_name: String,
@@ -262,6 +276,7 @@ impl Default for UiConfig {
             new_mail_notifications: true,
             notification_icon_style: NotificationIconStyle::default(),
             search_mode: MailSearchMode::default(),
+            visual_selection_style: VisualSelectionStyle::default(),
             new_mail_sound_name: default_mail_sound_name(),
             new_mail_sound_file: None,
         }
@@ -631,6 +646,15 @@ mod tests {
         assert_eq!(config.ui.notification_icon_style, super::NotificationIconStyle::Unicode);
         assert_eq!(config.ui.search_mode, super::MailSearchMode::Fuzzy);
         assert_eq!(config.ui.new_mail_sound_name, "message-new-email");
+    }
+
+    #[test]
+    fn visual_selection_style_defaults_to_gutter_and_accepts_row() {
+        let default: super::Config = toml::from_str("[ui]\n").unwrap();
+        assert_eq!(default.ui.visual_selection_style, super::VisualSelectionStyle::Gutter);
+        let row: super::Config = toml::from_str("[ui]\nvisual_selection_style = \"row\"").unwrap();
+        assert_eq!(row.ui.visual_selection_style, super::VisualSelectionStyle::Row);
+        assert!(toml::from_str::<super::Config>("[ui]\nvisual_selection_style = \"sideways\"").is_err());
     }
 
     #[test]

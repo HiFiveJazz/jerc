@@ -52,8 +52,10 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Mail actions", key: "L", description: "reply to mailing list" },
     HelpEntry { category: "Mail actions", key: "r / R", description: "reply / reply with quotation" },
     HelpEntry { category: "Mail actions", key: "s", description: "mark as spam / restore from Junk" },
+    HelpEntry { category: "Mail actions", key: "Space", description: "mark/unmark and advance; in Visual mode, mark the range" },
     HelpEntry { category: "Mail actions", key: "u", description: "mark read or unread" },
     HelpEntry { category: "Mail actions", key: "U", description: "restore archived message to INBOX" },
+    HelpEntry { category: "Mail actions", key: "v / V", description: "select an inclusive message range" },
     HelpEntry { category: "Message", key: "Ctrl-a", description: "open received attachments" },
     HelpEntry { category: "Message", key: "e / E", description: "export original RFC 5322 message" },
     HelpEntry { category: "Message", key: "Esc", description: "close the reader / exit selection" },
@@ -72,6 +74,60 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "View", key: "b", description: "show / hide mailbox sidebar" },
     HelpEntry { category: "View", key: "p", description: "show / hide split preview" },
 ];
+
+
+/// Contacts-specific shortcuts shown in the same searchable palette as mail.
+/// Keep all discoverability here instead of showing permanent shortcut hints
+/// across the contacts list.
+pub const CONTACT_HELP_ENTRIES: &[HelpEntry] = &[
+    HelpEntry { category: "Actions", key: "a", description: "add a contact" },
+    HelpEntry { category: "Actions", key: "d", description: "delete marked, visual or current contacts (confirm)" },
+    HelpEntry { category: "Actions", key: "e", description: "edit current contact" },
+    HelpEntry { category: "Actions", key: "Enter", description: "edit contact or insert recipients into compose" },
+    HelpEntry { category: "Actions", key: "p", description: "favorite / unfavorite selected contacts" },
+    HelpEntry { category: "Navigation", key: "Ctrl-j / Ctrl-k", description: "smooth scroll 22 rows" },
+    HelpEntry { category: "Navigation", key: "gg / G", description: "first / last contact" },
+    HelpEntry { category: "Navigation", key: "H / M / L", description: "top / middle / bottom visible row" },
+    HelpEntry { category: "Navigation", key: "j / k", description: "move down / up; supports counts like 5j" },
+    HelpEntry { category: "Navigation", key: "PageUp / PageDown", description: "page through contacts" },
+    HelpEntry { category: "Search", key: "/", description: "fuzzy search contacts by name or address" },
+    HelpEntry { category: "Search", key: "Enter / Esc", description: "finish contact search" },
+    HelpEntry { category: "Selection", key: "Space", description: "mark contact and advance / mark visual range" },
+    HelpEntry { category: "Selection", key: "v / V", description: "select visual contact rows" },
+    HelpEntry { category: "Window", key: "?", description: "open searchable keybindings palette" },
+    HelpEntry { category: "Window", key: "Esc / q", description: "close contacts or exit visual selection" },
+];
+
+/// Fuzzy ranking shared by the main and contacts keybinding palettes. Preserve
+/// the original category/shortcut order when no query is typed.
+#[must_use]
+pub fn ranked_help_matches(entries: &[HelpEntry], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() { return (0..entries.len()).collect(); }
+    let mut ranked = entries.iter().enumerate().filter_map(|(i, entry)| {
+        let score = [entry.key, entry.description, entry.category].iter()
+            .filter_map(|field| help_field_score(field, &needle)).max()?;
+        Some((i, score))
+    }).collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.into_iter().map(|(i, _)| i).collect()
+}
+
+fn help_field_score(field: &str, needle: &str) -> Option<i32> {
+    let lower = field.to_lowercase();
+    if lower == needle { return Some(500); }
+    if lower.starts_with(needle) { return Some(350); }
+    if lower.contains(needle) { return Some(250); }
+    let mut chars = lower.chars().enumerate();
+    let mut previous = None;
+    let mut score = 0;
+    for wanted in needle.chars() {
+        let (position, _) = chars.find(|(_, c)| *c == wanted)?;
+        score += if previous.is_some_and(|prev| position == prev + 1) { 15 } else { 5 };
+        previous = Some(position);
+    }
+    Some(score)
+}
 
 /// Shortcuts specific to the received-attachment viewer. Navigation uses
 /// normal Vim motions; it does not need a permanent on-screen legend.
@@ -98,7 +154,7 @@ pub const PICKER_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Select", key: "Enter", description: "attach selection / open a directory" },
     HelpEntry { category: "Select", key: "Space", description: "toggle file; in visual mode detach an all-attached range" },
     HelpEntry { category: "Select", key: "v / V", description: "start or exit visual range selection" },
-    HelpEntry { category: "Select", key: "x", description: "detach highlighted file or visual selection" },
+    HelpEntry { category: "Select", key: "x", description: "review and detach highlighted or visually selected file(s)" },
 ];
 
 /// Compose-specific, searchable modal shortcuts. Do not clutter the editor.
@@ -108,7 +164,7 @@ pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Compose", key: "Ctrl-n / Ctrl-p", description: "next / previous contact suggestion" },
     HelpEntry { category: "Compose", key: "Tab / Enter (suggestion)", description: "accept suggested recipient" },
     HelpEntry { category: "Compose", key: "Ctrl-a", description: "open attachment file picker" },
-    HelpEntry { category: "Compose", key: "Ctrl-d", description: "manage attached files" },
+    HelpEntry { category: "Compose", key: "Ctrl-d", description: "manage attachments: v/Space select, d review detach, u undo" },
     HelpEntry { category: "Compose", key: "Ctrl-o", description: "open advanced options for custom email headers" },
     HelpEntry { category: "Compose", key: "Ctrl-p", description: "save locally and in the account Drafts folder" },
     HelpEntry { category: "Compose", key: "Enter (normal)", description: "preview outgoing email before sending" },
@@ -135,6 +191,7 @@ pub enum Command {
     Bottom,
     Open,
     ToggleVisual,
+    ToggleMark,
     ToggleSeen,
     Delete,
     DeleteImmediate,
@@ -212,10 +269,11 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('K') => Command::MailboxUp,
         KeyCode::Char('g') | KeyCode::Home => Command::Top,
         KeyCode::Char('G') | KeyCode::End => Command::Bottom,
-        KeyCode::Char(' ') | KeyCode::PageDown => Command::PageDown,
+        KeyCode::Char(' ') => Command::ToggleMark,
+        KeyCode::PageDown => Command::PageDown,
         KeyCode::PageUp => Command::PageUp,
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Command::Open,
-        KeyCode::Char('v') => Command::ToggleVisual,
+        KeyCode::Char('v' | 'V') => Command::ToggleVisual,
         KeyCode::Char('u') => Command::ToggleSeen,
         KeyCode::Char('d') => Command::Delete,
         KeyCode::Char('D') => Command::DeleteImmediate,
@@ -252,6 +310,26 @@ pub fn command_for_key(key: KeyEvent) -> Command {
 mod tests {
     use super::{Command, Focus, HELP_ENTRIES, command_for_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn contact_keybindings_have_fuzzy_search_and_stable_default_order() {
+        use super::{CONTACT_HELP_ENTRIES, ranked_help_matches};
+        let all = ranked_help_matches(CONTACT_HELP_ENTRIES, "");
+        assert_eq!(all, (0..CONTACT_HELP_ENTRIES.len()).collect::<Vec<_>>());
+        let fuzzy = ranked_help_matches(CONTACT_HELP_ENTRIES, "fvrt");
+        assert!(fuzzy.iter().any(|&i|
+            CONTACT_HELP_ENTRIES[i].description.contains("favorite")));
+        let key_match = ranked_help_matches(CONTACT_HELP_ENTRIES, "space");
+        assert_eq!(CONTACT_HELP_ENTRIES[key_match[0]].key, "Space");
+        assert!(ranked_help_matches(CONTACT_HELP_ENTRIES, "noMatchingShortcutXYZ").is_empty());
+    }
+
+    #[test]
+    fn space_marks_mail_without_becoming_page_down() {
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)), Command::ToggleMark);
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)), Command::PageDown);
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT)), Command::ToggleVisual);
+    }
 
     #[test]
     fn account_shortcuts_are_exposed() {
