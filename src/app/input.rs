@@ -33,42 +33,42 @@ pub struct HelpEntry {
 /// Categories and the leading shortcut within each category sort alphabetically.
 pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Accounts", key: "Alt-1 … Alt-9", description: "switch directly to an email account" },
-    HelpEntry { category: "Accounts", key: "Alt-a", description: "add an account with editable setup wizard" },
-    HelpEntry { category: "Accounts", key: "Alt-d", description: "remove current account locally (confirm; mailbox view)" },
+    HelpEntry { category: "Accounts", key: "Alt-a", description: "add account with setup wizard" },
+    HelpEntry { category: "Accounts", key: "Alt-d", description: "remove account (confirm)" },
     HelpEntry { category: "Accounts", key: "Alt-n / Alt-p", description: "next / previous email account" },
     HelpEntry { category: "General", key: "!", description: "show account configuration warnings" },
     HelpEntry { category: "General", key: "?", description: "search command palette" },
     HelpEntry { category: "General", key: "Alt-c", description: "open the native contacts manager" },
     HelpEntry { category: "General", key: "B", description: "toggle new-mail terminal bell" },
     HelpEntry { category: "General", key: "Ctrl-r", description: "refresh selected mailbox" },
-    HelpEntry { category: "General", key: "n", description: "toggle desktop new-mail notifications (and sound)" },
+    HelpEntry { category: "General", key: "n", description: "toggle desktop notifications" },
     HelpEntry { category: "General", key: "q / Ctrl-c", description: "quit aerc-rs" },
     HelpEntry { category: "General", key: "T", description: "open theme picker" },
     HelpEntry { category: "Mail actions", key: "a", description: "archive selected message" },
     HelpEntry { category: "Mail actions", key: "A", description: "reply to all recipients" },
     HelpEntry { category: "Mail actions", key: "c", description: "compose new email" },
-    HelpEntry { category: "Mail actions", key: "d / D", description: "delete (confirm) / delete immediately" },
+    HelpEntry { category: "Mail actions", key: "d / D", description: "delete with / without prompt" },
     HelpEntry { category: "Mail actions", key: "f", description: "forward message" },
     HelpEntry { category: "Mail actions", key: "L", description: "reply to mailing list" },
     HelpEntry { category: "Mail actions", key: "r / R", description: "reply / reply with quotation" },
     HelpEntry { category: "Mail actions", key: "s", description: "mark as spam / restore from Junk" },
-    HelpEntry { category: "Mail actions", key: "Space", description: "mark/unmark and advance; in Visual mode, mark the range" },
+    HelpEntry { category: "Mail actions", key: "Space", description: "toggle mark; Visual marks range" },
     HelpEntry { category: "Mail actions", key: "u", description: "mark read or unread" },
     HelpEntry { category: "Mail actions", key: "U", description: "restore archived message to INBOX" },
     HelpEntry { category: "Mail actions", key: "v / V", description: "select an inclusive message range" },
     HelpEntry { category: "Message", key: "Ctrl-a", description: "open received attachments" },
     HelpEntry { category: "Message", key: "e / E", description: "export original RFC 5322 message" },
     HelpEntry { category: "Message", key: "Esc", description: "close the reader / exit selection" },
-    HelpEntry { category: "Message", key: "i", description: "toggle remote images for this session (outside Visual mode)" },
-    HelpEntry { category: "Message", key: "m", description: "toggle email addresses in From/To/Cc/Bcc and Message-ID" },
+    HelpEntry { category: "Message", key: "i", description: "toggle remote images" },
+    HelpEntry { category: "Message", key: "m", description: "show full email headers" },
     HelpEntry { category: "Message", key: "o", description: "open link under cursor" },
     HelpEntry { category: "Message", key: "O", description: "open original HTML in browser" },
     HelpEntry { category: "Message", key: "t", description: "toggle HTML / plain-text reader" },
     HelpEntry { category: "Message", key: "y", description: "copy selected text" },
     HelpEntry { category: "Navigation", key: "/", description: "filter current mailbox" },
-    HelpEntry { category: "Navigation", key: "Ctrl-Shift-j / Ctrl-Shift-k", description: "smooth mailbox list scrolling" },
+    HelpEntry { category: "Navigation", key: "Ctrl-j / Ctrl-k", description: "smooth scroll the message list" },
     HelpEntry { category: "Navigation", key: "Enter", description: "open selected email" },
-    HelpEntry { category: "Navigation", key: "gg / G", description: "jump to first / last email or reader line" },
+    HelpEntry { category: "Navigation", key: "gg / G", description: "first / last message or line" },
     HelpEntry { category: "Navigation", key: "J / K", description: "next / previous mailbox" },
     HelpEntry { category: "View", key: "Alt-h / Alt-l", description: "resize mailbox sidebar" },
     HelpEntry { category: "View", key: "Alt-Shift-h / Alt-Shift-l", description: "resize message preview" },
@@ -82,21 +82,21 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
 /// across the contacts list.
 pub const CONTACT_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Actions", key: "a", description: "add a contact" },
-    HelpEntry { category: "Actions", key: "d", description: "delete marked, visual or current contacts (confirm)" },
+    HelpEntry { category: "Actions", key: "d", description: "delete selection (confirm)" },
     HelpEntry { category: "Actions", key: "e", description: "edit current contact" },
-    HelpEntry { category: "Actions", key: "Enter", description: "edit contact or insert recipients into compose" },
-    HelpEntry { category: "Actions", key: "p", description: "favorite / unfavorite selected contacts" },
+    HelpEntry { category: "Actions", key: "Enter", description: "edit or insert into compose" },
+    HelpEntry { category: "Actions", key: "p", description: "toggle favorite for selection" },
     HelpEntry { category: "Navigation", key: "Ctrl-j / Ctrl-k", description: "smooth scroll 22 rows" },
     HelpEntry { category: "Navigation", key: "gg / G", description: "first / last contact" },
     HelpEntry { category: "Navigation", key: "H / M / L", description: "top / middle / bottom visible row" },
-    HelpEntry { category: "Navigation", key: "j / k", description: "move down / up; supports counts like 5j" },
+    HelpEntry { category: "Navigation", key: "j / k", description: "move down / up (counts allowed)" },
     HelpEntry { category: "Navigation", key: "PageUp / PageDown", description: "page through contacts" },
-    HelpEntry { category: "Search", key: "/", description: "fuzzy search contacts by name or address" },
+    HelpEntry { category: "Search", key: "/", description: "fuzzy search contacts" },
     HelpEntry { category: "Search", key: "Enter / Esc", description: "finish contact search" },
-    HelpEntry { category: "Selection", key: "Space", description: "mark contact and advance / mark visual range" },
+    HelpEntry { category: "Selection", key: "Space", description: "toggle mark; Visual marks range" },
     HelpEntry { category: "Selection", key: "v / V", description: "select visual contact rows" },
     HelpEntry { category: "Window", key: "?", description: "open searchable keybindings palette" },
-    HelpEntry { category: "Window", key: "Esc / q", description: "close contacts or exit visual selection" },
+    HelpEntry { category: "Window", key: "Esc / q", description: "clear selection / close contacts" },
 ];
 
 /// Fuzzy ranking shared by the main and contacts keybinding palettes. Preserve
@@ -135,44 +135,45 @@ fn help_field_score(field: &str, needle: &str) -> Option<i32> {
 pub const ATTACHMENT_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Attachments", key: "?", description: "search attachment shortcuts" },
     HelpEntry { category: "Attachments", key: "o / Enter", description: "open selected attachment externally" },
-    HelpEntry { category: "Attachments", key: "s", description: "browse folders and save selected or marked attachments" },
+    HelpEntry { category: "Attachments", key: "s", description: "save selected attachments" },
     HelpEntry { category: "Attachments", key: "Space", description: "mark or unmark an attachment" },
     HelpEntry { category: "Attachments", key: "a", description: "mark or unmark all attachments" },
     HelpEntry { category: "Attachments", key: "v / V", description: "select a visual range of attachments" },
-    HelpEntry { category: "Attachments", key: "p", description: "refresh the selected attachment preview" },
-    HelpEntry { category: "Attachments", key: "Esc / q", description: "close the viewer or exit visual selection" },
+    HelpEntry { category: "Attachments", key: "p", description: "refresh attachment preview" },
+    HelpEntry { category: "Attachments", key: "Esc / q", description: "clear selection / close viewer" },
 ];
 
 /// Searchable help for the attachment picker; intentionally not duplicated
 /// in the global compose keymap or at the bottom of the picker.
 pub const PICKER_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Browse", key: ".", description: "toggle hidden files" },
-    HelpEntry { category: "Browse", key: "/", description: "find folders or files in this directory" },
+    HelpEntry { category: "Browse", key: "/", description: "search files and folders" },
     HelpEntry { category: "Browse", key: "Enter (search)", description: "accept a search match" },
     HelpEntry { category: "Browse", key: "~ / d", description: "home / Downloads directory" },
     HelpEntry { category: "General", key: "?", description: "search picker keybindings" },
     HelpEntry { category: "General", key: "Esc / q", description: "exit visual selection / close picker" },
     HelpEntry { category: "Select", key: "Enter", description: "attach selection / open a directory" },
-    HelpEntry { category: "Select", key: "Space", description: "toggle file; in visual mode detach an all-attached range" },
+    HelpEntry { category: "Select", key: "Space", description: "toggle attachment / select range" },
     HelpEntry { category: "Select", key: "v / V", description: "start or exit visual range selection" },
-    HelpEntry { category: "Select", key: "x", description: "review and detach highlighted or visually selected file(s)" },
+    HelpEntry { category: "Select", key: "x", description: "review selected attachments" },
 ];
 
 /// Compose-specific, searchable modal shortcuts. Do not clutter the editor.
 pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { category: "Compose", key: "?", description: "search compose shortcuts" },
-    HelpEntry { category: "Compose", key: "Alt-c", description: "open contacts; Enter inserts selected recipient" },
-    HelpEntry { category: "Compose", key: "Ctrl-n / Ctrl-p", description: "next / previous contact suggestion" },
+    HelpEntry { category: "Compose", key: "Alt-c", description: "open contacts for recipients" },
+    HelpEntry { category: "Compose", key: "Ctrl-j / Ctrl-k", description: "next / previous contact suggestion" },
+    HelpEntry { category: "Compose", key: "Ctrl-n / Ctrl-p", description: "alternate suggestion navigation" },
     HelpEntry { category: "Compose", key: "Tab / Enter (suggestion)", description: "accept suggested recipient" },
     HelpEntry { category: "Compose", key: "Ctrl-a", description: "open attachment file picker" },
-    HelpEntry { category: "Compose", key: "Ctrl-d", description: "manage attachments: v/Space select, d review detach, u undo" },
-    HelpEntry { category: "Compose", key: "Ctrl-o", description: "open advanced options for custom email headers" },
-    HelpEntry { category: "Compose", key: "Ctrl-p", description: "save locally and in the account Drafts folder" },
-    HelpEntry { category: "Compose", key: "Enter (normal)", description: "preview outgoing email before sending" },
-    HelpEntry { category: "Compose", key: "Esc / q (normal)", description: "ask to save an unsent email in Drafts before closing (y save, d/n discard)" },
-    HelpEntry { category: "Compose", key: "Tab / Shift-Tab", description: "next / previous recipient, subject or body field" },
+    HelpEntry { category: "Compose", key: "Ctrl-d", description: "manage attachments" },
+    HelpEntry { category: "Compose", key: "Ctrl-o", description: "edit advanced message headers" },
+    HelpEntry { category: "Compose", key: "Ctrl-p", description: "save to Drafts folder" },
+    HelpEntry { category: "Compose", key: "Enter (normal)", description: "preview email before sending" },
+    HelpEntry { category: "Compose", key: "Esc / q (normal)", description: "save or discard draft on exit" },
+    HelpEntry { category: "Compose", key: "Tab / Shift-Tab", description: "next / previous compose field" },
     HelpEntry { category: "Send preview", key: "Enter / Esc", description: "send email / return to editor" },
-    HelpEntry { category: "Send preview", key: "t / O", description: "toggle HTML/plain, open browser preview" },
+    HelpEntry { category: "Send preview", key: "t / O", description: "HTML/plain or browser preview" },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +446,18 @@ mod tests {
             command_for_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
             Command::Yank
         );
+    }
+
+    #[test]
+    fn help_documents_the_real_smooth_message_scroll_keys() {
+        let entry = HELP_ENTRIES.iter().find(|entry|
+            entry.category == "Navigation" && entry.description == "smooth scroll the message list")
+            .expect("help should document smooth message scrolling");
+        assert_eq!(entry.key, "Ctrl-j / Ctrl-k");
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Command::SmoothDown);
+        assert_eq!(command_for_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            Command::SmoothUp);
     }
 
     #[test]

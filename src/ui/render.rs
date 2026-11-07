@@ -51,7 +51,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.composer.is_some() {
         draw_composer(frame, app);
         if app.composer.as_ref().is_some_and(|composer| composer.exit_prompt) {
-            draw_compose_exit_prompt(frame, app);
+            draw_compose_exit_prompt(frame, app.theme());
         } else if app.composer.as_ref().is_some_and(|composer| composer.confirm_send) {
             draw_send_confirmation(frame, app);
         } else if app.composer.as_ref().is_some_and(|composer| composer.help_visible) {
@@ -462,16 +462,21 @@ fn visual_row_style(theme: &Theme) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Editor/reader current-line background without the list row's bold weight.
+fn editor_current_line_style(theme: &Theme) -> Style {
+    theme.text().bg(theme.popup_bg)
+}
+
 fn browser_row_style(theme: &Theme, mode: VisualSelectionStyle,
     visual: bool, marked: bool, active: bool, unread: bool) -> Style {
-    if mode == VisualSelectionStyle::Row && visual {
-        visual_row_style(theme)
-    } else if mode == VisualSelectionStyle::Row && marked {
-        theme.selected()
-    } else if active && unread {
+    if active && unread {
         theme.unread().bg(theme.popup_bg)
     } else if active {
         theme.current_line()
+    } else if mode == VisualSelectionStyle::Row && visual {
+        visual_row_style(theme)
+    } else if mode == VisualSelectionStyle::Row && marked {
+        theme.selected()
     } else if unread {
         theme.unread()
     } else {
@@ -480,8 +485,8 @@ fn browser_row_style(theme: &Theme, mode: VisualSelectionStyle,
 }
 
 fn selection_check_style(theme: &Theme, mode: VisualSelectionStyle,
-    visual: bool, marked: bool) -> Style {
-    if mode == VisualSelectionStyle::Row && (visual || marked) {
+    visual: bool, marked: bool, active: bool) -> Style {
+    if mode == VisualSelectionStyle::Row && (visual || marked) && !active {
         // On a filled row, retain contrast rather than purple-on-purple.
         Style::default().fg(theme.selected_fg).add_modifier(Modifier::BOLD)
     } else if visual {
@@ -498,6 +503,13 @@ fn browser_gutter(theme: &Theme, visual: bool, marked: bool) -> Span<'static> {
     Span::styled(if visual || marked { "▍" } else { "▏" },
         if visual { Style::default().fg(theme.visual) }
         else if marked { theme.accent() } else { theme.border() })
+}
+
+/// Contacts share the mail marker's size and colors but never draw a
+/// continuous line through unmarked rows.
+fn contact_gutter(theme: &Theme, visual: bool, marked: bool) -> Span<'static> {
+    if visual || marked { browser_gutter(theme, visual, marked) }
+    else { Span::raw(" ") }
 }
 
 /// With the mailbox sidebar visible, the marker is on the *right* of its
@@ -601,7 +613,7 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let attachment_mark = message.has_attachment(account.bodies.get(&message.id));
         let mark = Line::from(vec![
             Span::styled(unread_mark, selection_check_style(&theme,
-                app.visual_selection_style, visual_selected, marked)),
+                app.visual_selection_style, visual_selected, marked, current)),
             if in_junk {
                 Span::styled("!", Style::default().fg(theme.error).add_modifier(Modifier::BOLD))
             } else { Span::raw(" ") },
@@ -673,7 +685,11 @@ fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             let marked = app.message_marked.contains(&message.id);
             let row_height = if message.has_attachment(account.bodies.get(&message.id)) { 2 } else { 1 };
             if (visual || marked) && y < list_area.bottom() {
-                let style = if visual { visual_row_style(&theme) } else { theme.selected() };
+                let current = position == current_position;
+                let style = if current {
+                    browser_row_style(&theme, app.visual_selection_style,
+                        visual, marked, true, message.unread())
+                } else if visual { visual_row_style(&theme) } else { theme.selected() };
                 frame.render_widget(Block::default().style(style),
                     Rect::new(list_area.x, y, list_area.width,
                         row_height.min(list_area.bottom().saturating_sub(y))));
@@ -839,12 +855,16 @@ fn reader_header_lines(
     lines
 }
 
+fn preview_split_border_style(theme: &Theme, resizing: bool) -> Style {
+    if resizing { theme.accent() } else { theme.border() }
+}
+
 fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let theme = app.theme().clone();
     let content_area = if !app.message_open {
         let block = Block::default()
             .borders(Borders::LEFT)
-            .border_style(theme.border());
+            .border_style(preview_split_border_style(&theme, app.preview_resizing));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         inner
@@ -1429,7 +1449,7 @@ fn reader_fragments(
             let bg = fragment_style.bg
                 .map(|diff_bg| reader_active_diff_bg(theme, diff_bg))
                 .unwrap_or(theme.popup_bg);
-            fragment_style = fragment_style.bg(bg).add_modifier(Modifier::BOLD);
+            fragment_style = fragment_style.bg(bg);
         }
         if illuminate_ranges
             .iter()
@@ -1567,8 +1587,7 @@ fn pad_reader_line(
     if reader_active && line_index == reader_cursor {
         style = style.bg(diff_background
             .map(|bg| reader_active_diff_bg(theme, bg))
-            .unwrap_or(theme.popup_bg))
-            .add_modifier(Modifier::BOLD);
+            .unwrap_or(theme.popup_bg));
     }
     if visual_line_selected && (linewise_visual || content_len == 0) {
         style = theme.selected();
@@ -1743,12 +1762,10 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(modal) = app.contacts_modal.as_ref() {
         // Contacts use the same global status row and mode slot as mail.
         // The contact count belongs inside the Contacts window, not here.
-        let mode_spans = contact_status_spans(&theme,
+        let mut mode_spans = contact_status_spans(&theme,
             app.account().map(|account| account.name.as_str()), modal);
+        mode_spans.extend(contact_footer_details(&theme, modal));
         frame.render_widget(Paragraph::new(Line::from(mode_spans)).style(theme.status()), status_area);
-        let (_, detail_area) = contacts_status_areas(frame.area(), status_area);
-        frame.render_widget(Paragraph::new(Line::from(contact_footer_details(&theme, modal)))
-            .style(theme.status()), detail_area);
     } else {
         frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.status()), status_area);
     }
@@ -1807,6 +1824,20 @@ fn draw_help(frame: &mut Frame<'_>, app: &App) {
         entries, &app.help_query, &matches, app.help_selected, app.help_scroll);
 }
 
+// At a standard 80-column terminal, the 86-column modal is clipped to 80.
+// After borders (2), the category (13), key (27) and two gaps (2), 36
+// terminal cells remain for each description. On narrow screens, shrink
+// category/key columns instead of allowing description cells to overflow.
+const HELP_CATEGORY_COLUMNS: u16 = 13;
+const HELP_KEY_COLUMNS: u16 = 27;
+
+fn help_columns(inner_width: u16) -> (u16, u16, u16) {
+    let category = HELP_CATEGORY_COLUMNS.min(inner_width / 4);
+    let key = HELP_KEY_COLUMNS.min(inner_width.saturating_sub(category + 2) / 2);
+    let description = inner_width.saturating_sub(category + key + 2);
+    (category, key, description)
+}
+
 /// Identical help table, search field, highlighting and footer for mail and contacts.
 fn draw_help_palette(
     frame: &mut Frame<'_>, theme: &Theme, title: &str, entries: &[HelpEntry],
@@ -1836,14 +1867,18 @@ fn draw_help_palette(
     if shown.is_empty() {
         frame.render_widget(Paragraph::new(" No matching keybindings").style(theme.muted()), chunks[1]);
     } else {
+        let (category_width, key_width, description_width) = help_columns(chunks[1].width);
         let rows = shown.iter().map(|&index| {
             let entry = entries[index];
             Row::new(vec![
-                Cell::from(entry.category), Cell::from(entry.key), Cell::from(entry.description),
+                Cell::from(truncate_display_width(entry.category, usize::from(category_width))),
+                Cell::from(truncate_display_width(entry.key, usize::from(key_width))),
+                Cell::from(truncate_display_width(entry.description, usize::from(description_width))),
             ])
         });
         let table = Table::new(rows, [
-            Constraint::Length(13), Constraint::Length(27), Constraint::Min(20),
+            Constraint::Length(category_width), Constraint::Length(key_width),
+            Constraint::Length(description_width),
         ]).style(theme.text()).column_spacing(1).row_highlight_style(theme.selected());
         let selected = shown.iter().position(|&index| index == selected);
         let mut state = TableState::default().with_selected(selected);
@@ -1961,7 +1996,7 @@ fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
             browser_gutter(&theme, visual, marked),
             Span::raw(prefix),
             Span::styled(mark, selection_check_style(&theme,
-                app.visual_selection_style, visual, marked)),
+                app.visual_selection_style, visual, marked, active)),
             Span::raw(format!(" {name}")),
         ])).style(style), rect);
     }
@@ -2116,14 +2151,13 @@ fn attachment_text_preview(file: &crate::model::OutgoingAttachment) -> Option<St
     Some(text)
 }
 
-fn draw_compose_exit_prompt(frame: &mut Frame<'_>, app: &App) {
-    let theme = app.theme();
-    // A compact dialog avoids a large empty area on tall terminals. The
-    // action hints always occupy the last line inside the dialog, not the
-    // second line below the prompt as they did on fullscreen terminals.
+/// The exit prompt uses the same two-button layout as deletion reviews. Yes
+/// saves the draft; No discards it. Esc still returns to editing, without an
+/// extra on-screen instruction competing with the actions.
+fn draw_compose_exit_prompt(frame: &mut Frame<'_>, theme: &Theme) {
     let viewport = frame.area();
-    let width = viewport.width.min(72).max(1);
-    let height = viewport.height.min(9).max(1);
+    let width = viewport.width.min(62);
+    let height = viewport.height.min(7);
     let area = Rect::new(
         viewport.x + viewport.width.saturating_sub(width) / 2,
         viewport.y + viewport.height.saturating_sub(height) / 2,
@@ -2131,22 +2165,17 @@ fn draw_compose_exit_prompt(frame: &mut Frame<'_>, app: &App) {
     );
     frame.render_widget(Clear, area);
     let block = Block::default().title(" Save unsent email? ")
-        .borders(Borders::ALL).border_style(theme.accent());
+        .borders(Borders::ALL).border_style(theme.border());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height == 0 { return; }
+    if inner.width < 10 || inner.height < 3 { return; }
     let prompt = "Save this email to Drafts before closing?";
-    frame.render_widget(
-        Paragraph::new(prompt).style(theme.text()).wrap(Wrap { trim: false }),
-        Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1)),
-    );
-    let footer = Line::from(vec![
-        Span::styled("y", theme.accent()), Span::styled("  Save draft    ", theme.text()),
-        Span::styled("d / n", theme.accent()), Span::styled("  Discard    ", theme.text()),
-        Span::styled("Esc", theme.accent()), Span::styled("  Keep editing", theme.text()),
-    ]);
-    frame.render_widget(Paragraph::new(footer),
-        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1));
+    frame.render_widget(Paragraph::new(truncate_display_width(prompt, usize::from(inner.width)))
+        .alignment(Alignment::Center).style(theme.text()),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1));
+    let buttons = Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2);
+    draw_confirmation_buttons(frame, theme, buttons,
+        setup_button_style(theme), destructive_button_style(theme));
 }
 
 fn draw_remove_account_confirmation(frame: &mut Frame<'_>, app: &App) {
@@ -2174,6 +2203,28 @@ fn review_item_line(number: usize, digits: usize, item: &str, width: usize,
         Span::styled(prefix, theme.muted()),
         Span::styled(truncate_display_width(item, available), theme.text()),
     ])
+}
+
+/// Shared horizontal rule and centered Yes/No buttons for confirmation popups.
+/// The calling dialog decides which action is destructive.
+fn draw_confirmation_buttons(frame: &mut Frame<'_>, theme: &Theme, area: Rect,
+    yes_style: Style, no_style: Style) {
+    if area.height < 2 || area.width == 0 { return; }
+    frame.render_widget(Paragraph::new("─".repeat(usize::from(area.width)))
+        .style(theme.border()), Rect::new(area.x, area.y, area.width, 1));
+    let gap = 3u16;
+    let yes_width = 11u16;
+    let no_width = 11u16;
+    let total = yes_width + no_width + gap;
+    let x = area.x + area.width.saturating_sub(total) / 2;
+    let y = area.y.saturating_add(1);
+    frame.render_widget(Paragraph::new(" [Y]es ").alignment(Alignment::Center)
+        .style(yes_style), Rect::new(x, y, yes_width.min(area.width), 1));
+    if area.width > yes_width + gap {
+        frame.render_widget(Paragraph::new(" [N]o ").alignment(Alignment::Center)
+            .style(no_style), Rect::new(x + yes_width + gap, y,
+                no_width.min(area.right().saturating_sub(x + yes_width + gap)), 1));
+    }
 }
 
 /// Shared Yazi-style review: visible item list, scroll position, and the same
@@ -2205,22 +2256,8 @@ fn draw_review_dialog(frame: &mut Frame<'_>, theme: &Theme, title: &str,
         " {} items  ·  {}–{}",
         items.len(), if items.is_empty() { 0 } else { start + 1 }, (start + capacity).min(items.len()),
     )).style(theme.muted()), chunks[2]);
-    let buttons = chunks[3];
-    frame.render_widget(Paragraph::new("─".repeat(usize::from(buttons.width)))
-        .style(theme.border()), Rect::new(buttons.x, buttons.y, buttons.width, 1));
-    let gap = 3u16;
-    let yes_width = 11u16;
-    let no_width = 11u16;
-    let total = yes_width + no_width + gap;
-    let x = buttons.x + buttons.width.saturating_sub(total) / 2;
-    let y = buttons.y.saturating_add(1).min(buttons.bottom().saturating_sub(1));
-    frame.render_widget(Paragraph::new(" [Y]es ").alignment(Alignment::Center)
-        .style(destructive_button_style(theme)), Rect::new(x, y, yes_width.min(buttons.width), 1));
-    if buttons.width > yes_width + gap {
-        frame.render_widget(Paragraph::new(" [N]o ").alignment(Alignment::Center)
-            .style(theme.current_line()), Rect::new(x + yes_width + gap, y,
-                no_width.min(buttons.right().saturating_sub(x + yes_width + gap)), 1));
-    }
+    draw_confirmation_buttons(frame, theme, chunks[3],
+        destructive_button_style(theme), theme.current_line());
 }
 
 fn draw_confirmation(frame: &mut Frame<'_>, app: &App) {
@@ -2557,12 +2594,19 @@ fn draw_compose_file_picker_help(frame: &mut Frame<'_>, app: &App, picker: &crat
     let matches = picker.help_matches();
     let start = picker.help_scroll.min(matches.len().saturating_sub(usize::from(chunks[1].height)));
     let shown: Vec<_> = matches.into_iter().skip(start).take(usize::from(chunks[1].height)).collect();
+    let (category_width, key_width, description_width) = help_columns(chunks[1].width);
     let rows = shown.iter().map(|&index| {
         let entry = PICKER_HELP_ENTRIES[index];
-        Row::new(vec![Cell::from(entry.category), Cell::from(entry.key), Cell::from(entry.description)])
+        Row::new(vec![
+            Cell::from(truncate_display_width(entry.category, usize::from(category_width))),
+            Cell::from(truncate_display_width(entry.key, usize::from(key_width))),
+            Cell::from(truncate_display_width(entry.description, usize::from(description_width))),
+        ])
     });
-    let table = Table::new(rows, [Constraint::Length(11), Constraint::Length(23), Constraint::Min(18)])
-        .style(theme.text()).column_spacing(1).row_highlight_style(theme.selected());
+    let table = Table::new(rows, [
+        Constraint::Length(category_width), Constraint::Length(key_width),
+        Constraint::Length(description_width),
+    ]).style(theme.text()).column_spacing(1).row_highlight_style(theme.selected());
     let mut state = TableState::default().with_selected(shown.iter().position(|&index| index == picker.help_selected));
     frame.render_stateful_widget(table, chunks[1], &mut state);
     // All picker bindings live in this searchable popup, not a footer.
@@ -2658,12 +2702,18 @@ fn draw_compose_help(frame: &mut Frame<'_>, app: &App) {
     let start = composer.help_scroll.min(max_start);
     let shown: Vec<usize> = matches.into_iter().skip(start)
         .take(usize::from(chunks[1].height)).collect();
+    let (category_width, key_width, description_width) = help_columns(chunks[1].width);
     let rows = shown.iter().map(|&index| {
         let entry = COMPOSE_HELP_ENTRIES[index];
-        Row::new(vec![Cell::from(entry.category), Cell::from(entry.key), Cell::from(entry.description)])
+        Row::new(vec![
+            Cell::from(truncate_display_width(entry.category, usize::from(category_width))),
+            Cell::from(truncate_display_width(entry.key, usize::from(key_width))),
+            Cell::from(truncate_display_width(entry.description, usize::from(description_width))),
+        ])
     });
     let table = Table::new(rows, [
-        Constraint::Length(10), Constraint::Length(22), Constraint::Min(18),
+        Constraint::Length(category_width), Constraint::Length(key_width),
+        Constraint::Length(description_width),
     ]).style(theme.text()).column_spacing(1).row_highlight_style(theme.selected());
     let selected = shown.iter().position(|&index| index == composer.help_selected);
     let mut state = TableState::default().with_selected(selected);
@@ -2696,8 +2746,8 @@ fn draw_contact_suggestions(frame: &mut Frame<'_>, app: &App) {
     let inner_x = compose.x.saturating_add(1);
     let inner_y = compose.y.saturating_add(1);
     let width = compose.width.saturating_sub(8).min(68);
-    let height = (ids.len() as u16 + 3).min(frame.area().height.saturating_sub(2));
-    if width < 12 || height < 4 { return; }
+    let height = (ids.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+    if width < 12 || height < 3 { return; }
     let x = inner_x.saturating_add(9).min(frame.area().right().saturating_sub(width));
     // Recipient fields may now occupy multiple wrapped rows. Anchor the
     // suggestions below the active field rather than at a fixed line offset.
@@ -2721,9 +2771,9 @@ fn draw_contact_suggestions(frame: &mut Frame<'_>, app: &App) {
     let y = inner_y.saturating_add(y_offset).min(frame.area().bottom().saturating_sub(height));
     let area = Rect::new(x, y, width, height);
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().title(" Contacts · suggestions ")
-        .borders(Borders::ALL).border_style(theme.border()).style(contact_surface_style(theme)), area);
-    for (position, id) in ids.iter().enumerate() {
+    frame.render_widget(Block::default().borders(Borders::ALL)
+        .border_style(theme.border()).style(contact_surface_style(theme)), area);
+    for (position, id) in ids.iter().take(usize::from(height.saturating_sub(2))).enumerate() {
         let contact = &app.contacts.entries[*id];
         let content = format!("{}  {}", if contact.favorite { "★" } else { " " }, contact.display());
         let truncated = truncate_display_width(&content, usize::from(width.saturating_sub(4)));
@@ -2733,9 +2783,6 @@ fn draw_contact_suggestions(frame: &mut Frame<'_>, app: &App) {
         frame.render_widget(Paragraph::new(format!(" {truncated}"))
             .style(style), Rect::new(area.x + 1, area.y + 1 + position as u16, width - 2, 1));
     }
-    frame.render_widget(Paragraph::new(" Ctrl-n/p navigate · Tab/Enter accept · Esc close ")
-        .style(theme.muted()),
-        Rect::new(area.x + 1, area.bottom() - 2, width.saturating_sub(2), 1));
 }
 
 /// SEARCH uses the theme's visual/purple color, while VISUAL uses its
@@ -2784,33 +2831,17 @@ fn contact_footer_mode(theme: &Theme, modal: &crate::contacts::ContactsModal) ->
     }
 }
 
-/// Counts, filters and marks go after the left contact-count region. That
-/// keeps the mode badge beside the account while the count remains centered.
+/// Contact filters and marks follow the mode at the left of the global status
+/// bar. The contact total stays in the quiet footer inside Contacts itself.
 fn contact_footer_details(theme: &Theme, modal: &crate::contacts::ContactsModal) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if !modal.searching && !modal.query.is_empty() {
-        spans.push(Span::styled(format!(" filter:/{} ", modal.query), theme.accent()));
-    }
     if !modal.marked.is_empty() {
         spans.push(Span::styled(format!(" {} marked ", modal.marked.len()), theme.accent()));
     }
+    if !modal.searching && !modal.query.is_empty() {
+        spans.push(Span::styled(format!(" filter:/{} ", modal.query), theme.accent()));
+    }
     spans
-}
-
-/// Place the contact count under the center of the left-hand contacts list
-/// without overwriting the account name or the SEARCH/VISUAL indicator.
-/// On narrow terminals, prioritize the account/mode text over the count.
-fn contacts_status_areas(frame_area: Rect, status_area: Rect) -> (Rect, Rect) {
-    let popup = centered_rect(frame_area, 116, 88);
-    let inner_width = popup.width.saturating_sub(4);
-    let list_x = popup.x.saturating_add(2).min(status_area.right());
-    let list_width = contacts_list_width(inner_width)
-        .min(status_area.right().saturating_sub(list_x));
-    let count = Rect::new(list_x, status_area.y, list_width, status_area.height);
-    let details_x = count.right().saturating_add(1).min(status_area.right());
-    let details = Rect::new(details_x, status_area.y,
-        status_area.right().saturating_sub(details_x), status_area.height);
-    (count, details)
 }
 
 /// Contacts get the same extra top search row as the message list, only while
@@ -2823,6 +2854,15 @@ fn contacts_search_layout(inner: Rect, searching: bool) -> (Option<Rect>, Rect) 
 
 fn contacts_list_width(inner_width: u16) -> u16 {
     (inner_width.saturating_mul(47) / 100).max(12).min(inner_width)
+}
+
+/// Use the existing favorite/saved icon cell for visual and marked checks.
+/// This keeps contact names aligned whether the row is selected or not.
+fn contact_list_icon(favorite: bool, saved: bool, visual: bool, marked: bool) -> &'static str {
+    if visual || marked { "✓ " }
+    else if favorite { "★ " }
+    else if saved { "● " }
+    else { "  " }
 }
 
 fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
@@ -2862,15 +2902,14 @@ fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
         let is_marked = modal.marked.contains(&contact.email.to_ascii_lowercase());
         let number = if active { (visual + 1).to_string() }
             else { visual.abs_diff(modal.selected).to_string() };
-        let kind = if contact.favorite { "★ " } else if contact.saved { "● " } else { "  " };
+        let icon = contact_list_icon(contact.favorite, contact.saved, is_visual, is_marked);
         let label = if contact.name.is_empty() { &contact.email } else { &contact.name };
-        let max_label = usize::from(list_width).saturating_sub(number_width + 5);
-        let check = if is_visual || is_marked { "✓ " } else { "  " };
+        let max_label = usize::from(list_width).saturating_sub(number_width + 4);
         let line = Line::from(vec![
+            contact_gutter(&theme, is_visual, is_marked),
             Span::raw(format!("{number:>number_width$} ")),
-            Span::styled(check, selection_check_style(&theme,
-                selection_style, is_visual, is_marked)),
-            Span::raw(kind),
+            Span::styled(icon, selection_check_style(&theme,
+                selection_style, is_visual, is_marked, active)),
             Span::raw(truncate_display_width(label, max_label)),
         ]);
         let row_style = browser_row_style(&theme, selection_style,
@@ -3053,7 +3092,7 @@ fn render_compose_header(frame: &mut Frame<'_>, area: Rect,
         display.cursor_row.saturating_sub(usize::from(area.height).saturating_sub(1))
     } else { 0 };
     frame.render_widget(Paragraph::new(display.lines)
-        .style(if display.active { theme.current_line() } else { theme.text() })
+        .style(if display.active { editor_current_line_style(theme) } else { theme.text() })
         .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)), area);
     if display.active && composer.mode == ComposeMode::Insert
         && composer.file_picker.is_none() && !composer.attachment_manager_open
@@ -3067,9 +3106,9 @@ fn render_compose_header(frame: &mut Frame<'_>, area: Rect,
     }
 }
 
-fn draw_composer(frame: &mut Frame<'_>, app: &App) {
+fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
     let theme = app.theme().clone();
-    let Some(composer) = app.composer.as_ref() else {
+    let Some(composer) = app.composer.as_mut() else {
         return;
     };
     let area = centered_rect(frame.area(), 96, 82);
@@ -3127,52 +3166,79 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(Line::from(Span::styled(
             if body_active { "▸ Body:" } else { "  Body:" },
             if body_active || !composer.body.trim().is_empty() { theme.accent() } else { theme.muted() },
-        ))).style(if body_active { theme.current_line() } else { theme.text() }),
+        ))).style(if body_active { editor_current_line_style(&theme) } else { theme.text() }),
         fields[5],
     );
 
-    let mut body = editor_text(&composer.body, composer, body_active, &theme);
-    let active_line = composer.body.chars().take(composer.cursor)
-        .filter(|&ch| ch == '\n').count();
+    // Compose, reply and forward use exactly the same physical-row model for
+    // rendering, j/k, and Ctrl-j/k. Explicit wrap rows avoid treating a long
+    // forwarded line as a single invisible logical line during navigation.
+    composer.body_view_width = usize::from(fields[6].width.saturating_sub(4)).max(1);
+    let viewport_height = usize::from(fields[6].height).max(1);
+    let rows = composer.body_rows();
+    let cursor_row = rows.iter().rposition(|row| row.start <= composer.cursor).unwrap_or(0);
+    let active_line = rows[cursor_row].logical_line;
+    let raw = editor_text(&composer.body, composer, body_active, &theme);
     let (mode_color, _) = compose_mode_colors(composer.mode, &theme);
-    for (i, line) in body.lines.iter_mut().enumerate() {
-        let active_number = body_active && i == active_line;
-        let number = if active_number { (i + 1).to_string() }
-            else { i.abs_diff(active_line).to_string() };
-        let style = if active_number {
+    let mut display = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let current = body_active && index == cursor_row;
+        let number = if row.continuation { "    ".to_owned() }
+            else {
+                let value = if row.logical_line == active_line { row.logical_line + 1 }
+                    else { row.logical_line.abs_diff(active_line) };
+                format!("{value:>3} ")
+            };
+        let number_style = if current {
             Style::default().fg(mode_color).add_modifier(Modifier::BOLD)
         } else { theme.muted() };
-        line.spans.insert(0, Span::styled(format!("{number:>3} "), style));
+        let mut spans = vec![Span::styled(number, number_style)];
+        if let Some(line) = raw.lines.get(row.logical_line) {
+            let offset = row.start.saturating_sub(row.line_start);
+            let length = row.end.saturating_sub(row.start);
+            spans.extend(line.spans.iter().skip(offset).take(length).cloned());
+            // At the end of a newline-terminated or final line, editor_text
+            // creates a separate block cursor cell in Normal/Visual mode.
+            if current && composer.mode != ComposeMode::Insert
+                && rows.get(index + 1).is_none_or(|next| next.logical_line != row.logical_line) {
+                if let Some(cell) = line.spans.get(offset + length) {
+                    spans.push(cell.clone());
+                }
+            }
+        }
+        display.push(Line::from(spans));
     }
-    let viewport_height = usize::from(fields[6].height).max(1);
-    let scroll = if body_active { active_line.saturating_sub(viewport_height.saturating_sub(3)) } else { 0 };
-    if body_active && active_line >= scroll && active_line - scroll < viewport_height {
-        // Paint the entire row first, including trailing whitespace and blank lines.
-        let y = fields[6].y.saturating_add((active_line - scroll) as u16);
-        frame.render_widget(Paragraph::new(" ").style(theme.current_line()),
+    let mut scroll = composer.body_scroll;
+    if body_active {
+        if cursor_row < scroll { scroll = cursor_row; }
+        if cursor_row >= scroll.saturating_add(viewport_height) {
+            scroll = cursor_row + 1 - viewport_height;
+        }
+    }
+    scroll = scroll.min(rows.len().saturating_sub(viewport_height));
+    composer.body_scroll = scroll;
+    if body_active && cursor_row >= scroll && cursor_row - scroll < viewport_height {
+        let y = fields[6].y.saturating_add((cursor_row - scroll) as u16);
+        frame.render_widget(Block::default().style(editor_current_line_style(&theme)),
             Rect::new(fields[6].x, y, fields[6].width, 1));
     }
     frame.render_widget(
-        Paragraph::new(body).style(theme.text())
-            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
-            .wrap(Wrap { trim: false }), fields[6],
+        Paragraph::new(Text::from(display)).style(theme.text())
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)), fields[6],
     );
     if body_active && composer.mode == ComposeMode::Insert && fields[6].width > 4
         && composer.file_picker.is_none() && !composer.attachment_manager_open
         && !composer.advanced_headers_open && !composer.help_visible
-        && !composer.confirm_send && !composer.exit_prompt {
-        // A real terminal caret does not insert a cell into the edited text.
-        let before = composer.body.chars().take(composer.cursor).collect::<String>();
-        let current_line = before.rsplit('\n').next().unwrap_or("");
-        let column = UnicodeWidthStr::width(current_line);
-        let available = usize::from(fields[6].width.saturating_sub(4)).max(1);
-        let wrapped_rows = column / available;
-        let visual_row = active_line.saturating_sub(scroll).saturating_add(wrapped_rows);
-        if visual_row < usize::from(fields[6].height) {
-            let x = fields[6].x.saturating_add(4).saturating_add((column % available) as u16);
-            let y = fields[6].y.saturating_add(visual_row as u16);
-            if x < fields[6].right() { frame.set_cursor_position((x, y)); }
-        }
+        && !composer.confirm_send && !composer.exit_prompt
+        && cursor_row >= scroll && cursor_row - scroll < viewport_height {
+        let before = composer.body.chars().skip(rows[cursor_row].start)
+            .take(composer.cursor.saturating_sub(rows[cursor_row].start))
+            .collect::<String>();
+        let column = UnicodeWidthStr::width(before.as_str());
+        let x = fields[6].x.saturating_add(4)
+            .saturating_add(u16::try_from(column).unwrap_or(u16::MAX));
+        let y = fields[6].y.saturating_add((cursor_row - scroll) as u16);
+        if x < fields[6].right() { frame.set_cursor_position((x, y)); }
     }
     // Mode and status are rendered in draw_status(), the application-wide
     // bottom bar. Compose no longer creates a second competing footer.
@@ -3412,7 +3478,11 @@ mod tests {
         assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
             true, false, false, false).bg, Some(theme.visual));
         assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
-            false, true, true, false), theme.selected());
+            false, true, true, false), theme.current_line());
+        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
+            true, true, true, false), theme.current_line());
+        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
+            false, true, true, true), theme.unread().bg(theme.popup_bg));
         let visual = super::browser_gutter(&theme, true, false);
         assert_eq!(visual.content.as_ref(), "▍");
         assert_eq!(visual.style.fg, Some(theme.visual));
@@ -3422,7 +3492,74 @@ mod tests {
         assert_eq!(normal.content.as_ref(), "▏");
         assert_eq!(normal.style.fg, Some(theme.border));
         assert_eq!(super::selection_check_style(&theme, VisualSelectionStyle::Gutter,
-            true, false).fg, Some(theme.visual));
+            true, false, false).fg, Some(theme.visual));
+        assert_eq!(super::selection_check_style(&theme, VisualSelectionStyle::Row,
+            true, false, true).fg, Some(theme.visual));
+        assert_eq!(super::selection_check_style(&theme, VisualSelectionStyle::Row,
+            false, true, true).fg, Some(theme.accent));
+    }
+
+    #[test]
+    fn contact_check_reuses_favorite_or_saved_icon_cell() {
+        assert_eq!(super::contact_list_icon(false, false, false, false), "  ");
+        assert_eq!(super::contact_list_icon(true, false, false, false), "★ ");
+        assert_eq!(super::contact_list_icon(false, true, false, false), "● ");
+        assert_eq!(super::contact_list_icon(true, true, true, false), "✓ ");
+        assert_eq!(super::contact_list_icon(true, true, false, true), "✓ ");
+    }
+
+    #[test]
+    fn contacts_have_markers_only_on_selected_rows() {
+        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        assert_eq!(super::contact_gutter(&theme, false, false).content.as_ref(), " ");
+        let visual = super::contact_gutter(&theme, true, false);
+        assert_eq!(visual.content.as_ref(), "▍");
+        assert_eq!(visual.style.fg, Some(theme.visual));
+        let marked = super::contact_gutter(&theme, false, true);
+        assert_eq!(marked.content.as_ref(), "▍");
+        assert_eq!(marked.style.fg, Some(theme.accent));
+    }
+
+    #[test]
+    fn editor_highlight_keeps_ordinary_text_unbolded() {
+        use ratatui::style::Modifier;
+        let theme = load_themes().into_iter().find(|t| t.id == "tokyo-night").unwrap();
+        let style = super::editor_current_line_style(&theme);
+        assert_eq!(style.bg, Some(theme.popup_bg));
+        assert!(!style.add_modifier.contains(Modifier::BOLD));
+        assert!(theme.current_line().add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn help_descriptions_fit_standard_terminal_and_narrow_layout() {
+        let width = super::centered_rect(ratatui::layout::Rect::new(0, 0, 80, 30), 86, 70).width;
+        let inner = width - 2; // outer popup borders
+        let (category, shortcut, max_description) = super::help_columns(inner);
+        assert_eq!((category, shortcut, max_description), (13, 27, 36));
+        for entries in [crate::app::HELP_ENTRIES, crate::app::CONTACT_HELP_ENTRIES,
+            crate::app::ATTACHMENT_HELP_ENTRIES, crate::app::PICKER_HELP_ENTRIES,
+            crate::app::COMPOSE_HELP_ENTRIES] {
+            for entry in entries {
+                assert!(UnicodeWidthStr::width(entry.description) <= usize::from(max_description),
+                    "key {} description too wide: {}", entry.key, entry.description);
+                assert!(UnicodeWidthStr::width(entry.key) <= usize::from(shortcut),
+                    "key label too wide: {}", entry.key);
+                assert!(UnicodeWidthStr::width(entry.category) <= usize::from(category),
+                    "category too wide: {}", entry.category);
+            }
+        }
+        for screen_width in 3u16..80 {
+            let (category, key, description) = super::help_columns(screen_width.saturating_sub(2));
+            assert!(category + key + description + 2 <= screen_width,
+                "columns overflow width {screen_width}");
+        }
+    }
+
+    #[test]
+    fn preview_resize_highlights_the_existing_divider_only_while_dragging() {
+        let theme = load_themes().into_iter().find(|t| t.id == "tokyo-night").unwrap();
+        assert_eq!(super::preview_split_border_style(&theme, false).fg, Some(theme.border));
+        assert_eq!(super::preview_split_border_style(&theme, true).fg, Some(theme.accent));
     }
 
     #[test]
@@ -3433,6 +3570,23 @@ mod tests {
         assert_eq!(visual.style.fg, Some(theme.visual));
         assert_eq!(super::mail_gutter(&theme, false, false, true).content.as_ref(), " ");
         assert_eq!(super::mail_gutter(&theme, false, false, false).content.as_ref(), "▏");
+    }
+
+    #[test]
+    fn compose_exit_uses_yes_no_buttons_and_no_escape_hint() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| super::draw_compose_exit_prompt(frame, &theme)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines = (0u16..24).map(|y| (0u16..80).map(|x|
+            buffer[(x, y)].symbol()).collect::<Vec<_>>().concat()).collect::<Vec<_>>();
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("[Y]es"));
+        assert!(rendered.contains("[N]o"));
+        assert!(!rendered.contains("Esc"));
+        assert!(!rendered.contains("Keep editing"));
+        assert!(!rendered.contains("Discard"));
     }
 
     #[test]
@@ -3481,6 +3635,13 @@ mod tests {
         assert_eq!(super::contact_status_spans(&theme, Some("Gmail"), &modal).len(), 2);
         let filtered = super::contact_footer_details(&theme, &modal);
         assert!(filtered[0].content.contains("filter:/john"));
+        modal.marked.insert("test@example.com".to_owned());
+        let mut status = super::contact_status_spans(&theme, Some("Gmail"), &modal);
+        status.extend(super::contact_footer_details(&theme, &modal));
+        assert_eq!(status[0].content.as_ref(), "[Gmail] ");
+        assert_eq!(status[1].content.as_ref(), " NORMAL ");
+        assert_eq!(status[2].content.as_ref(), " 1 marked ",
+            "marked count should follow the mode immediately at the left");
     }
 
     #[test]
@@ -3515,19 +3676,6 @@ mod tests {
         assert_eq!(spans[1].content.as_ref(), " NORMAL ");
     }
 
-    #[test]
-    fn contact_status_areas_remain_clipped_on_narrow_terminals() {
-        use ratatui::layout::Rect;
-        for width in 1..=30 {
-            let frame = Rect::new(0, 0, width, 8);
-            let status = Rect::new(0, 7, width.saturating_sub(2), 1);
-            let (count, mode) = super::contacts_status_areas(frame, status);
-            assert!(count.right() <= status.right(), "width {width}");
-            assert!(mode.right() <= status.right(), "width {width}");
-            assert_eq!(count.y, status.y);
-            assert_eq!(mode.y, status.y);
-        }
-    }
 
     #[test]
     fn contact_modals_use_the_terminal_background() {
@@ -3548,8 +3696,9 @@ mod tests {
             Some(PatchLineKind::Remove), None);
         assert_eq!(normal.spans.last().and_then(|s| s.style.bg), diff.bg);
         assert_eq!(active.spans.last().and_then(|s| s.style.bg), theme.current_line().bg);
-        assert!(active.spans.last().is_some_and(|s|
-            s.style.add_modifier.contains(ratatui::style::Modifier::BOLD)));
+        assert!(!active.spans.last().is_some_and(|s|
+            s.style.add_modifier.contains(ratatui::style::Modifier::BOLD)),
+            "only the current relative line number should be bold");
 
         let added = plain_reader_line("+ new text", 0, 10, 40, 0, 0, None, true,
             &theme, Some(PatchLineKind::Add), None);

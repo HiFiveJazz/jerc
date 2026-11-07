@@ -101,6 +101,7 @@ mod sender_tests {
             email: None, imap_username: None, smtp_username: None, imap_host: None, smtp_host: None,
             imap_port: None, smtp_port: None,
             default_mailbox: "INBOX".into(),
+            exclude_mailboxes: Vec::new(),
             source_cred_cmd: None, from: from.map(str::to_owned),
             outgoing: Some(outgoing.into()), outgoing_cred_cmd: None,
             copy_to: None, oauth: None,

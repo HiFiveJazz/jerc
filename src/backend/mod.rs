@@ -42,6 +42,7 @@ pub fn from_source(source: &str) -> Result<Box<dyn MailBackend>> {
         email: None, imap_username: None, smtp_username: None, imap_host: None, smtp_host: None,
         imap_port: None, smtp_port: None,
         default_mailbox: "INBOX".to_owned(),
+        exclude_mailboxes: Vec::new(),
         source_cred_cmd: None,
         from: None,
         outgoing: None,

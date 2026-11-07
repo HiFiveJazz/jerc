@@ -9,6 +9,9 @@
 name = "Kernel Maildir"
 source = "maildir://~/Mail/kernel"
 default_mailbox = "INBOX"
+# Optional per-account hidden folders; * and ? wildcards are supported.
+# These are hidden from the sidebar, not deleted or unsubscribed.
+# exclude_mailboxes = ["[Gmail]/Spam", "[Gmail]/All Mail", "Archive/*"]
 
 # Simplest Google OAuth account (remove leading # characters to use):
 # [[accounts]]
@@ -50,6 +53,9 @@ default_mailbox = "INBOX"
 # outgoing = "smtps://you%40gmail.com@smtp.gmail.com:465"
 # outgoing_cred_cmd = "pass show mail/personal-app-password"
 # default_mailbox = "INBOX"
+# Optional per-account hidden folders; * and ? wildcards are supported.
+# These are hidden from the sidebar, not deleted or unsubscribed.
+# exclude_mailboxes = ["[Gmail]/Spam", "[Gmail]/All Mail", "Archive/*"]
 # max_messages = 200 # legacy/headless fallback
 # page_size = 100    # interactive headers per page; smaller = faster huge-folder first paint
 
@@ -64,6 +70,9 @@ default_mailbox = "INBOX"
 # outgoing = "smtp+xoauth2://you%40example.edu@smtp.gmail.com:587?client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
 # outgoing_cred_cmd = "pass show mail/university-refresh-token"
 # default_mailbox = "INBOX"
+# Optional per-account hidden folders; * and ? wildcards are supported.
+# These are hidden from the sidebar, not deleted or unsubscribed.
+# exclude_mailboxes = ["[Gmail]/Spam", "[Gmail]/All Mail", "Archive/*"]
 # max_messages = 200 # legacy/headless fallback
 # page_size = 100    # interactive headers per page; smaller = faster huge-folder first paint
 

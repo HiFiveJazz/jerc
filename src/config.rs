@@ -63,6 +63,11 @@ pub struct AccountConfig {
     pub smtp_port: Option<u16>,
     #[serde(default = "default_mailbox")]
     pub default_mailbox: String,
+    /// Folder names to hide from this account's mailbox sidebar. Supports
+    /// exact names and case-insensitive `*`/`?` glob matches, e.g. `[Gmail]/Spam`.
+    /// Hidden folders are not deleted or unsubscribed on the server.
+    #[serde(default, alias = "folders-exclude")]
+    pub exclude_mailboxes: Vec<String>,
     /// Optional command that prints the account password/refresh token/access
     /// token on stdout. This mirrors aerc's source-cred-cmd idea and avoids
     /// storing long-lived credentials in config.toml.
@@ -172,6 +177,7 @@ impl std::fmt::Debug for AccountConfig {
             )
             .field("copy_to", &self.copy_to)
             .field("oauth", &self.oauth.as_ref().map(|oauth| &oauth.provider))
+            .field("exclude_mailboxes", &self.exclude_mailboxes)
             .field("max_messages", &self.max_messages)
             .field("page_size", &self.page_size)
             .finish()
@@ -283,6 +289,42 @@ impl Default for UiConfig {
     }
 }
 
+/// True if a mailbox is excluded by any account-level pattern.
+/// Literal IMAP folder names are matched in full; `*` matches any run of
+/// characters, and `?` one character. Empty patterns match nothing.
+#[must_use]
+pub fn mailbox_is_excluded(name: &str, patterns: &[String]) -> bool {
+    let name = name.to_lowercase();
+    patterns.iter().any(|pattern| {
+        if pattern.is_empty() { return false; }
+        let pattern = pattern.to_lowercase();
+        let chars: Vec<char> = name.chars().collect();
+        let mut matched = vec![false; chars.len() + 1];
+        matched[0] = true;
+        for part in pattern.chars() {
+            let mut next = vec![false; chars.len() + 1];
+            match part {
+                '*' => {
+                    next[0] = matched[0];
+                    for i in 1..=chars.len() {
+                        next[i] = matched[i] || next[i - 1];
+                    }
+                }
+                '?' => {
+                    for i in 1..=chars.len() { next[i] = matched[i - 1]; }
+                }
+                literal => {
+                    for i in 1..=chars.len() {
+                        next[i] = matched[i - 1] && chars[i - 1] == literal;
+                    }
+                }
+            }
+            matched = next;
+        }
+        matched[chars.len()]
+    })
+}
+
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let path = path.map_or_else(default_config_path, Path::to_path_buf);
@@ -347,6 +389,7 @@ impl Config {
                 imap_port: None,
                 smtp_port: None,
                 default_mailbox: default_mailbox(),
+                exclude_mailboxes: Vec::new(),
                 source_cred_cmd: None,
                 from: None,
                 outgoing: None,
@@ -646,6 +689,30 @@ mod tests {
         assert_eq!(config.ui.notification_icon_style, super::NotificationIconStyle::Unicode);
         assert_eq!(config.ui.search_mode, super::MailSearchMode::Fuzzy);
         assert_eq!(config.ui.new_mail_sound_name, "message-new-email");
+    }
+
+    #[test]
+    fn account_mailbox_exclusions_are_optional_and_support_globs() {
+        let config: Config = toml::from_str(r#"
+            [[accounts]]
+            name = "Personal"
+            source = "maildir:///tmp/mail"
+            exclude_mailboxes = ["[Gmail]/Spam", "Archive/*", "Draft?"]
+            [[accounts]]
+            name = "Other"
+            source = "maildir:///tmp/other"
+        "#).unwrap();
+        assert_eq!(config.accounts[0].exclude_mailboxes.len(), 3);
+        assert!(config.accounts[1].exclude_mailboxes.is_empty());
+        let patterns = &config.accounts[0].exclude_mailboxes;
+        assert!(super::mailbox_is_excluded("[Gmail]/SPAM", patterns));
+        assert!(super::mailbox_is_excluded("Archive/2026/October", patterns));
+        assert!(super::mailbox_is_excluded("Drafts", patterns));
+        assert!(!super::mailbox_is_excluded("INBOX", patterns));
+        assert!(!super::mailbox_is_excluded("Archive", patterns));
+        assert!(!super::mailbox_is_excluded("Draftsmith", patterns));
+        assert!(!super::mailbox_is_excluded("INBOX", &[String::new()]));
+        assert!(super::mailbox_is_excluded("工作/草稿", &["工作/*".into()]));
     }
 
     #[test]

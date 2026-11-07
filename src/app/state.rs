@@ -222,6 +222,67 @@ impl ComposeField {
     }
 }
 
+/// A displayed Compose body row. Soft wraps share the same logical line;
+/// source offsets always refer to characters in the *unmodified* draft.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ComposeBodyRow {
+    pub start: usize,
+    pub end: usize,
+    pub line_start: usize,
+    pub logical_line: usize,
+    pub continuation: bool,
+}
+
+/// Use the same column width for rendering and Vim motions. The four cells
+/// reserved for line numbers are excluded by the caller.
+fn compose_body_rows(body: &str, width: usize) -> Vec<ComposeBodyRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut line_start = 0;
+    let mut logical_line = 0;
+    let mut cells = 0usize;
+    let mut continuation = false;
+    let mut position = 0;
+    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(body, true) {
+        if grapheme.ends_with('\n') {
+            let trailing = grapheme.chars().count().saturating_sub(1);
+            rows.push(ComposeBodyRow { start, end: position + trailing, line_start,
+                logical_line, continuation });
+            position += grapheme.chars().count();
+            start = position;
+            line_start = position;
+            logical_line += 1;
+            cells = 0;
+            continuation = false;
+            continue;
+        }
+        let char_width = unicode_width::UnicodeWidthStr::width(grapheme).min(width);
+        if cells > 0 && cells + char_width > width {
+            rows.push(ComposeBodyRow { start, end: position, line_start,
+                logical_line, continuation });
+            start = position;
+            cells = 0;
+            continuation = true;
+        }
+        cells += char_width;
+        position += grapheme.chars().count();
+    }
+    rows.push(ComposeBodyRow { start, end: position, line_start,
+        logical_line, continuation });
+    rows
+}
+
+fn compose_body_cursor_row(rows: &[ComposeBodyRow], cursor: usize) -> usize {
+    // At a soft-wrap boundary the cursor belongs to the next visual row.
+    rows.iter().rposition(|row| row.start <= cursor).unwrap_or(0)
+}
+
+fn compose_body_column(body: &str, start: usize, cursor: usize) -> usize {
+    let text = body.chars().skip(start).take(cursor.saturating_sub(start)).collect::<String>();
+    unicode_width::UnicodeWidthStr::width(text.as_str())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComposeMode {
     Normal,
@@ -712,6 +773,15 @@ pub struct Composer {
     pub help_selected: usize,
     #[serde(skip)]
     pub help_scroll: usize,
+    /// Ephemeral viewport state shared by Compose body rendering and motions.
+    #[serde(skip)]
+    pub body_view_width: usize,
+    #[serde(skip)]
+    pub body_scroll: usize,
+    #[serde(skip)]
+    pub body_smooth_target: Option<usize>,
+    #[serde(skip)]
+    body_preferred_column: Option<usize>,
     #[serde(skip)]
     pub visual_linewise: bool,
     #[serde(skip)]
@@ -762,6 +832,8 @@ impl Composer {
             preview_forwarded_attachments: Vec::new(),
             help_visible: false, contact_suggestion: 0, dismissed_contact_query: None,
             help_query: String::new(), help_selected: 0, help_scroll: 0,
+            body_view_width: 72, body_scroll: 0, body_smooth_target: None,
+            body_preferred_column: None,
             visual_linewise: false, pending_g: false, pending_delete: false,
             pending_inner: false, pending_find: None, count: None,
             undo_history: Vec::new(), redo_history: Vec::new(),
@@ -832,6 +904,8 @@ impl Composer {
             preview_forwarded_attachments: Vec::new(),
             help_visible: false, contact_suggestion: 0, dismissed_contact_query: None,
             help_query: String::new(), help_selected: 0, help_scroll: 0,
+            body_view_width: 72, body_scroll: 0, body_smooth_target: None,
+            body_preferred_column: None,
             visual_linewise: false, pending_g: false, pending_delete: false,
             pending_inner: false, pending_find: None, count: None,
             undo_history: Vec::new(), redo_history: Vec::new(),
@@ -858,6 +932,8 @@ impl Composer {
             preview_forwarded_attachments: Vec::new(),
             help_visible: false, contact_suggestion: 0, dismissed_contact_query: None,
             help_query: String::new(), help_selected: 0, help_scroll: 0,
+            body_view_width: 72, body_scroll: 0, body_smooth_target: None,
+            body_preferred_column: None,
             visual_linewise: false, pending_g: false, pending_delete: false,
             pending_inner: false, pending_find: None, count: None,
             undo_history: Vec::new(), redo_history: Vec::new(),
@@ -1201,6 +1277,8 @@ impl Composer {
     }
 
     fn switch_field(&mut self, field: ComposeField) {
+        self.body_smooth_target = None;
+        self.body_preferred_column = None;
         self.field = field;
         self.cursor = self.char_count();
         self.visual_anchor = None;
@@ -1261,6 +1339,8 @@ impl Composer {
     }
 
     fn insert_char(&mut self, ch: char) {
+        self.body_smooth_target = None;
+        self.body_preferred_column = None;
         let cursor = self.cursor.min(self.char_count());
         let byte = Self::byte_index(self.field_value(), cursor);
         self.remember_edit();
@@ -1288,6 +1368,8 @@ impl Composer {
     }
 
     fn delete_range(&mut self, start: usize, end: usize) {
+        self.body_smooth_target = None;
+        self.body_preferred_column = None;
         if start >= end {
             return;
         }
@@ -1303,48 +1385,71 @@ impl Composer {
     }
 
     fn move_horizontal(&mut self, delta: isize) {
+        self.body_smooth_target = None;
+        self.body_preferred_column = None;
         self.cursor = self
             .cursor
             .saturating_add_signed(delta)
             .min(self.char_count());
     }
 
+    pub(crate) fn body_rows(&self) -> Vec<ComposeBodyRow> {
+        compose_body_rows(&self.body, self.body_view_width)
+    }
+
+    /// j/k navigate *displayed rows*, including soft wraps in forwarded mail.
+    /// Retain the preferred display-cell column when traversing short rows.
     fn move_line(&mut self, delta: isize) {
-        if self.field != ComposeField::Body {
+        if self.field != ComposeField::Body { return; }
+        let rows = compose_body_rows(&self.body, self.body_view_width);
+        let current = compose_body_cursor_row(&rows, self.cursor);
+        let target = current.saturating_add_signed(delta).min(rows.len() - 1);
+        if target == current { return; }
+        let preferred = self.body_preferred_column.unwrap_or_else(||
+            compose_body_column(&self.body, rows[current].start, self.cursor));
+        let row = rows[target];
+        let mut cursor = row.start;
+        let mut cells = 0usize;
+        let text = self.body.chars().skip(row.start).take(row.end - row.start)
+            .collect::<String>();
+        for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(text.as_str(), true) {
+            let width = unicode_width::UnicodeWidthStr::width(grapheme);
+            if cells + width > preferred { break; }
+            cells += width;
+            cursor += grapheme.chars().count();
+        }
+        // A soft-wrap boundary belongs to the next row. Keep a vertical
+        // motion *inside* its intended row, rather than accidentally jumping
+        // forward another row (or oscillating during an animation).
+        if rows.get(target + 1).is_some_and(|next| next.start == row.end)
+            && cursor == row.end && cursor > row.start {
+            cursor -= 1;
+        }
+        self.cursor = cursor;
+        self.body_preferred_column = Some(preferred);
+    }
+
+    fn queue_body_smooth_scroll(&mut self, delta: isize) {
+        if self.field != ComposeField::Body { return; }
+        let rows = compose_body_rows(&self.body, self.body_view_width);
+        let current = compose_body_cursor_row(&rows, self.cursor);
+        let from = self.body_smooth_target.unwrap_or(current);
+        let target = from.saturating_add_signed(delta).min(rows.len() - 1);
+        self.body_smooth_target = (target != current).then_some(target);
+    }
+
+    fn advance_body_smooth_scroll(&mut self) {
+        let Some(target) = self.body_smooth_target else { return; };
+        let rows = compose_body_rows(&self.body, self.body_view_width);
+        let current = compose_body_cursor_row(&rows, self.cursor);
+        if current == target {
+            self.body_smooth_target = None;
             return;
         }
-        let text = self.body.as_str();
-        let chars: Vec<char> = text.chars().collect();
-        let cursor = self.cursor.min(chars.len());
-        let mut line_start = cursor;
-        while line_start > 0 && chars[line_start - 1] != '\n' {
-            line_start -= 1;
+        self.move_line(if target > current { 1 } else { -1 });
+        if compose_body_cursor_row(&rows, self.cursor) == target {
+            self.body_smooth_target = None;
         }
-        let col = cursor.saturating_sub(line_start);
-        let target_start = if delta < 0 {
-            if line_start == 0 {
-                return;
-            }
-            let mut start = line_start - 1;
-            while start > 0 && chars[start - 1] != '\n' {
-                start -= 1;
-            }
-            start
-        } else {
-            let mut end = cursor;
-            while end < chars.len() && chars[end] != '\n' {
-                end += 1;
-            }
-            if end >= chars.len() {
-                return;
-            }
-            end + 1
-        };
-        let mut target_end = target_start;
-        while target_end < chars.len() && chars[target_end] != '\n' {
-            target_end += 1;
-        }
-        self.cursor = target_start + col.min(target_end.saturating_sub(target_start));
     }
 
     fn line_start(&self) -> usize {
@@ -1539,6 +1644,10 @@ impl Composer {
     }
 
     fn apply_motion(&mut self, code: KeyCode, count: usize) -> bool {
+        self.body_smooth_target = None;
+        if !matches!(code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down) {
+            self.body_preferred_column = None;
+        }
         match code {
             KeyCode::Char('h') | KeyCode::Left => self.move_horizontal(-(count as isize)),
             KeyCode::Char('l') | KeyCode::Right => self.move_horizontal(count as isize),
@@ -1635,6 +1744,7 @@ fn mail_fuzzy_score(field: &str, query_lower: &str) -> Option<i64> {
 pub struct AccountState {
     pub name: String,
     pub default_mailbox: String,
+    pub exclude_mailboxes: Vec<String>,
     pub from: String,
     pub outgoing_configured: bool,
     pub copy_to: Option<String>,
@@ -2381,11 +2491,14 @@ impl App {
                 let mut account = AccountState {
                 name: config.name.clone(),
                 default_mailbox: config.default_mailbox.clone(),
+                exclude_mailboxes: config.exclude_mailboxes.clone(),
                 from: crate::outgoing::sender_from_account(config),
                 outgoing_configured: config.outgoing.is_some(),
                 copy_to: config.copy_to.clone(),
                 capabilities: None,
-                mailboxes: snapshot.mailboxes,
+                mailboxes: snapshot.mailboxes.into_iter()
+                    .filter(|mailbox| !crate::config::mailbox_is_excluded(
+                        &mailbox.name, &config.exclude_mailboxes)).collect(),
                 mailbox_index: 0,
                 mailbox_view_offset: 0,
                 mailbox_view_height: 1,
@@ -2797,7 +2910,9 @@ impl App {
         }
         let mut preserve_count = false;
         match key.code {
-            KeyCode::Esc if modal.visual_anchor.is_some() => { modal.visual_anchor = None; }
+            KeyCode::Esc if modal.visual_anchor.is_some() || !modal.marked.is_empty() => {
+                modal.clear_selection();
+            }
             KeyCode::Esc | KeyCode::Char('q') => return false,
             KeyCode::Char('v' | 'V') if len > 0 => {
                 let linewise = key.code == KeyCode::Char('V');
@@ -3298,6 +3413,13 @@ impl App {
         if self.focus != Focus::Preview || !self.message_open {
             return false;
         }
+        // Esc must reach the shared selection-clearing command even when a
+        // multi-key Vim motion (g or an inner text object) is pending.
+        if key.code == KeyCode::Esc {
+            self.reader_pending_inner_object = false;
+            self.reader_pending_g = false;
+            return false;
+        }
 
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::SHIFT)
@@ -3541,7 +3663,9 @@ impl App {
                     .current_mailbox
                     .clone()
                     .unwrap_or_else(|| account.default_mailbox.clone());
-                account.mailboxes = mailboxes;
+                account.mailboxes = mailboxes.into_iter()
+                    .filter(|mailbox| !crate::config::mailbox_is_excluded(
+                        &mailbox.name, &account.exclude_mailboxes)).collect();
                 account.persist_mailboxes();
                 account.mailbox_index = account
                     .mailboxes
@@ -3555,6 +3679,11 @@ impl App {
                     })
                     .unwrap_or(0);
                 account.clamp_selection();
+                if account.mailboxes.is_empty() {
+                    account.current_mailbox = None;
+                    account.messages.clear();
+                    account.bodies.clear();
+                }
                 if let Some(name) = account
                     .selected_mailbox()
                     .map(|mailbox| mailbox.name.clone())
@@ -4425,17 +4554,13 @@ impl App {
             }
             Command::Escape => {
                 self.count_prefix = None;
-                if self.reader_visual_anchor.take().is_some() {
-                    self.reader_visual_linewise = false;
-                    self.status = StatusLine::temporary(
-                        "reader visual selection cleared",
-                        Duration::from_secs(1),
-                    );
-                } else if self.visual_anchor.take().is_some() {
-                    self.status = StatusLine::temporary(
-                        "visual selection cleared",
-                        Duration::from_secs(1),
-                    );
+                let had_selection = self.reader_visual_anchor.take().is_some()
+                    | self.visual_anchor.take().is_some()
+                    | !self.message_marked.is_empty();
+                self.message_marked.clear();
+                self.reader_visual_linewise = false;
+                if had_selection {
+                    self.status = StatusLine::temporary("selection cleared", Duration::from_secs(1));
                 } else if self.message_open {
                     self.close_message();
                 } else {
@@ -4486,7 +4611,8 @@ impl App {
             // scroll could keep redrawing contacts at 100 FPS indefinitely.
             return modal.smooth_target.is_some();
         }
-        (self.attachment_picker_visible && (self.attachment_smooth_target.is_some()
+        self.composer.as_ref().is_some_and(|composer| composer.body_smooth_target.is_some())
+            || (self.attachment_picker_visible && (self.attachment_smooth_target.is_some()
             || self.attachment_preview_due.is_some() || !self.attachment_preview_inflight.is_empty()
             || self.attachment_destination_picker.as_ref().is_some_and(|picker| picker.smooth_target.is_some())))
             || self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
@@ -4519,6 +4645,12 @@ impl App {
             let length = modal.matches.len();
             modal.advance(length);
             return;
+        }
+        if let Some(composer) = self.composer.as_mut() {
+            if composer.body_smooth_target.is_some() {
+                composer.advance_body_smooth_scroll();
+                return;
+            }
         }
         if self.attachment_picker_visible {
             if let Some(picker) = &mut self.attachment_destination_picker {
@@ -5566,7 +5698,7 @@ impl App {
         if current_role == Some(MailboxRole::Trash) {
             self.confirmation = Some(MutationConfirmation {
                 prompt: format!(
-                    "Permanently delete {count} message{}? This cannot be undone. [y/N]",
+                    "Permanently delete {count} message{}? This cannot be undone.",
                     if count == 1 { "" } else { "s" }
                 ),
                 items,
@@ -5586,7 +5718,7 @@ impl App {
         {
             self.confirmation = Some(MutationConfirmation {
                 prompt: format!(
-                    "Move {count} message{} to Trash? [y/N]",
+                    "Move {count} message{} to Trash?",
                     if count == 1 { "" } else { "s" }
                 ),
                 items,
@@ -5598,7 +5730,7 @@ impl App {
         } else {
             self.confirmation = Some(MutationConfirmation {
                 prompt: format!(
-                    "Delete {count} message{}? This server has no Trash mailbox. [y/N]",
+                    "Delete {count} message{}? This server has no Trash mailbox.",
                     if count == 1 { "" } else { "s" }
                 ),
                 items,
@@ -6622,7 +6754,10 @@ impl App {
         self.attachment_pending_count = 0;
         self.attachment_smooth_target = None;
         match key.code {
-            KeyCode::Esc if self.attachment_visual_anchor.is_some() => { self.attachment_visual_anchor = None; }
+            KeyCode::Esc if self.attachment_visual_anchor.is_some() || !self.attachment_marked.is_empty() => {
+                self.attachment_visual_anchor = None;
+                self.attachment_marked.clear();
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.dismiss_attachment_picker(),
             KeyCode::Char('j') | KeyCode::Down => self.move_attachment_selection(self.attachment_selection.saturating_add(count)),
             KeyCode::Char('k') | KeyCode::Up => self.move_attachment_selection(self.attachment_selection.saturating_sub(count)),
@@ -7238,8 +7373,12 @@ impl App {
                         composer.contact_suggestion = (composer.contact_suggestion + 1) % suggestions.len();
                         return;
                     }
-                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char('p' | 'k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         composer.contact_suggestion = (composer.contact_suggestion + suggestions.len() - 1) % suggestions.len();
+                        return;
+                    }
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        composer.contact_suggestion = (composer.contact_suggestion + 1) % suggestions.len();
                         return;
                     }
                     KeyCode::Down => {
@@ -7279,7 +7418,7 @@ impl App {
                     if let Some(composer) = self.composer.as_mut() { composer.exit_prompt = false; }
                     self.postpone_composer();
                 }
-                KeyCode::Char('d') | KeyCode::Char('n') => {
+                KeyCode::Char('d') | KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.composer = None;
                     self.resumed_draft_account = None;
                     self.status = StatusLine::temporary("unsent email discarded", Duration::from_secs(2));
@@ -7373,6 +7512,11 @@ impl App {
         if composer.attachment_manager_open {
             let composer = self.composer.as_mut().expect("composer exists");
             match key.code {
+                KeyCode::Esc if composer.attachment_manager_visual_anchor.is_some()
+                    || !composer.attachment_manager_marked.is_empty() => {
+                    composer.attachment_manager_visual_anchor = None;
+                    composer.attachment_manager_marked.clear();
+                }
                 KeyCode::Esc | KeyCode::Char('q') => composer.attachment_manager_open = false,
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     composer.attachment_manager_open = false;
@@ -7519,10 +7663,10 @@ impl App {
             match key.code {
                 KeyCode::Char('r') => composer.undo_edit(true),
                 KeyCode::Char('j') if composer.field == ComposeField::Body => {
-                    for _ in 0..5 { composer.move_line(1); }
+                    composer.queue_body_smooth_scroll(SMOOTH_SCROLL_ROWS);
                 }
                 KeyCode::Char('k') if composer.field == ComposeField::Body => {
-                    for _ in 0..5 { composer.move_line(-1); }
+                    composer.queue_body_smooth_scroll(-SMOOTH_SCROLL_ROWS);
                 }
                 _ => {}
             }
@@ -8494,6 +8638,110 @@ mod tests {
         assert!(marked.is_empty());
         super::toggle_message_marks(&mut marked, &ids);
         assert_eq!(marked.len(), 3);
+    }
+
+    #[test]
+    fn escape_clears_mail_marks_and_visual_selection_before_closing_reader() {
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        app.message_open = true;
+        app.message_marked.insert(MessageId("chosen".into()));
+        app.visual_anchor = Some(0);
+        app.reader_visual_anchor = Some(ReaderPosition { line: 0, column: 0 });
+        app.handle_command(crate::app::Command::Escape);
+        assert!(app.message_marked.is_empty());
+        assert!(app.visual_anchor.is_none());
+        assert!(app.reader_visual_anchor.is_none());
+        assert!(app.message_open, "first Escape must keep the reader open");
+    }
+
+    #[test]
+    fn compose_wrapped_lines_use_visual_jk_and_preserve_draft() {
+        use crossterm::event::KeyCode;
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.body = "abcdefghijklmnop\nshort\nabcdefghijklmnop".into();
+        composer.body_view_width = 5;
+        composer.cursor = 2;
+        let original = composer.body.clone();
+        assert_eq!(composer.body_rows().len(), 9);
+        assert!(composer.apply_motion(KeyCode::Char('j'), 1));
+        assert_eq!(composer.cursor, 7, "j moves one wrapped terminal row");
+        assert!(composer.apply_motion(KeyCode::Char('j'), 1));
+        assert_eq!(composer.cursor, 12);
+        assert!(composer.apply_motion(KeyCode::Char('k'), 1));
+        assert_eq!(composer.cursor, 7);
+        assert_eq!(composer.body, original);
+    }
+
+    #[test]
+    fn compose_neoscroll_advances_one_display_row_per_tick() {
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.body = "x\n".repeat(70);
+        composer.body_view_width = 20;
+        composer.cursor = 0;
+        composer.queue_body_smooth_scroll(SMOOTH_SCROLL_ROWS);
+        assert_eq!(composer.body_smooth_target, Some(22));
+        composer.advance_body_smooth_scroll();
+        assert_eq!(composer.cursor, 2);
+        assert!(composer.body_smooth_target.is_some());
+        // Repeated Ctrl-j extends the destination from the existing target.
+        composer.queue_body_smooth_scroll(SMOOTH_SCROLL_ROWS);
+        assert_eq!(composer.body_smooth_target, Some(44));
+        for _ in 0..43 { composer.advance_body_smooth_scroll(); }
+        assert!(composer.body_smooth_target.is_none());
+        assert_eq!(composer.cursor, 88);
+        composer.queue_body_smooth_scroll(-SMOOTH_SCROLL_ROWS);
+        for _ in 0..22 { composer.advance_body_smooth_scroll(); }
+        assert_eq!(composer.cursor, 44);
+    }
+
+    #[test]
+    fn compose_soft_wrap_neoscroll_does_not_skip_boundaries() {
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.body = "abcdefghijklmnopqrstuvwxyz".into();
+        composer.body_view_width = 5;
+        composer.cursor = 0;
+        composer.queue_body_smooth_scroll(SMOOTH_SCROLL_ROWS);
+        for _ in 0..10 { composer.advance_body_smooth_scroll(); }
+        assert!(composer.body_smooth_target.is_none());
+        assert_eq!(super::compose_body_cursor_row(&composer.body_rows(), composer.cursor), 5);
+    }
+
+    #[test]
+    fn compose_contact_suggestions_accept_control_jk() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        app.contacts_autocomplete = true;
+        app.contacts.upsert("Alex One", "alex1@example.org", true).unwrap();
+        app.contacts.upsert("Alex Two", "alex2@example.org", true).unwrap();
+        let mut composer = Composer::new();
+        composer.to = "Alex".into();
+        composer.cursor = 4;
+        app.composer = Some(composer);
+        assert!(app.contact_suggestions().len() >= 2);
+        let control = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.handle_composer_key(control('j'));
+        assert_eq!(app.composer.as_ref().unwrap().contact_suggestion, 1);
+        app.handle_composer_key(control('k'));
+        assert_eq!(app.composer.as_ref().unwrap().contact_suggestion, 0);
+    }
+
+    #[test]
+    fn escape_clears_contacts_marks_without_closing_manager() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut modal = crate::contacts::ContactsModal::default();
+        modal.visual_anchor = Some(0);
+        modal.marked.insert("person@example.com".into());
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.handle_contacts_modal_key(&mut modal, escape));
+        assert!(modal.marked.is_empty());
+        assert!(modal.visual_anchor.is_none());
     }
 
     #[test]
