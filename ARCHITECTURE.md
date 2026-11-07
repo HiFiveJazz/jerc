@@ -16,6 +16,14 @@ Remote image worker ── bounded fetch/decode ─────┤
                                                Ratatui
 ```
 
+## Finding code by feature
+
+The renderer is divided by surface (`src/ui/render/{mail_list,reader,compose,contacts,attachments,dialogs,help,status,setup}.rs`) with shared formatting in `common.rs`. The root `src/ui/render.rs` owns layout and overlay ordering. These modules use the same app state and theme; the split is organizational and does not change rendering behavior.
+
+The app's state types and command routing remain in `src/app/state.rs`. `src/app/state/` holds the corresponding Compose editor and picker implementations, Contacts actions, reader navigation, message mutations, worker event handling, and received-attachment actions. The protocol backends and the UI worker remain separate; the feature modules should not start network I/O from rendering functions.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for a file map and local validation commands.
+
 ## Browser model
 
 The browser has one logical message cursor and one mailbox cursor. `j/k` moves messages; `J/K` changes mailboxes. Smooth mailbox motion delays opening the destination until animation finishes, so rapidly traversing folders does not serialize expensive intermediate mailbox loads.
@@ -48,7 +56,7 @@ MIME parsing remains in `mail-parser`. A real HTML part is the default reader vi
 
 Before rich conversion, HTML tables explicitly marked `role="presentation"` are linearized so newsletter/grid scaffolding does not become data-table chrome. Post-processing then removes zero-width/preheader padding, Markdown-like heading markers emitted by the conversion layer, generic image labels and repeated layout-table chrome. Dense nested layout blocks are flattened as a fallback; remaining semantic tables have their outer edges closed instead of ending in dangling junctions.
 
-`ratatui-image` provides Kitty/Sixel/iTerm2 rendering with a half-block fallback. Remote image HTTP/decode work runs on its own bounded worker, has an 8 MiB body cap and a global timeout, and filters obvious/decoded tracking pixels. Remote loading defaults off because direct image requests can disclose IP address and read time; `I` toggles it for the session and `ui.remote_images` can opt in at startup.
+`ratatui-image` provides Kitty/Sixel/iTerm2 rendering with a half-block fallback. Remote image HTTP/decode work runs on its own bounded worker, has an 8 MiB body cap and a global timeout, and filters obvious/decoded tracking pixels. Remote loading defaults off because direct image requests can disclose IP address and read time; `i` toggles it for the session and `ui.remote_images` can opt in at startup.
 
 ## Modal composer
 
