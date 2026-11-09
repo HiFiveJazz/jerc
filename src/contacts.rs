@@ -29,7 +29,7 @@ impl Contact {
         let quoted = self
             .name
             .chars()
-            .any(|c| matches!(c, ',' | '"' | '<' | '>' | ';'))
+            .any(|c| matches!(c, ',' | '"' | '<' | '>' | ';' | '(' | ')' | '\\'))
             || self.name.starts_with(' ')
             || self.name.ends_with(' ');
         let label = if quoted {
@@ -51,6 +51,22 @@ pub struct ContactBook {
 }
 
 impl ContactBook {
+    /// Expose the user's own configured sender identities in recipient search.
+    /// These are derived in memory at startup, without contacting providers
+    /// or automatically changing contacts.json. Existing saved names win.
+    pub fn include_account_identities(&mut self, accounts: &[crate::config::AccountConfig]) {
+        for account in accounts {
+            let identity = crate::outgoing::sender_from_account(account);
+            if let Ok(mailbox) = identity.parse::<lettre::message::Mailbox>() {
+                let email = mailbox.email.to_string();
+                if self.find(&email).is_none_or(|index| !self.entries[index].saved) {
+                    let name = mailbox.name.unwrap_or_else(|| account.name.clone());
+                    let _ = self.upsert(&name, &email, true);
+                }
+            }
+        }
+    }
+
     pub fn default_path() -> PathBuf {
         dirs::data_local_dir()
             .or_else(dirs::config_dir)
@@ -538,6 +554,12 @@ pub struct ContactEdit {
     pub email: String,
     pub active_email: bool,
     pub cursor: usize,
+    pub mode: crate::app::ComposeMode,
+    pub visual_anchor: Option<usize>,
+    pub pending_yank: bool,
+    pub pending_delete: bool,
+    undo: Vec<(String, String, bool, usize)>,
+    redo: Vec<(String, String, bool, usize)>,
 }
 
 impl ContactEdit {
@@ -551,6 +573,12 @@ impl ContactEdit {
             email,
             active_email: false,
             cursor,
+            mode: crate::app::ComposeMode::Insert,
+            visual_anchor: None,
+            pending_yank: false,
+            pending_delete: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
     pub fn value(&self) -> &str {
@@ -570,28 +598,149 @@ impl ContactEdit {
     pub fn toggle(&mut self) {
         self.active_email = !self.active_email;
         self.cursor = self.value().chars().count();
+        self.visual_anchor = None;
+        self.pending_yank = false;
+        self.pending_delete = false;
+    }
+    fn snapshot(&self) -> (String, String, bool, usize) {
+        (self.name.clone(), self.email.clone(), self.active_email, self.cursor)
+    }
+    fn restore(&mut self, snapshot: (String, String, bool, usize)) {
+        (self.name, self.email, self.active_email, self.cursor) = snapshot;
+        self.visual_anchor = None;
+        self.mode = crate::app::ComposeMode::Normal;
+    }
+    fn record_edit(&mut self) {
+        if self.undo.len() == 100 { self.undo.remove(0); }
+        self.undo.push(self.snapshot());
+        self.redo.clear();
+    }
+    pub fn undo(&mut self) {
+        if let Some(prev) = self.undo.pop() {
+            self.redo.push(self.snapshot());
+            self.restore(prev);
+        }
+    }
+    pub fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(self.snapshot());
+            self.restore(next);
+        }
+    }
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        let end = end.min(self.value().chars().count());
+        let start = start.min(end);
+        if start == end { return; }
+        self.record_edit();
+        let a = char_to_byte(self.value(), start);
+        let b = char_to_byte(self.value(), end);
+        self.value_mut().replace_range(a..b, "");
+        self.cursor = start;
+        self.visual_anchor = None;
+    }
+    pub fn clear_line(&mut self) {
+        self.delete_range(0, self.value().chars().count());
+        self.mode = crate::app::ComposeMode::Insert;
+    }
+    pub fn selected_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.visual_anchor?;
+        let end = self.value().chars().count();
+        if end == 0 { return None; }
+        if self.mode != crate::app::ComposeMode::Visual { return None; }
+        if self.pending_delete { return None; }
+        if self.pending_yank { return None; }
+        Some((anchor.min(self.cursor).min(end), anchor.max(self.cursor).saturating_add(1).min(end)))
+    }
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selected_range()?;
+        Some(self.value().chars().skip(start).take(end - start).collect())
+    }
+    pub fn insert_text(&mut self, text: &str) {
+        if text.is_empty() { return; }
+        self.record_edit();
+        let offset = char_to_byte(self.value(), self.cursor);
+        self.value_mut().insert_str(offset, text);
+        self.cursor += text.chars().count();
+        self.visual_anchor = None;
     }
     pub fn insert(&mut self, ch: char) {
-        if ch.is_control() {
-            return;
+        if !ch.is_control() {
+            self.insert_text(&ch.to_string());
         }
-        let idx = char_to_byte(self.value(), self.cursor);
-        self.value_mut().insert(idx, ch);
-        self.cursor += 1;
     }
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
-            let a = char_to_byte(self.value(), self.cursor - 1);
-            let b = char_to_byte(self.value(), self.cursor);
-            self.value_mut().replace_range(a..b, "");
-            self.cursor -= 1;
+            self.delete_range(self.cursor - 1, self.cursor);
         }
+    }
+    pub fn move_word(&mut self, forward: bool) {
+        let chars: Vec<char> = self.value().chars().collect();
+        let mut n = self.cursor.min(chars.len());
+        if forward {
+            while n < chars.len() && !chars[n].is_whitespace() { n += 1; }
+            while n < chars.len() && chars[n].is_whitespace() { n += 1; }
+        } else {
+            n = n.saturating_sub(1);
+            while n > 0 && chars[n].is_whitespace() { n -= 1; }
+            while n > 0 && !chars[n - 1].is_whitespace() { n -= 1; }
+        }
+        self.cursor = n;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn autocontact_display_quotes_parenthesized_names_for_send() {
+        let recipients = [
+            Contact { name: "Jasmeet (Jazz) Bhatia".into(), email: "jazz@example.org".into(), saved: true, favorite: false },
+            Contact { name: "Jasmeet (Japan) Bhatia".into(), email: "japan@example.org".into(), saved: true, favorite: false },
+            Contact { name: "James Schneider".into(), email: "james@example.org".into(), saved: true, favorite: false },
+            Contact { name: "Björk (B)".into(), email: "bjork@example.org".into(), saved: true, favorite: false },
+        ].iter().map(Contact::display).collect::<Vec<_>>().join(", ");
+        assert!(recipients.contains("\"Jasmeet (Jazz) Bhatia\""));
+        assert!(crate::outgoing::validate_recipients(&recipients, "", "").is_ok());
+    }
+
+    #[test]
+    fn contact_vim_field_operations_preserve_unicode_and_undo() {
+        let mut editor = ContactEdit::new(None);
+        editor.insert_text("Jasmeet (Jazz)");
+        editor.mode = crate::app::ComposeMode::Normal;
+        editor.cursor = 0;
+        editor.move_word(true);
+        assert!(editor.cursor > 0);
+        editor.clear_line();
+        assert!(editor.name.is_empty());
+        editor.undo();
+        assert_eq!(editor.name, "Jasmeet (Jazz)");
+        editor.toggle();
+        editor.insert_text("jazz@example.org");
+        assert_eq!(editor.email, "jazz@example.org");
+        editor.clear_line();
+        assert!(editor.email.is_empty());
+        editor.undo();
+        assert_eq!(editor.email, "jazz@example.org");
+    }
+
+    #[test]
+    fn own_configured_address_autocompletes_without_overwriting_saved_contact() {
+        let config: crate::config::Config = toml::from_str(
+            "[[accounts]]\nname = \"Main\"\nsource = \"imap\"\nemail = \"me@example.org\"\nfrom = \"Jazz <me@example.org>\"\n",
+        )
+        .unwrap();
+        let mut book = super::ContactBook::default();
+        book.include_account_identities(&config.accounts);
+        assert_eq!(book.suggest("j", &std::collections::HashSet::new()), vec![0]);
+        assert_eq!(book.entries[0].display(), "Jazz <me@example.org>");
+        book.edit(Some("me@example.org"), "Preferred Name", "me@example.org")
+            .unwrap();
+        book.include_account_identities(&config.accounts);
+        assert_eq!(book.entries.len(), 1);
+        assert_eq!(book.entries[0].name, "Preferred Name");
+    }
+
     #[test]
     fn recipient_parser_preserves_quoted_commas_and_unicode() {
         let list = "\"Doe, Jane\" <jane@example.org>, Þór <thor@example.org>";

@@ -164,7 +164,12 @@ pub(super) fn contact_footer_mode(
     theme: &Theme,
     modal: &crate::contacts::ContactsModal,
 ) -> Vec<Span<'static>> {
-    if modal.searching {
+    if let Some(edit) = modal.edit.as_ref() {
+        vec![Span::styled(
+            format!(" {} ", edit.mode.label()),
+            compose_mode_style(edit.mode, theme),
+        )]
+    } else if modal.searching {
         vec![Span::styled(" SEARCH ", search_mode_style(theme))]
     } else if modal.visual_anchor.is_some() {
         vec![Span::styled(" VISUAL ", mode_style("VISUAL", theme))]
@@ -454,16 +459,34 @@ pub(super) fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
                 continue;
             }
             let label_text = format!("{label}: {value}");
-            frame.render_widget(
-                Paragraph::new(truncate_display_width(&label_text, width as usize)).style(
-                    if edit.active_email == is_email {
-                        theme.current_line()
-                    } else {
-                        theme.text()
-                    },
-                ),
-                Rect::new(edit_area.x + 2, y, width, 1),
-            );
+            let row_style = if edit.active_email == is_email {
+                theme.current_line()
+            } else {
+                theme.text()
+            };
+            let range = if edit.active_email == is_email && edit.mode == ComposeMode::Visual {
+                edit.selected_range()
+            } else {
+                None
+            };
+            if let Some((start, end)) = range {
+                    let left = value.chars().take(start).collect::<String>();
+                    let selected = value.chars().skip(start).take(end - start).collect::<String>();
+                    let right = value.chars().skip(end).collect::<String>();
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(format!("{label}: {left}"), row_style),
+                            Span::styled(selected, theme.selected()),
+                            Span::styled(right, row_style),
+                        ])),
+                        Rect::new(edit_area.x + 2, y, width, 1),
+                    );
+            } else {
+                frame.render_widget(
+                    Paragraph::new(truncate_display_width(&label_text, width as usize)).style(row_style),
+                    Rect::new(edit_area.x + 2, y, width, 1),
+                );
+            }
             if edit.active_email == is_email {
                 let prefix = UnicodeWidthStr::width(format!("{label}: ").as_str());
                 let before: String = value.chars().take(edit.cursor).collect();
@@ -475,7 +498,7 @@ pub(super) fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
         }
         if edit_area.height > 8 {
             frame.render_widget(
-                Paragraph::new("Tab switch fields · Enter next/save · Esc cancel")
+                Paragraph::new("Tab switch · Esc Normal/cancel · i Insert · v Visual · Enter next/save")
                     .style(theme.muted()),
                 Rect::new(
                     edit_area.x + 2,

@@ -634,9 +634,12 @@ pub(super) fn plain_reader_line(
         theme,
     } = view;
     let diff = diff_kind.map(|kind| diff_line_style(kind, theme));
+    let (quote_depth, quote_prefix_end) = quote_prefix(text);
     let base = diff.unwrap_or_else(|| {
-        if is_quoted_line(text) {
-            Style::default().fg(theme.muted)
+        if quote_depth > 0 {
+            quoted_body_style(quote_depth, theme)
+        } else if is_reply_attribution(text) {
+            attribution_style(theme)
         } else {
             theme.text()
         }
@@ -645,21 +648,47 @@ pub(super) fn plain_reader_line(
         .map(|word| word_match_ranges(text, word))
         .unwrap_or_default();
     let mut spans = reader_gutter(line_index, line_count, reader_cursor, reader_active, theme);
-    spans.extend(reader_fragments(
-        text,
-        base,
-        0,
-        text.chars().count(),
-        line_index,
-        ReaderView {
-            cursor: reader_cursor,
-            column: reader_column,
-            visual: reader_visual,
-            active: reader_active,
-            theme,
-        },
-        &illuminate_ranges,
-    ));
+    let line_len = text.chars().count();
+    let view = ReaderView {
+        cursor: reader_cursor,
+        column: reader_column,
+        visual: reader_visual,
+        active: reader_active,
+        theme,
+    };
+    if quote_depth > 0 && diff.is_none() {
+        // Differentiate the `>` markers from the quoted body without losing
+        // cursor, visual selection, or illuminated-word highlighting.
+        let prefix = &text[..quote_prefix_end];
+        spans.extend(reader_fragments(
+            prefix,
+            quoted_prefix_style(theme),
+            0,
+            line_len,
+            line_index,
+            view,
+            &illuminate_ranges,
+        ));
+        spans.extend(reader_fragments(
+            &text[quote_prefix_end..],
+            base,
+            prefix.chars().count(),
+            line_len,
+            line_index,
+            view,
+            &illuminate_ranges,
+        ));
+    } else {
+        spans.extend(reader_fragments(
+            text,
+            base,
+            0,
+            line_len,
+            line_index,
+            view,
+            &illuminate_ranges,
+        ));
+    }
     pad_reader_line(
         &mut spans,
         text.chars().count(),
@@ -707,7 +736,8 @@ pub(super) fn rich_html_line(
     let illuminate_ranges = illuminate_word
         .map(|word| word_match_ranges(&line_text, word))
         .unwrap_or_default();
-    let quoted = is_quoted_line(&line_text);
+    let (quote_depth, _) = quote_prefix(&line_text);
+    let attribution = is_reply_attribution(&line_text);
     let diff = diff_kind.map(|kind| diff_line_style(kind, theme));
     let mut column = 0usize;
     for span in &line.spans {
@@ -717,8 +747,10 @@ pub(super) fn rich_html_line(
             if let Some(bg) = diff.bg {
                 style = style.bg(bg);
             }
-        } else if quoted {
-            style = style.fg(theme.muted);
+        } else if quote_depth > 0 {
+            style = style.fg(quoted_body_style(quote_depth, theme).fg.unwrap_or(theme.muted));
+        } else if attribution {
+            style = attribution_style(theme);
         }
         spans.extend(reader_fragments(
             &span.text,

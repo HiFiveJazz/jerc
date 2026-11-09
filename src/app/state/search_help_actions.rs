@@ -37,6 +37,10 @@ impl App {
                     account.search_editing = false;
                     account.normalize_search_selection();
                 }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    account.search_query.clear();
+                    account.normalize_search_selection();
+                }
                 KeyCode::Backspace if key.modifiers.is_empty() => {
                     account.search_query.pop();
                     account.normalize_search_selection();

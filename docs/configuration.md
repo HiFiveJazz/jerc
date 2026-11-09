@@ -73,6 +73,8 @@ theme = "tokyo-night"
 border_style = "rounded"          # "square" or "rounded"
 visual_selection_style = "gutter" # "gutter" or "row"
 remote_images = false
+mailbox_width_percent = 22  # Alt-h/l or drag the mailbox divider
+preview_width_percent = 57  # Alt-Shift-h/l or drag the reader divider
 new_mail_notifications = true
 new_mail_bell = false
 ```
@@ -81,6 +83,8 @@ new_mail_bell = false
 - **Selection:** `gutter` shows colored selection markers, while `row` highlights the entire selected row, across mail, Contacts, and attachment lists.
 - **Borders:** `square` is the default; `rounded` changes window corners without altering layout.
 - **Remote images:** Disabled initially to avoid unsolicited network requests triggered by opening email. Press `i` in the reader to toggle for the session.
+- **Panel widths:** The mailbox and split-preview percentages are persisted directly in this `[ui]` section when resized. Jerc no longer writes separate `mailbox-width` or `preview-width` files. Existing sidecar files are ignored; set the desired values here when upgrading.
+- **Outgoing mail privacy:** Jerc does not announce its name/version through `User-Agent` or `X-Mailer` and uses random message identifiers. Standard `MIME-Version: 1.0` and UTF-8 `Content-Type` headers describe the format, not the client. Composing plain text does not create an HTML alternative. Providers can still add SMTP routing headers.
 - **Mail refresh:** `inbox_poll_seconds` controls periodic Inbox status checks. Jerc doesn't yet use IMAP IDLE.
 
 The [example config](../config.example.toml) documents preview widths, notification styling, contact learning, and other optional settings.

@@ -533,6 +533,26 @@ pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         category: "Compose",
+        key: "yy / Y / y$ (normal)",
+        description: "yank line or to end of line",
+    },
+    HelpEntry {
+        category: "Compose",
+        key: "v / V then y (visual)",
+        description: "yank selected text or lines",
+    },
+    HelpEntry {
+        category: "Compose",
+        key: "p / P (normal)",
+        description: "paste after or before cursor / line",
+    },
+    HelpEntry {
+        category: "Compose",
+        key: "p (visual)",
+        description: "replace selected text with register",
+    },
+    HelpEntry {
+        category: "Compose",
         key: "Esc / q (normal)",
         description: "save or discard draft on exit",
     },

@@ -83,12 +83,12 @@ default_mailbox = "INBOX"
 
 [ui]
 # Browser layout. Drag the mailbox divider, or press Alt-h / Alt-l to resize.
-# Width is remembered in ~/.config/jerc/mailbox-width after an adjustment.
+# Width is persisted to [ui] here in config.toml after an adjustment.
 # `b` toggles the sidebar; `p` toggles the message preview.
 mailbox_width_percent = 22
 # When `p` enables the split reader, drag its left divider or use
 # Alt-Shift-h / Alt-Shift-l to make the reader wider/narrower.
-# Saved to ~/.config/jerc/preview-width after an adjustment.
+# Width is saved here in config.toml after an adjustment.
 preview_width_percent = 57
 
 # Active theme. Press `T` in the TUI to preview/switch themes live; the chosen

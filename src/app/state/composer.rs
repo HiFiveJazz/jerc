@@ -28,6 +28,9 @@ impl Composer {
             in_reply_to: None,
             references: Vec::new(),
             forwarded_raw: None,
+            draft_raw: None,
+            draft_attachment_names: Vec::new(),
+            draft_source: None,
             sending: false,
             confirm_send: false,
             exit_prompt: false,
@@ -48,12 +51,62 @@ impl Composer {
             visual_linewise: false,
             pending_g: false,
             pending_delete: false,
+            pending_yank: false,
             pending_inner: false,
             pending_find: None,
             count: None,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
         }
+    }
+
+    pub(super) fn from_server_draft(id: MessageId, raw: Vec<u8>) -> anyhow::Result<Self> {
+        let parsed = mail_parser::MessageParser::new()
+            .parse(&raw)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse saved draft headers"))?;
+        // Normalize the display names through the same quoting implementation
+        // as autocomplete, rather than passing unquoted parentheses to Lettre.
+        macro_rules! recipients_in {
+            ($value:expr) => {
+                $value.map(|list| {
+                    list.mailboxes().filter_map(|mb| {
+                        let address = mb.address()?.trim();
+                        if address.is_empty() { return None; }
+                        Some(crate::contacts::Contact {
+                            name: mb.name().unwrap_or_default().to_owned(),
+                            email: address.to_owned(),
+                            saved: false,
+                            favorite: false,
+                        }.display())
+                    }).collect::<Vec<_>>().join(", ")
+                }).unwrap_or_default()
+            };
+        }
+        let summary = crate::mail::parse_summary(
+            id.clone(), &raw, raw.len() as u64, MessageFlags::empty()
+        )?;
+        let body = crate::mail::parse_body(id, &raw)?;
+        let mut composer = Self::new();
+        composer.to = recipients_in!(parsed.to());
+        composer.cc = recipients_in!(parsed.cc());
+        composer.bcc = recipients_in!(parsed.bcc());
+        composer.subject = summary.subject;
+        composer.body = body.plain_text
+            .or(body.plain_fallback)
+            .unwrap_or_default();
+        composer.in_reply_to = summary.in_reply_to;
+        composer.references = summary.references;
+        // Attachments remain encoded in the original RFC5322 payload until
+        // the user sends or saves. The Compose editor only modifies plain text;
+        // do not re-send a stale HTML alternative with diverging content.
+        if body.attachment_count > 0 {
+            composer.draft_attachment_names = body.attachment_names;
+            composer.draft_raw = Some(raw);
+        }
+        composer.field = ComposeField::Body;
+        composer.mode = ComposeMode::Insert;
+        composer.cursor = composer.body.chars().count();
+        Ok(composer)
     }
 
     pub(super) fn reply(message: &MessageSummary, body: Option<&MessageBody>, quote: bool) -> Self {
@@ -92,7 +145,12 @@ impl Composer {
             to: if message.from_name.is_empty() {
                 message.from_address.clone()
             } else {
-                format!("{} <{}>", message.from_name, message.from_address)
+                crate::contacts::Contact {
+                    name: message.from_name.clone(),
+                    email: message.from_address.clone(),
+                    saved: false,
+                    favorite: false,
+                }.display()
             },
             cc: String::new(),
             bcc: String::new(),
@@ -116,6 +174,9 @@ impl Composer {
             in_reply_to: message.message_id.clone(),
             references,
             forwarded_raw: None,
+            draft_raw: None,
+            draft_attachment_names: Vec::new(),
+            draft_source: None,
             sending: false,
             confirm_send: false,
             exit_prompt: false,
@@ -136,6 +197,7 @@ impl Composer {
             visual_linewise: false,
             pending_g: false,
             pending_delete: false,
+            pending_yank: false,
             pending_inner: false,
             pending_find: None,
             count: None,
@@ -173,6 +235,9 @@ impl Composer {
             in_reply_to: None,
             references: Vec::new(),
             forwarded_raw: Some(raw),
+            draft_raw: None,
+            draft_attachment_names: Vec::new(),
+            draft_source: None,
             sending: false,
             confirm_send: false,
             exit_prompt: false,
@@ -193,6 +258,7 @@ impl Composer {
             visual_linewise: false,
             pending_g: false,
             pending_delete: false,
+            pending_yank: false,
             pending_inner: false,
             pending_find: None,
             count: None,
@@ -205,12 +271,13 @@ impl Composer {
         crate::outgoing::validate_recipients(&self.to, &self.cc, &self.bcc)?;
         // Only parse/reflow rich mail and attachment metadata upon opening the
         // preview, never while the terminal draws successive frames.
-        self.preview_forwarded_attachments = self
+        self.preview_forwarded_attachments = self.draft_attachment_names.clone();
+        self.preview_forwarded_attachments.extend(self
             .forwarded_raw
             .as_deref()
             .and_then(|raw| crate::mail::extract_attachments(raw).ok())
-            .map(|parts| parts.into_iter().map(|part| part.filename).collect())
-            .unwrap_or_default();
+            .map(|parts| parts.into_iter().map(|part| part.filename).collect::<Vec<_>>())
+            .unwrap_or_default());
         self.preview_rich_lines = self
             .outgoing_html_preview()?
             .map(|html| render_html_for_terminal(&html, 90).1);
@@ -257,6 +324,10 @@ impl Composer {
             || !self.attachment_paths.is_empty()
             || self.forwarded_raw.is_some()
             || self.in_reply_to.is_some()
+    }
+
+    pub fn total_attachment_count(&self) -> usize {
+        self.attachment_count() + self.draft_attachment_names.len()
     }
 
     pub fn attachment_count(&self) -> usize {
@@ -696,6 +767,7 @@ impl Composer {
     pub(super) fn clear_pending(&mut self) {
         self.pending_g = false;
         self.pending_delete = false;
+        self.pending_yank = false;
         self.pending_inner = false;
         self.pending_find = None;
         self.count = None;
@@ -1039,6 +1111,21 @@ impl Composer {
         self.cursor = start.min(self.char_count());
     }
 
+    pub(super) fn clear_current_line(&mut self) {
+        if self.field != ComposeField::Body {
+            self.delete_range(0, self.char_count());
+        } else {
+            // Unlike dd, Ctrl-W leaves the newline in place.
+            let start = self.line_start();
+            let end = self.line_end();
+            self.delete_range(start, end);
+            self.cursor = start;
+        }
+        self.mode = ComposeMode::Insert;
+        self.visual_anchor = None;
+        self.clear_pending();
+    }
+
     pub(super) fn delete_words(&mut self, count: usize) {
         let start = self.cursor;
         for _ in 0..count {
@@ -1165,6 +1252,11 @@ impl Composer {
     pub fn visual_range(&self) -> Option<(usize, usize)> {
         let anchor = self.visual_anchor?;
         let cursor = self.cursor.min(self.char_count());
+        // To/Cc/Bcc/Subject are single-line editors: V selects the entire
+        // field, even when the caret is just past its final character.
+        if self.visual_linewise && self.field != ComposeField::Body {
+            return Some((0, self.char_count()));
+        }
         if self.visual_linewise && self.field == ComposeField::Body {
             let chars: Vec<char> = self.body.chars().collect();
             let mut start = anchor.min(cursor);
@@ -1185,6 +1277,141 @@ impl Composer {
         } else {
             (cursor, anchor.saturating_add(1).min(self.char_count()))
         })
+    }
+
+    /// Copy a Visual character range or entire lines, without touching the OS clipboard.
+    pub(super) fn yank_visual(&self) -> Option<YankRegister> {
+        let (start, end) = self.visual_range()?;
+        let text = self.field_value();
+        Some(YankRegister {
+            text: text[Self::byte_index(text, start)..Self::byte_index(text, end)].to_owned(),
+            linewise: self.visual_linewise && self.field == ComposeField::Body,
+        })
+    }
+
+    pub(super) fn yank_lines(&self, count: usize) -> YankRegister {
+        if self.field != ComposeField::Body {
+            return YankRegister {
+                text: self.field_value().to_owned(),
+                linewise: false,
+            };
+        }
+        let chars = self.body.chars().collect::<Vec<_>>();
+        let start = self.line_start();
+        let mut end = start;
+        for _ in 0..count {
+            while end < chars.len() && chars[end] != '\n' {
+                end += 1;
+            }
+            if end < chars.len() {
+                end += 1;
+            }
+        }
+        YankRegister {
+            text: self.body[Self::byte_index(&self.body, start)..Self::byte_index(&self.body, end)]
+                .to_owned(),
+            linewise: true,
+        }
+    }
+
+    pub(super) fn yank_to_line_end(&self) -> YankRegister {
+        let start = self.cursor.min(self.char_count());
+        let end = self.line_end();
+        let text = self.field_value();
+        YankRegister {
+            text: text[Self::byte_index(text, start)..Self::byte_index(text, end)].to_owned(),
+            linewise: false,
+        }
+    }
+
+    /// Replace a range as one undoable edit; all indices are Unicode scalar offsets.
+    fn replace_with_text(&mut self, start: usize, end: usize, text: &str, cursor: usize) {
+        let len = self.char_count();
+        let start = start.min(len);
+        let end = end.min(len).max(start);
+        if start == end && text.is_empty() {
+            return;
+        }
+        self.body_smooth_target = None;
+        self.body_preferred_column = None;
+        let first = Self::byte_index(self.field_value(), start);
+        let last = Self::byte_index(self.field_value(), end);
+        self.remember_edit();
+        self.field_mut().replace_range(first..last, text);
+        self.cursor = cursor.min(self.char_count());
+        self.visual_anchor = None;
+        self.visual_linewise = false;
+        self.contact_suggestion = 0;
+        self.dismissed_contact_query = None;
+    }
+
+    /// Vim's p/P: characterwise after/before cursor, linewise below/above line.
+    pub(super) fn paste_register(&mut self, register: &YankRegister, after: bool, count: usize) {
+        if register.text.is_empty() && !register.linewise {
+            return;
+        }
+        let count = count.clamp(1, MAX_COUNT_PREFIX);
+        if register.linewise && self.field == ComposeField::Body {
+            let content = register.text.strip_suffix('\n').unwrap_or(&register.text);
+            // Repeating a linewise register repeats complete logical lines.
+            let repeated = std::iter::repeat_n(content, count).collect::<Vec<_>>().join("\n");
+            if after {
+                let end = self.line_end();
+                let has_newline = self.body.chars().nth(end) == Some('\n');
+                if self.body.is_empty() {
+                    self.replace_with_text(0, 0, &repeated, 0);
+                } else if has_newline {
+                    let insert = format!("{repeated}\n");
+                    self.replace_with_text(end + 1, end + 1, &insert, end + 1);
+                } else {
+                    let insert = format!("\n{repeated}");
+                    self.replace_with_text(end, end, &insert, end + 1);
+                }
+            } else {
+                let start = self.line_start();
+                let insert = if self.body.is_empty() {
+                    repeated
+                } else {
+                    format!("{repeated}\n")
+                };
+                self.replace_with_text(start, start, &insert, start);
+            }
+        } else {
+            let text = if self.field == ComposeField::Body {
+                register.text.repeat(count)
+            } else {
+                register.text.replace(['\r', '\n'], " ").repeat(count)
+            };
+            let position = self.cursor.min(self.char_count());
+            let at = if after && position < self.char_count() {
+                position + 1
+            } else {
+                position
+            };
+            let last_char = at + text.chars().count().saturating_sub(1);
+            self.replace_with_text(at, at, &text, last_char);
+        }
+    }
+
+    /// Visual p replaces the selected text without overwriting the yank register.
+    pub(super) fn paste_over_visual(&mut self, register: &YankRegister) {
+        let Some((start, end)) = self.visual_range() else {
+            return;
+        };
+        let mut replacement = if self.field == ComposeField::Body {
+            register.text.clone()
+        } else {
+            register.text.replace(['\r', '\n'], " ")
+        };
+        if self.visual_linewise
+            && self.field == ComposeField::Body
+            && self.body.chars().nth(end.saturating_sub(1)) == Some('\n')
+            && !replacement.ends_with('\n')
+        {
+            replacement.push('\n');
+        }
+        self.replace_with_text(start, end, &replacement, start);
+        self.mode = ComposeMode::Normal;
     }
 }
 

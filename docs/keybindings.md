@@ -61,7 +61,13 @@ Normal, Insert, and Visual modes share Vim-style movement. Search the Compose `?
 | --- | --- |
 | `Tab` / `Shift-Tab` | Next / previous field |
 | `Enter` in Normal | Preview before sending |
-| `Esc` in Insert | Return to Normal mode |
+| `Esc` in Insert | Return to Normal mode (also dismisses recipient autocomplete) |
+| `yy` / `Y` (Normal) | Yank whole body line or entire To/Cc/Bcc/Subject field; prefix with a count for multiple body lines |
+| `v` / `V`, then `y` (Visual) | Yank selected characters / full body lines (or the entire current header field with `V`) |
+| `y$` (Normal) | Yank from cursor to end of line |
+| `p` / `P` (Normal) | Paste after / before cursor or below / above line |
+| `Ctrl-W` (any mode) | Clear current body line or complete To/Cc/Bcc/Subject field |
+| `p` (Visual) | Replace selection with last yanked text |
 | `Esc` / `q` in Normal | Exit prompt: save or discard draft |
 | `Ctrl-a` | Open attachment file picker |
 | `Ctrl-d` | Manage attached files |
@@ -72,7 +78,11 @@ Normal, Insert, and Visual modes share Vim-style movement. Search the Compose `?
 | `Ctrl-n` / `Ctrl-p` | Alternative suggestion navigation when suggestions are active |
 | `Tab` / `Enter` | Accept a contact suggestion when shown |
 
+Yanks use a session-only internal register (also shared with the reader), not automatic system-clipboard copying from Compose. The register is not written to postponed drafts. The reader's `y` also attempts to copy to the system clipboard as before. For externally copied text, use your terminal's normal paste shortcut in Insert mode.
+
 From the send preview, `Enter` sends; `Esc` returns to the editor. Saving a draft is not the same as sending it.
+
+Jerc highlights mailing-list reply attributions (such as “On ... wrote:”), `>` quoted text, and deeper `>>`/`> >` quote levels using the active theme. The author’s unquoted reply keeps the normal foreground color. Git diff highlighting still takes precedence inside actual patch hunks. This is a native Rust text renderer; no Tree-sitter grammar or additional parser is required.
 
 ## Contacts (`Alt-c`)
 
@@ -138,3 +148,5 @@ See [Contacts](contacts.md) for importing/learning behavior and storage details.
 | `q` / `Ctrl-c` | Quit from mail browser |
 
 Terminal key handling can vary with your terminal and modifiers. When unsure, use `?` in the relevant view.
+
+Saved drafts: open a message inside the **Drafts** mailbox with `Enter` to preview it; select **[Y]es** to edit or **[N]o** to keep reading. `Ctrl-N` still resumes a locally postponed draft. The original server draft is retained until a replacement is saved or the message is sent successfully.

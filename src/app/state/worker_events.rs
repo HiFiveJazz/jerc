@@ -567,6 +567,23 @@ impl App {
                 }
             }
             WorkerEventKind::RawLoaded { id, raw } => {
+                if self.pending_draft.as_ref().is_some_and(|pending| {
+                    pending.account == event.account && pending.message_id == id
+                }) {
+                    match Composer::from_server_draft(id.clone(), raw) {
+                        Ok(composer) => {
+                            if let Some(pending) = self.pending_draft.as_mut() {
+                                pending.composer = Some(composer);
+                            }
+                            self.status = StatusLine::info("Draft preview ready: [Y]es edit / [N]o preview");
+                        }
+                        Err(error) => {
+                            self.pending_draft = None;
+                            self.status = StatusLine::error(format!("cannot open draft: {error:#}"));
+                        }
+                    }
+                    return;
+                }
                 let pending = self
                     .pending_compose
                     .as_ref()
@@ -645,11 +662,21 @@ impl App {
                 self.status = StatusLine::temporary(message, Duration::from_secs(2));
             }
             WorkerEventKind::DraftSaveFailed { mailbox, error } => {
+                if self.pending_draft_replacement.as_ref().is_some_and(|(index, _)| *index == event.account) {
+                    self.pending_draft_replacement = None;
+                }
                 self.status = StatusLine::error(format!(
                     "saved locally only: uploading to {mailbox} failed ({error}); Ctrl+n resumes"
                 ));
             }
             WorkerEventKind::DraftSaved { mailbox } => {
+                if let Some((index, source)) = self.pending_draft_replacement.take() {
+                    if index == event.account && source.mailbox == mailbox {
+                        let _ = account.worker.post(ActionKind::Delete {
+                            mailbox: source.mailbox, id: source.id,
+                        });
+                    }
+                }
                 // Refresh cached Drafts on the next visit, or immediately if
                 // the user is already browsing that folder.
                 account.mailbox_cache.remove(&mailbox);
@@ -737,6 +764,16 @@ impl App {
                 }
                 Self::pump_mailbox_status(account);
 
+                if event.account == self.account_index
+                    && let Some(source) = self.composer.as_ref().and_then(|composer| composer.draft_source.clone())
+                {
+                    // Retire the server-side draft only after SMTP accepted the
+                    // outgoing message. A failure leaves the draft untouched.
+                    let _ = account.worker.post(ActionKind::Delete {
+                        mailbox: source.mailbox,
+                        id: source.id,
+                    });
+                }
                 if self.resumed_draft_account == Some(event.account) {
                     if let Ok(root) = Self::postponed_drafts_root() {
                         let _ = crate::outgoing::drafts::delete_draft(&root, &account.name);

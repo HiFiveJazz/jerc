@@ -555,6 +555,20 @@ struct RemovedAttachment {
     legacy: bool,
 }
 
+/// The unnamed Vim register is in memory only; neither its contents nor its
+/// linewise mode are serialized into drafts or synchronized to any provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct YankRegister {
+    text: String,
+    linewise: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DraftSource {
+    pub mailbox: String,
+    pub id: MessageId,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Composer {
     pub to: String,
@@ -596,6 +610,17 @@ pub struct Composer {
     /// for inline forwarding, including postponed drafts. Never serialized as
     /// a .eml attachment in the default forwarding workflow.
     pub forwarded_raw: Option<Vec<u8>>,
+    /// Original server draft, used to preserve attached MIME parts on resubmit.
+    #[serde(default)]
+    pub draft_raw: Option<Vec<u8>>,
+    /// Names of attachments already embedded in a server draft. Read-only in
+    /// the attachment manager; retained when editing the text or re-saving.
+    #[serde(default)]
+    pub draft_attachment_names: Vec<String>,
+    /// Only retire an earlier server draft AFTER SMTP accepts or a replacement
+    /// draft is successfully appended. Keep in local recovery JSON as well.
+    #[serde(default)]
+    pub draft_source: Option<DraftSource>,
     pub sending: bool,
     pub confirm_send: bool,
     /// Prompt before discarding a nonempty unsent message. Not stored in drafts.
@@ -638,6 +663,8 @@ pub struct Composer {
     #[serde(skip)]
     pending_delete: bool,
     #[serde(skip)]
+    pending_yank: bool,
+    #[serde(skip)]
     pending_inner: bool,
     #[serde(skip)]
     pending_find: Option<bool>,
@@ -663,6 +690,15 @@ struct PendingCompose {
     account: usize,
     message_id: MessageId,
     intent: ComposeIntent,
+}
+
+/// A pending read-only Drafts preview. Enter opens the normal reader first;
+/// the Yes/No dialog is shown only once the original MIME is ready.
+struct PendingDraft {
+    account: usize,
+    mailbox: String,
+    message_id: MessageId,
+    composer: Option<Composer>,
 }
 
 /// Match a query as an ordered, case-insensitive subsequence. Consecutive
@@ -1522,6 +1558,8 @@ pub struct App {
     pub confirmation: Option<MutationConfirmation>,
     pub detach_confirmation: Option<DetachConfirmation>,
     pub composer: Option<Composer>,
+    /// Session-only shared register: reader selections can be pasted into Compose.
+    yank_register: Option<YankRegister>,
     pub contacts: ContactBook,
     pub contacts_modal: Option<ContactsModal>,
     contacts_path: PathBuf,
@@ -1532,6 +1570,8 @@ pub struct App {
     contacts_dirty: bool,
     contacts_save_due: Option<Instant>,
     pending_compose: Option<PendingCompose>,
+    pending_draft: Option<PendingDraft>,
+    pending_draft_replacement: Option<(usize, DraftSource)>,
     resumed_draft_account: Option<usize>,
 }
 
@@ -1657,7 +1697,8 @@ impl App {
         let contacts_warning = loaded_contacts.as_ref().err().map(|error| {
             format!("Contacts file could not be loaded; preserving it unchanged: {error:#}")
         });
-        let contacts = loaded_contacts.unwrap_or_default();
+        let mut contacts = loaded_contacts.unwrap_or_default();
+        contacts.include_account_identities(&config.accounts);
         Self {
             accounts,
             account_index: 0,
@@ -1683,13 +1724,9 @@ impl App {
             new_mail_sound_name: config.ui.new_mail_sound_name.clone(),
             new_mail_sound_file: config.ui.new_mail_sound_file.clone(),
             new_mail_notices: VecDeque::new(),
-            mailbox_width_percent: stored_mailbox_width()
-                .unwrap_or(config.ui.mailbox_width_percent)
-                .clamp(12, 50),
+            mailbox_width_percent: config.ui.mailbox_width_percent.clamp(12, 50),
             mailbox_resizing: false,
-            preview_width_percent: stored_preview_width()
-                .unwrap_or(config.ui.preview_width_percent)
-                .clamp(25, 75),
+            preview_width_percent: config.ui.preview_width_percent.clamp(25, 75),
             preview_resizing: false,
             sidebar_visible: true,
             preview_split: false,
@@ -1755,6 +1792,7 @@ impl App {
             confirmation: None,
             detach_confirmation: None,
             composer: None,
+            yank_register: None,
             contacts,
             contacts_modal: None,
             contacts_path,
@@ -1765,8 +1803,15 @@ impl App {
             contacts_dirty: false,
             contacts_save_due: None,
             pending_compose: None,
+            pending_draft: None,
+            pending_draft_replacement: None,
             resumed_draft_account: None,
         }
+    }
+
+    #[must_use]
+    pub fn draft_resume_prompt_open(&self) -> bool {
+        self.pending_draft.as_ref().is_some_and(|pending| pending.composer.is_some())
     }
 
     #[must_use]
@@ -2109,6 +2154,17 @@ impl App {
             self.handle_contacts_key(key);
             return;
         }
+        if self.draft_resume_prompt_open() {
+            match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.resume_server_draft(),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    self.pending_draft = None;
+                    self.status = StatusLine::info("draft preview kept open");
+                }
+                _ => {}
+            }
+            return;
+        }
         // Account actions share Alt shortcuts. Ctrl-a remains available for
         // the compose attachment picker, not the account setup wizard.
         if key.modifiers == KeyModifiers::ALT
@@ -2161,7 +2217,7 @@ impl App {
             if let Some(adjustment) = adjustment {
                 self.preview_width_percent =
                     (i32::from(self.preview_width_percent) + adjustment).clamp(25, 75) as u16;
-                let _ = persist_preview_width(self.preview_width_percent);
+                self.save_panel_width(crate::config::PanelWidth::Preview);
                 return;
             }
         }
@@ -2179,7 +2235,7 @@ impl App {
             if let Some(adjustment) = adjustment {
                 self.mailbox_width_percent =
                     (i32::from(self.mailbox_width_percent) + adjustment).clamp(12, 50) as u16;
-                let _ = persist_mailbox_width(self.mailbox_width_percent);
+                self.save_panel_width(crate::config::PanelWidth::Mailbox);
                 return;
             }
         }
@@ -2791,6 +2847,7 @@ impl App {
         self.reader_smooth_target = None;
         self.reader_visual_linewise = false;
         self.pending_compose = None;
+        self.pending_draft = None;
         self.visual_anchor = None;
         self.message_marked.clear();
         self.confirmation = None;
@@ -3352,7 +3409,7 @@ impl App {
                     self.preview_resizing = false;
                     self.preview_width_percent =
                         preview_percent_at(mouse.column, sidebar_width, right_width);
-                    let _ = persist_preview_width(self.preview_width_percent);
+                    self.save_panel_width(crate::config::PanelWidth::Preview);
                     return;
                 }
                 _ => {}
@@ -3394,9 +3451,24 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) if self.mailbox_resizing => {
                 self.mailbox_resizing = false;
                 self.mailbox_width_percent = mouse_width_percent(mouse.column, width);
-                let _ = persist_mailbox_width(self.mailbox_width_percent);
+                self.save_panel_width(crate::config::PanelWidth::Mailbox);
             }
             _ => {}
+        }
+    }
+
+    /// Persist a divider adjustment to the active config.toml, including custom
+    /// --config paths. When Jerc has no config file, the width remains session-only.
+    fn save_panel_width(&mut self, panel: crate::config::PanelWidth) {
+        let Some(path) = self.theme_config_path.as_deref() else {
+            return;
+        };
+        let value = match panel {
+            crate::config::PanelWidth::Mailbox => self.mailbox_width_percent,
+            crate::config::PanelWidth::Preview => self.preview_width_percent,
+        };
+        if let Err(error) = crate::config::save_ui_panel_width(path, panel, value) {
+            self.status = StatusLine::error(format!("could not save panel width: {error:#}"));
         }
     }
 
@@ -3642,6 +3714,9 @@ fn outgoing_from_composer(composer: &Composer, from: &str) -> anyhow::Result<Out
         load_compose_attachments(&composer.attachments, &composer.attachment_paths)?;
     let custom_headers = parse_compose_headers(&composer.headers)?;
     let mut html_body = None;
+    if let Some(raw) = composer.draft_raw.as_deref() {
+        attachments.extend(crate::mail::extract_attachments(raw)?);
+    }
     if let Some(raw) = composer.forwarded_raw.as_deref() {
         let parts = inline_forward_parts(raw)?;
         attachments.extend(parts.attachments);
@@ -3940,52 +4015,6 @@ fn preview_percent_at(column: u16, sidebar_width: u16, remaining: u16) -> u16 {
     }
     let inside = column.saturating_sub(sidebar_width).min(remaining);
     (100 - (u32::from(inside) * 100 / u32::from(remaining)) as u16).clamp(25, 75)
-}
-
-fn preview_width_state_file() -> Option<PathBuf> {
-    dirs::config_dir().map(|directory| directory.join("jerc").join("preview-width"))
-}
-
-fn stored_preview_width() -> Option<u16> {
-    std::fs::read_to_string(preview_width_state_file()?)
-        .ok()?
-        .trim()
-        .parse::<u16>()
-        .ok()
-        .filter(|value| (25..=75).contains(value))
-}
-
-fn persist_preview_width(width: u16) -> std::io::Result<()> {
-    let Some(path) = preview_width_state_file() else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{}\n", width.clamp(25, 75)))
-}
-
-fn mailbox_width_state_file() -> Option<PathBuf> {
-    dirs::config_dir().map(|directory| directory.join("jerc").join("mailbox-width"))
-}
-
-fn stored_mailbox_width() -> Option<u16> {
-    std::fs::read_to_string(mailbox_width_state_file()?)
-        .ok()?
-        .trim()
-        .parse::<u16>()
-        .ok()
-        .filter(|value| (12..=50).contains(value))
-}
-
-fn persist_mailbox_width(width: u16) -> std::io::Result<()> {
-    let Some(path) = mailbox_width_state_file() else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{}\n", width.clamp(12, 50)))
 }
 
 /// Keep the temporary path alive so external viewers can open it after the
@@ -4349,8 +4378,9 @@ mod tests {
         SMOOTH_SCROLL_ROWS, bounded_index, inner_text_object_range, message_view_offset,
         offset_index, preview_neighbor_positions, preview_travel_positions,
         reader_image_target_size, reader_scroll_for_visual_cursor, reader_selection_text,
-        reader_word_target, reply_attribution, url_at_cursor,
+        reader_word_target, reply_attribution, url_at_cursor, Focus, PendingDraft,
     };
+    use crate::contacts::{ContactEdit, ContactsModal};
     use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
     use ratatui::widgets::BorderType;
@@ -4418,6 +4448,274 @@ mod tests {
         assert!(composer.apply_motion(KeyCode::Char('k'), 1));
         assert_eq!(composer.cursor, 7);
         assert_eq!(composer.body, original);
+    }
+
+    #[test]
+    fn compose_yy_p_p_and_undo_preserve_linewise_unicode() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.mode = ComposeMode::Normal;
+        composer.body = "αβ\nsecond\nthird".into();
+        composer.cursor = 0;
+        app.composer = Some(composer);
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        app.handle_composer_key(key('y'));
+        app.handle_composer_key(key('y'));
+        assert_eq!(
+            app.yank_register.as_ref().unwrap(),
+            &super::YankRegister {
+                text: "αβ\n".into(),
+                linewise: true,
+            }
+        );
+        app.handle_composer_key(key('p'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "αβ\nαβ\nsecond\nthird");
+        app.handle_composer_key(key('P'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "αβ\nαβ\nαβ\nsecond\nthird");
+        app.handle_composer_key(key('u'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "αβ\nαβ\nsecond\nthird");
+        app.handle_composer_key(key('u'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "αβ\nsecond\nthird");
+    }
+
+    #[test]
+    fn compose_visual_yank_and_paste_work_without_system_clipboard() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.mode = ComposeMode::Normal;
+        composer.body = "hello world".into();
+        composer.cursor = 6;
+        app.composer = Some(composer);
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        app.handle_composer_key(key('v'));
+        for _ in 0..4 {
+            app.handle_composer_key(key('l'));
+        }
+        app.handle_composer_key(key('y'));
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "world");
+        assert_eq!(app.composer.as_ref().unwrap().mode, ComposeMode::Normal);
+        app.composer.as_mut().unwrap().cursor = 0;
+        app.handle_composer_key(key('p'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "hworldello world");
+        app.composer.as_mut().unwrap().cursor = 1;
+        app.handle_composer_key(key('v'));
+        app.handle_composer_key(key('l'));
+        app.handle_composer_key(key('p'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "hworldrldello world");
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "world");
+        app.handle_composer_key(key('u'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "hworldello world");
+    }
+
+    #[test]
+    fn compose_linewise_paste_at_end_and_counted_yank() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.mode = ComposeMode::Normal;
+        composer.body = "one\ntwo\nthree".into();
+        composer.cursor = 0;
+        app.composer = Some(composer);
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        app.handle_composer_key(key('2'));
+        app.handle_composer_key(key('y'));
+        app.handle_composer_key(key('y'));
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "one\ntwo\n");
+        app.composer.as_mut().unwrap().cursor = 8; // 'three' at EOF
+        app.handle_composer_key(key('p'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "one\ntwo\nthree\none\ntwo");
+    }
+
+    #[test]
+    fn compose_linewise_paste_into_empty_body_has_no_leading_blank_line() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.mode = ComposeMode::Normal;
+        app.composer = Some(composer);
+        app.yank_register = Some(super::YankRegister {
+            text: "first\n".into(),
+            linewise: true,
+        });
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        app.handle_composer_key(key);
+        assert_eq!(app.composer.as_ref().unwrap().body, "first");
+    }
+
+    #[test]
+    fn compose_paste_into_header_keeps_it_single_line_and_register_is_ephemeral() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Subject);
+        composer.mode = ComposeMode::Normal;
+        composer.subject = "x".into();
+        composer.cursor = 0;
+        app.composer = Some(composer);
+        app.yank_register = Some(super::YankRegister {
+            text: "first\nsecond".into(),
+            linewise: false,
+        });
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        app.handle_composer_key(key);
+        assert_eq!(app.composer.as_ref().unwrap().subject, "xfirst second");
+        let stored = serde_json::to_string(app.composer.as_ref().unwrap()).unwrap();
+        assert!(!stored.contains("yank_register"));
+    }
+
+    #[test]
+    fn compose_header_yank_and_paste_work_for_every_address_and_subject_field() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        for field in [
+            ComposeField::To,
+            ComposeField::Cc,
+            ComposeField::Bcc,
+            ComposeField::Subject,
+        ] {
+            let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+            let mut app = super::App::new(&config, vec![]);
+            app.contacts_autocomplete = true;
+            app.contacts
+                .upsert("Alex", "alex@example.org", true)
+                .unwrap();
+            let mut composer = Composer::new();
+            composer.switch_field(field);
+            *composer.field_mut() = "Alex".into();
+            composer.cursor = composer.char_count();
+            assert_eq!(composer.mode, ComposeMode::Insert);
+            app.composer = Some(composer);
+
+            let is_recipient = field != ComposeField::Subject;
+            assert_eq!(
+                !app.contact_suggestions().is_empty(),
+                is_recipient,
+                "autocomplete should be visible only in recipient fields: {field:?}"
+            );
+            app.handle_composer_key(esc);
+            assert_eq!(app.composer.as_ref().unwrap().mode, ComposeMode::Normal);
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "Alex");
+
+            // yy yanks all of a single-line header even when its cursor is
+            // at the end after Tab/field navigation.
+            app.handle_composer_key(key('y'));
+            app.handle_composer_key(key('y'));
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "Alex", "{field:?}");
+            assert!(!app.yank_register.as_ref().unwrap().linewise);
+
+            // V should select the whole field, not a zero-width selection.
+            app.handle_composer_key(key('V'));
+            assert_eq!(app.composer.as_ref().unwrap().visual_range(), Some((0, 4)));
+            app.handle_composer_key(key('y'));
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "Alex", "{field:?}");
+            assert_eq!(app.composer.as_ref().unwrap().mode, ComposeMode::Normal);
+
+            // v at the end of a header must select the final character.
+            app.handle_composer_key(key('v'));
+            app.handle_composer_key(key('y'));
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "x", "{field:?}");
+            app.handle_composer_key(key('Y'));
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "Alex");
+
+            // Paste and undo work in the same field, without changing the
+            // register or any of the other Compose fields.
+            app.handle_composer_key(key('P'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "AleAlexx", "{field:?}");
+            app.handle_composer_key(key('u'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "Alex", "{field:?}");
+            app.composer.as_mut().unwrap().cursor = 0;
+            app.handle_composer_key(key('p'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "AAlexlex", "{field:?}");
+            app.handle_composer_key(key('u'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "Alex");
+        }
+    }
+
+    #[test]
+    fn compose_yank_register_pastes_between_recipient_fields_and_subject() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = Composer::new();
+        composer.to = "person@example.org".into();
+        composer.mode = ComposeMode::Normal;
+        composer.cursor = composer.to.chars().count();
+        app.composer = Some(composer);
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+
+        app.handle_composer_key(key('Y'));
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "person@example.org");
+        for field in [ComposeField::Cc, ComposeField::Bcc, ComposeField::Subject] {
+            app.composer.as_mut().unwrap().switch_field(field);
+            app.handle_composer_key(key('p'));
+            assert_eq!(
+                app.composer.as_ref().unwrap().field_value(),
+                "person@example.org",
+                "{field:?}"
+            );
+        }
+        assert_eq!(app.composer.as_ref().unwrap().to, "person@example.org");
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "person@example.org");
+    }
+
+    #[test]
+    fn compose_header_yank_motion_visual_replace_and_multiline_paste_are_safe() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        for field in [
+            ComposeField::To,
+            ComposeField::Cc,
+            ComposeField::Bcc,
+            ComposeField::Subject,
+        ] {
+            let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+            let mut app = super::App::new(&config, vec![]);
+            let mut composer = Composer::new();
+            composer.switch_field(field);
+            *composer.field_mut() = "Aébc".into();
+            composer.cursor = 1;
+            composer.mode = ComposeMode::Normal;
+            app.composer = Some(composer);
+
+            // y$ uses Unicode character positions, not UTF-8 byte offsets.
+            app.handle_composer_key(key('y'));
+            app.handle_composer_key(key('$'));
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "ébc");
+            app.composer.as_mut().unwrap().cursor = 0;
+            app.handle_composer_key(key('v'));
+            app.handle_composer_key(key('l'));
+            app.handle_composer_key(key('p'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "ébcbc", "{field:?}");
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "ébc");
+            app.handle_composer_key(key('u'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "Aébc");
+
+            // Reader/body yanks may contain newlines. A header paste must
+            // normalize those into spaces rather than inject header breaks.
+            app.yank_register = Some(super::YankRegister {
+                text: "one\ntwo".into(),
+                linewise: true,
+            });
+            app.composer.as_mut().unwrap().cursor = 0;
+            app.handle_composer_key(key('P'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "one twoAébc");
+            assert!(!app.composer.as_ref().unwrap().field_value().contains('\n'));
+            app.handle_composer_key(key('u'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "Aébc");
+        }
     }
 
     #[test]
@@ -4791,6 +5089,116 @@ mod tests {
         // the bottom row; scrolling begins only inside the scrolloff guard.
         assert_eq!(message_view_offset(20, 30, 100, 20), 20);
         assert_eq!(message_view_offset(20, 36, 100, 20), 21);
+    }
+
+    #[test]
+    fn contact_editor_uses_compose_modal_keys_for_both_fields() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut modal = ContactsModal { edit: Some(ContactEdit::new(None)), ..ContactsModal::default() };
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        for ch in "Jazz".chars() { app.handle_contacts_modal_key(&mut modal, key(ch)); }
+        assert_eq!(modal.edit.as_ref().unwrap().name, "Jazz");
+        app.handle_contacts_modal_key(&mut modal, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(modal.edit.as_ref().unwrap().mode, ComposeMode::Normal);
+        app.handle_contacts_modal_key(&mut modal, key('y'));
+        app.handle_contacts_modal_key(&mut modal, key('y'));
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "Jazz");
+        app.handle_contacts_modal_key(&mut modal, ctrl_w);
+        assert_eq!(modal.edit.as_ref().unwrap().name, "");
+        app.handle_contacts_modal_key(&mut modal, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_contacts_modal_key(&mut modal, key('u'));
+        assert_eq!(modal.edit.as_ref().unwrap().name, "Jazz");
+        app.handle_contacts_modal_key(&mut modal, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(modal.edit.as_ref().unwrap().active_email);
+        app.handle_contacts_modal_key(&mut modal, key('p'));
+        assert_eq!(modal.edit.as_ref().unwrap().email, "Jazz");
+        app.handle_contacts_modal_key(&mut modal, ctrl_w);
+        assert!(modal.edit.as_ref().unwrap().email.is_empty());
+        app.handle_contacts_modal_key(&mut modal, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_contacts_modal_key(&mut modal, key('u'));
+        assert_eq!(modal.edit.as_ref().unwrap().email, "Jazz");
+        // A first Escape exits Insert; a second from Normal closes editing.
+        app.handle_contacts_modal_key(&mut modal, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(modal.edit.is_none());
+    }
+
+    #[test]
+    fn draft_resume_decline_keeps_reader_and_accept_opens_composer() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        app.setup = None;
+        let make_pending = || PendingDraft {
+            account: 0, mailbox: "Drafts".into(),
+            message_id: MessageId("draft:42".into()),
+            composer: Some(Composer::new()),
+        };
+        app.message_open = true;
+        app.focus = Focus::Preview;
+        app.pending_draft = Some(make_pending());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.message_open);
+        assert!(app.composer.is_none());
+        assert!(app.pending_draft.is_none());
+        app.pending_draft = Some(make_pending());
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!app.message_open);
+        assert_eq!(app.composer.as_ref().unwrap().draft_source.as_ref().unwrap().mailbox, "Drafts");
+        assert_eq!(app.composer.as_ref().unwrap().draft_source.as_ref().unwrap().id.0, "draft:42");
+    }
+
+    #[test]
+    fn compose_ctrl_w_clears_each_field_or_one_body_line_and_is_undoable() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        for field in [ComposeField::To, ComposeField::Cc, ComposeField::Bcc, ComposeField::Subject] {
+            let mut editor = Composer::new();
+            editor.switch_field(field);
+            *editor.field_mut() = "Jasmeet (Jazz) Bhatia".into();
+            editor.cursor = 4;
+            app.composer = Some(editor);
+            app.handle_composer_key(ctrl_w);
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "", "{field:?}");
+            app.handle_composer_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            app.handle_composer_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "Jasmeet (Jazz) Bhatia");
+        }
+        let mut editor = Composer::new();
+        editor.switch_field(ComposeField::Body);
+        editor.body = "first line\nsecond line\nthird".into();
+        editor.cursor = "first line\nsec".chars().count();
+        app.composer = Some(editor);
+        app.handle_composer_key(ctrl_w);
+        assert_eq!(app.composer.as_ref().unwrap().body, "first line\n\nthird");
+    }
+
+    #[test]
+    fn draft_parser_restores_headers_and_body_without_html() {
+        let original = crate::model::OutgoingMessage {
+            from: "Sender <sender@example.org>".into(),
+            to: "\"Jasmeet (Jazz) Bhatia\" <jazz@example.org>".into(),
+            cc: "Another <cc@example.org>".into(),
+            bcc: "Blind <bcc@example.org>".into(),
+            subject: "Continue later".into(),
+            body: "Hello draft 🌎".into(),
+            html_body: None,
+            attachments: vec![],
+            forwarded_raw: None,
+            custom_headers: vec![],
+            in_reply_to: None,
+            references: vec![],
+        };
+        let raw = crate::outgoing::build_draft(&original, &original.from).unwrap();
+        let draft = Composer::from_server_draft(crate::model::MessageId("uid:1".into()), raw).unwrap();
+        assert_eq!(draft.subject, "Continue later");
+        assert_eq!(draft.body.trim(), "Hello draft 🌎");
+        assert!(crate::outgoing::validate_recipients(&draft.to, &draft.cc, &draft.bcc).is_ok());
+        assert!(draft.draft_raw.is_none());
     }
 
     #[test]

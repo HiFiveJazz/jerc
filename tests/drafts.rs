@@ -1,4 +1,5 @@
-use jerc::app::Composer;
+use jerc::app::{Composer, DraftSource};
+use jerc::model::MessageId;
 use jerc::outgoing::drafts::{delete_draft, load_draft, save_draft};
 
 #[test]
@@ -42,4 +43,23 @@ fn postponement_is_isolated_by_account_and_replaces_old_version() {
             .subject,
         "second"
     );
+}
+
+#[test]
+fn postponed_draft_preserves_server_source_and_existing_attachments() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut draft = Composer::new();
+    draft.draft_source = Some(DraftSource {
+        mailbox: "Drafts".into(),
+        id: MessageId("draft:42".into()),
+    });
+    draft.draft_attachment_names = vec!["existing.patch".into()];
+    draft.draft_raw = Some(b"From: sender@example.org\r\n\r\nold draft".to_vec());
+    save_draft(temporary.path(), "work", &draft).unwrap();
+    let restored = load_draft(temporary.path(), "work").unwrap().unwrap();
+    let source = restored.draft_source.unwrap();
+    assert_eq!(source.mailbox, "Drafts");
+    assert_eq!(source.id.0, "draft:42");
+    assert_eq!(restored.draft_attachment_names, draft.draft_attachment_names);
+    assert_eq!(restored.draft_raw, draft.draft_raw);
 }

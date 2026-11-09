@@ -13,22 +13,29 @@
 
 ---
 
-Jerc is a batteries-included terminal mail app, acting as a successor to **[aerc](https://aerc-mail.org/)**! Features include contacts, and composition together in a responsive terminal interface. Navigate with Vim-style keys, manage multiple accounts, and read rich messages without leaving your terminal.
+Jerc is a light-weight terminal mail app, acting as a successor to **[aerc](https://aerc-mail.org/)**! Features include Vim motions, local contacts, attachment previewing, manage multiple accounts, rich message reading, and much more!
+
+![Jerc mail browser showing Vim-style navigation and multiple mail accounts](assets/images/example.png)
 
 ## Features
 
 | Feature| Highlights |
 | --- | --- |
 | **Mail** | IMAP and Maildir accounts, multiple mailboxes, background refresh, and cached message lists. |
-| **Keyboard-first** | Vim-style navigation, relative line numbers, smooth scrolling, searchable `?` help, and mouse support. |
-| **Fast triage** | Visual selection, persistent marks, bulk actions, archive, spam handling, and in-mailbox filtering. |
-| **Rich reading** | HTML and plain-text views, tables, links, attachments, Git patch highlighting, and optional inline images. |
-| **Compose naturally** | Modal editing, reply/reply-all/forward, recipient suggestions, attachment picker, drafts, and send preview. |
-| **Your setup** | Multiple accounts, built-in and custom themes, adjustable panels, and rounded or square borders. |
+| **Attachment Previews** | Preview attachments like PDFs, images, and more! |
+| **Keyboard-First** | Vim motions and relative line numbers, smooth scrolling, searchable `?` help, and mouse support. |
+| **Effecient Actions** | Visual selection, persistent marks, bulk actions, archive, spam handling, and in-mailbox filtering. |
+| **Rich Reading** | HTML and plain-text views, tables, links, attachments, Git patch highlighting, and optional inline images. |
+| **Natural Composing** | Modal editing, reply options, recipient auto-suggestions, attachment picker, drafts, and send preview. |
+| **Customization** | Multiple accounts, built-in and custom themes, adjustable panels, and rounded or square borders. |
+
+
 
 ### Privacy by default
 
 Jerc strives to be privacy first by limiting tracking requests. Jerc uses TLS for supported network transports, supports OAuth and credential commands, and keeps its native contacts database local (and soon encrypted). End-to-end email encryption are planned for future Jerc releases! 
+
+Outgoing messages omit the optional `User-Agent` header and use opaque, randomly generated `Message-ID` values. Standard UTF-8 MIME headers describe the message format without naming Jerc; plain-text messages remain plain text (no automatic HTML alternative). Providers may still add their own routing headers.
 
 See [configuration](docs/configuration.md) for the relevant controls.
 
@@ -86,6 +93,6 @@ The full reference lives in **[Keybindings](docs/keybindings.md)**. Press `?` in
 
 ## Project status
 
-Jerc is under active development. IMAP and Maildir reading, SMTP sending, drafts, and the UI are implemented; more advanced features such as full threading and IMAP IDLE are still planned. Expect changes before 1.0.
+Jerc is under active development. IMAP and Maildir reading, SMTP sending, drafts, and the UI are implemented and somewhat finalized. However, email is complex, and as such more advanced features such as full threading and IMAP IDLE are still planned. Expect breaking changes before 1.0.
 
 Released under the [MIT License](LICENSE).

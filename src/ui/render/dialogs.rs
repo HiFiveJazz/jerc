@@ -43,6 +43,44 @@ pub(super) fn draw_compose_exit_prompt(frame: &mut Frame<'_>, theme: &Theme) {
     );
 }
 
+/// The saved draft stays visible behind this small Yes/No prompt. Rejecting
+/// the prompt leaves the reader open; accepting opens the regular composer.
+pub(super) fn draw_draft_resume_confirmation(frame: &mut Frame<'_>, theme: &Theme) {
+    let viewport = frame.area();
+    let width = viewport.width.min(68);
+    let height = viewport.height.min(7);
+    let area = Rect::new(
+        viewport.x + viewport.width.saturating_sub(width) / 2,
+        viewport.y + viewport.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Continue saved draft? ")
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(theme.border());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 10 || inner.height < 3 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new("Continue composing this saved email?")
+            .alignment(Alignment::Center)
+            .style(theme.text()),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+    draw_confirmation_buttons(
+        frame,
+        theme,
+        Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2),
+        setup_button_style(theme),
+        destructive_button_style(theme),
+    );
+}
+
 pub(super) fn draw_remove_account_confirmation(frame: &mut Frame<'_>, app: &App) {
     let Some(name) = app.remove_account_confirmation.as_ref() else {
         return;
@@ -293,7 +331,7 @@ pub(super) fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
         y += 1;
     }
     let mut filenames = compose_attachment_names(composer);
-    filenames.extend(composer.preview_forwarded_attachments.iter().cloned());
+    filenames.extend(composer.preview_forwarded_attachments.iter().filter(|name| !composer.draft_attachment_names.contains(name)).cloned());
     let files = if filenames.is_empty() {
         "none".to_owned()
     } else {

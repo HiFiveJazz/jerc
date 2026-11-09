@@ -25,6 +25,7 @@ pub(super) fn compose_attachment_names(composer: &crate::app::Composer) -> Vec<S
                     .unwrap_or_else(|| path.to_owned())
             }),
     );
+    names.extend(composer.draft_attachment_names.iter().cloned());
     names
 }
 
@@ -538,8 +539,13 @@ pub(super) fn draw_compose_attachment_manager(frame: &mut Frame<'_>, app: &App) 
             .map(std::path::PathBuf::from),
     );
     if files.is_empty() {
+        let label = if composer.draft_attachment_names.is_empty() {
+            " No files attached".to_owned()
+        } else {
+            format!(" Saved draft attachment(s) retained: {}", composer.draft_attachment_names.join(", "))
+        };
         frame.render_widget(
-            Paragraph::new(" No files attached").style(theme.muted()),
+            Paragraph::new(label).style(theme.muted()),
             inner,
         );
         return;
@@ -882,7 +888,7 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(block, area);
 
     let selected_names = compose_attachment_names(composer);
-    let attachments_label = format!("  Attachments ({}):", composer.attachment_count());
+    let attachments_label = format!("  Attachments ({}):", composer.total_attachment_count());
     let summary = if selected_names.is_empty() {
         " none".to_owned()
     } else {
@@ -1111,27 +1117,6 @@ pub(super) fn editor_spans(
     spans
 }
 
-pub(super) fn is_quoted_line(text: &str) -> bool {
-    text.trim_start().starts_with('>')
-}
-
-pub(super) fn quoted_line_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut global = 0usize;
-    for line in text.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        let content_len = content.chars().count();
-        if is_quoted_line(content) {
-            ranges.push((global, global.saturating_add(content_len)));
-        }
-        global = global.saturating_add(line.chars().count());
-    }
-    if !text.is_empty() && !text.ends_with('\n') && ranges.is_empty() && is_quoted_line(text) {
-        ranges.push((0, text.chars().count()));
-    }
-    ranges
-}
-
 pub(super) fn editor_text(
     value: &str,
     composer: &crate::app::Composer,
@@ -1140,7 +1125,17 @@ pub(super) fn editor_text(
 ) -> Text<'static> {
     let selection = active.then(|| composer.visual_range()).flatten();
     let cursor = composer.cursor.min(value.chars().count());
-    let quote_ranges = quoted_line_ranges(value);
+    // Quote classification is computed once per logical line; composer text
+    // remains editable, including nested mailing-list reply history.
+    let quote_lines = value
+        .split('\n')
+        .map(|line| {
+            let (depth, prefix_bytes) = quote_prefix(line);
+            (depth, prefix_bytes, is_reply_attribution(line))
+        })
+        .collect::<Vec<_>>();
+    let mut logical_line = 0usize;
+    let mut column = 0usize;
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut global = 0usize;
@@ -1156,25 +1151,33 @@ pub(super) fn editor_text(
             }
             lines.push(Line::from(std::mem::take(&mut spans)));
             global += 1;
+            logical_line += 1;
+            column = 0;
             continue;
         }
         let selected = selection.is_some_and(|(start, end)| (start..end).contains(&global));
-        let quoted = quote_ranges
-            .iter()
-            .any(|&(start, end)| global >= start && global < end);
+        let (depth, quote_marker_len, attribution) = quote_lines
+            .get(logical_line)
+            .copied()
+            .unwrap_or((0, 0, false));
         spans.push(Span::styled(
             ch.to_string(),
             if at_cursor && composer.mode != ComposeMode::Insert {
                 block
             } else if selected {
                 theme.selected()
-            } else if quoted {
-                Style::default().fg(theme.muted)
+            } else if depth > 0 && column < quote_marker_len {
+                quoted_prefix_style(theme)
+            } else if attribution {
+                attribution_style(theme)
+            } else if depth > 0 {
+                quoted_body_style(depth, theme)
             } else {
                 theme.text()
             },
         ));
         global += 1;
+        column += 1;
     }
     if active && global == cursor && composer.mode != ComposeMode::Insert {
         spans.push(Span::styled(" ", block));

@@ -39,6 +39,7 @@ mod dialogs;
 mod help;
 mod mail_list;
 mod reader;
+mod quote;
 mod setup;
 mod status;
 
@@ -50,6 +51,7 @@ use self::dialogs::*;
 use self::help::*;
 use self::mail_list::*;
 use self::reader::*;
+use self::quote::*;
 use self::setup::*;
 use self::status::*;
 
@@ -139,6 +141,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.detach_confirmation.is_some() {
         draw_detach_confirmation(frame, app);
+    }
+    if app.draft_resume_prompt_open() {
+        draw_draft_resume_confirmation(frame, app.theme());
     }
 }
 
@@ -664,6 +669,39 @@ mod tests {
             added.spans.last().and_then(|s| s.style.bg),
             theme.current_line().bg
         );
+    }
+
+    #[test]
+    fn mailing_list_quotations_are_distinct_from_the_authors_reply() {
+        let theme = load_themes().into_iter().next().expect("theme");
+        let view = ReaderView {
+            cursor: 0,
+            column: 0,
+            visual: None,
+            active: false,
+            theme: &theme,
+        };
+        let own = super::plain_reader_line("My response", 0, 4, 30, view, None, None);
+        let first = super::plain_reader_line("> Original", 1, 4, 30, view, None, None);
+        let nested = super::plain_reader_line("> > Earlier", 2, 4, 30, view, None, None);
+        let intro = super::plain_reader_line(
+            "On Monday, Phillip wrote:", 3, 4, 30, view, None, None,
+        );
+        assert_eq!(own.spans[0].style.fg, Some(theme.foreground));
+        assert_eq!(first.spans[0].style.fg, Some(theme.accent));
+        assert_eq!(first.spans[1].style.fg, Some(theme.muted));
+        assert_eq!(nested.spans[1].style.fg, Some(theme.accent));
+        assert_eq!(intro.spans[0].style.fg, Some(theme.accent));
+        let patch = super::plain_reader_line(
+            "> + added",
+            3,
+            4,
+            30,
+            view,
+            Some(super::PatchLineKind::Add),
+            None,
+        );
+        assert_eq!(patch.spans[0].style.fg, Some(theme.unread));
     }
 
     #[test]

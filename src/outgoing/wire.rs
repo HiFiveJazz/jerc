@@ -1,8 +1,6 @@
 //! Typed outgoing MIME construction and reply address policy. This module does
 //! no network I/O, so its wire-format tests can run without a mail account.
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use lettre::Message;
@@ -11,11 +9,11 @@ use lettre::message::{
     header::{ContentType, HeaderName, HeaderValue},
 };
 use mail_parser::MessageParser;
+use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::model::OutgoingMessage;
 
 pub const FORWARD_SEPARATOR: &str = "---------- Forwarded message ---------";
-static NEXT_OUTGOING_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Restrict interactive outgoing recipients to fully qualified public mail domains.
 /// A syntactically valid but misspelled local part cannot be detected without
@@ -72,16 +70,14 @@ fn sender_message_id_domain(from: &Mailbox) -> String {
     )
 }
 
-fn new_outgoing_message_id(domain: &str) -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let sequence = NEXT_OUTGOING_ID.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "<jerc-{timestamp:x}-{:x}-{sequence:x}@{domain}>",
-        std::process::id()
-    )
+fn new_outgoing_message_id(domain: &str) -> Result<String> {
+    // Opaque 128-bit CSPRNG token: no client name, timestamp, PID, or host name.
+    // Refuse to send rather than silently falling back to a predictable ID.
+    let mut random = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| anyhow!("secure randomness is unavailable for Message-ID"))?;
+    Ok(format!("<{:032x}@{domain}>", u128::from_be_bytes(random)))
 }
 
 /// Inline forward: preserve MIME alternatives and the
@@ -353,12 +349,11 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
     };
     let from: Mailbox = from_value.parse().context("invalid From mailbox")?;
     validate_recipients(&message.to, &message.cc, &message.bcc)?;
-    let message_id = new_outgoing_message_id(&sender_message_id_domain(&from));
+    let message_id = new_outgoing_message_id(&sender_message_id_domain(&from))?;
     let mut builder = Message::builder()
         .from(from)
         .message_id(Some(message_id))
-        .subject(message.subject.clone())
-        .user_agent(format!("jerc/{}", env!("CARGO_PKG_VERSION")));
+        .subject(message.subject.clone());
     let mut recipients = 0usize;
     for (value, kind) in [(&message.to, 0), (&message.cc, 1), (&message.bcc, 2)] {
         if value.trim().is_empty() {
@@ -431,8 +426,11 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
         && message.html_body.is_none()
         && message.forwarded_raw.is_none()
     {
+        // A single MIME text part declares UTF-8 and MIME-Version: 1.0.
+        // A bare .body() only sets Content-Transfer-Encoding and leaves the
+        // charset unspecified (US-ASCII by default). No HTML is generated.
         return builder
-            .body(message.body.clone())
+            .singlepart(SinglePart::plain(message.body.clone()))
             .context("building plain outgoing message");
     }
     let mut body = if let Some(html) = message.html_body.as_ref() {

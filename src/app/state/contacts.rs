@@ -205,61 +205,151 @@ impl App {
             }
             return true;
         }
-        if key.code == KeyCode::Esc && modal.edit.is_some() {
-            modal.edit = None;
+        if modal.edit.is_some()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('s')
+        {
+            self.save_contact_editor(modal);
             return true;
         }
         if let Some(editor) = modal.edit.as_mut() {
-            let save = match key.code {
-                KeyCode::Tab | KeyCode::BackTab => {
-                    editor.toggle();
-                    false
+            use crate::app::ComposeMode;
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('w') => editor.clear_line(),
+                    KeyCode::Char('r') => editor.redo(),
+                    _ => {}
                 }
-                KeyCode::Left => {
-                    editor.cursor = editor.cursor.saturating_sub(1);
-                    false
+                return true;
+            }
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                editor.toggle();
+                return true;
+            }
+            if key.code == KeyCode::Esc {
+                if editor.mode != ComposeMode::Normal {
+                    editor.mode = ComposeMode::Normal;
+                    editor.visual_anchor = None;
+                } else {
+                    modal.edit = None;
                 }
-                KeyCode::Right => {
-                    editor.cursor = (editor.cursor + 1).min(editor.value().chars().count());
-                    false
+                return true;
+            }
+            if key.code == KeyCode::Enter {
+                if editor.active_email { self.save_contact_editor(modal); }
+                else { editor.toggle(); }
+                return true;
+            }
+            if editor.mode == ComposeMode::Insert {
+                match key.code {
+                    KeyCode::Left => editor.cursor = editor.cursor.saturating_sub(1),
+                    KeyCode::Right => editor.cursor = (editor.cursor + 1).min(editor.value().chars().count()),
+                    KeyCode::Home => editor.cursor = 0,
+                    KeyCode::End => editor.cursor = editor.value().chars().count(),
+                    KeyCode::Backspace => editor.backspace(),
+                    KeyCode::Delete => editor.delete_range(editor.cursor, editor.cursor + 1),
+                    KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => editor.insert(ch),
+                    _ => {}
                 }
-                KeyCode::Home => {
-                    editor.cursor = 0;
-                    false
+                return true;
+            }
+            if editor.pending_yank {
+                editor.pending_yank = false;
+                if key.code == KeyCode::Char('y') {
+                    self.yank_register = Some(YankRegister { text: editor.value().to_owned(), linewise: false });
                 }
-                KeyCode::End => {
-                    editor.cursor = editor.value().chars().count();
-                    false
+                return true;
+            }
+            if editor.pending_delete {
+                editor.pending_delete = false;
+                if key.code == KeyCode::Char('d') {
+                    editor.delete_range(0, editor.value().chars().count());
                 }
-                KeyCode::Backspace => {
-                    editor.backspace();
-                    false
-                }
-                KeyCode::Delete => {
-                    if editor.cursor < editor.value().chars().count() {
-                        editor.cursor += 1;
-                        editor.backspace();
+                return true;
+            }
+            if editor.mode == ComposeMode::Visual {
+                match key.code {
+                    KeyCode::Char('y') => {
+                        if let Some(text) = editor.selected_text() {
+                            self.yank_register = Some(YankRegister { text, linewise: false });
+                        }
+                        editor.mode = ComposeMode::Normal;
+                        editor.visual_anchor = None;
                     }
-                    false
+                    KeyCode::Char('d' | 'x') => {
+                        if let Some((start, end)) = editor.selected_range() {
+                            editor.delete_range(start, end);
+                        }
+                        editor.mode = ComposeMode::Normal;
+                        editor.visual_anchor = None;
+                    }
+                    KeyCode::Char('p' | 'P') => {
+                        if let Some(register) = self.yank_register.as_ref() {
+                            if let Some((start, end)) = editor.selected_range() {
+                                let text = register.text.replace(['\n', '\r'], " ");
+                                editor.delete_range(start, end);
+                                editor.insert_text(&text);
+                            }
+                        }
+                        editor.mode = ComposeMode::Normal;
+                        editor.visual_anchor = None;
+                    }
+                    _ => {}
                 }
-                KeyCode::Enter if !editor.active_email => {
-                    editor.toggle();
-                    false
+                if matches!(key.code, KeyCode::Char('y' | 'd' | 'x' | 'p' | 'P')) { return true; }
+            }
+            match key.code {
+                KeyCode::Char('h') | KeyCode::Left => editor.cursor = editor.cursor.saturating_sub(1),
+                KeyCode::Char('l') | KeyCode::Right => editor.cursor = (editor.cursor + 1).min(editor.value().chars().count()),
+                KeyCode::Char('w' | 'e') => editor.move_word(true),
+                KeyCode::Char('b') => editor.move_word(false),
+                KeyCode::Char('0') | KeyCode::Home => editor.cursor = 0,
+                KeyCode::Char('$') | KeyCode::End => editor.cursor = editor.value().chars().count(),
+                KeyCode::Char('i') if editor.mode == ComposeMode::Normal => editor.mode = ComposeMode::Insert,
+                KeyCode::Char('a') if editor.mode == ComposeMode::Normal => {
+                    editor.cursor = (editor.cursor + 1).min(editor.value().chars().count());
+                    editor.mode = ComposeMode::Insert;
                 }
-                KeyCode::Enter => true,
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
-                KeyCode::Char(ch)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-                {
-                    editor.insert(ch);
-                    false
+                KeyCode::Char('I') if editor.mode == ComposeMode::Normal => {
+                    editor.cursor = 0;
+                    editor.mode = ComposeMode::Insert;
                 }
-                _ => false,
-            };
-            if save {
-                self.save_contact_editor(modal);
+                KeyCode::Char('A') if editor.mode == ComposeMode::Normal => {
+                    editor.cursor = editor.value().chars().count();
+                    editor.mode = ComposeMode::Insert;
+                }
+                KeyCode::Char('v' | 'V') if editor.mode == ComposeMode::Normal => {
+                    let last = editor.value().chars().count();
+                    if key.code == KeyCode::Char('V') {
+                        editor.visual_anchor = Some(0);
+                        editor.cursor = last.saturating_sub(1);
+                    } else {
+                        let anchor = editor.cursor.min(last.saturating_sub(1));
+                        editor.visual_anchor = Some(anchor);
+                        editor.cursor = anchor;
+                    }
+                    editor.mode = ComposeMode::Visual;
+                }
+                KeyCode::Char('u') if editor.mode == ComposeMode::Normal => editor.undo(),
+                KeyCode::Char('x') if editor.mode == ComposeMode::Normal => editor.delete_range(editor.cursor, editor.cursor + 1),
+                KeyCode::Char('D') if editor.mode == ComposeMode::Normal => {
+                    editor.delete_range(editor.cursor, editor.value().chars().count());
+                }
+                KeyCode::Char('d') if editor.mode == ComposeMode::Normal => editor.pending_delete = true,
+                KeyCode::Char('y') if editor.mode == ComposeMode::Normal => editor.pending_yank = true,
+                KeyCode::Char('Y') if editor.mode == ComposeMode::Normal => {
+                    self.yank_register = Some(YankRegister { text: editor.value().to_owned(), linewise: false });
+                }
+                KeyCode::Char('p' | 'P') if editor.mode == ComposeMode::Normal => {
+                    if let Some(register) = self.yank_register.as_ref() {
+                        let text = register.text.replace(['\n', '\r'], " ");
+                        if key.code == KeyCode::Char('p') {
+                            editor.cursor = (editor.cursor + 1).min(editor.value().chars().count());
+                        }
+                        editor.insert_text(&text);
+                    }
+                }
+                _ => {}
             }
             return true;
         }
@@ -325,6 +415,11 @@ impl App {
             }
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => modal.searching = false,
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    modal.query.clear();
+                    modal.selected = 0;
+                    modal.scroll = 0;
+                }
                 KeyCode::Backspace => {
                     modal.query.pop();
                     modal.selected = 0;

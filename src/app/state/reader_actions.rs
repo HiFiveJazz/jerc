@@ -640,12 +640,17 @@ impl App {
                     Self::mark_cached_selected_seen(account);
                 }
                 self.focus = Focus::Preview;
+                // A Drafts item opens in the ordinary reader as a preview.
+                // Fetch exact MIME in parallel, then offer [Y]es/[N]o once
+                // it is available; selecting No leaves the preview untouched.
+                self.prepare_draft_resume();
             }
             Focus::Preview => {}
         }
     }
 
     pub(super) fn close_message(&mut self) {
+        self.pending_draft = None;
         self.reader_cursor = 0;
         self.reader_column = 0;
         self.reader_preferred_column = None;
@@ -731,13 +736,20 @@ impl App {
             return;
         }
 
+        // Always retain a private in-process register, even without wl-copy,
+        // xclip, or another clipboard helper. This can be pasted into Compose.
+        self.yank_register = Some(YankRegister {
+            text: selected.clone(),
+            linewise: self.reader_visual_linewise,
+        });
+        self.reader_visual_anchor = None;
+        self.reader_visual_linewise = false;
         self.status = match copy_text_to_clipboard(&selected) {
-            Ok(()) => {
-                self.reader_visual_anchor = None;
-                self.reader_visual_linewise = false;
-                StatusLine::temporary("copied reader selection", Duration::from_secs(2))
-            }
-            Err(error) => StatusLine::error(format!("could not copy selection: {error}")),
+            Ok(()) => StatusLine::temporary("copied reader selection", Duration::from_secs(2)),
+            Err(_) => StatusLine::temporary(
+                "copied to internal register (system clipboard unavailable)",
+                Duration::from_secs(3),
+            ),
         };
     }
 }

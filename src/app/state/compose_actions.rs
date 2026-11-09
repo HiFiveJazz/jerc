@@ -3,6 +3,40 @@
 use super::*;
 
 impl App {
+    pub(super) fn prepare_draft_resume(&mut self) {
+        let Some(account) = self.account() else { return; };
+        if !account.outgoing_configured { return; }
+        let Some(mailbox) = account.selected_mailbox()
+            .filter(|folder| folder.role == MailboxRole::Drafts)
+            .map(|folder| folder.name.clone()) else { return; };
+        let Some(message_id) = account.selected_message().map(|m| m.id.clone()) else { return; };
+        let account_index = self.account_index;
+        let queued = account.worker.post(ActionKind::FetchRawForCompose {
+            mailbox: mailbox.clone(), id: message_id.clone(),
+        }).is_ok();
+        if queued {
+            self.pending_draft = Some(PendingDraft {
+                account: account_index, mailbox, message_id, composer: None,
+            });
+            self.status = StatusLine::info("loading draft for preview…");
+        } else {
+            self.status = StatusLine::error("could not load draft: worker busy");
+        }
+    }
+
+    pub(super) fn resume_server_draft(&mut self) {
+        let Some(mut pending) = self.pending_draft.take() else { return; };
+        let Some(mut composer) = pending.composer.take() else { return; };
+        if self.account_index != pending.account { return; }
+        composer.draft_source = Some(DraftSource {
+            mailbox: pending.mailbox, id: pending.message_id,
+        });
+        self.close_message();
+        self.composer = Some(composer);
+        self.resumed_draft_account = None;
+        self.status = StatusLine::info("editing saved draft; original preserved until replacement succeeds");
+    }
+
     pub(super) fn begin_compose(&mut self) {
         let Some(account) = self.account() else {
             return;
@@ -14,6 +48,7 @@ impl App {
             return;
         }
         self.composer = Some(Composer::new());
+        self.pending_draft = None;
         self.resumed_draft_account = None;
     }
 
@@ -130,6 +165,13 @@ impl App {
                     KeyCode::Esc => {
                         composer.dismissed_contact_query =
                             Some(recipient_query(composer.field_value(), composer.cursor));
+                        // One Escape should dismiss completion AND leave Insert
+                        // mode, so the next y/yy/p key is a Vim operation,
+                        // not literal text typed into an address field.
+                        composer.mode = ComposeMode::Normal;
+                        composer.visual_anchor = None;
+                        composer.visual_linewise = false;
+                        composer.clear_pending();
                         return;
                     }
                     _ => {
@@ -450,6 +492,9 @@ impl App {
                 KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     composer.toggle_advanced_headers()
                 }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    composer.clear_current_line();
+                }
                 KeyCode::Backspace => composer.backspace(),
                 KeyCode::Delete => composer.delete_at_cursor(),
                 KeyCode::Left => composer.move_horizontal(-1),
@@ -498,6 +543,9 @@ impl App {
         let composer = self.composer.as_mut().expect("composer exists");
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                // Ctrl-W clears the current logical body line or the entire
+                // single-line header field, consistently in every Compose mode.
+                KeyCode::Char('w') => composer.clear_current_line(),
                 KeyCode::Char('r') => composer.undo_edit(true),
                 KeyCode::Char('j') if composer.field == ComposeField::Body => {
                     composer.queue_body_smooth_scroll(SMOOTH_SCROLL_ROWS);
@@ -583,6 +631,19 @@ impl App {
                 return;
             }
         }
+        if composer.pending_yank {
+            composer.pending_yank = false;
+            let count = composer.count.take().unwrap_or(1);
+            let copied = match key.code {
+                KeyCode::Char('y') => Some(composer.yank_lines(count)),
+                KeyCode::Char('$') => Some(composer.yank_to_line_end()),
+                _ => None,
+            };
+            if let Some(register) = copied {
+                self.yank_register = Some(register);
+            }
+            return;
+        }
         if composer.pending_delete {
             composer.pending_delete = false;
             let count = composer.count.take().unwrap_or(1);
@@ -665,7 +726,18 @@ impl App {
                     composer.mode = ComposeMode::Insert;
                 }
                 KeyCode::Char('v') => {
-                    composer.visual_anchor = Some(composer.cursor.min(composer.char_count()));
+                    // Switching header fields places the caret after the last
+                    // character. Vim Visual mode must still select that last
+                    // character rather than starting with an empty range.
+                    let anchor = if composer.field != ComposeField::Body
+                        && composer.char_count() > 0
+                    {
+                        composer.cursor.min(composer.char_count() - 1)
+                    } else {
+                        composer.cursor.min(composer.char_count())
+                    };
+                    composer.cursor = anchor;
+                    composer.visual_anchor = Some(anchor);
                     composer.visual_linewise = false;
                     composer.mode = ComposeMode::Visual;
                 }
@@ -675,6 +747,16 @@ impl App {
                     composer.mode = ComposeMode::Visual;
                 }
                 KeyCode::Char('u') => composer.undo_edit(false),
+                KeyCode::Char('y') => {
+                    composer.pending_yank = true;
+                    composer.count = Some(count);
+                }
+                KeyCode::Char('Y') => self.yank_register = Some(composer.yank_lines(count)),
+                KeyCode::Char('p' | 'P') => {
+                    if let Some(register) = &self.yank_register {
+                        composer.paste_register(register, key.code == KeyCode::Char('p'), count);
+                    }
+                }
                 KeyCode::Char('x') | KeyCode::Delete => {
                     for _ in 0..count {
                         composer.delete_at_cursor();
@@ -706,6 +788,19 @@ impl App {
                 }
                 KeyCode::Char('V') => composer.visual_linewise = !composer.visual_linewise,
                 KeyCode::Char('i') => composer.pending_inner = true,
+                KeyCode::Char('y') => {
+                    if let Some(register) = composer.yank_visual() {
+                        self.yank_register = Some(register);
+                    }
+                    composer.visual_anchor = None;
+                    composer.visual_linewise = false;
+                    composer.mode = ComposeMode::Normal;
+                }
+                KeyCode::Char('p' | 'P') => {
+                    if let Some(register) = &self.yank_register {
+                        composer.paste_over_visual(register);
+                    }
+                }
                 KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
                     if let Some((start, end)) = composer.visual_range() {
                         composer.delete_range(start, end);
@@ -823,6 +918,11 @@ impl App {
             }
         } else {
             false
+        };
+        self.pending_draft_replacement = if draft_queued {
+            composer.draft_source.clone().map(|source| (self.account_index, source))
+        } else {
+            None
         };
         self.composer = None;
         self.resumed_draft_account = None;

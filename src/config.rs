@@ -622,18 +622,42 @@ fn build_mail_uri(scheme: &str, username: &str, host: &str, port: u16) -> Result
     Ok(url.to_string())
 }
 
-/// Persist the theme directly into the user's TOML config, preserving account
-/// secrets, unrelated comments and other settings. A temporary
-/// file in the same directory prevents truncating config on an interrupted write.
+/// Which divider width to save. These are the only supported writable
+/// percentage keys, preventing untrusted input from becoming a TOML key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelWidth {
+    Mailbox,
+    Preview,
+}
+
+/// Persist a resized panel in the same config used for theme selection.
+/// Existing account settings and comments outside the edited line survive.
+pub fn save_ui_panel_width(path: &Path, panel: PanelWidth, width: u16) -> Result<()> {
+    let (key, value) = match panel {
+        PanelWidth::Mailbox => ("mailbox_width_percent", width.clamp(12, 50)),
+        PanelWidth::Preview => ("preview_width_percent", width.clamp(25, 75)),
+    };
+    save_ui_setting(path, key, &value.to_string())
+}
+
+/// Persist the theme into the user's TOML config instead of a sidecar state
+/// file, preserving unrelated settings, account credentials and comments.
 pub fn save_ui_theme(path: &Path, theme: &str) -> Result<()> {
+    let quoted = toml::Value::String(theme.to_owned()).to_string();
+    save_ui_setting(path, "theme", &quoted)
+}
+
+/// Shared atomic writer for trusted [ui] settings. Prevent partial writes and
+/// validate TOML before replacing a user's working configuration.
+fn save_ui_setting(path: &Path, key: &str, value: &str) -> Result<()> {
     use std::io::Write;
 
     let file_path =
         fs::canonicalize(path).with_context(|| format!("resolving config {}", path.display()))?;
     let original = fs::read_to_string(&file_path)
         .with_context(|| format!("reading config {}", file_path.display()))?;
-    let quoted = toml::Value::String(theme.to_owned()).to_string();
-    let mut updated = String::with_capacity(original.len() + 48);
+    let setting_line = format!("{key} = {value}\n");
+    let mut updated = String::with_capacity(original.len() + setting_line.len() + 48);
     let mut in_ui = false;
     let mut found_ui = false;
     let mut replaced = false;
@@ -641,7 +665,7 @@ pub fn save_ui_theme(path: &Path, theme: &str) -> Result<()> {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             if in_ui && !replaced {
-                updated.push_str(&format!("theme = {quoted}\n"));
+                updated.push_str(&setting_line);
                 replaced = true;
             }
             in_ui = trimmed.split('#').next().unwrap_or("").trim() == "[ui]";
@@ -651,9 +675,9 @@ pub fn save_ui_theme(path: &Path, theme: &str) -> Result<()> {
             && !trimmed.starts_with('#')
             && line
                 .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "theme")
+                .is_some_and(|(existing, _)| existing.trim() == key)
         {
-            updated.push_str(&format!("theme = {quoted}\n"));
+            updated.push_str(&setting_line);
             replaced = true;
         } else {
             updated.push_str(line);
@@ -661,12 +685,12 @@ pub fn save_ui_theme(path: &Path, theme: &str) -> Result<()> {
         }
     }
     if in_ui && !replaced {
-        updated.push_str(&format!("theme = {quoted}\n"));
+        updated.push_str(&setting_line);
     } else if !found_ui {
-        updated.push_str(&format!("\n[ui]\ntheme = {quoted}\n"));
+        updated.push_str("\n[ui]\n");
+        updated.push_str(&setting_line);
     }
-    // Never write a malformed TOML file back over working account settings.
-    toml::from_str::<Config>(&updated).context("validating updated theme config")?;
+    toml::from_str::<Config>(&updated).context("validating updated UI config")?;
     let parent = file_path
         .parent()
         .ok_or_else(|| anyhow!("config path has no directory"))?;
@@ -1131,6 +1155,39 @@ mod tests {
             .map(|a| (a.source.clone(), a.outgoing.clone()))
             .collect::<Vec<_>>();
         assert_eq!(original, updated);
+    }
+
+    #[test]
+    fn panel_widths_are_saved_in_config_without_sidecars_or_losing_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.toml");
+        let source = "# preserved\n[[accounts]]\nname = \"Personal\"\nsource = \"imaps://user:secret@example.org\"\n[ui]\nmailbox_width_percent = 22 # old width\npreview_width_percent = 57\nremote_images = false\n";
+        std::fs::write(&path, source).unwrap();
+        super::save_ui_panel_width(&path, super::PanelWidth::Mailbox, 31).unwrap();
+        super::save_ui_panel_width(&path, super::PanelWidth::Preview, 64).unwrap();
+        let result = super::Config::load(Some(&path)).unwrap();
+        assert_eq!(result.ui.mailbox_width_percent, 31);
+        assert_eq!(result.ui.preview_width_percent, 64);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# preserved"));
+        assert!(saved.contains("user:secret@example.org"));
+        assert!(saved.contains("remote_images = false"));
+        assert_eq!(saved.matches("mailbox_width_percent =").count(), 1);
+        assert_eq!(saved.matches("preview_width_percent =").count(), 1);
+        assert!(!dir.path().join("mailbox-width").exists());
+        assert!(!dir.path().join("preview-width").exists());
+    }
+
+    #[test]
+    fn panel_widths_create_ui_section_and_clamp_out_of_range_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\"\n").unwrap();
+        super::save_ui_panel_width(&path, super::PanelWidth::Mailbox, 99).unwrap();
+        super::save_ui_panel_width(&path, super::PanelWidth::Preview, 1).unwrap();
+        let config = super::Config::load(Some(&path)).unwrap();
+        assert_eq!(config.ui.mailbox_width_percent, 50);
+        assert_eq!(config.ui.preview_width_percent, 25);
     }
 
     #[test]

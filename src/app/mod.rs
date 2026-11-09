@@ -7,6 +7,6 @@ pub use input::{
 };
 pub use state::{
     AccountState, App, ComposeField, ComposeFileEntry, ComposeFilePicker, ComposeFilePreview,
-    ComposeMode, Composer, NewMailNotice, ReaderPosition, ReaderSelection, ReviewScroll,
+    ComposeMode, Composer, DraftSource, NewMailNotice, ReaderPosition, ReaderSelection, ReviewScroll,
     StatusLine,
 };

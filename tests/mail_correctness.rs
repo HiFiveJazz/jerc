@@ -44,6 +44,46 @@ fn outgoing_message_has_unique_id_and_utf8_headers() {
 }
 
 #[test]
+fn plain_mail_has_minimal_utf8_mime_without_html_or_client_branding() {
+    let (_, raw) = wire(&draft());
+    let headers = String::from_utf8_lossy(&raw);
+    let headers = headers.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+    assert!(headers.contains("mime-version: 1.0"));
+    assert!(headers.contains("content-type: text/plain; charset=utf-8"));
+    assert_eq!(headers.matches("mime-version:").count(), 1);
+    assert_eq!(headers.matches("content-type:").count(), 1);
+    assert!(headers.contains("content-transfer-encoding:"));
+    assert!(!headers.contains("multipart/alternative"));
+    assert!(!headers.contains("text/html"));
+    assert!(!headers.contains("user-agent:"));
+    assert!(!headers.contains("x-mailer:"));
+    let parsed = MessageParser::new().parse(&raw).expect("valid MIME mail");
+    assert_eq!(parsed.text_body().count(), 1);
+    // mail-parser exposes a plain-text fallback through html_body() when an
+    // actual HTML alternative is absent. Check the underlying part kind, not
+    // the fallback iterator's length.
+    assert!(parsed
+        .html_body()
+        .all(|part| !matches!(part.kind(), mail_parser::PartKind::Html)));
+    assert!(parsed.text_body().any(|part| part
+        .text()
+        .is_some_and(|text| text.contains("héllo"))));
+}
+
+#[test]
+fn reply_with_ascii_body_is_still_plain_utf8_mime() {
+    let mut message = draft();
+    message.subject = "Re: [PATCH] small fix".into();
+    message.body = "On Mon, somebody wrote:\n> Test\n\nLooks good.\n".into();
+    message.in_reply_to = Some("original@example.org".into());
+    let (_, raw) = wire(&message);
+    let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+    assert!(text.contains("content-type: text/plain; charset=utf-8"));
+    assert!(text.contains("in-reply-to: <original@example.org>"));
+    assert!(!text.contains("text/html"));
+}
+
+#[test]
 fn bcc_envelope_contains_secret_recipient_but_header_does_not() {
     let mut draft = draft();
     draft.bcc = "Secret <secret@example.net>".into();
