@@ -51,14 +51,7 @@ pub(super) fn draw_help_palette(
 ) {
     let (selected, scroll) = navigation;
     let area = centered_rect(frame.area(), 86, 70);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.accent());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = popup_inner(frame, theme, area, title, theme.accent());
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
@@ -147,14 +140,7 @@ pub(super) fn draw_help_palette(
 pub(super) fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme().clone();
     let area = centered_rect(frame.area(), 52, 46);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Themes ")
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.accent());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = popup_inner(frame, &theme, area, " Themes ", theme.accent());
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

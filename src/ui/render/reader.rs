@@ -1030,16 +1030,16 @@ pub(super) fn reader_word_at(text: &str, line_index: usize, column: usize) -> Op
     let line = text.lines().nth(line_index)?;
     let chars = line.chars().collect::<Vec<_>>();
     let current = *chars.get(column)?;
-    if !is_reader_word_char(current) {
+    if !crate::app::vim::is_word_char(current) {
         return None;
     }
 
     let mut start = column;
-    while start > 0 && is_reader_word_char(chars[start - 1]) {
+    while start > 0 && crate::app::vim::is_word_char(chars[start - 1]) {
         start -= 1;
     }
     let mut end = column + 1;
-    while end < chars.len() && is_reader_word_char(chars[end]) {
+    while end < chars.len() && crate::app::vim::is_word_char(chars[end]) {
         end += 1;
     }
     Some(chars[start..end].iter().collect())
@@ -1056,18 +1056,14 @@ pub(super) fn word_match_ranges(text: &str, word: &str) -> Vec<(usize, usize)> {
     for start in 0..=chars.len() - needle.len() {
         let end = start + needle.len();
         if chars[start..end] != needle[..]
-            || start > 0 && is_reader_word_char(chars[start - 1])
-            || end < chars.len() && is_reader_word_char(chars[end])
+            || start > 0 && crate::app::vim::is_word_char(chars[start - 1])
+            || end < chars.len() && crate::app::vim::is_word_char(chars[end])
         {
             continue;
         }
         matches.push((start, end));
     }
     matches
-}
-
-pub(super) fn is_reader_word_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
 }
 
 pub(super) fn reader_illuminate_bg(theme: &Theme) -> Color {

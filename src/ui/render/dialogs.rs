@@ -2,12 +2,13 @@
 
 use super::*;
 
-/// The exit prompt uses the same two-button layout as deletion reviews. Yes
-/// saves the draft; No discards it. Esc still returns to editing, without an
-/// extra on-screen instruction competing with the actions.
-pub(super) fn draw_compose_exit_prompt(frame: &mut Frame<'_>, theme: &Theme) {
+/// Shared compact two-button confirmation. The caller owns the action and
+/// this renderer only draws the same themed layout in each context.
+fn draw_short_confirmation(
+    frame: &mut Frame<'_>, theme: &Theme, width: u16, title: &str, message: &str,
+) {
     let viewport = frame.area();
-    let width = viewport.width.min(62);
+    let width = viewport.width.min(width);
     let height = viewport.height.min(7);
     let area = Rect::new(
         viewport.x + viewport.width.saturating_sub(width) / 2,
@@ -15,69 +16,36 @@ pub(super) fn draw_compose_exit_prompt(frame: &mut Frame<'_>, theme: &Theme) {
         width,
         height,
     );
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Save unsent email? ")
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.border());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = popup_inner(frame, theme, area, title, theme.border());
     if inner.width < 10 || inner.height < 3 {
         return;
     }
-    let prompt = "Save this email to Drafts before closing?";
     frame.render_widget(
-        Paragraph::new(truncate_display_width(prompt, usize::from(inner.width)))
+        Paragraph::new(truncate_display_width(message, usize::from(inner.width)))
             .alignment(Alignment::Center)
             .style(theme.text()),
         Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
     );
-    let buttons = Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2);
     draw_confirmation_buttons(
-        frame,
-        theme,
-        buttons,
-        setup_button_style(theme),
-        destructive_button_style(theme),
+        frame, theme,
+        Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2),
+        setup_button_style(theme), destructive_button_style(theme),
     );
 }
 
-/// The saved draft stays visible behind this small Yes/No prompt. Rejecting
-/// the prompt leaves the reader open; accepting opens the regular composer.
+/// Yes saves the draft; No discards it. Esc returns to editing.
+pub(super) fn draw_compose_exit_prompt(frame: &mut Frame<'_>, theme: &Theme) {
+    draw_short_confirmation(
+        frame, theme, 62, " Save unsent email? ",
+        "Save this email to Drafts before closing?",
+    );
+}
+
+/// The saved draft stays visible behind the confirmation popup.
 pub(super) fn draw_draft_resume_confirmation(frame: &mut Frame<'_>, theme: &Theme) {
-    let viewport = frame.area();
-    let width = viewport.width.min(68);
-    let height = viewport.height.min(7);
-    let area = Rect::new(
-        viewport.x + viewport.width.saturating_sub(width) / 2,
-        viewport.y + viewport.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Continue saved draft? ")
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.border());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width < 10 || inner.height < 3 {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new("Continue composing this saved email?")
-            .alignment(Alignment::Center)
-            .style(theme.text()),
-        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
-    );
-    draw_confirmation_buttons(
-        frame,
-        theme,
-        Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2),
-        setup_button_style(theme),
-        destructive_button_style(theme),
+    draw_short_confirmation(
+        frame, theme, 68, " Continue saved draft? ",
+        "Continue composing this saved email?",
     );
 }
 
@@ -87,14 +55,7 @@ pub(super) fn draw_remove_account_confirmation(frame: &mut Frame<'_>, app: &App)
     };
     let theme = app.theme();
     let area = centered_rect(frame.area(), 72, 27);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Remove local email account ")
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.error());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = popup_inner(frame, theme, area, " Remove local email account ", theme.error());
     frame.render_widget(Paragraph::new(format!(
         "Remove account {:?} from jerc?\n\nThis edits only config.toml. \
          No messages or folders on the server are deleted. Cached OAuth tokens\nare not revoked.\n\n[y] Remove   [n/Esc] Cancel", name))
@@ -172,14 +133,7 @@ pub(super) fn draw_review_dialog(
     scroll: usize,
 ) {
     let area = centered_rect(frame.area(), 86, 72);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(format!(" {title} "))
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.error());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = popup_inner(frame, theme, area, &format!(" {title} "), theme.error());
     if inner.width < 10 || inner.height < 5 {
         return;
     }
@@ -282,14 +236,7 @@ pub(super) fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
         frame.area().width.saturating_sub(4).min(100),
         88,
     );
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Review outgoing email ")
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.accent());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = popup_inner(frame, theme, area, " Review outgoing email ", theme.accent());
     if inner.height < 8 {
         return;
     }

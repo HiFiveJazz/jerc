@@ -490,10 +490,7 @@ impl ContactsModal {
 
     pub fn navigate(&mut self, length: usize, delta: isize) {
         self.smooth_target = None;
-        self.selected = self
-            .selected
-            .saturating_add_signed(delta)
-            .min(length.saturating_sub(1));
+        self.selected = crate::app::navigation::bounded_index(self.selected, length, delta);
         self.ensure_visible(length);
     }
     pub fn ensure_visible(&mut self, length: usize) {
@@ -508,9 +505,7 @@ impl ContactsModal {
     }
     pub fn smooth(&mut self, length: usize, offset: isize) {
         let base = self.smooth_target.unwrap_or(self.selected);
-        let target = base
-            .saturating_add_signed(offset)
-            .min(length.saturating_sub(1));
+        let target = crate::app::navigation::bounded_index(base, length, offset);
         self.smooth_target = (target != self.selected).then_some(target);
     }
     pub fn advance(&mut self, length: usize) {

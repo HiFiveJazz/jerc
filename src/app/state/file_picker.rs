@@ -238,20 +238,14 @@ impl ComposeFilePicker {
 
     pub(super) fn move_selection(&mut self, delta: isize) {
         self.smooth_target = None;
-        self.selected = self
-            .selected
-            .saturating_add_signed(delta)
-            .min(self.entries.len().saturating_sub(1));
+        self.selected = bounded_index(self.selected, self.entries.len(), delta);
         self.refresh_preview();
     }
 
     pub(super) fn queue_smooth_scroll(&mut self, delta: isize) {
         // Queue relative to the *visible* cursor so opposite-direction keys
         // reverse immediately instead of inheriting an unfinished target.
-        let target = self
-            .selected
-            .saturating_add_signed(delta)
-            .min(self.entries.len().saturating_sub(1));
+        let target = bounded_index(self.selected, self.entries.len(), delta);
         self.smooth_target = (target != self.selected).then_some(target);
         // A new scroll invalidates a pending preview debounce; schedule only
         // the final destination once the animation has settled.

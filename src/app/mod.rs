@@ -1,4 +1,5 @@
 mod input;
+pub(crate) mod navigation;
 mod state;
 pub(crate) mod vim;
 

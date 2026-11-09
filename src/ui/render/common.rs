@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// Shared overlay shell. Clear before borders and keep theme-specific border
+/// styling with the caller while ensuring consistent popup geometry.
+pub(super) fn popup_inner(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+    title: &str,
+    border_style: Style,
+) -> Rect {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(theme.border_type)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+
 pub(super) fn centered_rect(area: Rect, max_width: u16, percent_height: u16) -> Rect {
     let width = area.width.min(max_width).max(1);
     let height = ((u32::from(area.height) * u32::from(percent_height) / 100) as u16)

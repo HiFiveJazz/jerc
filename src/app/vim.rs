@@ -55,6 +55,74 @@ pub(crate) fn word_start(text: &str, cursor: usize, backward: bool, whole: bool)
     at
 }
 
+/// Word characters have the same meaning in the editor, reader motions,
+/// and reader highlighting. Keep this predicate in one place.
+pub(crate) fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn delimiter_pair(delimiter: char) -> Option<(char, char)> {
+    match delimiter {
+        '"' => Some(('"', '"')),
+        '\'' => Some(('\'', '\'')),
+        '`' => Some(('`', '`')),
+        '(' | ')' => Some(('(', ')')),
+        '[' | ']' => Some(('[', ']')),
+        '{' | '}' => Some(('{', '}')),
+        '<' | '>' => Some(('<', '>')),
+        _ => None,
+    }
+}
+
+pub(crate) fn inner_text_object_range(text: &str, column: usize, delimiter: char) -> Option<(usize, usize)> {
+    let (open, close) = delimiter_pair(delimiter)?;
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return None;
+    }
+    let cursor = column.min(chars.len().saturating_sub(1));
+
+    let (opening, closing) = if open == close {
+        let positions = chars
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ch)| (*ch == open).then_some(index))
+            .collect::<Vec<_>>();
+        positions
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter_map(|pair| {
+                let start = pair[0];
+                let end = pair[1];
+                (start <= cursor && cursor <= end).then_some((start, end))
+            })
+            .min_by_key(|(start, end)| end.saturating_sub(*start))?
+    } else {
+        let mut stack = Vec::new();
+        let mut enclosing = Vec::new();
+        for (index, ch) in chars.iter().copied().enumerate() {
+            if ch == open {
+                stack.push(index);
+            } else if ch == close
+                && let Some(start) = stack.pop()
+                && start <= cursor
+                && cursor <= index
+            {
+                enclosing.push((start, index));
+            }
+        }
+        enclosing
+            .into_iter()
+            .min_by_key(|(start, end)| end.saturating_sub(*start))?
+    };
+
+    if closing <= opening.saturating_add(1) {
+        return None;
+    }
+    Some((opening + 1, closing - 1))
+}
+
 /// An inclusive Vim visual selection, expressed as an exclusive Rust range.
 pub(crate) fn visual_chars(anchor: usize, cursor: usize, len: usize) -> Option<(usize, usize)> {
     (len > 0).then(|| {
@@ -120,6 +188,16 @@ mod tests {
         assert_eq!(visual_chars(0, 0, 0), None);
         assert_eq!(word_start("first second", 0, false, true), 6);
         assert_eq!(word_start("first second", 8, true, true), 6);
+    }
+
+    #[test]
+    fn nested_text_objects_work_in_reader_and_composer() {
+        assert_eq!(inner_text_object_range(r#"say "hello" now"#, 6, '"'), Some((5, 9)));
+        assert_eq!(inner_text_object_range("call(foo[bar])", 9, ']'), Some((9, 11)));
+        assert_eq!(inner_text_object_range("call(foo[bar])", 9, ')'), Some((5, 12)));
+        assert_eq!(inner_text_object_range("{empty}", 0, '('), None);
+        assert!(is_word_char('é'));
+        assert!(!is_word_char('-'));
     }
 
     #[test]

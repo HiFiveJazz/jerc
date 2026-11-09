@@ -20,7 +20,15 @@ Remote image worker ── bounded fetch/decode ─────┤
 
 The renderer is divided by surface (`src/ui/render/{mail_list,reader,compose,contacts,attachments,dialogs,help,status,setup}.rs`) with shared formatting in `common.rs`. The root `src/ui/render.rs` owns layout and overlay ordering. These modules use the same app state and theme; the split is organizational and does not change rendering behavior.
 
-The app's state types and command routing remain in `src/app/state.rs`. `src/app/state/` holds the corresponding Compose editor and picker implementations, Contacts actions, reader navigation, message mutations, worker event handling, and received-attachment actions. The protocol backends and the UI worker remain separate; the feature modules should not start network I/O from rendering functions.
+`src/app/state.rs` owns the central `App`/`AccountState` data model and orchestration, not all input behavior. Focused modules under `src/app/state/` own application initialization (`initialization.rs`), top-level keyboard commands (`input_dispatch.rs`), mouse interactions (`mouse.rs`), reader positions and text motions (`reader_text.rs`), Compose/editor actions, Contacts, mailbox caching, message mutations, worker events and attachments. State regression tests live in sibling test modules under that directory rather than expanding the production state file. These modules are deliberately *not* separate state stores: there is still one `App` and one account model.
+
+The shared behavior layer is:
+
+- `src/app/vim.rs`: UTF-8 character offsets, word motions, text objects, visual ranges and persistent marked selection. Reader, composer, and contacts should reuse these primitives rather than introduce independent cursor math.
+- `src/app/navigation.rs`: bounded/wrapping row navigation and scrolloff in display rows. Mailbox lists, file pickers, contacts, and the reader reuse it.
+- `src/ui/render/common.rs`: shared popup shells, display-width truncation, and rendering helpers. Feature renderers keep ownership of their content while using a common themed overlay frame.
+
+The protocol backends and the UI worker remain separate; renderers must never start filesystem or network I/O. Prefer adding behavior to the existing shared primitives over introducing new duplicate implementations.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for a file map and local validation commands.
 
