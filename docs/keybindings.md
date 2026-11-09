@@ -45,6 +45,7 @@
 | `v` / `V` | Visual selection |
 | `y` | Copy selected text |
 | `t` | Toggle HTML / plain text |
+| `Shift-C` (`C`) | Toggle conversation quote colors / quoted Git diff colors (session only) |
 | `i` | Toggle remote images for the session |
 | `m` | Toggle expanded message headers |
 | `o` | Open link under the cursor |
@@ -59,12 +60,14 @@ Normal, Insert, and Visual modes share Vim-style movement. Search the Compose `?
 
 | Key | Action |
 | --- | --- |
+| `C` (Shift-C) in Normal/Visual | Toggle conversation quote / quoted Git diff colors (session only) |
 | `Tab` / `Shift-Tab` | Next / previous field |
 | `Enter` in Normal | Preview before sending |
 | `Esc` in Insert | Return to Normal mode (also dismisses recipient autocomplete) |
 | `yy` / `Y` (Normal) | Yank whole body line or entire To/Cc/Bcc/Subject field; prefix with a count for multiple body lines |
 | `v` / `V`, then `y` (Visual) | Yank selected characters / full body lines (or the entire current header field with `V`) |
 | `y$` (Normal) | Yank from cursor to end of line |
+| `x` (Normal / Visual) | Cut character(s) or selected text into the register and system clipboard, when available |
 | `p` / `P` (Normal) | Paste after / before cursor or below / above line |
 | `Ctrl-W` (any mode) | Clear current body line or complete To/Cc/Bcc/Subject field |
 | `p` (Visual) | Replace selection with last yanked text |
@@ -78,7 +81,7 @@ Normal, Insert, and Visual modes share Vim-style movement. Search the Compose `?
 | `Ctrl-n` / `Ctrl-p` | Alternative suggestion navigation when suggestions are active |
 | `Tab` / `Enter` | Accept a contact suggestion when shown |
 
-Yanks use a session-only internal register (also shared with the reader), not automatic system-clipboard copying from Compose. The register is not written to postponed drafts. The reader's `y` also attempts to copy to the system clipboard as before. For externally copied text, use your terminal's normal paste shortcut in Insert mode.
+Plain yanks (`y`, `yy`, `Y`) use a session-only internal register shared with the reader; they do not automatically copy to the system clipboard. Explicit cuts with `x` also attempt a system-clipboard copy and retain the internal register if the clipboard is unavailable. The register is not written to postponed drafts. The reader's `y` also attempts to copy to the system clipboard as before. For externally copied text, use your terminal's normal paste shortcut in Insert mode.
 
 From the send preview, `Enter` sends; `Esc` returns to the editor. Saving a draft is not the same as sending it.
 

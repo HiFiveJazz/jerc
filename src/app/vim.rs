@@ -10,6 +10,16 @@ pub(crate) fn byte_offset(text: &str, cursor: usize) -> usize {
     text.char_indices().nth(cursor).map_or(text.len(), |(at, _)| at)
 }
 
+/// Return a character-indexed selection without splitting UTF-8 codepoints.
+/// A missing or empty selection must not overwrite the yank register.
+pub(crate) fn text_range(text: &str, start: usize, end: usize) -> Option<&str> {
+    let len = text.chars().count();
+    if start >= end || start >= len {
+        return None;
+    }
+    Some(&text[byte_offset(text, start)..byte_offset(text, end.min(len))])
+}
+
 pub(crate) fn horizontal(cursor: usize, len: usize, delta: isize) -> usize {
     cursor.saturating_add_signed(delta).min(len)
 }
@@ -100,6 +110,10 @@ mod tests {
     #[test]
     fn unicode_motions_and_visual_ranges_use_character_offsets() {
         assert_eq!(byte_offset("a😊é", 2), 5);
+        assert_eq!(text_range("a😊é", 1, 3), Some("😊é"));
+        assert_eq!(text_range("a😊é", 1, 99), Some("😊é"));
+        assert_eq!(text_range("a😊é", 3, 4), None);
+        assert_eq!(text_range("a😊é", 1, 1), None);
         assert_eq!(horizontal(0, 3, -1), 0);
         assert_eq!(horizontal(1, 3, 100), 3);
         assert_eq!(visual_chars(3, 1, 4), Some((1, 4)));

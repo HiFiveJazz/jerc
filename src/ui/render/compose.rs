@@ -870,6 +870,7 @@ pub(super) fn render_compose_header(
 
 pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
     let theme = app.theme().clone();
+    let quoted_diff_highlighting = app.quoted_diff_highlighting;
     let Some(composer) = app.composer.as_mut() else {
         return;
     };
@@ -986,7 +987,13 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
         .rposition(|row| row.start <= composer.cursor)
         .unwrap_or(0);
     let active_line = rows[cursor_row].logical_line;
-    let raw = editor_text(&composer.body, composer, body_active, &theme);
+    let raw = editor_text(
+        &composer.body,
+        composer,
+        body_active,
+        &theme,
+        quoted_diff_highlighting,
+    );
     let (mode_color, _) = compose_mode_colors(composer.mode, &theme);
     let mut display = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
@@ -1122,16 +1129,24 @@ pub(super) fn editor_text(
     composer: &crate::app::Composer,
     active: bool,
     theme: &Theme,
+    quoted_diff_highlighting: bool,
 ) -> Text<'static> {
     let selection = active.then(|| composer.visual_range()).flatten();
     let cursor = composer.cursor.min(value.chars().count());
     // Quote classification is computed once per logical line; composer text
     // remains editable, including nested mailing-list reply history.
-    let quote_lines = value
-        .split('\n')
-        .map(|line| {
+    let logical_lines = value.split('\n').collect::<Vec<_>>();
+    let diff_lines = if quoted_diff_highlighting {
+        classify_patch_lines_with_quotes(&logical_lines, true)
+    } else {
+        vec![None; logical_lines.len()]
+    };
+    let quote_lines = logical_lines
+        .iter()
+        .zip(diff_lines)
+        .map(|(line, diff)| {
             let (depth, prefix_bytes) = quote_prefix(line);
-            (depth, prefix_bytes, is_reply_attribution(line))
+            (depth, prefix_bytes, is_reply_attribution(line), diff)
         })
         .collect::<Vec<_>>();
     let mut logical_line = 0usize;
@@ -1156,10 +1171,10 @@ pub(super) fn editor_text(
             continue;
         }
         let selected = selection.is_some_and(|(start, end)| (start..end).contains(&global));
-        let (depth, quote_marker_len, attribution) = quote_lines
+        let (depth, quote_marker_len, attribution, diff_kind) = quote_lines
             .get(logical_line)
             .copied()
-            .unwrap_or((0, 0, false));
+            .unwrap_or((0, 0, false, None));
         spans.push(Span::styled(
             ch.to_string(),
             if at_cursor && composer.mode != ComposeMode::Insert {
@@ -1167,11 +1182,18 @@ pub(super) fn editor_text(
             } else if selected {
                 theme.selected()
             } else if depth > 0 && column < quote_marker_len {
-                quoted_prefix_style(theme)
+                quoted_prefix_style(depth, theme)
+            } else if let Some(kind) = diff_kind {
+                diff_line_style(kind, theme)
+            } else if depth > 0 {
+                let quoted = quoted_body_style(depth, theme);
+                if attribution {
+                    quoted.add_modifier(Modifier::BOLD)
+                } else {
+                    quoted
+                }
             } else if attribution {
                 attribution_style(theme)
-            } else if depth > 0 {
-                quoted_body_style(depth, theme)
             } else {
                 theme.text()
             },

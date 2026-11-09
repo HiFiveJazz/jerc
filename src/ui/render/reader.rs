@@ -223,6 +223,7 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .flatten();
 
+    let quoted_diff_highlighting = app.quoted_diff_highlighting;
     let (lines, body_start, body_line_count, image_start) = {
         let account = app.account().expect("account exists");
         let message = account.selected_message().expect("message checked above");
@@ -307,7 +308,11 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         })
                         .collect::<Vec<_>>();
                     let texts = rendered.iter().map(String::as_str).collect::<Vec<_>>();
-                    let diff_lines = classify_patch_lines(&texts);
+                    let diff_lines = if quoted_diff_highlighting {
+                        classify_patch_lines_with_quotes(&texts, true)
+                    } else {
+                        classify_patch_lines(&texts)
+                    };
                     lines.extend(html_lines.iter().enumerate().map(|(line_index, line)| {
                         rich_html_line(
                             line,
@@ -319,6 +324,7 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                                 column: reader_column,
                                 visual: reader_visual,
                                 active: reader_active,
+                                quoted_diff_highlighting,
                                 theme: &theme,
                             },
                             diff_lines[line_index],
@@ -328,7 +334,11 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 } else {
                     let rendered = body.display_text(true).lines().collect::<Vec<_>>();
                     body_line_count = rendered.len();
-                    let diff_lines = classify_patch_lines(&rendered);
+                    let diff_lines = if quoted_diff_highlighting {
+                    classify_patch_lines_with_quotes(&rendered, true)
+                } else {
+                    classify_patch_lines(&rendered)
+                };
                     lines.extend(rendered.into_iter().enumerate().map(|(line_index, line)| {
                         plain_reader_line(
                             line,
@@ -340,6 +350,7 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                                 column: reader_column,
                                 visual: reader_visual,
                                 active: reader_active,
+                                quoted_diff_highlighting,
                                 theme: &theme,
                             },
                             diff_lines[line_index],
@@ -350,7 +361,11 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } else {
                 let rendered = body.display_text(false).lines().collect::<Vec<_>>();
                 body_line_count = rendered.len();
-                let diff_lines = classify_patch_lines(&rendered);
+                let diff_lines = if quoted_diff_highlighting {
+                    classify_patch_lines_with_quotes(&rendered, true)
+                } else {
+                    classify_patch_lines(&rendered)
+                };
                 lines.extend(rendered.into_iter().enumerate().map(|(line_index, line)| {
                     plain_reader_line(
                         line,
@@ -362,6 +377,7 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             column: reader_column,
                             visual: reader_visual,
                             active: reader_active,
+                            quoted_diff_highlighting,
                             theme: &theme,
                         },
                         diff_lines[line_index],
@@ -480,21 +496,14 @@ pub(super) fn reader_visual_cursor_row(
 
 /// Only color *real patch hunks*. An email quote containing `-EIO`, a
 /// Markdown `---` divider, or a plain `+text` line is not a Git diff.
-/// Classify the entire body at once so hunk ranges and quoted patches are
-/// recognized without falsely coloring nearby prose.
+/// Quoted patch examples belong to the conversation and use the quote palette;
+/// only unquoted, structurally valid patch hunks receive diff colors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PatchLineKind {
     Meta,
     Hunk,
     Add,
     Remove,
-}
-
-pub(super) fn strip_mail_quotes(mut text: &str) -> &str {
-    while let Some(after) = text.strip_prefix('>') {
-        text = after.strip_prefix(' ').unwrap_or(after);
-    }
-    text
 }
 
 pub(super) fn patch_hunk_counts(line: &str) -> Option<(usize, usize)> {
@@ -517,19 +526,71 @@ pub(super) fn is_patch_target(text: &str) -> bool {
 }
 
 pub(super) fn classify_patch_lines(lines: &[&str]) -> Vec<Option<PatchLineKind>> {
+    classify_patch_lines_with_quotes(lines, false)
+}
+
+/// In diff-aware mode, classify quoted patch hunks using the same structural
+/// checks as unquoted patches. Each quote depth has an independent boundary so
+/// a quoted hunk can never color the author's unquoted reply as an addition.
+pub(super) fn classify_patch_lines_with_quotes(
+    lines: &[&str],
+    quoted_diffs: bool,
+) -> Vec<Option<PatchLineKind>> {
     let mut result = Vec::with_capacity(lines.len());
     let mut in_patch = false;
     let mut in_hunk = false;
     let (mut old_left, mut new_left) = (0usize, 0usize);
+    let mut current_depth = 0usize;
     for (index, line) in lines.iter().enumerate() {
-        let text = strip_mail_quotes(line);
-        let next_is_target = lines
-            .get(index + 1)
-            .is_some_and(|next| is_patch_target(strip_mail_quotes(next)));
+        let (depth, _) = quote_prefix(line);
+        if depth != current_depth {
+            // Do not carry Git hunk state across authors/quotation levels.
+            current_depth = depth;
+            in_patch = false;
+            in_hunk = false;
+            old_left = 0;
+            new_left = 0;
+        }
+        // Conversation mode treats quoted patches as quotations. Diff-aware
+        // mode still checks the hunk structure before enabling diff colors.
+        if depth > 0 && !quoted_diffs {
+            in_patch = false;
+            in_hunk = false;
+            result.push(None);
+            continue;
+        }
+        let text = if depth > 0 {
+            quoted_patch_payload(line, depth)
+        } else {
+            *line
+        };
+        let next_is_target = lines.get(index + 1).is_some_and(|next| {
+            let (next_depth, _) = quote_prefix(next);
+            if next_depth != depth {
+                return false;
+            }
+            let next_text = if next_depth > 0 {
+                quoted_patch_payload(next, next_depth)
+            } else {
+                *next
+            };
+            is_patch_target(next_text)
+        });
         let kind = if text.starts_with("diff --git ") || is_patch_source(text) && next_is_target {
             in_patch = true;
             in_hunk = false;
             Some(PatchLineKind::Meta)
+        } else if depth > 0
+            && quoted_diffs
+            && !in_patch
+            && let Some((old, new)) = patch_hunk_counts(text)
+        {
+            // Review replies often quote only the hunk, not the diff header.
+            in_patch = true;
+            old_left = old;
+            new_left = new;
+            in_hunk = old > 0 || new > 0;
+            Some(PatchLineKind::Hunk)
         } else if !in_patch {
             None
         } else if text.starts_with("index ")
@@ -632,9 +693,16 @@ pub(super) fn plain_reader_line(
         visual: reader_visual,
         active: reader_active,
         theme,
+        ..
     } = view;
-    let diff = diff_kind.map(|kind| diff_line_style(kind, theme));
     let (quote_depth, quote_prefix_end) = quote_prefix(text);
+    // Conversation mode keeps quotes violet/amber. Diff-aware mode uses
+    // classified Git hunks even when they are part of an earlier reply.
+    let diff = if quote_depth == 0 || view.quoted_diff_highlighting {
+        diff_kind.map(|kind| diff_line_style(kind, theme))
+    } else {
+        None
+    };
     let base = diff.unwrap_or_else(|| {
         if quote_depth > 0 {
             quoted_body_style(quote_depth, theme)
@@ -654,15 +722,16 @@ pub(super) fn plain_reader_line(
         column: reader_column,
         visual: reader_visual,
         active: reader_active,
+        quoted_diff_highlighting: view.quoted_diff_highlighting,
         theme,
     };
-    if quote_depth > 0 && diff.is_none() {
+    if quote_depth > 0 {
         // Differentiate the `>` markers from the quoted body without losing
         // cursor, visual selection, or illuminated-word highlighting.
         let prefix = &text[..quote_prefix_end];
         spans.extend(reader_fragments(
             prefix,
-            quoted_prefix_style(theme),
+            quoted_prefix_style(quote_depth, theme),
             0,
             line_len,
             line_index,
@@ -699,6 +768,7 @@ pub(super) fn plain_reader_line(
             column: reader_column,
             visual: reader_visual,
             active: reader_active,
+            quoted_diff_highlighting: view.quoted_diff_highlighting,
             theme,
         },
         diff.and_then(|style| style.bg),
@@ -721,6 +791,7 @@ pub(super) fn rich_html_line(
         visual: reader_visual,
         active: reader_active,
         theme,
+        ..
     } = view;
     let mut spans = reader_gutter(line_index, line_count, reader_cursor, reader_active, theme);
     let line_len = line
@@ -736,9 +807,21 @@ pub(super) fn rich_html_line(
     let illuminate_ranges = illuminate_word
         .map(|word| word_match_ranges(&line_text, word))
         .unwrap_or_default();
-    let (quote_depth, _) = quote_prefix(&line_text);
+    let (quote_depth, quote_prefix_end) = quote_prefix(&line_text);
+    let prefix_chars = line_text[..quote_prefix_end].chars().count();
     let attribution = is_reply_attribution(&line_text);
-    let diff = diff_kind.map(|kind| diff_line_style(kind, theme));
+    // HTML-rendered lines may split `>> ` from the text across several
+    // spans. Apply the quote color to ALL spans, not just the leading token.
+    let diff = if quote_depth == 0 || view.quoted_diff_highlighting {
+        diff_kind.map(|kind| diff_line_style(kind, theme))
+    } else {
+        None
+    };
+    let quote_color = if quote_depth > 0 && diff.is_none() {
+        Some(quoted_body_style(quote_depth, theme).fg.unwrap_or(theme.visual))
+    } else {
+        None
+    };
     let mut column = 0usize;
     for span in &line.spans {
         let mut style = rich_html_style(&span.style, &span.text, theme);
@@ -747,26 +830,58 @@ pub(super) fn rich_html_line(
             if let Some(bg) = diff.bg {
                 style = style.bg(bg);
             }
-        } else if quote_depth > 0 {
-            style = style.fg(quoted_body_style(quote_depth, theme).fg.unwrap_or(theme.muted));
+        } else if let Some(color) = quote_color {
+            style = style.fg(color);
         } else if attribution {
             style = attribution_style(theme);
         }
-        spans.extend(reader_fragments(
-            &span.text,
-            style,
-            column,
-            line_len,
-            line_index,
-            ReaderView {
-                cursor: reader_cursor,
-                column: reader_column,
-                visual: reader_visual,
-                active: reader_active,
-                theme,
-            },
-            &illuminate_ranges,
-        ));
+        let view = ReaderView {
+            cursor: reader_cursor,
+            column: reader_column,
+            visual: reader_visual,
+            active: reader_active,
+            quoted_diff_highlighting: view.quoted_diff_highlighting,
+            theme,
+        };
+        let marker_len = prefix_chars.saturating_sub(column).min(span.text.chars().count());
+        if quote_depth > 0 && marker_len > 0 {
+            // Use a UTF-8-safe boundary: the quote prefix can end halfway
+            // through an HTML span that also contains multibyte text.
+            let boundary = span
+                .text
+                .char_indices()
+                .nth(marker_len)
+                .map_or(span.text.len(), |(byte, _)| byte);
+            let (marker, body) = span.text.split_at(boundary);
+            spans.extend(reader_fragments(
+                marker,
+                quoted_prefix_style(quote_depth, theme),
+                column,
+                line_len,
+                line_index,
+                view,
+                &illuminate_ranges,
+            ));
+            spans.extend(reader_fragments(
+                body,
+                style,
+                column + marker_len,
+                line_len,
+                line_index,
+                view,
+                &illuminate_ranges,
+            ));
+        } else {
+            spans.extend(reader_fragments(
+                &span.text,
+                style,
+                column,
+                line_len,
+                line_index,
+                view,
+                &illuminate_ranges,
+            ));
+        }
         column = column.saturating_add(span.text.chars().count());
     }
     pad_reader_line(
@@ -779,6 +894,7 @@ pub(super) fn rich_html_line(
             column: reader_column,
             visual: reader_visual,
             active: reader_active,
+            quoted_diff_highlighting: view.quoted_diff_highlighting,
             theme,
         },
         diff.and_then(|style| style.bg),
@@ -825,6 +941,7 @@ pub(super) fn reader_fragments(
         visual: reader_visual,
         active: reader_active,
         theme,
+        ..
     } = view;
     if text.is_empty() {
         return Vec::new();
@@ -991,6 +1108,7 @@ pub(super) fn pad_reader_line(
         visual: reader_visual,
         active: reader_active,
         theme,
+        ..
     } = view;
     if !reader_active && diff_background.is_none() {
         return;

@@ -154,6 +154,11 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         category: "Message",
+        key: "C / Shift-C",
+        description: "toggle quote / Git diff colors",
+    },
+    HelpEntry {
+        category: "Message",
         key: "Ctrl-a",
         description: "open received attachments",
     },
@@ -499,6 +504,11 @@ pub const DESTINATION_HELP_ENTRIES: &[HelpEntry] = &[
 pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry {
         category: "Compose",
+        key: "C / Shift-C",
+        description: "toggle quote / diff colors",
+    },
+    HelpEntry {
+        category: "Compose",
         key: "?",
         description: "search compose shortcuts",
     },
@@ -625,6 +635,7 @@ pub enum Command {
     ExportRaw,
     ToggleHelp,
     ToggleHtml,
+    ToggleQuotedDiff,
     ToggleImages,
     ToggleBell,
     ToggleNotifications,
@@ -710,6 +721,7 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('e') | KeyCode::Char('E') => Command::ExportRaw,
         KeyCode::Char('?') => Command::ToggleHelp,
         KeyCode::Char('t') => Command::ToggleHtml,
+        KeyCode::Char('C') => Command::ToggleQuotedDiff,
         KeyCode::Char('i') => Command::ToggleImages,
         KeyCode::Char('B') => Command::ToggleBell,
         KeyCode::Char('n') => Command::ToggleNotifications,
@@ -726,7 +738,7 @@ pub fn command_for_key(key: KeyEvent) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Focus, HELP_ENTRIES, command_for_key};
+    use super::{Command, Focus, HELP_ENTRIES, command_for_key, ranked_help_matches};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
@@ -942,6 +954,27 @@ mod tests {
             command_for_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
             Command::Top
         );
+    }
+
+    #[test]
+    fn quoted_diff_mode_has_a_reader_key() {
+        assert_eq!(
+            command_for_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)),
+            Command::ToggleQuotedDiff
+        );
+    }
+
+    #[test]
+    fn quoted_diff_toggle_is_discoverable_in_searchable_help() {
+        let entry = HELP_ENTRIES
+            .iter()
+            .find(|entry| entry.category == "Message" && entry.key == "C / Shift-C")
+            .expect("reader quote/diff toggle should appear in ? help");
+        assert!(entry.description.contains("diff"));
+        let matches = ranked_help_matches(HELP_ENTRIES, "Shift-C");
+        assert!(matches.iter().any(|&index| HELP_ENTRIES[index] == *entry));
+        let matches = ranked_help_matches(HELP_ENTRIES, "quote");
+        assert!(matches.iter().any(|&index| HELP_ENTRIES[index] == *entry));
     }
 
     #[test]

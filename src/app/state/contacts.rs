@@ -278,37 +278,27 @@ impl App {
                     }
                     KeyCode::Char('d' | 'x') => {
                         if let Some((start, end)) = editor.selected_range() {
-                            if key.code == KeyCode::Char('x') {
-                                let cut = editor.selected_text().unwrap_or_default();
-                                if !cut.is_empty() {
-                                    self.yank_register = Some(YankRegister {
-                                        text: cut.clone(),
-                                        linewise: false,
-                                    });
-                                    self.status = match copy_text_to_clipboard(&cut) {
-                                        Ok(()) => StatusLine::temporary(
-                                            "contact selection copied to clipboard",
-                                            Duration::from_secs(2),
-                                        ),
-                                        Err(_) => StatusLine::temporary(
-                                            "cut to internal register (system clipboard unavailable)",
-                                            Duration::from_secs(3),
-                                        ),
-                                    };
-                                }
-                            }
+                            let cut = (key.code == KeyCode::Char('x'))
+                                .then(|| crate::app::vim::text_range(editor.value(), start, end))
+                                .flatten()
+                                .map(str::to_owned);
                             editor.delete_range(start, end);
+                            if let Some(cut) = cut
+                                && let Some(status) = record_cut(&mut self.yank_register, cut, false)
+                            {
+                                self.status = status;
+                            }
                         }
                         editor.mode = ComposeMode::Normal;
                         editor.visual_anchor = None;
                     }
                     KeyCode::Char('p' | 'P') => {
-                        if let Some(register) = self.yank_register.as_ref() {
-                            if let Some((start, end)) = editor.selected_range() {
-                                let text = register.text.replace(['\n', '\r'], " ");
-                                editor.delete_range(start, end);
-                                editor.insert_text(&text);
-                            }
+                        if let Some(register) = self.yank_register.as_ref()
+                            && let Some((start, end)) = editor.selected_range()
+                        {
+                            let text = register.text.replace(['\n', '\r'], " ");
+                            editor.delete_range(start, end);
+                            editor.insert_text(&text);
                         }
                         editor.mode = ComposeMode::Normal;
                         editor.visual_anchor = None;
@@ -353,23 +343,14 @@ impl App {
                 }
                 KeyCode::Char('u') if editor.mode == ComposeMode::Normal => editor.undo(),
                 KeyCode::Char('x') if editor.mode == ComposeMode::Normal => {
-                    let cut = editor.value().chars().nth(editor.cursor).map(|ch| ch.to_string());
+                    let start = editor.cursor;
+                    let cut = crate::app::vim::text_range(editor.value(), start, start + 1)
+                        .map(str::to_owned);
                     if let Some(cut) = cut {
-                        self.yank_register = Some(YankRegister {
-                            text: cut.clone(),
-                            linewise: false,
-                        });
-                        self.status = match copy_text_to_clipboard(&cut) {
-                            Ok(()) => StatusLine::temporary(
-                                "contact character copied to clipboard",
-                                Duration::from_secs(2),
-                            ),
-                            Err(_) => StatusLine::temporary(
-                                "cut to internal register (system clipboard unavailable)",
-                                Duration::from_secs(3),
-                            ),
-                        };
-                        editor.delete_range(editor.cursor, editor.cursor + 1);
+                        editor.delete_range(start, start + 1);
+                        if let Some(status) = record_cut(&mut self.yank_register, cut, false) {
+                            self.status = status;
+                        }
                     }
                 },
                 KeyCode::Char('D') if editor.mode == ComposeMode::Normal => {

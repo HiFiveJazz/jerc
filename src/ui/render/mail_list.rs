@@ -189,7 +189,17 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .position(|&index| index == account.message_index);
 
     if visible.is_empty() {
-        let message = if account.messages_loading {
+        let message = if account.cached_mailbox_unverified() {
+            if account.connecting
+                || account.mailboxes_loading
+                || account.messages_loading
+                || account.page_inflight.is_some()
+            {
+                " Verifying cached mailbox…".to_owned()
+            } else {
+                " Cached mailbox not verified; Ctrl-r to retry.".to_owned()
+            }
+        } else if account.messages_loading {
             " Loading messages…".to_owned()
         } else if !search_query.is_empty() {
             format!(" No loaded messages match /{search_query}")

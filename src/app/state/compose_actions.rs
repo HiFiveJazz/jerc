@@ -537,6 +537,23 @@ impl App {
             self.postpone_composer();
             return;
         }
+        // Match the reader's C toggle while editing quoted replies. In Insert
+        // mode uppercase C remains literal text, as in a regular Vim buffer.
+        if key.code == KeyCode::Char('C')
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && self
+                .composer
+                .as_ref()
+                .is_some_and(|composer| composer.mode != ComposeMode::Insert)
+        {
+            self.quoted_diff_highlighting = !self.quoted_diff_highlighting;
+            self.status = StatusLine::info(if self.quoted_diff_highlighting {
+                "quoted Git diff colors enabled"
+            } else {
+                "conversation quote colors enabled"
+            });
+            return;
+        }
         let composer = self.composer.as_mut().expect("composer exists");
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -754,7 +771,20 @@ impl App {
                         composer.paste_register(register, key.code == KeyCode::Char('p'), count);
                     }
                 }
-                KeyCode::Char('x') | KeyCode::Delete => {
+                KeyCode::Char('x') => {
+                    let start = composer.cursor.min(composer.char_count());
+                    // Vim's x does not join lines when the cursor reaches a newline.
+                    let end = start.saturating_add(count).min(composer.line_end());
+                    let cut = crate::app::vim::text_range(composer.field_value(), start, end)
+                        .map(str::to_owned);
+                    if let Some(cut) = cut {
+                        composer.delete_range(start, end);
+                        if let Some(status) = record_cut(&mut self.yank_register, cut, false) {
+                            self.status = status;
+                        }
+                    }
+                }
+                KeyCode::Delete => {
                     for _ in 0..count {
                         composer.delete_at_cursor();
                     }
@@ -798,7 +828,23 @@ impl App {
                         composer.paste_over_visual(register);
                     }
                 }
-                KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
+                KeyCode::Char('x') => {
+                    if let Some((start, end)) = composer.visual_range() {
+                        let linewise = composer.visual_linewise && composer.field == ComposeField::Body;
+                        let cut = crate::app::vim::text_range(composer.field_value(), start, end)
+                            .map(str::to_owned);
+                        composer.delete_range(start, end);
+                        if let Some(cut) = cut
+                            && let Some(status) = record_cut(&mut self.yank_register, cut, linewise)
+                        {
+                            self.status = status;
+                        }
+                    }
+                    composer.visual_anchor = None;
+                    composer.visual_linewise = false;
+                    composer.mode = ComposeMode::Normal;
+                }
+                KeyCode::Char('d') | KeyCode::Delete => {
                     if let Some((start, end)) = composer.visual_range() {
                         composer.delete_range(start, end);
                     }

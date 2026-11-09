@@ -27,6 +27,7 @@ struct ReaderView<'a> {
     column: usize,
     visual: Option<ReaderSelection>,
     active: bool,
+    quoted_diff_highlighting: bool,
     theme: &'a Theme,
 }
 
@@ -651,6 +652,7 @@ mod tests {
                 column: 0,
                 visual: None,
                 active: true,
+                quoted_diff_highlighting: false,
                 theme: &theme,
             },
             Some(PatchLineKind::Remove),
@@ -666,6 +668,7 @@ mod tests {
                 column: 0,
                 visual: None,
                 active: true,
+                quoted_diff_highlighting: false,
                 theme: &theme,
             },
             Some(PatchLineKind::Remove),
@@ -694,6 +697,7 @@ mod tests {
                 column: 0,
                 visual: None,
                 active: true,
+                quoted_diff_highlighting: false,
                 theme: &theme,
             },
             Some(PatchLineKind::Add),
@@ -713,6 +717,7 @@ mod tests {
             column: 0,
             visual: None,
             active: false,
+            quoted_diff_highlighting: false,
             theme: &theme,
         };
         let own = super::plain_reader_line("My response", 0, 4, 30, view, None, None);
@@ -722,10 +727,11 @@ mod tests {
             "On Monday, Phillip wrote:", 3, 4, 30, view, None, None,
         );
         assert_eq!(own.spans[0].style.fg, Some(theme.foreground));
-        assert_eq!(first.spans[0].style.fg, Some(theme.accent));
-        assert_eq!(first.spans[1].style.fg, Some(theme.muted));
-        assert_eq!(nested.spans[1].style.fg, Some(theme.accent));
-        assert_eq!(intro.spans[0].style.fg, Some(theme.accent));
+        assert_eq!(first.spans.iter().map(|span| span.content.as_ref()).collect::<String>(), "> Original");
+        assert!(first.spans.iter().all(|span| span.style.fg == Some(theme.visual)));
+        assert_eq!(nested.spans.iter().map(|span| span.content.as_ref()).collect::<String>(), "> > Earlier");
+        assert!(nested.spans.iter().all(|span| span.style.fg == Some(theme.warning)));
+        assert_eq!(intro.spans[0].style.fg, Some(theme.visual));
         let patch = super::plain_reader_line(
             "> + added",
             3,
@@ -735,7 +741,8 @@ mod tests {
             Some(super::PatchLineKind::Add),
             None,
         );
-        assert_eq!(patch.spans[0].style.fg, Some(theme.unread));
+        assert!(patch.spans.iter().all(|span| span.style.fg == Some(theme.visual)));
+        assert!(patch.spans.iter().all(|span| span.style.bg.is_none()));
     }
 
     #[test]
@@ -981,7 +988,7 @@ mod tests {
                 .collect::<String>(),
             "abc"
         );
-        let rendered = super::editor_text("abc", &composer, true, &theme);
+        let rendered = super::editor_text("abc", &composer, true, &theme, false);
         assert_eq!(
             rendered.lines[0]
                 .spans
@@ -1014,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn mailed_diff_only_colors_real_hunks_with_backgrounds() {
+    fn quoted_patch_examples_are_not_tinted_like_active_diffs() {
         use super::{PatchLineKind, classify_patch_lines, diff_line_style};
         let theme = load_themes().into_iter().next().unwrap();
         let lines = [
@@ -1034,18 +1041,280 @@ mod tests {
             "> This is ordinary follow-up prose, -EIO should stay plain.",
         ];
         let kinds = classify_patch_lines(&lines);
-        assert!(kinds[..5].iter().all(Option::is_none));
-        assert_eq!(kinds[5], Some(PatchLineKind::Meta));
-        assert_eq!(kinds[9], Some(PatchLineKind::Hunk));
-        assert_eq!(kinds[11], Some(PatchLineKind::Remove));
-        assert_eq!(kinds[12], Some(PatchLineKind::Add));
-        assert_eq!(kinds[13], None);
+        assert!(kinds.iter().all(Option::is_none));
+        // When a real, unquoted patch follows, it must still be recognized.
+        let real_patch = [
+            "diff --git a/a.c b/a.c",
+            "--- a/a.c",
+            "+++ b/a.c",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ];
+        let real_kinds = classify_patch_lines(&real_patch);
+        assert_eq!(real_kinds[0], Some(PatchLineKind::Meta));
+        assert_eq!(real_kinds[3], Some(PatchLineKind::Hunk));
+        assert_eq!(real_kinds[4], Some(PatchLineKind::Remove));
+        assert_eq!(real_kinds[5], Some(PatchLineKind::Add));
         let add = diff_line_style(PatchLineKind::Add, &theme);
         let remove = diff_line_style(PatchLineKind::Remove, &theme);
         assert_ne!(add.fg, remove.fg);
         assert!(add.bg.is_some());
         assert!(remove.bg.is_some());
         assert_ne!(add.bg, remove.bg);
+    }
+
+    #[test]
+    fn quoted_patch_diff_mode_recognizes_only_structural_hunks() {
+        use super::{PatchLineKind, classify_patch_lines_with_quotes};
+        let lines = [
+            "On Mon, Phillip wrote:",
+            "> The command returned -EIO.",
+            "> diff --git a/a.c b/a.c",
+            "> index 0123..abcd 100644",
+            "> --- a/a.c",
+            "> +++ b/a.c",
+            "> @@ -1,2 +1,2 @@",
+            ">  context",
+            "> -old",
+            "> +new",
+            ">> +not a hunk in another reply",
+            "My response follows.",
+            "+not a patch line",
+        ];
+        let in_conversation_mode = classify_patch_lines_with_quotes(&lines, false);
+        assert!(in_conversation_mode.iter().all(Option::is_none));
+        let in_diff_mode = classify_patch_lines_with_quotes(&lines, true);
+        assert_eq!(in_diff_mode[1], None);
+        assert_eq!(in_diff_mode[2], Some(PatchLineKind::Meta));
+        assert_eq!(in_diff_mode[6], Some(PatchLineKind::Hunk));
+        assert_eq!(in_diff_mode[7], None);
+        assert_eq!(in_diff_mode[8], Some(PatchLineKind::Remove));
+        assert_eq!(in_diff_mode[9], Some(PatchLineKind::Add));
+        assert!(in_diff_mode[10..].iter().all(Option::is_none));
+        // A hunk-only quotation from a review is also a valid diff fragment.
+        let hunk_only = [
+            "> @@ -3,2 +3,2 @@",
+            ">  unchanged",
+            "> -prior",
+            "> +updated",
+            "I agree with the change.",
+        ];
+        let kinds = classify_patch_lines_with_quotes(&hunk_only, true);
+        assert_eq!(kinds[0], Some(PatchLineKind::Hunk));
+        assert_eq!(kinds[1], None);
+        assert_eq!(kinds[2], Some(PatchLineKind::Remove));
+        assert_eq!(kinds[3], Some(PatchLineKind::Add));
+        assert_eq!(kinds[4], None);
+    }
+
+    #[test]
+    fn quote_diff_toggle_colors_only_quoted_patch_content() {
+        use super::{PatchLineKind, plain_reader_line, rich_html_line};
+        use crate::model::{HtmlLine, HtmlSpan};
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .expect("TokyoNight theme");
+        let view = ReaderView {
+            cursor: 99,
+            column: 0,
+            visual: None,
+            active: false,
+            quoted_diff_highlighting: true,
+            theme: &theme,
+        };
+        let line = plain_reader_line("> +added", 0, 1, 40, view, Some(PatchLineKind::Add), None);
+        // The reader pads each visual row to its viewport width. Verify the
+        // actual message text and the padding separately, rather than treating
+        // the intentional trailing spaces as part of the quotation.
+        let rendered = line.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert_eq!(rendered.trim_end_matches(' '), "> +added");
+        assert_eq!(rendered.chars().count(), 40);
+        assert_eq!(line.spans[0].style.fg, Some(theme.visual));
+        assert_eq!(line.spans[1].style.fg, Some(theme.unread));
+        assert!(line.spans[1].style.bg.is_some());
+        let plain_quote = plain_reader_line("> +mentioned in prose", 0, 1, 40, view, None, None);
+        assert!(plain_quote.spans.iter().all(|span| span.style.fg == Some(theme.visual)));
+        assert!(plain_quote.spans.iter().all(|span| span.style.bg.is_none()));
+        let html_line = HtmlLine {
+            spans: vec![
+                HtmlSpan { text: "> ".into(), style: HtmlSpanStyle::default() },
+                HtmlSpan { text: "-removed".into(), style: HtmlSpanStyle::default() },
+            ],
+        };
+        let rich = rich_html_line(&html_line, 0, 1, 40, view, Some(PatchLineKind::Remove), None);
+        let rich_rendered = rich.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert_eq!(rich_rendered.trim_end_matches(' '), "> -removed");
+        assert_eq!(rich_rendered.chars().count(), 40);
+        assert_eq!(rich.spans[0].style.fg, Some(theme.visual));
+        assert_eq!(rich.spans[1].style.fg, Some(theme.error));
+        assert!(rich.spans[1].style.bg.is_some());
+    }
+
+    #[test]
+    fn quoted_diff_state_does_not_leak_into_following_reply_text() {
+        let lines = [
+            "> diff --git a/a.c b/a.c",
+            "> --- a/a.c",
+            "> +++ b/a.c",
+            "> @@ -1 +1 @@",
+            "> -old",
+            "Thanks for reviewing the patch.",
+            "+not a code addition",
+        ];
+        assert!(super::classify_patch_lines(&lines).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn quoted_plain_mail_colors_the_entire_reply_not_just_the_marker() {
+        use super::{PatchLineKind, plain_reader_line, quoted_body_style};
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
+        for (depth, input) in [
+            (1, "> This is Phillip's previous response."),
+            (2, ">> Older response with -EIO."),
+            (3, ">  > > Even older résumé and ✅."),
+        ] {
+            let rendered = plain_reader_line(
+                input,
+                0,
+                3,
+                72,
+                ReaderView {
+                    cursor: 99,
+                    column: 0,
+                    visual: None,
+                    active: false,
+                    quoted_diff_highlighting: false,
+                    theme: &theme,
+                },
+                // A quote must not become a green diff even if a patch
+                // classifier has recognized a previously quoted hunk.
+                Some(PatchLineKind::Add),
+                None,
+            );
+            assert_eq!(
+                rendered.spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+                input,
+            );
+            let expected = quoted_body_style(depth, &theme).fg;
+            assert!(
+                rendered.spans.iter().all(|s| s.style.fg == expected && s.style.bg.is_none()),
+                "quote depth {depth} lost styling on part of the line"
+            );
+        }
+        let unquoted_diff = plain_reader_line(
+            "+actual addition",
+            0,
+            3,
+            72,
+            ReaderView {
+                cursor: 99,
+                column: 0,
+                visual: None,
+                active: false,
+                quoted_diff_highlighting: false,
+                theme: &theme,
+            },
+            Some(PatchLineKind::Add),
+            None,
+        );
+        assert_eq!(unquoted_diff.spans[0].style.fg, Some(theme.unread));
+        assert!(unquoted_diff.spans[0].style.bg.is_some());
+    }
+
+    #[test]
+    fn rich_html_quote_spanning_multiple_spans_keeps_whole_line_colored() {
+        use super::{PatchLineKind, quoted_body_style, rich_html_line};
+        use crate::model::{HtmlLine, HtmlSpan};
+        use ratatui::style::Modifier;
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
+        let line = HtmlLine {
+            spans: vec![
+                HtmlSpan { text: ">".into(), style: HtmlSpanStyle::default() },
+                HtmlSpan { text: "> From ".into(), style: HtmlSpanStyle::default() },
+                HtmlSpan {
+                    text: "Jérôme: quoted full text".into(),
+                    style: HtmlSpanStyle {
+                        foreground: Some((255, 0, 0)),
+                        bold: true,
+                        ..Default::default()
+                    },
+                },
+            ],
+        };
+        let rendered = rich_html_line(
+            &line,
+            0,
+            2,
+            70,
+            ReaderView {
+                cursor: 99,
+                column: 0,
+                visual: None,
+                active: false,
+                quoted_diff_highlighting: false,
+                theme: &theme,
+            },
+            Some(PatchLineKind::Remove),
+            None,
+        );
+        let expected = quoted_body_style(2, &theme).fg;
+        assert_eq!(
+            rendered.spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+            ">> From Jérôme: quoted full text"
+        );
+        assert!(rendered.spans.iter().all(|span| span.style.fg == expected));
+        assert!(rendered.spans.iter().all(|span| span.style.bg.is_none()));
+        assert!(rendered.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn composer_quoted_attribution_keeps_depth_color() {
+        use super::{editor_text, quoted_body_style};
+        use crate::app::Composer;
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
+        let mut composer = Composer::new();
+        composer.body = "> On Mon, Phillip wrote:\n>> Earlier reply".to_string();
+        let text = editor_text(&composer.body, &composer, false, &theme, false);
+        for (depth, line) in text.lines.iter().enumerate() {
+            let expected = quoted_body_style(depth + 1, &theme).fg;
+            assert!(line.spans.iter().all(|s| s.style.fg == expected));
+        }
+    }
+
+    #[test]
+    fn composer_quote_diff_mode_preserves_quote_markers_and_only_colors_patch_hunks() {
+        use super::{diff_line_style, editor_text, quoted_body_style, PatchLineKind};
+        use crate::app::{ComposeMode, Composer};
+        let theme = load_themes().into_iter()
+            .find(|theme| theme.id == "tokyo-night").unwrap();
+        let mut composer = Composer::new();
+        composer.mode = ComposeMode::Insert; // Do not mask text with the Normal block cursor.
+        composer.body = "> @@ -1 +1 @@\n> -before\n> +after\n> plain prose".into();
+        let conversation = editor_text(&composer.body, &composer, false, &theme, false);
+        assert_eq!(conversation.lines.len(), 4);
+        for line in &conversation.lines {
+            assert!(line.spans.iter().all(|span| span.style.bg.is_none()));
+            assert_eq!(line.spans[2].style.fg, quoted_body_style(1, &theme).fg);
+        }
+        let diff = editor_text(&composer.body, &composer, false, &theme, true);
+        assert_eq!(diff.lines[0].spans[2].style.fg, diff_line_style(PatchLineKind::Hunk, &theme).fg);
+        assert_eq!(diff.lines[1].spans[2].style.bg, diff_line_style(PatchLineKind::Remove, &theme).bg);
+        assert_eq!(diff.lines[2].spans[2].style.bg, diff_line_style(PatchLineKind::Add, &theme).bg);
+        assert_eq!(diff.lines[3].spans[2].style.fg, quoted_body_style(1, &theme).fg);
+        // The leading '>' and the following space are still conversation styling.
+        assert_eq!(diff.lines[1].spans[0].style.fg, quoted_body_style(1, &theme).fg);
+        assert!(diff.lines[1].spans[0].style.bg.is_none());
     }
 
     #[test]
@@ -1296,6 +1565,7 @@ mod tests {
                 column: 0,
                 visual: None,
                 active: true,
+                quoted_diff_highlighting: false,
                 theme: &theme,
             },
             &[(0, 4)],
@@ -1336,6 +1606,7 @@ mod tests {
                 column: 0,
                 visual: None,
                 active: true,
+                quoted_diff_highlighting: false,
                 theme: &theme,
             },
             &[(0, 4)],
@@ -1363,6 +1634,7 @@ mod tests {
                 column: 0,
                 visual: None,
                 active: true,
+                quoted_diff_highlighting: false,
                 theme: &theme,
             },
             None,

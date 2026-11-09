@@ -45,16 +45,36 @@ impl App {
             Duration::ZERO,
             true,
         );
-        if cached.is_none()
-            && account
-                .worker
-                .post(ActionKind::FetchAttachments {
-                    mailbox,
-                    id: id.clone(),
-                })
-                .is_err()
+        // A parsed MIME body is authoritative. Never open an empty browser.
+        // Header-only attachment hints are not reliable enough to reject a
+        // message, so unknown bodies are checked on the worker first.
+        if cached.as_ref().is_some_and(|files| files.is_empty())
+            || (cached.is_none()
+                && account.selected_body().is_some_and(|body| body.attachment_count == 0))
         {
-            self.status = StatusLine::error("mail worker busy; cannot load attachments");
+            self.status = StatusLine::info("no attachments to preview");
+            return;
+        }
+        if cached.is_none() {
+            if self.attachment_pending.as_ref() == Some(&id)
+                && self.attachment_source.as_ref() == Some(&source)
+            {
+                self.status = StatusLine::info("checking attachments…");
+                return;
+            }
+            let request = account.worker.post(ActionKind::FetchAttachments {
+                mailbox,
+                id: id.clone(),
+            });
+            let Ok(request_id) = request else {
+                self.status = StatusLine::error("mail worker busy; cannot load attachments");
+                return;
+            };
+            self.attachment_source = Some(source);
+            self.attachment_pending = Some(id);
+            self.attachment_pending_request_id = Some(request_id);
+            self.status = StatusLine::info("checking attachments…");
+            // Don't show a popup until MIME extraction confirms files exist.
             return;
         }
         self.attachment_picker_visible = true;
@@ -70,19 +90,17 @@ impl App {
         self.attachment_smooth_target = None;
         self.attachment_source = Some(source);
         self.reset_received_attachment_previews();
-        self.attachment_pending = if cached.is_some() { None } else { Some(id) };
-        if cached.is_some() {
-            self.queue_attachment_preview();
-            self.status = StatusLine::info("attachments restored from memory");
-        } else {
-            self.status = StatusLine::info("loading attachments…");
-        }
+        self.attachment_pending = None;
+        self.attachment_pending_request_id = None;
+        self.queue_attachment_preview();
+        self.status = StatusLine::info("attachments restored from memory");
     }
 
     pub(super) fn dismiss_attachment_picker(&mut self) {
         self.help_visible = false;
         self.attachment_picker_visible = false;
         self.attachment_pending = None;
+        self.attachment_pending_request_id = None;
         self.attachment_files = Arc::new(Vec::new());
         self.attachment_source = None;
         self.attachment_marked.clear();

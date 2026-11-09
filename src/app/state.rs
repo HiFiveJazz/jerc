@@ -800,7 +800,17 @@ impl AccountState {
     }
 
     #[must_use]
+    pub fn cached_mailbox_unverified(&self) -> bool {
+        self.current_mailbox
+            .as_ref()
+            .is_some_and(|name| self.unverified_mailboxes.contains(name))
+    }
+
+    #[must_use]
     pub fn selected_message(&self) -> Option<&MessageSummary> {
+        if self.cached_mailbox_unverified() {
+            return None;
+        }
         self.messages.get(self.message_index)
     }
 
@@ -837,6 +847,11 @@ impl AccountState {
 
     #[must_use]
     pub fn visible_message_indices(&self) -> Vec<usize> {
+        // Disk snapshots are hints for fast IMAP delta synchronization, not
+        // verified current folder contents. Do not flash already-deleted mail.
+        if self.cached_mailbox_unverified() {
+            return Vec::new();
+        }
         let query = self.search_query.trim().to_lowercase();
         if query.is_empty() {
             return (0..self.messages.len()).collect();
@@ -1510,6 +1525,8 @@ pub struct App {
     reader_image_target_width: u16,
     reader_image_target_height: u16,
     pub reader_images_enabled: bool,
+    /// Show Git patch colors even inside quoted mailing-list replies.
+    pub quoted_diff_highlighting: bool,
     pub show_header_details: bool,
     theme_config_path: Option<PathBuf>,
     pub attachment_picker_visible: bool,
@@ -1534,6 +1551,8 @@ pub struct App {
     attachment_preview_results: Arc<Mutex<VecDeque<AttachmentPreviewResult>>>,
     attachment_preview_cache: VecDeque<(usize, Result<image::DynamicImage, String>)>,
     attachment_pending: Option<MessageId>,
+    /// Correlates an asynchronous MIME attachment check with its worker reply.
+    attachment_pending_request_id: Option<u64>,
     attachment_preview: Option<Protocol>,
     attachment_preview_identity: Option<(usize, u16, u16)>,
     compose_file_preview_image: Option<Protocol>,
@@ -1753,6 +1772,7 @@ impl App {
             reader_image_target_width: 48,
             reader_image_target_height: 18,
             reader_images_enabled: config.ui.remote_images,
+            quoted_diff_highlighting: false,
             show_header_details: false,
             theme_config_path: config.config_path.clone(),
             attachment_picker_visible: false,
@@ -1773,6 +1793,7 @@ impl App {
             attachment_preview_results: Arc::new(Mutex::new(VecDeque::new())),
             attachment_preview_cache: VecDeque::new(),
             attachment_pending: None,
+            attachment_pending_request_id: None,
             attachment_preview: None,
             attachment_preview_identity: None,
             compose_file_preview_image: None,
@@ -2457,6 +2478,18 @@ impl App {
             Command::ToggleHtml => {
                 self.count_prefix = None;
                 self.toggle_html();
+            }
+            Command::ToggleQuotedDiff => {
+                self.count_prefix = None;
+                self.quoted_diff_highlighting = !self.quoted_diff_highlighting;
+                self.status = StatusLine::temporary(
+                    if self.quoted_diff_highlighting {
+                        "quoted Git diff colors enabled"
+                    } else {
+                        "conversation quote colors enabled"
+                    },
+                    Duration::from_secs(2),
+                );
             }
             Command::ToggleImages => {
                 self.count_prefix = None;
@@ -3840,6 +3873,40 @@ fn load_compose_file(path: &Path) -> anyhow::Result<OutgoingAttachment> {
     })
 }
 
+/// Explicit Vim cuts (`x`) share one clipboard/register policy across
+/// Compose and Contacts. Plain yanks stay in Jerc's in-memory register.
+fn record_cut(
+    register: &mut Option<YankRegister>,
+    text: String,
+    linewise: bool,
+) -> Option<StatusLine> {
+    record_cut_with(register, text, linewise, copy_text_to_clipboard)
+}
+
+/// Keep the clipboard attempt injectable so success, failure, and an empty cut
+/// can be tested without depending on wl-copy, pbcopy, or a running desktop.
+fn record_cut_with(
+    register: &mut Option<YankRegister>,
+    text: String,
+    linewise: bool,
+    copy: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Option<StatusLine> {
+    if text.is_empty() {
+        return None;
+    }
+    *register = Some(YankRegister {
+        text: text.clone(),
+        linewise,
+    });
+    Some(match copy(&text) {
+        Ok(()) => StatusLine::temporary("cut copied to clipboard", Duration::from_secs(2)),
+        Err(_) => StatusLine::temporary(
+            "cut to internal register (system clipboard unavailable)",
+            Duration::from_secs(3),
+        ),
+    })
+}
+
 fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
     let mut child = ProcessCommand::new(program)
         .args(args)
@@ -4382,6 +4449,266 @@ mod tests {
     use ratatui::layout::Size;
     use ratatui::widgets::BorderType;
     use std::path::PathBuf;
+
+    #[test]
+    fn quoted_diff_mode_toggles_without_changing_the_message() {
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        assert!(!app.quoted_diff_highlighting);
+        app.handle_command(super::Command::ToggleQuotedDiff);
+        assert!(app.quoted_diff_highlighting);
+        app.handle_command(super::Command::ToggleQuotedDiff);
+        assert!(!app.quoted_diff_highlighting);
+    }
+
+    #[test]
+    fn compose_shift_c_toggles_diff_mode_without_editing_text_or_insert_key() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = Composer::new();
+        composer.body = "> old text".into();
+        composer.switch_field(ComposeField::Body);
+        composer.mode = ComposeMode::Normal;
+        app.composer = Some(composer);
+        let shift_c = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT);
+        app.handle_composer_key(shift_c);
+        assert!(app.quoted_diff_highlighting);
+        assert_eq!(app.composer.as_ref().unwrap().body, "> old text");
+        app.handle_composer_key(shift_c);
+        assert!(!app.quoted_diff_highlighting);
+        app.composer.as_mut().unwrap().mode = ComposeMode::Insert;
+        app.composer.as_mut().unwrap().cursor = 0;
+        app.handle_composer_key(shift_c);
+        assert!(!app.quoted_diff_highlighting);
+        assert!(app.composer.as_ref().unwrap().body.starts_with('C'));
+    }
+
+    #[test]
+    fn unverified_cached_mail_never_appears_as_live_mail() {
+        use std::sync::mpsc::sync_channel;
+        use crate::worker::WorkerHandle;
+        let root = tempfile::tempdir().unwrap();
+        let (tx, _rx) = sync_channel(8);
+        let worker = WorkerHandle::spawn(
+            0,
+            Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+            None,
+            None,
+            tx,
+        );
+        let config = crate::config::Config::single_maildir(
+            "Local".into(), root.path().to_path_buf()
+        );
+        let mut app = super::App::new(&config, vec![worker]);
+        let raw = b"From: Example <example@example.org>\r\nSubject: Already deleted\r\n\r\nold";
+        let message = crate::mail::parse_summary(
+            MessageId("old-uid".into()), raw, raw.len() as u64, MessageFlags::empty()
+        ).unwrap();
+        let account = app.account_mut().unwrap();
+        account.current_mailbox = Some("INBOX".into());
+        account.messages = vec![message];
+        account.unverified_mailboxes.insert("INBOX".into());
+        assert!(account.cached_mailbox_unverified());
+        assert!(account.visible_message_indices().is_empty());
+        assert!(account.selected_message().is_none());
+        // A first-page server response marks this folder verified, after
+        // which its real rows (not disk-only guesses) can be displayed.
+        account.unverified_mailboxes.remove("INBOX");
+        assert_eq!(account.visible_message_indices(), vec![0]);
+        assert_eq!(account.selected_message().unwrap().subject, "Already deleted");
+    }
+
+    #[test]
+    fn ctrl_a_does_not_open_attachment_browser_for_known_empty_mime() {
+        use std::sync::mpsc::sync_channel;
+        use crate::worker::WorkerHandle;
+        let root = tempfile::tempdir().unwrap();
+        let (tx, _rx) = sync_channel(8);
+        let worker = WorkerHandle::spawn(
+            0,
+            Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+            None,
+            None,
+            tx,
+        );
+        let config = crate::config::Config::single_maildir(
+            "Local".into(), root.path().to_path_buf()
+        );
+        let mut app = super::App::new(&config, vec![worker]);
+        let raw = b"From: Sender <sender@example.org>\r\nSubject: No files\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello";
+        let id = MessageId("empty-attachment-test".into());
+        let message = crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, MessageFlags::empty()).unwrap();
+        let body = crate::mail::parse_body(id.clone(), raw).unwrap();
+        assert_eq!(body.attachment_count, 0);
+        let account = app.account_mut().unwrap();
+        account.current_mailbox = Some("INBOX".into());
+        account.messages = vec![message];
+        account.bodies.insert(id.clone(), body);
+        account.unverified_mailboxes.remove("INBOX");
+        app.open_attachment_picker();
+        assert!(!app.attachment_picker_visible);
+        assert!(app.attachment_pending.is_none());
+        assert_eq!(app.status.text, "no attachments to preview");
+
+        // If the MIME body is not cached, the worker checks it without
+        // opening a blank popup. An empty result leaves the reader visible.
+        app.account_mut().unwrap().bodies.clear();
+        app.open_attachment_picker();
+        assert!(!app.attachment_picker_visible);
+        let request_id = app.attachment_pending_request_id.expect("attachment check queued");
+        app.handle_worker_event(crate::worker::WorkerEvent {
+            account: 0,
+            request_id,
+            kind: crate::worker::WorkerEventKind::AttachmentsLoaded {
+                mailbox: "INBOX".into(),
+                id,
+                attachments: Vec::new(),
+            },
+        });
+        assert!(!app.attachment_picker_visible);
+        assert!(app.attachment_pending.is_none());
+        assert_eq!(app.status.text, "no attachments to preview");
+    }
+
+    #[test]
+    fn shared_cut_writes_clipboard_and_keeps_register_on_clipboard_failure() {
+        let mut register = None;
+        let mut clipboard_text = String::new();
+        let status = super::record_cut_with(&mut register, "😊text".into(), false, |text| {
+            clipboard_text = text.to_owned();
+            Ok(())
+        });
+        assert!(status.is_some());
+        assert_eq!(clipboard_text, "😊text");
+        assert_eq!(register.as_ref().unwrap().text, "😊text");
+
+        let status = super::record_cut_with(&mut register, "other".into(), true, |_text| {
+            Err(std::io::Error::other("clipboard unavailable"))
+        });
+        assert!(status.is_some());
+        assert_eq!(register.as_ref().unwrap().text, "other");
+        assert!(register.as_ref().unwrap().linewise);
+
+        let mut clipboard_called = false;
+        assert!(super::record_cut_with(&mut register, String::new(), false, |_text| {
+            clipboard_called = true;
+            Ok(())
+        }).is_none());
+        assert!(!clipboard_called);
+        assert_eq!(register.as_ref().unwrap().text, "other");
+    }
+
+    #[test]
+    fn compose_normal_x_cuts_to_register_in_every_header_and_body() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+
+        for field in [
+            ComposeField::To,
+            ComposeField::Cc,
+            ComposeField::Bcc,
+            ComposeField::Subject,
+            ComposeField::Body,
+        ] {
+            let mut composer = Composer::new();
+            composer.switch_field(field);
+            *composer.field_mut() = "a😊bc".into();
+            composer.mode = ComposeMode::Normal;
+            composer.cursor = 1;
+            app.composer = Some(composer);
+            app.yank_register = None;
+
+            // Counted x uses Unicode character offsets, not UTF-8 bytes.
+            app.handle_composer_key(key('2'));
+            app.handle_composer_key(key('x'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "ac", "{field:?}");
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "😊b", "{field:?}");
+            assert!(!app.yank_register.as_ref().unwrap().linewise);
+
+            app.handle_composer_key(key('u'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "a😊bc");
+            app.composer.as_mut().unwrap().cursor = 1;
+            app.handle_composer_key(key('x'));
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "😊");
+            app.handle_composer_key(key('P'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "a😊bc");
+
+            // Reaching end of a field must not erase the previous register.
+            let len = app.composer.as_ref().unwrap().char_count();
+            app.composer.as_mut().unwrap().cursor = len;
+            app.handle_composer_key(key('x'));
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "😊");
+        }
+    }
+
+    #[test]
+    fn compose_visual_x_cuts_selected_unicode_in_every_field_and_can_undo() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+
+        for field in [
+            ComposeField::To,
+            ComposeField::Cc,
+            ComposeField::Bcc,
+            ComposeField::Subject,
+            ComposeField::Body,
+        ] {
+            let mut composer = Composer::new();
+            composer.switch_field(field);
+            *composer.field_mut() = "a😊bc".into();
+            composer.mode = ComposeMode::Normal;
+            composer.cursor = 1;
+            app.composer = Some(composer);
+            app.yank_register = None;
+
+            app.handle_composer_key(key('v'));
+            app.handle_composer_key(key('l'));
+            app.handle_composer_key(key('x'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "ac", "{field:?}");
+            assert_eq!(app.yank_register.as_ref().unwrap().text, "😊b", "{field:?}");
+            assert_eq!(app.composer.as_ref().unwrap().mode, ComposeMode::Normal);
+            app.handle_composer_key(key('u'));
+            assert_eq!(app.composer.as_ref().unwrap().field_value(), "a😊bc", "{field:?}");
+        }
+    }
+
+    #[test]
+    fn compose_linewise_visual_x_preserves_register_type_and_normal_delete_does_not_yank() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.mode = ComposeMode::Normal;
+        composer.body = "first 😊\nsecond".into();
+        composer.cursor = 0;
+        app.composer = Some(composer);
+
+        app.handle_composer_key(key('V'));
+        app.handle_composer_key(key('x'));
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "first 😊\n");
+        assert!(app.yank_register.as_ref().unwrap().linewise);
+        assert_eq!(app.composer.as_ref().unwrap().body, "second");
+        app.handle_composer_key(key('u'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "first 😊\nsecond");
+
+        app.composer.as_mut().unwrap().cursor = 0;
+        app.handle_composer_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(app.composer.as_ref().unwrap().body, "irst 😊\nsecond");
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "first 😊\n");
+
+        // x on a newline does not accidentally concatenate adjacent lines.
+        app.composer.as_mut().unwrap().cursor = 6;
+        app.handle_composer_key(key('x'));
+        assert_eq!(app.composer.as_ref().unwrap().body, "irst 😊\nsecond");
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "first 😊\n");
+    }
 
     #[test]
     fn compose_and_contacts_share_unicode_word_motions() {

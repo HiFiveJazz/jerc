@@ -520,8 +520,26 @@ impl App {
                         });
                 if expected
                     && self.attachment_pending.as_ref() == Some(&id)
-                    && self.attachment_picker_visible
+                    && self.attachment_pending_request_id == Some(event.request_id)
                 {
+                    self.attachment_pending_request_id = None;
+                    // The user may have selected another email while this MIME
+                    // extraction ran. Never pop up the old message's files.
+                    if event.account != self.account_index
+                        || account.current_mailbox.as_deref() != Some(mailbox.as_str())
+                        || !account.selected_message().is_some_and(|message| message.id == id)
+                    {
+                        self.attachment_pending = None;
+                        self.attachment_source = None;
+                        return;
+                    }
+                    if attachments.is_empty() {
+                        self.attachment_pending = None;
+                        self.attachment_source = None;
+                        self.status = StatusLine::info("no attachments to preview");
+                        return;
+                    }
+                    self.attachment_picker_visible = true;
                     self.attachment_files = Arc::new(attachments);
                     if let Some(source) = self
                         .attachment_source
@@ -814,6 +832,13 @@ impl App {
                 };
             }
             WorkerEventKind::Error(error) => {
+                if self.attachment_pending_request_id == Some(event.request_id) {
+                    self.attachment_pending_request_id = None;
+                    self.attachment_pending = None;
+                    self.attachment_source = None;
+                    self.status = StatusLine::error(format!("could not load attachments: {error}"));
+                    return;
+                }
                 if account.mailbox_status_inflight == Some(event.request_id) {
                     account.mailbox_status_inflight = None;
                     // Background count lookup failure is nonfatal: keep the
