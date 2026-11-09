@@ -146,11 +146,17 @@ fn create_workers(
             // Maildir uses a separate inexpensive local worker as well, so
             // disk reads cannot stall interactive navigation.
             let status_backend = Some(backend::from_account(account)?);
+            let idle_backend = if backend::ImapSource::supports(&account.source) {
+                Some(backend::from_account(account)?)
+            } else {
+                None
+            };
             let sender = outgoing::from_account(account)?;
-            Ok(WorkerHandle::spawn(
+            Ok(WorkerHandle::spawn_with_idle(
                 index,
                 backend,
                 status_backend,
+                idle_backend,
                 sender,
                 runtime_tx.clone(),
             ))

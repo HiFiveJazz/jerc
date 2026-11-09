@@ -65,6 +65,13 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         if account.search_editing {
             // The editable query is already rendered in the message-list search
             // header. Avoid echoing the status text below it a second time.
+        } else if app.message_open
+            && let Some(url) = app.link_under_reader_cursor()
+        {
+            // The actual destination has priority over transient status text
+            // while the Vim reader cursor rests on a hyperlink. Never follow it
+            // automatically: the user can inspect the complete URL first.
+            spans.push(Span::styled(format!("URL: {url}"), theme.accent()));
         } else if account.connecting {
             spans.push(Span::raw("Connecting…"));
         } else if account.mailboxes_loading {

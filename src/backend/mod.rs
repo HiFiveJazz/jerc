@@ -1,7 +1,9 @@
 mod imap;
 mod maildir;
 
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Result, anyhow};
 
@@ -117,6 +119,16 @@ pub trait MailBackend: Send {
     fn capabilities(&self) -> Capabilities;
     fn connect(&mut self) -> Result<()>;
     fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>>;
+    /// Dedicated read-only IDLE connection. Never runs on the interactive
+    /// session. Backends without push support retain the existing poll path.
+    fn watch_mailbox(
+        &mut self,
+        _name: &str,
+        _cancel: &AtomicBool,
+        _changed: &mut dyn FnMut(),
+    ) -> Result<()> {
+        Err(anyhow!("IMAP IDLE is not supported by this backend"))
+    }
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)>;
     /// UIDVALIDITY from the currently selected mailbox, if provided by IMAP.
     fn mailbox_uid_validity(&self, _name: &str) -> Option<u32> {
@@ -139,6 +151,18 @@ pub trait MailBackend: Send {
     }
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody>;
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>>;
+    /// Stream a raw .eml export directly into a private temporary file, rather
+    /// than retaining an arbitrarily large message in the process heap.
+    fn export_raw_into(
+        &mut self,
+        mailbox: &str,
+        id: &MessageId,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
+        writer.write_all(&self.fetch_raw(mailbox, id)?)?;
+        Ok(())
+    }
+
     /// Append an already-built RFC 5322 message to a mailbox. Outgoing mail uses
     /// this for a Sent copy after the SMTP relay accepts the exact same bytes.
     fn append_message(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {

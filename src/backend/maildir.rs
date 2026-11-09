@@ -1,13 +1,13 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::backend::MailBackend;
-use crate::mail::{parse_body, parse_summary, read_all, read_header_block};
+use crate::mail::{MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body, parse_summary, read_all_limited, read_header_block};
 use crate::model::{
     Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage,
     MessageSummary,
@@ -229,14 +229,22 @@ impl MailBackend for MaildirBackend {
     }
 
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody> {
-        let raw = self.fetch_raw(mailbox, id)?;
+        let path = self.locate(mailbox, id)?;
+        let raw = read_all_limited(File::open(&path)?, MAX_BODY_MESSAGE_BYTES)
+            .with_context(|| format!("reading message from {}", path.display()))?;
         parse_body(id.clone(), &raw).context("parsing Maildir message body")
     }
 
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
         let path = self.locate(mailbox, id)?;
-        read_all(File::open(&path)?)
+        read_all_limited(File::open(&path)?, MAX_RAW_MESSAGE_BYTES)
             .with_context(|| format!("reading message from {}", path.display()))
+    }
+
+    fn export_raw_into(&mut self, mailbox: &str, id: &MessageId, writer: &mut dyn Write) -> Result<()> {
+        let path = self.locate(mailbox, id)?;
+        io::copy(&mut File::open(&path)?, writer)?;
+        Ok(())
     }
 
     fn append_message(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
@@ -251,7 +259,7 @@ impl MailBackend for MaildirBackend {
             std::process::id()
         );
         let tmp = maildir.join("tmp").join(&unique);
-        fs::write(&tmp, raw).with_context(|| format!("writing {}", tmp.display()))?;
+        write_private_new(&tmp, raw).with_context(|| format!("writing {}", tmp.display()))?;
         let filename = if seen {
             format!("{unique}{}2,S", maildir_info_separator())
         } else {
@@ -279,7 +287,7 @@ impl MailBackend for MaildirBackend {
             std::process::id()
         );
         let tmp = maildir.join("tmp").join(&unique);
-        fs::write(&tmp, raw).with_context(|| format!("writing draft {}", tmp.display()))?;
+        write_private_new(&tmp, raw).with_context(|| format!("writing draft {}", tmp.display()))?;
         let target = maildir
             .join("cur")
             .join(format!("{unique}{}2,DS", maildir_info_separator()));
@@ -410,6 +418,28 @@ fn mailbox_sort_key(name: &str) -> (u8, String) {
     (weight, name.to_ascii_lowercase())
 }
 
+/// A Maildir message must never be world-readable, even with umask 022.
+fn private_new_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn write_private_new(path: &Path, raw: &[u8]) -> Result<()> {
+    let mut file = private_new_file(path)?;
+    if let Err(error) = file.write_all(raw) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn move_file(source: &Path, destination: &Path) -> Result<()> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
@@ -417,7 +447,16 @@ fn move_file(source: &Path, destination: &Path) -> Result<()> {
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
-            fs::copy(source, destination)?;
+            // fs::copy preserves source permissions on many platforms; an old
+            // 0644 message must not leak when crossing filesystems.
+            let mut input = File::open(source)?;
+            let mut output = private_new_file(destination)?;
+            let result = io::copy(&mut input, &mut output);
+            drop(output);
+            if let Err(error) = result {
+                let _ = fs::remove_file(destination);
+                return Err(error.into());
+            }
             fs::remove_file(source)?;
             Ok(())
         }
@@ -445,4 +484,17 @@ mod tests {
         assert_eq!(role_for_name("Sent Items"), MailboxRole::Sent);
         assert_eq!(role_for_name("Archive/2026"), MailboxRole::Archive);
     }
+    #[cfg(unix)]
+    #[test]
+    fn new_maildir_message_is_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message");
+        super::write_private_new(&path, b"private data").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"private data");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(super::write_private_new(&path, b"overwrite").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"private data");
+    }
+
 }

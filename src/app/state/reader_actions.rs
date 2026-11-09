@@ -702,7 +702,7 @@ impl App {
         };
     }
 
-    pub(super) fn link_under_reader_cursor(&self) -> Option<String> {
+    pub(crate) fn link_under_reader_cursor(&self) -> Option<String> {
         let account = self.account()?;
         let body = account.selected_body()?;
         let showing_html = body.has_html_alternative() && account.prefer_html;

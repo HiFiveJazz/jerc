@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -64,12 +65,27 @@ struct CacheFileRef<'a> {
 /// reader may hold up to 80 bodies (including large rich HTML layouts), but
 /// disk persistence only retains the first 12 eligible bodies among the first
 /// 400 message headers. Avoid cloning the full working set on every update.
+#[cfg(test)]
 pub(crate) fn persistable_bodies(
     messages: &[MessageSummary],
     bodies: &HashMap<MessageId, MessageBody>,
 ) -> HashMap<MessageId, MessageBody> {
+    persistable_bodies_near(messages, bodies, 0)
+}
+
+/// Cache the currently selected message before the surrounding previews.
+/// After restarting, re-opening that message should not wait for Gmail.
+pub(crate) fn persistable_bodies_near(
+    messages: &[MessageSummary],
+    bodies: &HashMap<MessageId, MessageBody>,
+    selected_index: usize,
+) -> HashMap<MessageId, MessageBody> {
     let mut selected = HashMap::with_capacity(MAX_BODIES_PER_FOLDER.min(bodies.len()));
-    for message in messages.iter().take(MAX_MESSAGES_PER_FOLDER) {
+    let limit = messages.len().min(MAX_MESSAGES_PER_FOLDER);
+    let mut positions = (0..limit).collect::<Vec<_>>();
+    positions.sort_by_key(|index| index.abs_diff(selected_index));
+    for index in positions {
+        let message = &messages[index];
         if selected.len() >= MAX_BODIES_PER_FOLDER {
             break;
         }
@@ -96,22 +112,70 @@ pub(crate) enum Change {
     RemoveFolder(String),
 }
 
+/// A single latest change per folder. The wake channel only holds a token;
+/// arbitrary numbers of reader selections cannot queue expensive snapshots.
+#[derive(Default)]
+struct PendingChanges {
+    mailboxes: Option<Vec<Mailbox>>,
+    folders: HashMap<String, Option<CachedMailbox>>,
+}
+
+impl PendingChanges {
+    fn insert(&mut self, change: Change) {
+        match change {
+            Change::Mailboxes(mailboxes) => self.mailboxes = Some(mailboxes),
+            Change::Folder(name, folder) => {
+                if self.folders.len() < MAX_FOLDERS || self.folders.contains_key(&name) {
+                    self.folders.insert(name, Some(folder));
+                }
+            }
+            Change::RemoveFolder(name) => {
+                if self.folders.len() == MAX_FOLDERS && !self.folders.contains_key(&name)
+                    && let Some(evict) = self.folders.keys().next().cloned()
+                {
+                    self.folders.remove(&evict);
+                }
+                self.folders.insert(name, None);
+            }
+        }
+    }
+
+    fn drain_into(&mut self, snapshot: &mut Snapshot) {
+        if let Some(mailboxes) = self.mailboxes.take() {
+            apply(snapshot, Change::Mailboxes(mailboxes));
+        }
+        for (name, folder) in self.folders.drain() {
+            match folder {
+                Some(folder) => apply(snapshot, Change::Folder(name, folder)),
+                None => apply(snapshot, Change::RemoveFolder(name)),
+            }
+        }
+    }
+}
+
 pub(crate) struct Writer {
-    tx: Option<Sender<Change>>,
+    wake: Option<SyncSender<()>>,
+    pending: Arc<Mutex<PendingChanges>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl Writer {
     pub(crate) fn send(&self, change: Change) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(change);
+        let Some(wake) = &self.wake else { return };
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(change);
+            // Capacity one, coalesced by folder: never block terminal input.
+            match wake.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(())) => {}
+                Err(TrySendError::Disconnected(())) => {}
+            }
         }
     }
 }
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        self.tx.take();
+        self.wake.take();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -146,26 +210,35 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
             .is_some_and(|snapshot| !snapshot.folders.is_empty()),
     );
     let snapshot = loaded.unwrap_or_default();
-    let (tx, rx) = mpsc::channel::<Change>();
+    let (wake, rx) = mpsc::sync_channel::<()>(1);
+    let pending = Arc::new(Mutex::new(PendingChanges::default()));
+    let thread_pending = Arc::clone(&pending);
     let mut stored = snapshot.clone();
     let join = thread::Builder::new()
         .name("mail-cache-writer".into())
         .spawn(move || {
-            while let Ok(change) = rx.recv() {
-                apply(&mut stored, change);
-                // Combine the stream of 10+ STATUS replies on startup into a
-                // single atomic write. Shutdown drains the channel before exit.
-                while let Ok(change) = rx.recv_timeout(Duration::from_millis(160)) {
-                    apply(&mut stored, change);
+            while rx.recv().is_ok() {
+                // Coalesce status replies and quick reader changes into a
+                // single disk write, without ever queueing duplicate bodies.
+                while rx.recv_timeout(Duration::from_millis(160)).is_ok() {}
+                if let Ok(mut changes) = thread_pending.lock() {
+                    changes.drain_into(&mut stored);
                 }
                 let _ = write_snapshot(&path, &stored);
             }
+            // One final flush on shutdown, including changes sent while a
+            // write was in progress.
+            if let Ok(mut changes) = thread_pending.lock() {
+                changes.drain_into(&mut stored);
+            }
+            let _ = write_snapshot(&path, &stored);
         });
     match join {
         Ok(join) => (
             snapshot,
             Some(Writer {
-                tx: Some(tx),
+                wake: Some(wake),
+                pending,
                 join: Some(join),
             }),
         ),
@@ -294,6 +367,29 @@ fn write_snapshot(path: &PathBuf, snapshot: &Snapshot) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_writer_coalesces_latest_folder_and_removal() {
+        let mut pending = super::PendingChanges::default();
+        pending.insert(super::Change::Mailboxes(Vec::new()));
+        pending.insert(super::Change::RemoveFolder("INBOX".into()));
+        pending.insert(super::Change::RemoveFolder("INBOX".into()));
+        assert_eq!(pending.folders.len(), 1);
+        let mut stored = super::Snapshot::default();
+        pending.drain_into(&mut stored);
+        assert!(pending.folders.is_empty());
+    }
+
+    #[test]
+    fn coalesced_writer_queue_never_exceeds_folder_limit() {
+        let mut pending = PendingChanges::default();
+        for index in 0..1_000 {
+            pending.insert(Change::RemoveFolder(format!("F{index}")));
+        }
+        assert!(pending.folders.len() <= MAX_FOLDERS);
+        pending.insert(Change::RemoveFolder("latest".into()));
+        assert!(pending.folders["latest"].is_none());
+    }
 
     #[test]
     fn snapshot_roundtrip_and_private_permissions() {

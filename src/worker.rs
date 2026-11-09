@@ -1,7 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -20,6 +22,8 @@ pub enum ActionKind {
     Connect,
     ListMailboxes,
     MailboxStatus(String),
+    /// Wake from a dedicated IDLE session; the UI owns STATUS reconciliation.
+    WatchMailboxChanged(String),
     /// A single newest message preview after a known Inbox count increase.
     NewMailPreview {
         mailbox: String,
@@ -129,6 +133,7 @@ pub enum WorkerEventKind {
         total: usize,
         unread: usize,
     },
+    MailboxChanged { name: String },
     NewMailPreview {
         count: usize,
         sender: String,
@@ -216,13 +221,28 @@ pub struct WorkerHandle {
     status_sender: Option<SyncSender<Action>>,
     join: Option<JoinHandle<()>>,
     status_join: Option<JoinHandle<()>>,
+    idle_stop: Arc<AtomicBool>,
+    idle_join: Option<JoinHandle<()>>,
 }
 
 impl WorkerHandle {
     pub fn spawn(
         account: usize,
+        backend: Box<dyn MailBackend>,
+        status_backend: Option<Box<dyn MailBackend>>,
+        outgoing: Option<Box<dyn MailSender>>,
+        runtime_tx: SyncSender<RuntimeEvent>,
+    ) -> Self {
+        Self::spawn_with_idle(account, backend, status_backend, None, outgoing, runtime_tx)
+    }
+
+    /// The IDLE watcher is optional and completely separate from the two
+    /// existing workers. Existing callers/tests use `spawn` unchanged.
+    pub fn spawn_with_idle(
+        account: usize,
         mut backend: Box<dyn MailBackend>,
         status_backend: Option<Box<dyn MailBackend>>,
+        idle_backend: Option<Box<dyn MailBackend>>,
         mut outgoing: Option<Box<dyn MailSender>>,
         runtime_tx: SyncSender<RuntimeEvent>,
     ) -> Self {
@@ -244,11 +264,22 @@ impl WorkerHandle {
         } else {
             (None, None)
         };
+        let idle_stop = Arc::new(AtomicBool::new(false));
+        let idle_join = idle_backend.map(|backend| {
+            let stop = Arc::clone(&idle_stop);
+            let wake = status_sender.clone().unwrap_or_else(|| sender.clone());
+            thread::Builder::new()
+                .name(format!("mail-idle-{account}"))
+                .spawn(move || run_idle_worker(backend, stop, wake))
+                .expect("failed to spawn IMAP IDLE worker")
+        });
         Self {
             sender,
             status_sender,
             join: Some(join),
             status_join,
+            idle_stop,
+            idle_join,
         }
     }
 
@@ -283,7 +314,7 @@ impl WorkerHandle {
             }
         } else if matches!(
             &action.kind,
-            ActionKind::MailboxStatus(_) | ActionKind::NewMailPreview { .. }
+            ActionKind::MailboxStatus(_) | ActionKind::WatchMailboxChanged(_) | ActionKind::NewMailPreview { .. }
         ) {
             self.status_sender
                 .as_ref()
@@ -299,6 +330,7 @@ impl WorkerHandle {
         let Some(join) = self.join.take() else {
             return;
         };
+        self.idle_stop.store(true, Ordering::Relaxed);
         // Shutdown is allowed to wait for the bounded queue to drain. Ordinary
         // UI actions use try_send() so backend pressure can never freeze input.
         // The status worker is independent: shut it down as well, but never
@@ -311,12 +343,56 @@ impl WorkerHandle {
         if let Some(status_join) = self.status_join.take() {
             let _ = status_join.join();
         }
+        // Connection establishment can outlive the UI. Its send channel is
+        // disconnected on shutdown, so an old watcher cannot update a reloaded
+        // account. Never block quit on a stuck server handshake.
+        if let Some(idle_join) = self.idle_join.take() {
+            if idle_join.is_finished() {
+                let _ = idle_join.join();
+            }
+        }
     }
 }
 
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// A separate long-lived IMAP IDLE session. Only sends bounded wake
+/// tokens; all UID validation and mailbox changes remain in existing workers.
+fn run_idle_worker(
+    mut backend: Box<dyn MailBackend>,
+    stop: Arc<AtomicBool>,
+    wake: SyncSender<Action>,
+) {
+    let mut backoff_secs: u64 = 2;
+    while !stop.load(Ordering::Relaxed) {
+        let started = Instant::now();
+        let result = (|| -> anyhow::Result<()> {
+            backend.connect()?;
+            let inbox = backend.list_mailboxes()?.into_iter()
+                .find(|mailbox| mailbox.role == crate::model::MailboxRole::Inbox);
+            let Some(inbox) = inbox else { return Ok(()) };
+            let mut last_wake = Instant::now() - Duration::from_secs(2);
+            backend.watch_mailbox(&inbox.name, &stop, &mut || {
+                // A UID+FLAGS event burst only needs one STATUS reconciliation.
+                if last_wake.elapsed() >= Duration::from_secs(1) {
+                    let _ = wake.try_send(Action::new(ActionKind::WatchMailboxChanged(inbox.name.clone())));
+                    last_wake = Instant::now();
+                }
+            })
+        })();
+        crate::perf::record("imap_idle_session", None, started.elapsed(), result.is_ok());
+        if result.is_ok() || stop.load(Ordering::Relaxed) {
+            break; // No IDLE capability / huge Inbox: retain existing polling.
+        }
+        for _ in 0..backoff_secs {
+            if stop.load(Ordering::Relaxed) { return; }
+            thread::sleep(Duration::from_secs(1));
+        }
+        backoff_secs = (backoff_secs * 2).min(60);
     }
 }
 
@@ -357,6 +433,7 @@ fn run_worker(
             ActionKind::Connect => "worker_connect",
             ActionKind::ListMailboxes => "worker_list_mailboxes",
             ActionKind::MailboxStatus(_) => "worker_mailbox_status",
+            ActionKind::WatchMailboxChanged(_) => "worker_idle_changed",
             ActionKind::NewMailPreview { .. } => "worker_new_mail_preview",
             ActionKind::OpenMailbox { .. } => "worker_open_mailbox",
             ActionKind::FetchBody { .. } => "worker_fetch_body",
@@ -393,6 +470,7 @@ fn run_worker(
             ActionKind::NewMailPreview { mailbox, count } => {
                 Ok(new_mail_preview(backend, &mailbox, count))
             }
+            ActionKind::WatchMailboxChanged(name) => Ok(WorkerEventKind::MailboxChanged { name }),
             ActionKind::MailboxStatus(name) => backend.mailbox_status(&name).map(|(total, unread)| {
                 WorkerEventKind::MailboxStatus {
                     name,
@@ -425,10 +503,9 @@ fn run_worker(
                 .fetch_raw(&mailbox, &id)
                 .and_then(|raw| crate::mail::extract_attachments(&raw))
                 .map(|attachments| WorkerEventKind::AttachmentsLoaded { mailbox, id, attachments }),
-            ActionKind::ExportRaw { mailbox, id, path } => backend
-                .fetch_raw(&mailbox, &id)
-                .and_then(|raw| write_export(&path, &raw).map(|()| path))
-                .map(|path| WorkerEventKind::MessageExported { path }),
+            ActionKind::ExportRaw { mailbox, id, path } =>
+                write_export_stream(&path, |output| backend.export_raw_into(&mailbox, &id, output))
+                    .map(|()| WorkerEventKind::MessageExported { path }),
             ActionKind::SetSeen { mailbox, id, seen } => backend
                 .set_seen(&mailbox, &id, seen)
                 .map(|()| WorkerEventKind::SeenChanged { id, seen }),
@@ -724,6 +801,15 @@ fn run_status_worker(
                     break;
                 }
             }
+            ActionKind::WatchMailboxChanged(name) => {
+                if runtime_tx.try_send(RuntimeEvent::Worker(WorkerEvent {
+                    account,
+                    request_id: action.id,
+                    kind: WorkerEventKind::MailboxChanged { name },
+                })).is_err() {
+                    // The periodic STATUS poll will reconcile this missed wake.
+                }
+            }
             ActionKind::MailboxStatus(name) => {
                 bodies_since_status = 0;
                 let result = (|| {
@@ -879,16 +965,23 @@ fn new_mail_preview(backend: &mut dyn MailBackend, mailbox: &str, count: usize) 
     }
 }
 
-fn write_export(path: &std::path::Path, raw: &[u8]) -> anyhow::Result<()> {
+fn write_export_stream(
+    path: &std::path::Path,
+    stream: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, raw)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    // Private from creation, atomic on success, and automatically removed
+    // after a partial network failure.
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("missing export parent"))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    stream(tmp.as_file_mut())?;
+    if tmp.as_file().metadata()?.len() == 0 {
+        anyhow::bail!("export returned an empty RFC 5322 message");
     }
+    tmp.flush()?;
+    tmp.persist(path)?;
     Ok(())
 }
 
@@ -896,13 +989,42 @@ fn write_export(path: &std::path::Path, raw: &[u8]) -> anyhow::Result<()> {
 mod tests {
     use super::{
         Action, ActionKind, RuntimeEvent, WorkerEventKind, WorkerHandle, compact_navigation_queue,
-        pop_background_action, write_export,
+        pop_background_action, write_export_stream,
     };
     use crate::backend::MailBackend;
     use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage};
     use std::collections::VecDeque;
     use std::sync::mpsc::{self, Receiver, SyncSender};
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_export_does_not_follow_existing_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let export = dir.path().join("message.eml");
+        std::os::unix::fs::symlink(&victim, &export).unwrap();
+        write_export_stream(&export, |writer| { std::io::Write::write_all(writer, b"confidential")?; Ok(()) }).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&export).unwrap(), b"confidential");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&export).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn failed_streaming_export_keeps_existing_target_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message.eml");
+        std::fs::write(&path, b"original").unwrap();
+        let result = write_export_stream(&path, |out| {
+            std::io::Write::write_all(out, b"partial")?;
+            anyhow::bail!("simulated disconnect")
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     fn open(name: &str) -> Action {
         Action::new(ActionKind::OpenMailbox {
@@ -1255,7 +1377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("message.eml");
         let raw = b"From: test@example.com\r\nSubject: debug\r\n\r\nbody\r\n";
-        write_export(&path, raw).unwrap();
+        write_export_stream(&path, |writer| { std::io::Write::write_all(writer, raw)?; Ok(()) }).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), raw);
         #[cfg(unix)]
         {

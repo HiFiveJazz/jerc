@@ -79,6 +79,19 @@ impl App {
                 }
                 Self::pump_mailbox_status(account);
             }
+            WorkerEventKind::MailboxChanged { name } => {
+                if account.current_mailbox.as_deref() == Some(name.as_str()) {
+                    account.pending_inbox_refresh = true;
+                }
+                if account.inbox_poll_inflight.is_none()
+                    && account.mailbox_status_inflight.is_none()
+                    && account.pending_mutations == 0
+                {
+                    if let Ok(request) = account.worker.post(ActionKind::MailboxStatus(name)) {
+                        account.inbox_poll_inflight = Some(request);
+                    }
+                }
+            }
             WorkerEventKind::MailboxStatus {
                 name,
                 total,
@@ -92,7 +105,9 @@ impl App {
                     account.inbox_poll_inflight = None;
                 }
                 let mut new_count = 0usize;
+                let mut changed = false;
                 if let Some(mailbox) = account.mailboxes.iter_mut().find(|m| m.name == name) {
+                    changed = mailbox.counts_known && (mailbox.total != total || mailbox.unread != unread);
                     new_count = inbox_new_mail_count(
                         from_poll && mailbox.role == MailboxRole::Inbox,
                         mailbox.counts_known,
@@ -149,9 +164,22 @@ impl App {
                         {
                             account.pending_inbox_refresh = true;
                         } else {
+                            account.pending_inbox_refresh = false;
                             account.restore_message_index = Some(account.message_index);
-                            let _ = account.request_mailbox_page(name, 0);
+                            let _ = account.request_mailbox_page(name.clone(), 0);
                         }
+                    }
+                }
+                if (changed || (from_poll && account.pending_inbox_refresh)) && new_count == 0
+                    && account.current_mailbox.as_deref() == Some(name.as_str())
+                {
+                    if account.page_inflight.is_some()
+                        || (self.message_open && event.account == self.account_index)
+                    {
+                        account.pending_inbox_refresh = true;
+                    } else {
+                        account.pending_inbox_refresh = false;
+                        let _ = account.request_mailbox_page(name.clone(), 0);
                     }
                 }
                 account.persist_mailboxes();
@@ -222,7 +250,7 @@ impl App {
                     account.page_inflight = None;
                     account.messages_loading = false;
                     if page.offset == 0 {
-                        account.mailbox_cache.insert(
+                        account.remember_mailbox(
                             name,
                             CachedMailbox {
                                 messages: page.messages,

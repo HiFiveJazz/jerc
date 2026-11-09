@@ -1,11 +1,16 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
+use std::io::{self, Write};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use io_imap::client::{ImapClient, ImapClientStd, ImapClientStdConnectOptions};
+use io_imap::client::{
+    ImapClient, ImapClientStd, ImapClientStdConnectOptions, ImapMailboxWatchStreamOptions,
+};
 use io_imap::rfc3501::{
     append::ImapMessageAppendOptions, copy::ImapMessageCopyOptions, fetch::ImapMessageFetchOptions,
     login::ImapLoginOptions, select::ImapMailboxSelectOptions, store::ImapMessageStoreOptions,
@@ -18,6 +23,7 @@ use io_imap::types::{
     fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
     flag::{Flag, FlagFetch, FlagNameAttribute, StoreType},
     mailbox::{ListMailbox, Mailbox as ImapMailbox},
+    response::Capability,
     sequence::SequenceSet,
     status::{StatusDataItem, StatusDataItemName},
 };
@@ -26,13 +32,42 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::backend::{MailBackend, MailboxSyncHint};
-use crate::mail::{parse_body, parse_summary};
+use crate::mail::{MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body, parse_summary};
 use crate::model::{
     Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage,
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(90);
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Reject data at the IMAP stream boundary, before a malicious literal can
+/// allocate an arbitrary-sized Vec. The writer is not a disk cache.
+struct LimitedMessageWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl LimitedMessageWriter {
+    fn new(limit: usize) -> Self {
+        Self { bytes: Vec::new(), limit }
+    }
+}
+
+impl Write for LimitedMessageWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::other(format!(
+                "IMAP message exceeds the {} MiB in-memory limit",
+                self.limit / (1024 * 1024)
+            )));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImapAuth {
@@ -729,6 +764,32 @@ fn summary_from_fetch(
     Some(summary)
 }
 
+impl ImapBackend {
+    fn fetch_raw_limited(
+        &mut self,
+        mailbox: &str,
+        id: &MessageId,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        self.ensure_selected(mailbox)?;
+        self.check_uid_generation(id)?;
+        let uid = Self::uid_from_id(id)?;
+        let uid = NonZeroU32::new(uid).ok_or_else(|| anyhow!("IMAP UID cannot be zero"))?;
+        let mut raw = LimitedMessageWriter::new(limit);
+        let started = Instant::now();
+        let result = self
+            .session()?
+            .fetch_body_stream(uid, true, &mut raw)
+            .with_context(|| format!("fetching IMAP message UID {uid}"));
+        crate::perf::record("imap_fetch_body", None, started.elapsed(), result.is_ok());
+        result?;
+        if raw.bytes.is_empty() {
+            bail!("IMAP server did not return requested UID {uid}");
+        }
+        Ok(raw.bytes)
+    }
+}
+
 impl MailBackend for ImapBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities::IMAP_BASIC
@@ -837,6 +898,48 @@ impl MailBackend for ImapBackend {
         Ok(())
     }
 
+    fn watch_mailbox(
+        &mut self,
+        name: &str,
+        cancel: &AtomicBool,
+        changed: &mut dyn FnMut(),
+    ) -> Result<()> {
+        // io-imap's watcher stores a UID+FLAGS shadow for the entire folder.
+        // Do not start it for a giant Inbox: STATUS polling stays available
+        // and has constant retained memory regardless of mailbox size.
+        const MAX_IDLE_SHADOW_MESSAGES: usize = 3_000;
+        let (total, _) = self.mailbox_status(name)?;
+        if total > MAX_IDLE_SHADOW_MESSAGES || cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mailbox = mailbox_from_name(name)?;
+        let mut session = self.session.take().ok_or_else(|| anyhow!("IMAP not connected"))?;
+        // Only use IDLE when the server explicitly advertises RFC 2177.
+        let capability = session.capability().context("reading IMAP capabilities")?;
+        if !capability.contains(&Capability::Idle) {
+            return Ok(());
+        }
+        let opts = ImapMailboxWatchStreamOptions {
+            shutdown_poll: Duration::from_secs(1),
+            // Reissue IDLE periodically to survive quiet middleboxes.
+            idle_timeout: Some(Duration::from_secs(25 * 60)),
+            poll: None,
+        };
+        let watch = session.watch_mailbox(mailbox, &capability, opts)
+            .context("starting IMAP IDLE mailbox watcher")?;
+        // The watcher owns the connection, leaving all foreground navigation
+        // and the independent STATUS/prefetch worker unaffected.
+        while !cancel.load(Ordering::Relaxed) {
+            match watch.recv_timeout(Duration::from_secs(1)) {
+                Ok(Ok(_)) => changed(),
+                Ok(Err(error)) => return Err(error.into()),
+                Err(RecvTimeoutError::Timeout) => {},
+                Err(RecvTimeoutError::Disconnected) => bail!("IMAP IDLE stream stopped"),
+            }
+        }
+        Ok(())
+    }
+
     fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>> {
         let reference: ImapMailbox<'static> = ""
             .to_owned()
@@ -934,32 +1037,22 @@ impl MailBackend for ImapBackend {
     }
 
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody> {
-        let raw = self.fetch_raw(mailbox, id)?;
+        let raw = self.fetch_raw_limited(mailbox, id, MAX_BODY_MESSAGE_BYTES)?;
         parse_body(id.clone(), &raw).context("parsing IMAP message body")
     }
 
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
+        self.fetch_raw_limited(mailbox, id, MAX_RAW_MESSAGE_BYTES)
+    }
+
+    fn export_raw_into(&mut self, mailbox: &str, id: &MessageId, writer: &mut dyn Write) -> Result<()> {
         self.ensure_selected(mailbox)?;
         self.check_uid_generation(id)?;
         let uid = Self::uid_from_id(id)?;
         let uid = NonZeroU32::new(uid).ok_or_else(|| anyhow!("IMAP UID cannot be zero"))?;
-        let mut raw = Vec::new();
-        let started = Instant::now();
-        let fetched_result = self
-            .session()?
-            .fetch_body_stream(uid, true, &mut raw)
-            .with_context(|| format!("fetching IMAP message UID {uid}"));
-        crate::perf::record(
-            "imap_fetch_body",
-            None,
-            started.elapsed(),
-            fetched_result.is_ok(),
-        );
-        fetched_result?;
-        if raw.is_empty() {
-            bail!("IMAP server did not return requested UID {uid}");
-        }
-        Ok(raw)
+        self.session()?.fetch_body_stream(uid, true, writer)
+            .with_context(|| format!("streaming IMAP message UID {uid} to disk"))?;
+        Ok(())
     }
 
     fn append_message(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
@@ -1546,4 +1639,16 @@ mod tests {
             crate::model::MailboxRole::Trash
         );
     }
+    #[test]
+    fn imap_literal_cannot_exceed_memory_budget() {
+        use super::LimitedMessageWriter;
+        use std::io::Write;
+        let mut writer = LimitedMessageWriter::new(5);
+        writer.write_all(b"123").unwrap();
+        assert!(writer.write_all(b"456").is_err());
+        assert_eq!(writer.bytes, b"123");
+        writer.write_all(b"45").unwrap();
+        assert_eq!(writer.bytes, b"12345");
+    }
+
 }

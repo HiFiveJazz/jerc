@@ -312,7 +312,17 @@ pub fn visible_attachment_hints(hints: &[String]) -> Vec<String> {
         .collect()
 }
 
+// Raw message limits apply before mail-parser can decode MIME parts.
+// Explicit attachments/forwarding may be larger than a reader preview.
+pub const MAX_BODY_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_RAW_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RENDERED_HTML_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+
 pub fn extract_attachments(raw: &[u8]) -> Result<Vec<OutgoingAttachment>> {
+    if raw.len() > MAX_RAW_MESSAGE_BYTES {
+        anyhow::bail!("message exceeds the 32 MiB MIME attachment limit");
+    }
+
     let parsed = MessageParser::new()
         .parse(raw)
         .ok_or_else(|| anyhow!("unable to parse MIME attachments"))?;
@@ -365,6 +375,9 @@ fn guessed_attachment_type(name: &str, bytes: &[u8]) -> &'static str {
 }
 
 pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
+    if raw.len() > MAX_BODY_MESSAGE_BYTES {
+        anyhow::bail!("message exceeds the 8 MiB reader limit; export the raw message instead");
+    }
     let parser = MessageParser::new();
     let message = parser
         .parse(raw)
@@ -383,6 +396,14 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         PartKind::Html => part.text().map(|html| html.into_owned()),
         _ => None,
     });
+    // HTML expansion (table flattening, rich layout, styled spans) can be much
+    // larger than the RFC 5322 input. Reject oversized HTML before rendering.
+    if html_source
+        .as_ref()
+        .is_some_and(|html| html.len() > MAX_RENDERED_HTML_SOURCE_BYTES)
+    {
+        anyhow::bail!("HTML body exceeds the 2 MiB rendering limit");
+    }
     let plain_fallback = if plain_text
         .as_deref()
         .is_none_or(|text| text.trim().is_empty())
@@ -1327,16 +1348,22 @@ fn clean_reader_text(text: &str) -> String {
     out.trim().to_owned()
 }
 
-pub fn read_all(mut reader: impl Read) -> Result<Vec<u8>> {
+pub fn read_all_limited(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    reader.read_to_end(&mut out).context("reading message")?;
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)
+        .context("reading message")?;
+    if out.len() > limit {
+        anyhow::bail!("message exceeds the {} MiB in-memory limit", limit / (1024 * 1024));
+    }
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_bare_list_markers, compact_decorative_horizontal_rules,
+        read_all_limited, compact_bare_list_markers, compact_decorative_horizontal_rules,
         compact_generic_image_alt_lines, compact_prose_whitespace, compact_social_link_chrome,
         extract_thread_headers, parse_body, parse_summary, read_header_block,
         render_html_for_terminal, simplify_layout_table_blocks,
@@ -1353,6 +1380,13 @@ References: <root@example.com>\r\n\t<cover@example.com>\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 Hello from the body.\r\n";
+
+    #[test]
+    fn streaming_reader_rejects_input_larger_than_budget() {
+        let ok = read_all_limited(Cursor::new(b"1234"), 4).unwrap();
+        assert_eq!(ok, b"1234");
+        assert!(read_all_limited(Cursor::new(b"12345"), 4).is_err());
+    }
 
     #[test]
     fn old_cached_calendar_hints_are_collapsed_for_list_and_reader() {

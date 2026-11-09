@@ -181,9 +181,29 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         draw_search_header(frame, chunks[0], &search_query, app);
     }
 
+    let unverified = app.account().is_some_and(|account| account.cached_mailbox_unverified());
+    // Present the disk snapshot immediately, even on slow Gmail connections.
+    // It is explicitly labeled provisional and stays read-only: mutation and
+    // opening paths still use verified visible_message_indices/selected_message.
+    let list_area = if unverified && list_area.height > 1 {
+        let banner = Rect::new(list_area.x, list_area.y, list_area.width, 1);
+        frame.render_widget(
+            Paragraph::new(" Cached messages · verifying with server (read-only)")
+                .style(theme.muted()),
+            banner,
+        );
+        Rect::new(list_area.x, list_area.y + 1, list_area.width, list_area.height - 1)
+    } else {
+        list_area
+    };
     app.set_message_view_height(usize::from(list_area.height.max(1)));
     let account = app.account().expect("account exists");
-    let visible = account.visible_message_indices();
+    let visible = if unverified {
+        // Display-only: never hand these unverified IDs to action handlers.
+        (0..account.messages.len()).collect::<Vec<_>>()
+    } else {
+        account.visible_message_indices()
+    };
     let selected_position = visible
         .iter()
         .position(|&index| index == account.message_index);
@@ -233,7 +253,11 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
     // Resolve the visual range once; calling message_is_visual_selected() for
     // every row previously rebuilt and searched the entire filtered index list.
-    let visual_range = message_list_visual_range(&visible, app.visual_anchor, selected_position);
+    let visual_range = if unverified {
+        None
+    } else {
+        message_list_visual_range(&visible, app.visual_anchor, selected_position)
+    };
     let in_junk = account.current_mailbox.as_ref().is_some_and(|source| {
         account.mailboxes.iter().any(|mailbox| {
             mailbox.name == *source && mailbox.role == crate::model::MailboxRole::Junk
@@ -261,7 +285,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let number = relative_number(absolute_position, current_position);
         let visual_selected =
             visual_range.is_some_and(|(first, last)| (first..=last).contains(&absolute_position));
-        let marked = app.message_marked.contains(&message.id);
+        let marked = !unverified && app.message_marked.contains(&message.id);
         let is_selected = visual_selected || marked;
         let current = absolute_position == current_position;
         let unread_mark = if is_selected {
@@ -374,7 +398,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Cell::from(message.date_label.as_str()),
         ])
         .height(if attachment_mark { 2 } else { 1 })
-        .style(style)
+        .style(if unverified { theme.muted() } else { style })
     });
 
     let table = Table::new(rows, message_columns)
@@ -389,7 +413,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             let position = start + row_position;
             let visual =
                 visual_range.is_some_and(|(first, last)| (first..=last).contains(&position));
-            let marked = app.message_marked.contains(&message.id);
+            let marked = !unverified && app.message_marked.contains(&message.id);
             let row_height = if message.has_attachment(account.bodies.get(&message.id)) {
                 2
             } else {

@@ -39,6 +39,7 @@ use crate::worker::{ActionKind, RuntimeEvent, WorkerEvent, WorkerEventKind, Work
 
 // Large feature handlers live alongside the state model. Keeping the types
 // here preserves the public API and serialized draft representation.
+mod account_cache;
 mod attachment_actions;
 mod compose_actions;
 mod composer;
@@ -63,6 +64,7 @@ const BODY_PREFETCH_BACKWARD: usize = 6;
 const BODY_PREFETCH_FAST_FORWARD: usize = 22;
 const BODY_PREFETCH_FAST_BACKWARD: usize = 8;
 const PREFETCH_WINDOW_REARM_ROWS: usize = 12;
+const MAX_WARM_MAILBOXES: usize = 6;
 const MAX_CACHED_PREVIEW_BODIES: usize = 80;
 const MAX_CACHED_PREVIEW_BYTES: usize = 48 * 1024 * 1024;
 // Avoid silently downloading giant attachments simply because the cursor is
@@ -769,6 +771,7 @@ pub struct AccountState {
     last_prefetch_window: Option<(String, Vec<MessageId>)>,
     last_prefetch_anchor: Option<(String, usize, isize)>,
     mailbox_cache: HashMap<String, CachedMailbox>,
+    warm_folder_order: VecDeque<String>,
     cache_writer: Option<cache::Writer>,
     uid_validities: HashMap<String, u32>,
     uid_nexts: HashMap<String, u32>,
@@ -922,120 +925,6 @@ impl AccountState {
             visible.len(),
             self.message_view_height,
         );
-    }
-
-    fn save_current_cache(&mut self) {
-        let Some(name) = self.current_mailbox.clone() else {
-            return;
-        };
-        let uid_validity = self.uid_validities.get(&name).copied();
-        let uid_next = self.uid_nexts.get(&name).copied();
-        self.mailbox_cache.insert(
-            name,
-            CachedMailbox {
-                messages: self.messages.clone(),
-                bodies: self.bodies.clone(),
-                message_index: self.message_index,
-                message_view_offset: self.message_view_offset,
-                next_page_offset: self.next_page_offset,
-                has_more: self.has_more,
-                uid_validity,
-                uid_next,
-            },
-        );
-    }
-
-    fn persist_mailboxes(&self) {
-        if let Some(writer) = &self.cache_writer {
-            writer.send(cache::Change::Mailboxes(self.mailboxes.clone()));
-        }
-    }
-
-    fn persist_current_cache(&mut self) {
-        let Some(name) = self.current_mailbox.as_ref() else {
-            return;
-        };
-        let Some(writer) = &self.cache_writer else {
-            return;
-        };
-        // Don't clone 80 warm preview bodies into the in-session cache and
-        // then clone them *again* for a disk writer that can only keep 12.
-        // In-session snapshots are captured separately when changing folders.
-        let Some(uid_validity) = self.uid_validities.get(name).copied() else {
-            return;
-        };
-        if self.unverified_mailboxes.contains(name) {
-            return;
-        }
-        let truncated = self.messages.len() > cache::MAX_MESSAGES_PER_FOLDER;
-        writer.send(cache::Change::Folder(
-            name.clone(),
-            CachedMailbox {
-                messages: self
-                    .messages
-                    .iter()
-                    .take(cache::MAX_MESSAGES_PER_FOLDER)
-                    .cloned()
-                    .collect(),
-                bodies: cache::persistable_bodies(&self.messages, &self.bodies),
-                message_index: self.message_index,
-                message_view_offset: self.message_view_offset,
-                next_page_offset: if truncated {
-                    cache::MAX_MESSAGES_PER_FOLDER
-                } else {
-                    self.next_page_offset
-                },
-                has_more: truncated || self.has_more,
-                uid_validity: Some(uid_validity),
-                uid_next: self.uid_nexts.get(name).copied(),
-            },
-        ));
-    }
-
-    fn remove_persistent_folder(&self, name: &str) {
-        if let Some(writer) = &self.cache_writer {
-            writer.send(cache::Change::RemoveFolder(name.to_owned()));
-        }
-    }
-
-    fn restore_cached_mailbox(&mut self, name: &str) -> bool {
-        // Once selected, the live vectors own the folder. Moving them avoids
-        // duplicating potentially megabytes of HTML previews on every switch.
-        let Some(cached) = self.mailbox_cache.remove(name) else {
-            return false;
-        };
-        self.current_mailbox = Some(name.to_owned());
-        self.messages = cached.messages;
-        self.bodies = cached.bodies;
-        self.message_index = cached
-            .message_index
-            .min(self.messages.len().saturating_sub(1));
-        self.message_view_offset = cached.message_view_offset;
-        self.next_page_offset = cached.next_page_offset;
-        self.has_more = cached.has_more;
-        self.page_inflight = None;
-        self.page_request_id = None;
-        self.body_request_id = None;
-        self.last_prefetch_window = None;
-        self.messages_loading = false;
-        self.preview_scroll = 0;
-        self.preview_max_scroll = 0;
-        self.pending_bodies.clear();
-        self.pending_seen.clear();
-        self.search_query.clear();
-        self.search_editing = false;
-        self.clamp_selection();
-        // This precedes the network refresh. It identifies the moment cached
-        // rows become available to the UI, not the terminal's paint latency.
-        crate::perf::record("ui_cache_restore", None, Duration::ZERO, true);
-        true
-    }
-
-    fn invalidate_current_cache(&mut self) {
-        if let Some(name) = self.current_mailbox.as_ref() {
-            self.mailbox_cache.remove(name);
-            self.remove_persistent_folder(name);
-        }
     }
 
     fn queue_unknown_mailbox_statuses(&mut self, priority: Option<&str>) {
@@ -1532,6 +1421,9 @@ pub struct App {
     pub attachment_picker_visible: bool,
     pub attachment_selection: usize,
     pub attachment_files: Arc<Vec<OutgoingAttachment>>,
+    /// TempPath deletes the opened attachment on eviction or App shutdown.
+    /// Bound both the number and total size of these exports.
+    opened_attachment_files: VecDeque<tempfile::TempPath>,
     // A small per-session MIME cache makes reopening a received attachment
     // browser instantaneous instead of refetching the entire raw email.
     // Include UIDVALIDITY to avoid reusing a recycled IMAP UID.
@@ -1599,6 +1491,14 @@ pub struct App {
 
 impl App {
     pub fn new(config: &Config, workers: Vec<WorkerHandle>) -> Self {
+        // A crash may bypass TempPath's normal cleanup. Best-effort removal
+        // of old private attachment exports runs once, off the UI startup path.
+        static ATTACHMENT_CLEANUP_ONCE: std::sync::Once = std::sync::Once::new();
+        ATTACHMENT_CLEANUP_ONCE.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("jerc-attachment-cleanup".into())
+                .spawn(cleanup_stale_attachment_files);
+        });
         let app_search_mode = config.ui.search_mode;
         let accounts = config
             .accounts
@@ -1621,6 +1521,16 @@ impl App {
                     })
                     .collect();
                 let unverified_mailboxes = snapshot.folders.keys().cloned().collect();
+                let mut warm_names = snapshot.folders.keys().cloned().collect::<Vec<_>>();
+                warm_names.sort();
+                warm_names.retain(|name| name != &config.default_mailbox);
+                warm_names.insert(0, config.default_mailbox.clone());
+                warm_names.truncate(MAX_WARM_MAILBOXES);
+                let warm_folder_order = warm_names.into_iter()
+                    .filter(|name| snapshot.folders.contains_key(name))
+                    .collect::<VecDeque<_>>();
+                let mut warm_folders = snapshot.folders;
+                warm_folders.retain(|name, _| warm_folder_order.contains(name));
                 let mut account = AccountState {
                     name: config.name.clone(),
                     default_mailbox: config.default_mailbox.clone(),
@@ -1664,7 +1574,8 @@ impl App {
                     body_request_id: None,
                     last_prefetch_window: None,
                     last_prefetch_anchor: None,
-                    mailbox_cache: snapshot.folders,
+                    mailbox_cache: warm_folders,
+                    warm_folder_order,
                     cache_writer,
                     uid_validities,
                     uid_nexts,
@@ -1778,6 +1689,7 @@ impl App {
             attachment_picker_visible: false,
             attachment_selection: 0,
             attachment_files: Arc::new(Vec::new()),
+            opened_attachment_files: VecDeque::new(),
             attachment_source: None,
             attachment_cache: VecDeque::new(),
             attachment_marked: HashSet::new(),
@@ -3575,16 +3487,25 @@ impl App {
         let Some(file) = self.attachment_files.get(self.attachment_selection) else {
             return;
         };
+        let filename = file.filename.clone();
         match export_attachment_for_open(file) {
-            Ok(path) => match open_url(&path.to_string_lossy()) {
-                Ok(()) => {
-                    self.status = StatusLine::temporary(
-                        format!("opened {} with system viewer", file.filename),
-                        Duration::from_secs(3),
-                    )
-                }
-                Err(error) => {
-                    self.status = StatusLine::error(format!("could not open attachment: {error}"))
+            Ok(path) => {
+                match open_url(&path.to_string_lossy()) {
+                    Ok(()) => {
+                        // External viewers may open asynchronously, so retain
+                        // the file while Jerc runs, not just for this call.
+                        self.opened_attachment_files.push_back(path);
+                        while self.opened_attachment_files.len() > 4 {
+                            self.opened_attachment_files.pop_front();
+                        }
+                        self.status = StatusLine::temporary(
+                            format!("opened {filename} with system viewer"),
+                            Duration::from_secs(3),
+                        );
+                    }
+                    Err(error) => {
+                        self.status = StatusLine::error(format!("could not open attachment: {error}"));
+                    }
                 }
             },
             Err(error) => {
@@ -4050,7 +3971,14 @@ fn save_attachment_without_overwrite(
             format!("{stem} ({attempt}).{suffix}")
         };
         let path = directory.join(candidate);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(mut handle) => {
                 use std::io::Write as _;
                 if let Err(error) = handle.write_all(&file.data) {
@@ -4088,9 +4016,38 @@ fn preview_percent_at(column: u16, sidebar_width: u16, remaining: u16) -> u16 {
     (100 - (u32::from(inside) * 100 / u32::from(remaining)) as u16).clamp(25, 75)
 }
 
+/// Normal exit cleans up TempPath values automatically. After a crash, only
+/// old, private, regular files with our prefix are eligible for cleanup.
+#[cfg(unix)]
+fn cleanup_stale_attachment_files() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::time::SystemTime;
+
+    let Ok(identity) = tempfile::NamedTempFile::new() else { return; };
+    let Ok(owner) = identity.as_file().metadata() else { return; };
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return; };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue; };
+        if !name.starts_with("jerc-attachment-") { continue; }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue; };
+        if meta.file_type().is_file()
+            && meta.uid() == owner.uid()
+            && meta.permissions().mode() & 0o777 == 0o600
+            && meta.modified().ok().and_then(|time| SystemTime::now().duration_since(time).ok())
+                .is_some_and(|age| age >= Duration::from_secs(7 * 24 * 60 * 60))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_stale_attachment_files() {}
+
 /// Keep the temporary path alive so external viewers can open it after the
 /// TUI immediately regains control. tempfile creates files with mode 0600.
-fn export_attachment_for_open(file: &OutgoingAttachment) -> anyhow::Result<std::path::PathBuf> {
+fn export_attachment_for_open(file: &OutgoingAttachment) -> anyhow::Result<tempfile::TempPath> {
     use std::io::Write as _;
     if file.data.len() > 32 * 1024 * 1024 {
         anyhow::bail!("attachment is larger than the 32 MiB open limit");
@@ -4111,8 +4068,7 @@ fn export_attachment_for_open(file: &OutgoingAttachment) -> anyhow::Result<std::
         .tempfile()?;
     file_out.write_all(&file.data)?;
     file_out.flush()?;
-    let (_, path) = file_out.keep()?;
-    Ok(path)
+    Ok(file_out.into_temp_path())
 }
 
 fn open_url(url: &str) -> std::io::Result<()> {
@@ -6751,6 +6707,21 @@ mod received_attachment_browser_tests {
         assert_ne!(key, (0, "INBOX".to_owned(), Some(124u32), uid.clone()));
         assert_ne!(key, (1, "INBOX".to_owned(), Some(123u32), uid.clone()));
         assert_ne!(key, (0, "Archive".to_owned(), Some(123u32), uid));
+    }
+
+    #[test]
+    fn opened_attachment_temp_file_is_deleted_when_dropped() {
+        let path = super::export_attachment_for_open(&attachment("secret.txt", b"sensitive"))
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"sensitive");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let location = path.to_path_buf();
+        drop(path);
+        assert!(!location.exists());
     }
 
     #[test]
