@@ -2,7 +2,10 @@
 
 [← Back to README](../README.md)
 
-**Press `?` in Jerc for the searchable shortcut palette for your current view.** This document is a quick reference for the defaults; some actions depend on focus and mode. `Ctrl` / `Alt` are modifier keys, and uppercase letters mean `Shift` + that letter.
+**Press `?` in Jerc for the searchable shortcut palette for your current view.** This document is a quick reference for the defaults; some actions depend on focus and mode. `Ctrl` / `Alt` are modifier keys, and uppercase letters mean `Shift` + that letter. 
+
+> [!NOTE]
+> Keybinding support in the client and in the config file are being worked on. As of now, not all keybinds are modifiable. This will be updated in feature update soon!
 
 ## Mail browser
 

@@ -2,13 +2,13 @@
 
 [← Back to README](../README.md) · [Keybindings](keybindings.md)
 
-Jerc includes a local contacts manager and recipient suggestions without a separate address-book daemon or permission to access your operating system's address book.
+Jerc includes a local contacts manager and recipient suggestions./<
 
-## Recipient suggestions
+## Recipient Suggestions
 
 When composing in **To**, **Cc**, or **Bcc**, type part of a known name or email address. A small popup offers fuzzy-ranked contacts. Use `Ctrl-j` / `Ctrl-k` (or `Ctrl-n` / `Ctrl-p`) to navigate and `Tab` or `Enter` to accept. `Esc` dismisses the popup. Open the full Contacts manager with `Alt-c`.
 
-## Contacts manager
+## Contacts Manager
 
 Press **`Alt-c`** from Jerc to open Contacts. The left panel shows names; the right panel shows details. Press `?` for the searchable Contacts keymap.
 
@@ -21,7 +21,7 @@ Press **`Alt-c`** from Jerc to open Contacts. The left panel shows names; the ri
 
 The active UI theme controls selection colors. Change `[ui] visual_selection_style` to `gutter` or `row` to control how selection is painted.
 
-## Storage and privacy
+## Storage and Privacy
 
 On Linux, contact records are typically stored in `~/.local/share/jerc/contacts.json`. They contain names, email addresses, and favorite/source metadata; they are **not end-to-end encrypted**. Storage uses a local JSON database and atomic replacement. Nothing is synced to a contacts service automatically.
 

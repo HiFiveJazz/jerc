@@ -70,7 +70,7 @@ Check any suggested username against your provider's documentation or an existin
 
 - IMAP/SMTP OAuth bearer tokens and refresh tokens are credentials; treat them as secrets.
 - Jerc's account configuration supports external credential commands to avoid embedding passwords in TOML.
-- Organizational Microsoft 365 accounts can require administrator consent, independent of correct client configuration.
+- Organizational Microsoft 365 accounts can require administrator consent, independent of correct client configuration. If your organization supports Thunderbird, Jerc should work out of the box. Ask your administrator to approve using your email with Thunderbird in order to use it with Jerc.
 - If an account cannot send, verify its outgoing server, login identity, SMTP permissions, and OAuth scopes before changing tokens.
 
 For full field examples, see [`config.example.toml`](../config.example.toml).

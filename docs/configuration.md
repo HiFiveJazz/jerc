@@ -2,14 +2,10 @@
 
 [← Back to README](../README.md) · [OAuth guide](oauth.md)
 
-Jerc reads `config.toml` from the operating system's user configuration directory. On Linux this is usually `~/.config/jerc/config.toml` (or `$XDG_CONFIG_HOME/jerc/config.toml`). Start from the [example configuration](../config.example.toml), which documents additional fields.
+> [!NOTE]
+> Jerc strives to never require users to edit a configuration file for normal use. That said, we leave options open for advanced/power users who desire configuring everything themselves!
 
-```sh
-mkdir -p ~/.config/jerc
-cp config.example.toml ~/.config/jerc/config.toml
-```
-
-The sample enables a local Maildir account. Adjust it for your own mail location or replace it with an IMAP account.
+Starting Jerc for the first time generates a `config.toml` from the operating system's user configuration directory. On Linux this is usually `~/.config/jerc/config.toml` (or `$XDG_CONFIG_HOME/jerc/config.toml`). Refer to the [example configuration](../config.example.toml), which documents additional fields.
 
 ## Accounts
 
@@ -36,7 +32,9 @@ outgoing_cred_cmd = "pass show mail/smtp"
 from = "Your Name <you@example.com>"
 ```
 
-Prefer credential commands over placing reusable secrets directly in configuration files. Never commit a real account configuration to source control.
+
+> [!CAUTION]
+> Strive to use credential commands over placing reusable secrets directly in configuration files. Never commit a real account configuration to source control like git 
 
 ### OAuth accounts
 
@@ -87,11 +85,11 @@ new_mail_bell = false
 
 The [example config](../config.example.toml) documents preview widths, notification styling, contact learning, and other optional settings.
 
-## Contact data, tokens, and drafts
+## Contact Data, Tokens, and Drafts
 
 Jerc uses separate per-user directories for different kinds of data. The exact base directory depends on the operating system and XDG settings.
 
-| Data | Typical Linux location |
+| Data | Linux Location |
 | --- | --- |
 | Config | `~/.config/jerc/config.toml` |
 | Custom themes | `~/.config/jerc/themes/` |
@@ -100,7 +98,6 @@ Jerc uses separate per-user directories for different kinds of data. The exact b
 | Local postponed drafts | `~/.local/share/jerc/postponed/` |
 | Mail index cache | `~/.cache/jerc/mail-index/` |
 
-**Existing installations:** A project rename changes these paths. If upgrading from a development build with the old name, stop the application, back up your data, and manually move the relevant configuration, contacts, drafts, token, and cache directories before launching Jerc. Do not overwrite an existing destination. Cached indexes can be regenerated; authentication tokens and drafts cannot always be reconstructed automatically.
 
 ## Command-line tools
 
