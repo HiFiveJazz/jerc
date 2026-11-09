@@ -13,7 +13,7 @@ use ratatui::widgets::BorderType;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
 use crate::app::navigation::{bounded_index, wrapped_index as offset_index, reveal_row};
-use crate::app::vim::inner_text_object_range;
+use crate::app::vim::{YankRegister, inner_text_object_range};
 use self::reader_text::{
     ReaderWordMotion, reader_scroll_for_visual_cursor, reader_selection_text, reader_word_target,
     url_at_cursor,
@@ -530,14 +530,6 @@ struct RemovedAttachment {
     legacy: bool,
 }
 
-/// The unnamed Vim register is in memory only; neither its contents nor its
-/// linewise mode are serialized into drafts or synchronized to any provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct YankRegister {
-    text: String,
-    linewise: bool,
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DraftSource {
     pub mailbox: String,
@@ -633,22 +625,12 @@ pub struct Composer {
     body_preferred_column: Option<usize>,
     #[serde(skip)]
     pub visual_linewise: bool,
+    /// Transient Vim operator/count state; never serialized into drafts.
     #[serde(skip)]
-    pending_g: bool,
+    vim_sequence: crate::app::vim::VimSequence,
+    /// Bounded undo/redo of one field's value/cursor at a time.
     #[serde(skip)]
-    pending_delete: bool,
-    #[serde(skip)]
-    pending_yank: bool,
-    #[serde(skip)]
-    pending_inner: bool,
-    #[serde(skip)]
-    pending_find: Option<bool>,
-    #[serde(skip)]
-    count: Option<usize>,
-    #[serde(skip)]
-    undo_history: Vec<(ComposeField, String, usize)>,
-    #[serde(skip)]
-    redo_history: Vec<(ComposeField, String, usize)>,
+    edit_history: crate::app::vim::VimHistory<(ComposeField, String, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

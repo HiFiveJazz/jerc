@@ -527,10 +527,8 @@ pub struct ContactEdit {
     pub cursor: usize,
     pub mode: crate::app::ComposeMode,
     pub visual_anchor: Option<usize>,
-    pub pending_yank: bool,
-    pub pending_delete: bool,
-    undo: Vec<(String, String, bool, usize)>,
-    redo: Vec<(String, String, bool, usize)>,
+    pub(crate) vim_sequence: crate::app::vim::VimSequence,
+    history: crate::app::vim::VimHistory<(String, String, bool, usize)>,
 }
 
 impl ContactEdit {
@@ -546,10 +544,8 @@ impl ContactEdit {
             cursor,
             mode: crate::app::ComposeMode::Insert,
             visual_anchor: None,
-            pending_yank: false,
-            pending_delete: false,
-            undo: Vec::new(),
-            redo: Vec::new(),
+            vim_sequence: crate::app::vim::VimSequence::default(),
+            history: crate::app::vim::VimHistory::new(100),
         }
     }
     pub fn value(&self) -> &str {
@@ -570,8 +566,7 @@ impl ContactEdit {
         self.active_email = !self.active_email;
         self.cursor = self.value().chars().count();
         self.visual_anchor = None;
-        self.pending_yank = false;
-        self.pending_delete = false;
+        self.vim_sequence.clear();
     }
     fn snapshot(&self) -> (String, String, bool, usize) {
         (self.name.clone(), self.email.clone(), self.active_email, self.cursor)
@@ -582,19 +577,18 @@ impl ContactEdit {
         self.mode = crate::app::ComposeMode::Normal;
     }
     fn record_edit(&mut self) {
-        if self.undo.len() == 100 { self.undo.remove(0); }
-        self.undo.push(self.snapshot());
-        self.redo.clear();
+        let snapshot = self.snapshot();
+        self.history.record(snapshot);
     }
     pub fn undo(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            self.redo.push(self.snapshot());
-            self.restore(prev);
+        let current = self.snapshot();
+        if let Some(previous) = self.history.undo(current) {
+            self.restore(previous);
         }
     }
     pub fn redo(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(self.snapshot());
+        let current = self.snapshot();
+        if let Some(next) = self.history.redo(current) {
             self.restore(next);
         }
     }
@@ -616,7 +610,7 @@ impl ContactEdit {
     pub fn selected_range(&self) -> Option<(usize, usize)> {
         let anchor = self.visual_anchor?;
         if self.mode != crate::app::ComposeMode::Visual { return None; }
-        if self.pending_delete || self.pending_yank { return None; }
+        if self.vim_sequence.has_operator() { return None; }
         crate::app::vim::visual_chars(anchor, self.cursor, self.value().chars().count())
     }
     pub fn selected_text(&self) -> Option<String> {

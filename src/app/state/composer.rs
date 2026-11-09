@@ -49,14 +49,8 @@ impl Composer {
             body_smooth_target: None,
             body_preferred_column: None,
             visual_linewise: false,
-            pending_g: false,
-            pending_delete: false,
-            pending_yank: false,
-            pending_inner: false,
-            pending_find: None,
-            count: None,
-            undo_history: Vec::new(),
-            redo_history: Vec::new(),
+            vim_sequence: crate::app::vim::VimSequence::default(),
+            edit_history: crate::app::vim::VimHistory::new(200),
         }
     }
 
@@ -195,14 +189,8 @@ impl Composer {
             body_smooth_target: None,
             body_preferred_column: None,
             visual_linewise: false,
-            pending_g: false,
-            pending_delete: false,
-            pending_yank: false,
-            pending_inner: false,
-            pending_find: None,
-            count: None,
-            undo_history: Vec::new(),
-            redo_history: Vec::new(),
+            vim_sequence: crate::app::vim::VimSequence::default(),
+            edit_history: crate::app::vim::VimHistory::new(200),
         }
     }
 
@@ -256,14 +244,8 @@ impl Composer {
             body_smooth_target: None,
             body_preferred_column: None,
             visual_linewise: false,
-            pending_g: false,
-            pending_delete: false,
-            pending_yank: false,
-            pending_inner: false,
-            pending_find: None,
-            count: None,
-            undo_history: Vec::new(),
-            redo_history: Vec::new(),
+            vim_sequence: crate::app::vim::VimSequence::default(),
+            edit_history: crate::app::vim::VimHistory::new(200),
         })
     }
 
@@ -765,38 +747,22 @@ impl Composer {
     }
 
     pub(super) fn clear_pending(&mut self) {
-        self.pending_g = false;
-        self.pending_delete = false;
-        self.pending_yank = false;
-        self.pending_inner = false;
-        self.pending_find = None;
-        self.count = None;
+        self.vim_sequence.clear();
     }
 
     pub(super) fn remember_edit(&mut self) {
-        if self.undo_history.len() >= 200 {
-            self.undo_history.remove(0);
-        }
-        self.undo_history
-            .push((self.field, self.field_value().to_owned(), self.cursor));
-        self.redo_history.clear();
+        let snapshot = (self.field, self.field_value().to_owned(), self.cursor);
+        self.edit_history.record(snapshot);
     }
 
     pub(super) fn undo_edit(&mut self, redo: bool) {
-        let previous = if redo {
-            self.redo_history.pop()
-        } else {
-            self.undo_history.pop()
-        };
-        let Some((field, text, cursor)) = previous else {
-            return;
-        };
         let current = (self.field, self.field_value().to_owned(), self.cursor);
-        if redo {
-            self.undo_history.push(current);
+        let previous = if redo {
+            self.edit_history.redo(current)
         } else {
-            self.redo_history.push(current);
-        }
+            self.edit_history.undo(current)
+        };
+        let Some((field, text, cursor)) = previous else { return; };
         self.field = field;
         *self.field_mut() = text;
         self.cursor = cursor.min(self.char_count());
@@ -993,29 +959,7 @@ impl Composer {
     }
 
     pub(super) fn move_word_end(&mut self, whole: bool) {
-        let chars: Vec<char> = self.field_value().chars().collect();
-        if chars.is_empty() {
-            self.cursor = 0;
-            return;
-        }
-        let belongs = |ch: char| {
-            if whole {
-                !ch.is_whitespace()
-            } else {
-                ch.is_alphanumeric() || ch == '_'
-            }
-        };
-        let mut i = self.cursor.min(chars.len().saturating_sub(1));
-        if belongs(chars[i]) {
-            i = (i + 1).min(chars.len().saturating_sub(1));
-        }
-        while i < chars.len().saturating_sub(1) && !belongs(chars[i]) {
-            i += 1;
-        }
-        while i < chars.len().saturating_sub(1) && belongs(chars[i + 1]) {
-            i += 1;
-        }
-        self.cursor = i;
+        self.cursor = crate::app::vim::word_end(self.field_value(), self.cursor, whole);
     }
 
     pub(super) fn first_nonblank(&self) -> usize {

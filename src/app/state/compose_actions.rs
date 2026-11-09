@@ -622,86 +622,76 @@ impl App {
             return;
         }
 
-        // Multi-key Vim operations take precedence over simple motions.
-        if let Some(forward) = composer.pending_find.take() {
-            if let KeyCode::Char(ch) = key.code {
-                let count = composer.count.take().unwrap_or(1);
-                composer.find_char(ch, forward, count);
-            }
-            return;
-        }
-        if composer.pending_inner {
-            composer.pending_inner = false;
-            if let KeyCode::Char(delim) = key.code {
-                composer.select_inner_object(delim);
-            }
-            return;
-        }
-        if composer.pending_g {
-            composer.pending_g = false;
-            if key.code == KeyCode::Char('g') {
-                composer.cursor = 0;
-                composer.count = None;
-                return;
-            }
-        }
-        if composer.pending_yank {
-            composer.pending_yank = false;
-            let count = composer.count.take().unwrap_or(1);
-            let copied = match key.code {
-                KeyCode::Char('y') => Some(composer.yank_lines(count)),
-                KeyCode::Char('$') => Some(composer.yank_to_line_end()),
-                _ => None,
-            };
-            if let Some(register) = copied {
-                self.yank_register = Some(register);
-            }
-            return;
-        }
-        if composer.pending_delete {
-            composer.pending_delete = false;
-            let count = composer.count.take().unwrap_or(1);
-            match key.code {
-                KeyCode::Char('d') => composer.delete_current_lines(count),
-                KeyCode::Char('w') => composer.delete_words(count),
-                KeyCode::Char('$') => {
-                    let end = composer.line_end();
-                    composer.delete_range(composer.cursor, end);
+        // One shared pending-command state machine: no overlapping pending
+        // delete/yank/find flags, and count parsing is shared with Contacts.
+        if let Some(prefix) = composer.vim_sequence.take_command() {
+            use crate::app::vim::VimPrefix;
+            match prefix {
+                VimPrefix::FindForward | VimPrefix::FindBackward => {
+                    if let KeyCode::Char(ch) = key.code {
+                        let count = composer.vim_sequence.take_count();
+                        composer.find_char(ch, prefix == VimPrefix::FindForward, count);
+                    }
+                    return;
                 }
-                _ => {}
+                VimPrefix::Inner => {
+                    if let KeyCode::Char(delim) = key.code {
+                        composer.select_inner_object(delim);
+                    }
+                    return;
+                }
+                VimPrefix::Goto => {
+                    if key.code == KeyCode::Char('g') {
+                        composer.cursor = 0;
+                        composer.vim_sequence.discard_count();
+                        return;
+                    }
+                    // Historically, an unmatched g is ignored and the next
+                    // key still gets processed as a normal command.
+                }
+                VimPrefix::Yank => {
+                    let count = composer.vim_sequence.take_count();
+                    let copied = match key.code {
+                        KeyCode::Char('y') => Some(composer.yank_lines(count)),
+                        KeyCode::Char('$') => Some(composer.yank_to_line_end()),
+                        _ => None,
+                    };
+                    if let Some(register) = copied { self.yank_register = Some(register); }
+                    return;
+                }
+                VimPrefix::Delete => {
+                    let count = composer.vim_sequence.take_count();
+                    match key.code {
+                        KeyCode::Char('d') => composer.delete_current_lines(count),
+                        KeyCode::Char('w') => composer.delete_words(count),
+                        KeyCode::Char('$') => {
+                            let end = composer.line_end();
+                            composer.delete_range(composer.cursor, end);
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
             }
+        }
+        if let KeyCode::Char(digit) = key.code
+            && composer.vim_sequence.push_digit(digit, MAX_COUNT_PREFIX)
+        {
             return;
         }
-        if let KeyCode::Char(digit @ '1'..='9') = key.code {
-            composer.count = Some(
-                composer
-                    .count
-                    .unwrap_or(0)
-                    .saturating_mul(10)
-                    .saturating_add(digit.to_digit(10).unwrap_or(0) as usize)
-                    .min(MAX_COUNT_PREFIX),
-            );
-            return;
-        }
-        if key.code == KeyCode::Char('0') && composer.count.is_some() {
-            composer.count = Some(
-                composer
-                    .count
-                    .unwrap_or(0)
-                    .saturating_mul(10)
-                    .min(MAX_COUNT_PREFIX),
-            );
-            return;
-        }
-        if matches!(key.code, KeyCode::Char('g')) {
-            composer.pending_g = true;
+        if key.code == KeyCode::Char('g') {
+            composer.vim_sequence.start(crate::app::vim::VimPrefix::Goto);
             return;
         }
         if matches!(key.code, KeyCode::Char('f' | 'F')) {
-            composer.pending_find = Some(key.code == KeyCode::Char('f'));
+            composer.vim_sequence.start(if key.code == KeyCode::Char('f') {
+                crate::app::vim::VimPrefix::FindForward
+            } else {
+                crate::app::vim::VimPrefix::FindBackward
+            });
             return;
         }
-        let count = composer.count.take().unwrap_or(1);
+        let count = composer.vim_sequence.take_count();
         // Header navigation is separate from body Vim motions.
         match key.code {
             KeyCode::Char('j') | KeyCode::Down if composer.move_header_field(true, count) => return,
@@ -762,8 +752,8 @@ impl App {
                 }
                 KeyCode::Char('u') => composer.undo_edit(false),
                 KeyCode::Char('y') => {
-                    composer.pending_yank = true;
-                    composer.count = Some(count);
+                    composer.vim_sequence.start(crate::app::vim::VimPrefix::Yank);
+                    composer.vim_sequence.set_count(count);
                 }
                 KeyCode::Char('Y') => self.yank_register = Some(composer.yank_lines(count)),
                 KeyCode::Char('p' | 'P') => {
@@ -794,8 +784,8 @@ impl App {
                     composer.delete_range(composer.cursor, end);
                 }
                 KeyCode::Char('d') => {
-                    composer.pending_delete = true;
-                    composer.count = Some(count);
+                    composer.vim_sequence.start(crate::app::vim::VimPrefix::Delete);
+                    composer.vim_sequence.set_count(count);
                 }
                 KeyCode::Char('o') if composer.field == ComposeField::Body => {
                     composer.open_line_below();
@@ -814,7 +804,7 @@ impl App {
                     composer.mode = ComposeMode::Normal;
                 }
                 KeyCode::Char('V') => composer.visual_linewise = !composer.visual_linewise,
-                KeyCode::Char('i') => composer.pending_inner = true,
+                KeyCode::Char('i') => composer.vim_sequence.start(crate::app::vim::VimPrefix::Inner),
                 KeyCode::Char('y') => {
                     if let Some(register) = composer.yank_visual() {
                         self.yank_register = Some(register);

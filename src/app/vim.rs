@@ -1,10 +1,123 @@
 //! Shared, allocation-free cursor motions and identity-stable bulk selection.
 //!
-//! Compose and Contacts keep their own undo histories and field validation,
-//! but agree on character positions, motions, and visual/marked action sets.
+//! Compose and Contacts share pending Vim commands and bounded history while
+//! keeping independent field validation and editing operations.
 
+use std::collections::{HashSet, VecDeque};
+
+/// The Vim key sequences shared by text editors. Editing actions remain with
+/// the owning surface (single-line Contacts vs. multiline Compose).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VimPrefix {
+    Goto,
+    Delete,
+    Yank,
+    Inner,
+    FindForward,
+    FindBackward,
+}
+
+/// Normal/Visual-mode input prefix state. A single pending command is possible
+/// at a time; storing it as one enum prevents impossible combinations (e.g.
+/// pending Delete and Yank simultaneously). Counts are bounded at input time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct VimSequence {
+    command: Option<VimPrefix>,
+    count: Option<usize>,
+}
+
+impl VimSequence {
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn start(&mut self, command: VimPrefix) {
+        self.command = Some(command);
+    }
+
+    pub(crate) fn take_command(&mut self) -> Option<VimPrefix> {
+        self.command.take()
+    }
+
+    pub(crate) fn has_operator(&self) -> bool {
+        matches!(self.command, Some(VimPrefix::Delete | VimPrefix::Yank))
+    }
+
+    /// `0` without an existing count remains a normal Vim motion.
+    pub(crate) fn push_digit(&mut self, digit: char, max: usize) -> bool {
+        let Some(value) = digit.to_digit(10) else { return false };
+        if value == 0 && self.count.is_none() { return false; }
+        self.count = Some(
+            self.count.unwrap_or(0)
+                .saturating_mul(10)
+                .saturating_add(value as usize)
+                .min(max),
+        );
+        true
+    }
+
+    pub(crate) fn set_count(&mut self, count: usize) {
+        self.count = Some(count);
+    }
+
+    pub(crate) fn take_count(&mut self) -> usize {
+        self.count.take().unwrap_or(1)
+    }
+
+    pub(crate) fn discard_count(&mut self) {
+        self.count = None;
+    }
+}
+
+/// Bounded, reusable undo/redo state shared by Compose and Contacts.
+/// Snapshots belong to each editor: the history doesn't know about fields,
+/// selections, or how text should be restored.
+#[derive(Debug, Clone)]
+pub(crate) struct VimHistory<T> {
+    undo: VecDeque<T>,
+    redo: VecDeque<T>,
+    limit: usize,
+}
+
+impl<T> Default for VimHistory<T> {
+    fn default() -> Self { Self::new(200) }
+}
+
+impl<T> VimHistory<T> {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self { undo: VecDeque::new(), redo: VecDeque::new(), limit: limit.max(1) }
+    }
+
+    pub(crate) fn record(&mut self, snapshot: T) {
+        if self.undo.len() == self.limit { self.undo.pop_front(); }
+        self.undo.push_back(snapshot);
+        self.redo.clear();
+    }
+
+    pub(crate) fn undo(&mut self, current: T) -> Option<T> {
+        let previous = self.undo.pop_back()?;
+        if self.redo.len() == self.limit { self.redo.pop_front(); }
+        self.redo.push_back(current);
+        Some(previous)
+    }
+
+    pub(crate) fn redo(&mut self, current: T) -> Option<T> {
+        let next = self.redo.pop_back()?;
+        if self.undo.len() == self.limit { self.undo.pop_front(); }
+        self.undo.push_back(current);
+        Some(next)
+    }
+}
 use std::collections::HashSet;
 use std::hash::Hash;
+
+/// One unnamed Vim register is shared by Compose, Contacts, and the reader.
+/// It is never serialized with drafts or synchronized to mail providers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct YankRegister {
+    pub(crate) text: String,
+    pub(crate) linewise: bool,
+}
 
 pub(crate) fn byte_offset(text: &str, cursor: usize) -> usize {
     text.char_indices().nth(cursor).map_or(text.len(), |(at, _)| at)
@@ -26,9 +139,7 @@ pub(crate) fn horizontal(cursor: usize, len: usize, delta: isize) -> usize {
 
 /// Vim word motion without allocating a temporary Vec<char> per keystroke.
 pub(crate) fn word_start(text: &str, cursor: usize, backward: bool, whole: bool) -> usize {
-    let belongs = |ch: char| {
-        if whole { !ch.is_whitespace() } else { ch.is_alphanumeric() || ch == '_' }
-    };
+    let belongs = |ch: char| is_word_part(ch, whole);
     let len = text.chars().count();
     let mut at = cursor.min(len);
     if backward {
@@ -53,6 +164,34 @@ pub(crate) fn word_start(text: &str, cursor: usize, backward: bool, whole: bool)
         }
     }
     at
+}
+
+fn is_word_part(ch: char, whole: bool) -> bool {
+    if whole { !ch.is_whitespace() } else { is_word_char(ch) }
+}
+
+/// Move to the final character of the next Vim word, without allocating a
+/// character vector on each keystroke. This preserves the composer's existing
+/// behavior when the cursor starts on punctuation or at the end of a field.
+pub(crate) fn word_end(text: &str, cursor: usize, whole: bool) -> usize {
+    let len = text.chars().count();
+    if len == 0 { return 0; }
+    let mut index = cursor.min(len - 1);
+    let mut chars = text.chars().skip(index).peekable();
+    if chars.peek().is_some_and(|ch| is_word_part(*ch, whole)) && index < len - 1 {
+        chars.next();
+        index += 1;
+    }
+    while index < len - 1 && chars.peek().is_some_and(|ch| !is_word_part(*ch, whole)) {
+        chars.next();
+        index += 1;
+    }
+    chars.next(); // the current character; peek now examines the next one
+    while index < len - 1 && chars.peek().is_some_and(|ch| is_word_part(*ch, whole)) {
+        chars.next();
+        index += 1;
+    }
+    index
 }
 
 /// Word characters have the same meaning in the editor, reader motions,
@@ -188,6 +327,11 @@ mod tests {
         assert_eq!(visual_chars(0, 0, 0), None);
         assert_eq!(word_start("first second", 0, false, true), 6);
         assert_eq!(word_start("first second", 8, true, true), 6);
+        assert_eq!(word_end("first second", 0, false), 4);
+        assert_eq!(word_end("first second", 4, false), 11); // advances to next word
+        assert_eq!(word_end("first second", 5, false), 11);
+        assert_eq!(word_end("éé 😊abc", 0, false), 1);
+        assert_eq!(word_end("", 0, true), 0);
     }
 
     #[test]
@@ -217,5 +361,47 @@ mod tests {
         assert_eq!(marks, HashSet::from([2, 3]));
         toggle_group(&mut marks, &[2, 3]);
         assert!(marks.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod editing_tests {
+    use super::*;
+
+    #[test]
+    fn pending_sequences_do_not_overlap_and_zero_without_count_is_a_motion() {
+        let mut sequence = VimSequence::default();
+        assert!(!sequence.push_digit('0', 99));
+        assert!(sequence.push_digit('2', 99));
+        assert!(sequence.push_digit('0', 99));
+        assert_eq!(sequence.take_count(), 20);
+        assert!(sequence.push_digit('9', 99));
+        assert!(sequence.push_digit('9', 99));
+        assert_eq!(sequence.take_count(), 99);
+        sequence.start(VimPrefix::Delete);
+        assert!(sequence.has_operator());
+        sequence.start(VimPrefix::Yank);
+        assert_eq!(sequence.take_command(), Some(VimPrefix::Yank));
+        assert_eq!(sequence.take_command(), None);
+        assert!(!sequence.has_operator());
+        sequence.start(VimPrefix::FindForward);
+        sequence.clear();
+        assert_eq!(sequence.take_command(), None);
+        assert_eq!(sequence.take_count(), 1);
+    }
+
+    #[test]
+    fn bounded_history_supports_undo_redo_and_new_edits_invalidate_redo() {
+        let mut history = VimHistory::new(2);
+        history.record("initial");
+        history.record("second");
+        history.record("third");
+        assert_eq!(history.undo("current"), Some("third"));
+        assert_eq!(history.undo("third"), Some("second"));
+        assert_eq!(history.undo("second"), None); // oldest entry evicted
+        assert_eq!(history.redo("second"), Some("third"));
+        history.record("fourth");
+        assert_eq!(history.redo("next"), None);
+        assert_eq!(history.undo("next"), Some("fourth"));
     }
 }

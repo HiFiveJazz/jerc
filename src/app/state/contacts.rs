@@ -230,6 +230,7 @@ impl App {
                 if editor.mode != ComposeMode::Normal {
                     editor.mode = ComposeMode::Normal;
                     editor.visual_anchor = None;
+                    editor.vim_sequence.clear();
                 } else {
                     modal.edit = None;
                 }
@@ -253,17 +254,17 @@ impl App {
                 }
                 return true;
             }
-            if editor.pending_yank {
-                editor.pending_yank = false;
-                if key.code == KeyCode::Char('y') {
-                    self.yank_register = Some(YankRegister { text: editor.value().to_owned(), linewise: false });
-                }
-                return true;
-            }
-            if editor.pending_delete {
-                editor.pending_delete = false;
-                if key.code == KeyCode::Char('d') {
-                    editor.delete_range(0, editor.value().chars().count());
+            if let Some(prefix) = editor.vim_sequence.take_command() {
+                match (prefix, key.code) {
+                    (crate::app::vim::VimPrefix::Yank, KeyCode::Char('y')) => {
+                        self.yank_register = Some(YankRegister {
+                            text: editor.value().to_owned(), linewise: false,
+                        });
+                    }
+                    (crate::app::vim::VimPrefix::Delete, KeyCode::Char('d')) => {
+                        editor.delete_range(0, editor.value().chars().count());
+                    }
+                    _ => {}
                 }
                 return true;
             }
@@ -312,7 +313,10 @@ impl App {
                     editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), -1);
                 }
                 KeyCode::Char('l') | KeyCode::Right => editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), 1),
-                KeyCode::Char('w' | 'e') => editor.move_word(true),
+                KeyCode::Char('w') => editor.move_word(true),
+                KeyCode::Char('e') => {
+                    editor.cursor = crate::app::vim::word_end(editor.value(), editor.cursor, true);
+                },
                 KeyCode::Char('b') => editor.move_word(false),
                 KeyCode::Char('0' | 'H') | KeyCode::Home => editor.cursor = 0,
                 KeyCode::Char('$' | 'L') | KeyCode::End => editor.cursor = editor.value().chars().count(),
@@ -356,8 +360,8 @@ impl App {
                 KeyCode::Char('D') if editor.mode == ComposeMode::Normal => {
                     editor.delete_range(editor.cursor, editor.value().chars().count());
                 }
-                KeyCode::Char('d') if editor.mode == ComposeMode::Normal => editor.pending_delete = true,
-                KeyCode::Char('y') if editor.mode == ComposeMode::Normal => editor.pending_yank = true,
+                KeyCode::Char('d') if editor.mode == ComposeMode::Normal => editor.vim_sequence.start(crate::app::vim::VimPrefix::Delete),
+                KeyCode::Char('y') if editor.mode == ComposeMode::Normal => editor.vim_sequence.start(crate::app::vim::VimPrefix::Yank),
                 KeyCode::Char('Y') if editor.mode == ComposeMode::Normal => {
                     self.yank_register = Some(YankRegister { text: editor.value().to_owned(), linewise: false });
                 }
