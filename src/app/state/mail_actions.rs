@@ -7,10 +7,12 @@ impl App {
         let Some(account) = self.account_mut() else {
             return;
         };
-        let Some((id, seen)) = account
-            .selected_message()
-            .map(|message| (message.id.clone(), !message.flags.contains(MessageFlags::SEEN)))
-        else {
+        let Some((id, seen)) = account.selected_message().map(|message| {
+            (
+                message.id.clone(),
+                !message.flags.contains(MessageFlags::SEEN),
+            )
+        }) else {
             return;
         };
         if !account.request_seen(id.clone(), seen) {
@@ -46,14 +48,23 @@ impl App {
     /// the whole range as a set and exits visual mode without moving.
     pub(super) fn toggle_message_mark(&mut self) {
         let visual_range = self.visual_range();
-        let Some(account) = self.account() else { return; };
-        let ids = if let Some((first, last)) = visual_range {
-            account.visible_message_indices()[first..=last].iter()
-                .map(|&index| account.messages[index].id.clone()).collect::<Vec<_>>()
-        } else {
-            account.selected_message().map(|m| vec![m.id.clone()]).unwrap_or_default()
+        let Some(account) = self.account() else {
+            return;
         };
-        if ids.is_empty() { return; }
+        let ids = if let Some((first, last)) = visual_range {
+            account.visible_message_indices()[first..=last]
+                .iter()
+                .map(|&index| account.messages[index].id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            account
+                .selected_message()
+                .map(|m| vec![m.id.clone()])
+                .unwrap_or_default()
+        };
+        if ids.is_empty() {
+            return;
+        }
         toggle_message_marks(&mut self.message_marked, &ids);
         self.visual_anchor = None;
         if visual_range.is_none() {
@@ -82,7 +93,11 @@ impl App {
             return;
         }
 
-        if self.message_open || self.account().is_none_or(|account| account.messages.is_empty()) {
+        if self.message_open
+            || self
+                .account()
+                .is_none_or(|account| account.messages.is_empty())
+        {
             return;
         }
         self.visual_anchor = if self.visual_anchor.is_some() {
@@ -177,14 +192,18 @@ impl App {
     }
 
     pub(super) fn selected_message_ids(&self) -> Vec<MessageId> {
-        let Some(account) = self.account() else { return Vec::new(); };
+        let Some(account) = self.account() else {
+            return Vec::new();
+        };
         let visible = account.visible_message_indices();
         let mut selected = Vec::new();
         let mut seen = HashSet::new();
         if let Some((start, end)) = self.visual_range() {
             for &index in &visible[start..=end] {
                 let id = &account.messages[index].id;
-                if seen.insert(id.clone()) { selected.push(id.clone()); }
+                if seen.insert(id.clone()) {
+                    selected.push(id.clone());
+                }
             }
         }
         // Marks survive filtering, and can be combined with a fresh visual
@@ -195,7 +214,10 @@ impl App {
             }
         }
         if selected.is_empty() {
-            return account.selected_message().map(|m| vec![m.id.clone()]).unwrap_or_default();
+            return account
+                .selected_message()
+                .map(|m| vec![m.id.clone()])
+                .unwrap_or_default();
         }
         selected
     }
@@ -203,16 +225,30 @@ impl App {
     /// Snapshot visible names for confirmation. The preview must match the
     /// identities that will be sent to the worker even if the list changes.
     pub(super) fn message_review_items(&self, ids: &[MessageId]) -> Vec<String> {
-        let Some(account) = self.account() else { return Vec::new(); };
+        let Some(account) = self.account() else {
+            return Vec::new();
+        };
         // Build one lookup instead of scanning a large mailbox for every mark.
-        let by_id: HashMap<&MessageId, &MessageSummary> = account.messages.iter()
-            .map(|message| (&message.id, message)).collect();
-        ids.iter().map(|id| by_id.get(id)
-            .map_or_else(|| "(message no longer loaded)".to_owned(), |message| {
-                let subject = if message.subject.trim().is_empty() { "(no subject)" }
-                    else { message.subject.as_str() };
-                format!("{subject}  ·  {}", message.from_address)
-            })).collect()
+        let by_id: HashMap<&MessageId, &MessageSummary> = account
+            .messages
+            .iter()
+            .map(|message| (&message.id, message))
+            .collect();
+        ids.iter()
+            .map(|id| {
+                by_id.get(id).map_or_else(
+                    || "(message no longer loaded)".to_owned(),
+                    |message| {
+                        let subject = if message.subject.trim().is_empty() {
+                            "(no subject)"
+                        } else {
+                            message.subject.as_str()
+                        };
+                        format!("{subject}  ·  {}", message.from_address)
+                    },
+                )
+            })
+            .collect()
     }
 
     pub(super) fn delete_selected(&mut self) {
@@ -316,49 +352,83 @@ impl App {
     /// Use discovered mailbox roles rather than guessing Gmail or Outlook paths.
     pub(super) fn toggle_spam_selected(&mut self) {
         let ids = self.selected_message_ids();
-        if ids.is_empty() { return; }
-        let Some(account) = self.account() else { return; };
-        let Some(source) = account.current_mailbox.clone() else { return; };
-        let in_junk = account.mailboxes.iter().any(|mailbox|
-            mailbox.name == source && mailbox.role == MailboxRole::Junk);
-        let target_role = if in_junk { MailboxRole::Inbox } else { MailboxRole::Junk };
-        let destination = account.mailboxes.iter()
+        if ids.is_empty() {
+            return;
+        }
+        let Some(account) = self.account() else {
+            return;
+        };
+        let Some(source) = account.current_mailbox.clone() else {
+            return;
+        };
+        let in_junk = account
+            .mailboxes
+            .iter()
+            .any(|mailbox| mailbox.name == source && mailbox.role == MailboxRole::Junk);
+        let target_role = if in_junk {
+            MailboxRole::Inbox
+        } else {
+            MailboxRole::Junk
+        };
+        let destination = account
+            .mailboxes
+            .iter()
             .find(|mailbox| mailbox.role == target_role && mailbox.name != source)
             .map(|mailbox| mailbox.name.clone());
         let Some(destination) = destination else {
             self.status = StatusLine::error(if in_junk {
                 "cannot mark as not spam: no Inbox mailbox found"
-            } else { "cannot mark as spam: no Junk/Spam mailbox found" });
+            } else {
+                "cannot mark as spam: no Junk/Spam mailbox found"
+            });
             return;
         };
         // Move is the existing IMAP worker operation, which already updates
         // the source list and invalidates the destination cache.
         self.start_mutation(source, ids, MutationKind::Move { destination });
         if !self.status.is_error {
-            self.status = StatusLine::temporary(if in_junk {
-                "moved out of Spam to Inbox"
-            } else { "marked as Spam" }, Duration::from_secs(2));
+            self.status = StatusLine::temporary(
+                if in_junk {
+                    "moved out of Spam to Inbox"
+                } else {
+                    "marked as Spam"
+                },
+                Duration::from_secs(2),
+            );
         }
     }
 
     pub(super) fn unarchive_selected(&mut self) {
         let ids = self.selected_message_ids();
-        if ids.is_empty() { return; }
-        let Some(account) = self.account() else { return; };
-        let Some(source) = account.current_mailbox.clone() else { return; };
-        if !account.mailboxes.iter().any(|m| m.name == source && m.role == MailboxRole::Archive) {
+        if ids.is_empty() {
+            return;
+        }
+        let Some(account) = self.account() else {
+            return;
+        };
+        let Some(source) = account.current_mailbox.clone() else {
+            return;
+        };
+        if !account
+            .mailboxes
+            .iter()
+            .any(|m| m.name == source && m.role == MailboxRole::Archive)
+        {
             self.status = StatusLine::temporary(
                 "open Archive / All Mail, then press U to restore to INBOX",
                 Duration::from_secs(3),
             );
             return;
         }
-        let Some(inbox) = account.mailboxes.iter()
+        let Some(inbox) = account
+            .mailboxes
+            .iter()
             .find(|m| m.role == MailboxRole::Inbox && m.name != source)
-            .map(|m| m.name.clone()) else {
-                self.status = StatusLine::error("no INBOX available to restore archived mail");
-                return;
-            };
+            .map(|m| m.name.clone())
+        else {
+            self.status = StatusLine::error("no INBOX available to restore archived mail");
+            return;
+        };
         self.start_mutation(source, ids, MutationKind::Unarchive { destination: inbox });
     }
 
@@ -373,8 +443,15 @@ impl App {
         let Some(source) = account.current_mailbox.clone() else {
             return;
         };
-        if account.mailboxes.iter().any(|mailbox| mailbox.name == source && mailbox.role == MailboxRole::Archive) {
-            self.status = StatusLine::temporary("message is already in Archive / All Mail", Duration::from_secs(2));
+        if account
+            .mailboxes
+            .iter()
+            .any(|mailbox| mailbox.name == source && mailbox.role == MailboxRole::Archive)
+        {
+            self.status = StatusLine::temporary(
+                "message is already in Archive / All Mail",
+                Duration::from_secs(2),
+            );
             return;
         }
         let destination = account
@@ -394,14 +471,21 @@ impl App {
         // so require explicit confirmation instead of hiding the risk.
         if source.eq_ignore_ascii_case("INBOX")
             && (destination.to_ascii_lowercase().starts_with("[gmail]/")
-                || destination.to_ascii_lowercase().starts_with("[googlemail]/"))
+                || destination
+                    .to_ascii_lowercase()
+                    .starts_with("[googlemail]/"))
         {
             let items = self.message_review_items(&ids);
             self.confirmation = Some(MutationConfirmation {
                 items,
                 review: ReviewScroll::default(),
-                prompt: format!("Archive {} Gmail message(s)? This uses IMAP expunge; check Gmail deletion settings first. [y/N]", ids.len()),
-                source, ids, kind: MutationKind::Archive { destination },
+                prompt: format!(
+                    "Archive {} Gmail message(s)? This uses IMAP expunge; check Gmail deletion settings first. [y/N]",
+                    ids.len()
+                ),
+                source,
+                ids,
+                kind: MutationKind::Archive { destination },
             });
         } else {
             self.start_mutation(source, ids, MutationKind::Archive { destination });
@@ -413,27 +497,35 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
-                let Some(name) = self.remove_account_confirmation.take() else { return; };
+                let Some(name) = self.remove_account_confirmation.take() else {
+                    return;
+                };
                 match crate::setup::remove_account(&self.setup_config_path, &name) {
                     Ok(()) => {
-                        self.status = StatusLine::info(format!("Removed {name:?} from local config; server mail untouched"));
+                        self.status = StatusLine::info(format!(
+                            "Removed {name:?} from local config; server mail untouched"
+                        ));
                         self.setup_reload_requested = true;
                     }
                     Err(error) => {
-                        self.status = StatusLine::error(format!("Cannot remove account: {error:#}"));
+                        self.status =
+                            StatusLine::error(format!("Cannot remove account: {error:#}"));
                     }
                 }
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.remove_account_confirmation = None;
-                self.status = StatusLine::temporary("account removal cancelled", Duration::from_secs(2));
+                self.status =
+                    StatusLine::temporary("account removal cancelled", Duration::from_secs(2));
             }
             _ => {}
         }
     }
 
     pub(super) fn handle_detach_confirmation_key(&mut self, key: KeyEvent) {
-        let Some(review) = self.detach_confirmation.as_mut() else { return; };
+        let Some(review) = self.detach_confirmation.as_mut() else {
+            return;
+        };
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('j') => review.review.queue(review.paths.len(), SMOOTH_SCROLL_ROWS),
@@ -445,16 +537,29 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => review.review.queue(review.paths.len(), 1),
             KeyCode::Char('k') | KeyCode::Up => review.review.queue(review.paths.len(), -1),
-            KeyCode::Esc | KeyCode::Char('n' | 'N') => { self.detach_confirmation = None; }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                self.detach_confirmation = None;
+            }
             KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                let Some(confirmation) = self.detach_confirmation.take() else { return; };
+                let Some(confirmation) = self.detach_confirmation.take() else {
+                    return;
+                };
                 let paths: HashSet<PathBuf> = confirmation.paths.into_iter().collect();
                 if let Some(composer) = self.composer.as_mut() {
                     // Use the existing detach operation so its undo stack
                     // continues to work for multi-selection as well.
-                    let names = composer.attachment_paths.iter().cloned()
-                        .chain(composer.attachments.split(';').map(str::trim)
-                            .filter(|part| !part.is_empty()).map(PathBuf::from))
+                    let names = composer
+                        .attachment_paths
+                        .iter()
+                        .cloned()
+                        .chain(
+                            composer
+                                .attachments
+                                .split(';')
+                                .map(str::trim)
+                                .filter(|part| !part.is_empty())
+                                .map(PathBuf::from),
+                        )
                         .collect::<Vec<_>>();
                     let original_selected = composer.attachment_manager_selected;
                     for index in (0..names.len()).rev() {
@@ -465,14 +570,16 @@ impl App {
                     }
                     composer.attachment_manager_visual_anchor = None;
                     composer.attachment_manager_marked.clear();
-                    composer.attachment_manager_selected = original_selected
-                        .min(composer.attachment_count().saturating_sub(1));
+                    composer.attachment_manager_selected =
+                        original_selected.min(composer.attachment_count().saturating_sub(1));
                     if let Some(picker) = composer.file_picker.as_mut() {
                         picker.visual_anchor = None;
                     }
                 }
-                self.status = StatusLine::temporary(format!("detached {} file(s)", paths.len()),
-                    Duration::from_secs(2));
+                self.status = StatusLine::temporary(
+                    format!("detached {} file(s)", paths.len()),
+                    Duration::from_secs(2),
+                );
             }
             _ => {}
         }
@@ -482,8 +589,12 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(confirmation) = self.confirmation.as_mut() {
                 match key.code {
-                    KeyCode::Char('j') => confirmation.review.queue(confirmation.items.len(), SMOOTH_SCROLL_ROWS),
-                    KeyCode::Char('k') => confirmation.review.queue(confirmation.items.len(), -SMOOTH_SCROLL_ROWS),
+                    KeyCode::Char('j') => confirmation
+                        .review
+                        .queue(confirmation.items.len(), SMOOTH_SCROLL_ROWS),
+                    KeyCode::Char('k') => confirmation
+                        .review
+                        .queue(confirmation.items.len(), -SMOOTH_SCROLL_ROWS),
                     _ => {}
                 }
             }
@@ -516,7 +627,12 @@ impl App {
         }
     }
 
-    pub(super) fn start_mutation(&mut self, source: String, ids: Vec<MessageId>, kind: MutationKind) {
+    pub(super) fn start_mutation(
+        &mut self,
+        source: String,
+        ids: Vec<MessageId>,
+        kind: MutationKind,
+    ) {
         if ids.is_empty() {
             return;
         }
@@ -526,13 +642,19 @@ impl App {
                 ids: ids.clone(),
             },
             MutationKind::Move { destination } => ActionKind::MoveMany {
-                source: source.clone(), destination: destination.clone(), ids: ids.clone(),
+                source: source.clone(),
+                destination: destination.clone(),
+                ids: ids.clone(),
             },
             MutationKind::Archive { destination } => ActionKind::ArchiveMany {
-                source: source.clone(), destination: destination.clone(), ids: ids.clone(),
+                source: source.clone(),
+                destination: destination.clone(),
+                ids: ids.clone(),
             },
             MutationKind::Unarchive { destination } => ActionKind::UnarchiveMany {
-                source: source.clone(), destination: destination.clone(), ids: ids.clone(),
+                source: source.clone(),
+                destination: destination.clone(),
+                ids: ids.clone(),
             },
         };
 
@@ -540,18 +662,29 @@ impl App {
             if self.account().is_some_and(|account| account.mailboxes.iter()
                 .any(|mailbox| mailbox.name == *destination && mailbox.role == MailboxRole::Trash)));
         let (pending_label, complete_label) = match &kind {
-            MutationKind::Delete => ("permanently deleting message(s)…", "message(s) permanently deleted"),
-            MutationKind::Move { .. } if moving_to_trash => ("deleting message(s) to Trash…", "message(s) deleted to Trash"),
+            MutationKind::Delete => (
+                "permanently deleting message(s)…",
+                "message(s) permanently deleted",
+            ),
+            MutationKind::Move { .. } if moving_to_trash => (
+                "deleting message(s) to Trash…",
+                "message(s) deleted to Trash",
+            ),
             MutationKind::Move { .. } => ("moving message(s)…", "message(s) moved"),
             MutationKind::Archive { .. } => ("archiving message(s)…", "message(s) archived"),
-            MutationKind::Unarchive { .. } => ("restoring message(s) to INBOX…", "message(s) restored to INBOX"),
+            MutationKind::Unarchive { .. } => (
+                "restoring message(s) to INBOX…",
+                "message(s) restored to INBOX",
+            ),
         };
         let started = self
             .account_mut()
             .is_some_and(|account| match account.worker.post(action) {
                 Ok(request) => {
                     account.pending_mutations = account.pending_mutations.saturating_add(1);
-                    account.pending_mutation_labels.insert(request, complete_label);
+                    account
+                        .pending_mutation_labels
+                        .insert(request, complete_label);
                     true
                 }
                 Err(_) => false,
@@ -570,7 +703,12 @@ impl App {
         self.status = StatusLine::info(pending_label);
     }
 
-    pub(super) fn remove_messages_locally(&mut self, source: &str, ids: &[MessageId], kind: &MutationKind) {
+    pub(super) fn remove_messages_locally(
+        &mut self,
+        source: &str,
+        ids: &[MessageId],
+        kind: &MutationKind,
+    ) {
         let Some(account) = self.account_mut() else {
             return;
         };
@@ -581,7 +719,9 @@ impl App {
             .filter(|message| selected_ids.contains(&message.id))
             .cloned()
             .collect();
-        if removed.is_empty() { return; }
+        if removed.is_empty() {
+            return;
+        }
         // Gmail All Mail is a view containing both archived and INBOX messages.
         // Unarchiving adds the INBOX label without removing that All Mail row.
         if let MutationKind::Unarchive { destination } = kind
@@ -590,15 +730,21 @@ impl App {
         {
             account.mailbox_cache.remove(destination);
             account.remove_persistent_folder(destination);
-            if let Some(mailbox) = account.mailboxes.iter_mut()
+            if let Some(mailbox) = account
+                .mailboxes
+                .iter_mut()
                 .find(|mailbox| mailbox.name == *destination && mailbox.counts_known)
             {
                 mailbox.total = mailbox.total.saturating_add(removed.len());
-                mailbox.unread = mailbox.unread.saturating_add(removed.iter().filter(|m| m.unread()).count());
+                mailbox.unread = mailbox
+                    .unread
+                    .saturating_add(removed.iter().filter(|m| m.unread()).count());
             }
             return;
         }
-        account.messages.retain(|message| !selected_ids.contains(&message.id));
+        account
+            .messages
+            .retain(|message| !selected_ids.contains(&message.id));
         for id in ids {
             account.bodies.remove(id);
             account.pending_bodies.remove(id);
@@ -619,8 +765,9 @@ impl App {
             mailbox.unread = mailbox.unread.saturating_sub(removed_unread);
         }
         if let MutationKind::Move { destination }
-            | MutationKind::Archive { destination }
-            | MutationKind::Unarchive { destination } = kind {
+        | MutationKind::Archive { destination }
+        | MutationKind::Unarchive { destination } = kind
+        {
             // A destination cache cannot know about the moved messages without
             // a server response containing their destination UIDs. Drop only
             // that cache; the active source list stays updated locally.
@@ -639,5 +786,4 @@ impl App {
         account.persist_current_cache();
         account.persist_mailboxes();
     }
-
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive warm-cache versus no-cache aerc-rs comparison.
+"""Interactive warm-cache versus no-cache jerc comparison.
 
 No dependency beyond Python 3.  Runs a real TUI, asks the operator to close
 it normally, and compares *instrumented data readiness*, not actual paints.
@@ -70,8 +70,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=int, default=5, help="number of runs per mode")
     parser.add_argument("--scenario", choices=("startup", "switch", "message"), default="startup")
-    parser.add_argument("--binary", default="./target/release/aerc-rs")
-    parser.add_argument("--out", default="/tmp/aerc-cache-bench")
+    parser.add_argument("--binary", default="./target/release/jerc")
+    parser.add_argument("--out", default="/tmp/jerc-cache-bench")
     parser.add_argument("--skip-warmup", action="store_true")
     args = parser.parse_args()
     if args.runs < 1:
@@ -90,11 +90,11 @@ def main():
     def launch(label, index, disable):
         path = out / f"{index:02d}-{label}.log"
         env = os.environ.copy()
-        env["AERC_RS_PERF_LOG"] = str(path)
+        env["JERC_PERF_LOG"] = str(path)
         if disable:
-            env["AERC_RS_DISABLE_CACHE"] = "1"
+            env["JERC_DISABLE_CACHE"] = "1"
         else:
-            env.pop("AERC_RS_DISABLE_CACHE", None)
+            env.pop("JERC_DISABLE_CACHE", None)
         try:
             input(f"\n{index}: {label} — Enter to launch (Ctrl+C to end): ")
         except (KeyboardInterrupt, EOFError):

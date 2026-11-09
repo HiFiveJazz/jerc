@@ -48,8 +48,11 @@ impl ComposeFilePicker {
         self.parent_selected = 0;
         if let Some(parent) = self.directory.parent() {
             self.parent_entries = compose_read_dir(parent, self.show_hidden).unwrap_or_default();
-            if let Some(index) = self.parent_entries.iter()
-                .position(|entry| entry.path == self.directory) {
+            if let Some(index) = self
+                .parent_entries
+                .iter()
+                .position(|entry| entry.path == self.directory)
+            {
                 self.parent_selected = index;
             }
         }
@@ -66,10 +69,12 @@ impl ComposeFilePicker {
             // Never block navigation on decoding images or reading file bodies.
             self.preview = match self.entries.get(self.selected) {
                 None => ComposeFilePreview::Empty,
-                Some(entry) if entry.is_directory => match compose_read_dir(&entry.path, self.show_hidden) {
-                    Ok(entries) => ComposeFilePreview::Directory(entries),
-                    Err(error) => ComposeFilePreview::Error(error.to_string()),
-                },
+                Some(entry) if entry.is_directory => {
+                    match compose_read_dir(&entry.path, self.show_hidden) {
+                        Ok(entries) => ComposeFilePreview::Directory(entries),
+                        Err(error) => ComposeFilePreview::Error(error.to_string()),
+                    }
+                }
                 Some(entry) => match std::fs::metadata(&entry.path) {
                     Ok(metadata) => ComposeFilePreview::Binary(metadata.len()),
                     Err(error) => ComposeFilePreview::Error(error.to_string()),
@@ -79,21 +84,32 @@ impl ComposeFilePicker {
         }
         self.preview = match self.entries.get(self.selected) {
             None => ComposeFilePreview::Empty,
-            Some(entry) if entry.is_directory => match compose_read_dir(&entry.path, self.show_hidden) {
-                Ok(entries) => ComposeFilePreview::Directory(entries),
-                Err(error) => ComposeFilePreview::Error(error.to_string()),
-            },
-            Some(entry) if entry.path.extension().and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf")) => {
-                if let Some((_, cached)) = self.pdf_preview_cache.iter()
-                    .find(|(path, _)| path == &entry.path) {
+            Some(entry) if entry.is_directory => {
+                match compose_read_dir(&entry.path, self.show_hidden) {
+                    Ok(entries) => ComposeFilePreview::Directory(entries),
+                    Err(error) => ComposeFilePreview::Error(error.to_string()),
+                }
+            }
+            Some(entry)
+                if entry
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf")) =>
+            {
+                if let Some((_, cached)) = self
+                    .pdf_preview_cache
+                    .iter()
+                    .find(|(path, _)| path == &entry.path)
+                {
                     match cached {
                         Ok(bytes) => ComposeFilePreview::Image(bytes.clone()),
                         Err(error) => ComposeFilePreview::Error(error.clone()),
                     }
                 } else {
                     if !self.pdf_preview_inflight.contains(&entry.path) {
-                        self.pdf_preview_due = Some((entry.path.clone(), Instant::now() + PDF_PREVIEW_DEBOUNCE));
+                        self.pdf_preview_due =
+                            Some((entry.path.clone(), Instant::now() + PDF_PREVIEW_DEBOUNCE));
                     }
                     ComposeFilePreview::Loading("Rendering PDF preview…")
                 }
@@ -117,16 +133,36 @@ impl ComposeFilePicker {
                     Ok(metadata) => {
                         // No unbounded reads while traversing large binary attachments.
                         let mut bytes = Vec::new();
-                        match std::io::Read::by_ref(&mut file).take(24 * 1024).read_to_end(&mut bytes) {
+                        match std::io::Read::by_ref(&mut file)
+                            .take(24 * 1024)
+                            .read_to_end(&mut bytes)
+                        {
                             Err(error) => ComposeFilePreview::Error(error.to_string()),
                             Ok(_) => match String::from_utf8(bytes) {
                                 Ok(text) if !text.contains('\0') => {
-                                    let truncated = metadata.len() > 24 * 1024 || text.lines().count() > 180;
-                                    if entry.path.extension().and_then(|ext| ext.to_str())
-                                        .is_some_and(|ext| ext.eq_ignore_ascii_case("patch") || ext.eq_ignore_ascii_case("diff")) {
-                                        ComposeFilePreview::Patch(crate::patch_preview::highlight_patch(&text, truncated))
+                                    let truncated =
+                                        metadata.len() > 24 * 1024 || text.lines().count() > 180;
+                                    if entry
+                                        .path
+                                        .extension()
+                                        .and_then(|ext| ext.to_str())
+                                        .is_some_and(|ext| {
+                                            ext.eq_ignore_ascii_case("patch")
+                                                || ext.eq_ignore_ascii_case("diff")
+                                        })
+                                    {
+                                        ComposeFilePreview::Patch(
+                                            crate::patch_preview::highlight_patch(&text, truncated),
+                                        )
                                     } else {
-                                        ComposeFilePreview::Text { lines: text.lines().take(180).map(str::to_owned).collect(), truncated }
+                                        ComposeFilePreview::Text {
+                                            lines: text
+                                                .lines()
+                                                .take(180)
+                                                .map(str::to_owned)
+                                                .collect(),
+                                            truncated,
+                                        }
                                     }
                                 }
                                 _ => ComposeFilePreview::Binary(metadata.len()),
@@ -159,31 +195,52 @@ impl ComposeFilePicker {
                 self.pdf_preview_cache.pop_front();
             }
             refresh |= self.smooth_target.is_none()
-                && self.entries.get(self.selected).is_some_and(|entry| entry.path == path);
+                && self
+                    .entries
+                    .get(self.selected)
+                    .is_some_and(|entry| entry.path == path);
         }
-        if refresh { self.refresh_preview(); }
+        if refresh {
+            self.refresh_preview();
+        }
 
-        let ready = self.pdf_preview_due.as_ref()
+        let ready = self
+            .pdf_preview_due
+            .as_ref()
             .is_some_and(|(_, due)| *due <= Instant::now());
-        if !ready || self.pdf_preview_inflight.len() >= PDF_PREVIEW_CONCURRENCY { return; }
-        let Some((path, _)) = self.pdf_preview_due.take() else { return; };
-        if self.pdf_preview_inflight.contains(&path) { return; }
+        if !ready || self.pdf_preview_inflight.len() >= PDF_PREVIEW_CONCURRENCY {
+            return;
+        }
+        let Some((path, _)) = self.pdf_preview_due.take() else {
+            return;
+        };
+        if self.pdf_preview_inflight.contains(&path) {
+            return;
+        }
         let results = Arc::clone(&self.pdf_preview_results);
         let worker_path = path.clone();
-        match std::thread::Builder::new().name("aerc-pdf-preview".into()).spawn(move || {
-            let result = compose_pdf_thumbnail(&worker_path).map_err(|error| error.to_string());
-            if let Ok(mut queue) = results.lock() {
-                queue.push_back((worker_path, result));
+        match std::thread::Builder::new()
+            .name("jerc-pdf-preview".into())
+            .spawn(move || {
+                let result = compose_pdf_thumbnail(&worker_path).map_err(|error| error.to_string());
+                if let Ok(mut queue) = results.lock() {
+                    queue.push_back((worker_path, result));
+                }
+            }) {
+            Ok(_handle) => {
+                self.pdf_preview_inflight.insert(path);
             }
-        }) {
-            Ok(_handle) => { self.pdf_preview_inflight.insert(path); }
-            Err(error) => { self.preview = ComposeFilePreview::Error(format!("PDF preview worker: {error}")); }
+            Err(error) => {
+                self.preview = ComposeFilePreview::Error(format!("PDF preview worker: {error}"));
+            }
         }
     }
 
     pub(super) fn move_selection(&mut self, delta: isize) {
         self.smooth_target = None;
-        self.selected = self.selected.saturating_add_signed(delta)
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
             .min(self.entries.len().saturating_sub(1));
         self.refresh_preview();
     }
@@ -191,18 +248,29 @@ impl ComposeFilePicker {
     pub(super) fn queue_smooth_scroll(&mut self, delta: isize) {
         // Queue relative to the *visible* cursor so opposite-direction keys
         // reverse immediately instead of inheriting an unfinished target.
-        let target = self.selected.saturating_add_signed(delta)
+        let target = self
+            .selected
+            .saturating_add_signed(delta)
             .min(self.entries.len().saturating_sub(1));
         self.smooth_target = (target != self.selected).then_some(target);
         // A new scroll invalidates a pending preview debounce; schedule only
         // the final destination once the animation has settled.
-        if self.smooth_target.is_some() { self.pdf_preview_due = None; }
+        if self.smooth_target.is_some() {
+            self.pdf_preview_due = None;
+        }
     }
 
     pub(super) fn advance_smooth_scroll(&mut self) {
-        let Some(target) = self.smooth_target else { return; };
-        if target == self.selected { self.smooth_target = None; return; }
-        self.selected = self.selected.saturating_add_signed(if target > self.selected { 1 } else { -1 });
+        let Some(target) = self.smooth_target else {
+            return;
+        };
+        if target == self.selected {
+            self.smooth_target = None;
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add_signed(if target > self.selected { 1 } else { -1 });
         // Rebuilding a preview for every *intermediate* animation row makes
         // Ctrl-j/k do filesystem I/O and image rasterization for files the user
         // never stopped on. Keep the old preview while moving and refresh once.
@@ -214,25 +282,45 @@ impl ComposeFilePicker {
 
     pub fn help_matches(&self) -> Vec<usize> {
         let query = self.help_query.trim().to_lowercase();
-        crate::app::PICKER_HELP_ENTRIES.iter().enumerate()
-            .filter(|(_, entry)| query.is_empty() || format!("{} {} {}", entry.category, entry.key, entry.description)
-                .to_lowercase().contains(&query))
-            .map(|(index, _)| index).collect()
+        crate::app::PICKER_HELP_ENTRIES
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                query.is_empty()
+                    || format!("{} {} {}", entry.category, entry.key, entry.description)
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// Immutable match indices for the renderer's current-search counter.
-    pub fn search_matches_for_display(&self) -> Vec<usize> { self.search_matches() }
+    pub fn search_matches_for_display(&self) -> Vec<usize> {
+        self.search_matches()
+    }
 
     pub(super) fn search_matches(&self) -> Vec<usize> {
         let query = self.search_query.as_deref().unwrap_or("").to_lowercase();
-        let matches: Vec<usize> = self.entries.iter().enumerate()
+        let matches: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
             .filter(|(_, entry)| entry.name.to_lowercase().contains(&query))
-            .map(|(index, _)| index).collect();
+            .map(|(index, _)| index)
+            .collect();
         // A directory jump is the primary use case. Fall back to files when
         // no folder matches, so slash remains useful for finding attachments.
-        let directories: Vec<usize> = matches.iter().copied()
-            .filter(|&index| self.entries[index].is_directory).collect();
-        if directories.is_empty() { matches } else { directories }
+        let directories: Vec<usize> = matches
+            .iter()
+            .copied()
+            .filter(|&index| self.entries[index].is_directory)
+            .collect();
+        if directories.is_empty() {
+            matches
+        } else {
+            directories
+        }
     }
 
     pub(super) fn update_search_selection(&mut self) {
@@ -246,11 +334,19 @@ impl ComposeFilePicker {
     pub(super) fn next_search_match(&mut self, backwards: bool) {
         self.smooth_target = None;
         let matches = self.search_matches();
-        if matches.is_empty() { return; }
-        let next = matches.iter().position(|&index| index == self.selected)
-            .map_or(0, |position| if backwards {
-                (position + matches.len() - 1) % matches.len()
-            } else { (position + 1) % matches.len() });
+        if matches.is_empty() {
+            return;
+        }
+        let next = matches
+            .iter()
+            .position(|&index| index == self.selected)
+            .map_or(0, |position| {
+                if backwards {
+                    (position + matches.len() - 1) % matches.len()
+                } else {
+                    (position + 1) % matches.len()
+                }
+            });
         self.selected = matches[next];
         self.refresh_preview();
     }
@@ -273,5 +369,4 @@ impl ComposeFilePicker {
         }
         Ok(())
     }
-
 }

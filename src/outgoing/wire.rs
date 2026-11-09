@@ -5,8 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use lettre::message::{Attachment, Mailbox, Mailboxes, MultiPart, SinglePart, header::{ContentType, HeaderName, HeaderValue}};
 use lettre::Message;
+use lettre::message::{
+    Attachment, Mailbox, Mailboxes, MultiPart, SinglePart,
+    header::{ContentType, HeaderName, HeaderValue},
+};
 use mail_parser::MessageParser;
 
 use crate::model::OutgoingMessage;
@@ -20,43 +23,68 @@ static NEXT_OUTGOING_ID: AtomicU64 = AtomicU64::new(0);
 pub fn validate_recipients(to: &str, cc: &str, bcc: &str) -> Result<()> {
     let mut count = 0;
     for (label, value) in [("To", to), ("Cc", cc), ("Bcc", bcc)] {
-        if value.trim().is_empty() { continue; }
-        let mailboxes: Mailboxes = value.parse().with_context(|| format!("invalid {label} recipient list"))?;
+        if value.trim().is_empty() {
+            continue;
+        }
+        let mailboxes: Mailboxes = value
+            .parse()
+            .with_context(|| format!("invalid {label} recipient list"))?;
         for mailbox in mailboxes {
             let email = mailbox.email.to_string();
-            let (_, domain) = email.rsplit_once('@')
+            let (_, domain) = email
+                .rsplit_once('@')
                 .ok_or_else(|| anyhow!("invalid {label} address {email:?}"))?;
             let labels: Vec<_> = domain.split('.').collect();
             // A single-label host can be valid on private SMTP installations,
             // but accepting it by default lets typos such as @gmail reach Send.
-            if labels.len() < 2 || labels.iter().any(|part| part.is_empty()
-                || part.starts_with('-') || part.ends_with('-')
-                || !part.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-'))
-                || labels.last().is_some_and(|tld| tld.len() < 2 || !tld.bytes().all(|c| c.is_ascii_alphabetic())) {
-                bail!("{label} recipient {email:?} has an incomplete or invalid domain (e.g. use gmail.com, not gmail)");
+            if labels.len() < 2
+                || labels.iter().any(|part| {
+                    part.is_empty()
+                        || part.starts_with('-')
+                        || part.ends_with('-')
+                        || !part
+                            .bytes()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
+                })
+                || labels.last().is_some_and(|tld| {
+                    tld.len() < 2 || !tld.bytes().all(|c| c.is_ascii_alphabetic())
+                })
+            {
+                bail!(
+                    "{label} recipient {email:?} has an incomplete or invalid domain (e.g. use gmail.com, not gmail)"
+                );
             }
             count += 1;
         }
     }
-    if count == 0 { bail!("outgoing email has no To, Cc, or Bcc recipient"); }
+    if count == 0 {
+        bail!("outgoing email has no To, Cc, or Bcc recipient");
+    }
     Ok(())
 }
 
 fn sender_message_id_domain(from: &Mailbox) -> String {
     // Keep the sender's domain, not the machine's local hostname. A single
     // generated ID must be reused for both SMTP and the Sent folder copy.
-    from.email.to_string().rsplit_once('@')
-        .map_or_else(|| "localhost".to_owned(), |(_, domain)| domain.to_ascii_lowercase())
+    from.email.to_string().rsplit_once('@').map_or_else(
+        || "localhost".to_owned(),
+        |(_, domain)| domain.to_ascii_lowercase(),
+    )
 }
 
 fn new_outgoing_message_id(domain: &str) -> String {
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let sequence = NEXT_OUTGOING_ID.fetch_add(1, Ordering::Relaxed);
-    format!("<aerc-rs-{timestamp:x}-{:x}-{sequence:x}@{domain}>", std::process::id())
+    format!(
+        "<jerc-{timestamp:x}-{:x}-{sequence:x}@{domain}>",
+        std::process::id()
+    )
 }
 
-
-/// Gmail/aerc-style inline forward: preserve MIME alternatives and the
+/// Inline forward: preserve MIME alternatives and the
 /// original attachments, rather than sending the entire mail as forwarded.eml.
 #[derive(Debug, Clone)]
 pub struct InlineForwardParts {
@@ -67,7 +95,8 @@ pub struct InlineForwardParts {
 
 pub fn inline_forward_parts(raw: &[u8]) -> Result<InlineForwardParts> {
     use mail_parser::PartKind;
-    let message = MessageParser::new().parse(raw)
+    let message = MessageParser::new()
+        .parse(raw)
         .ok_or_else(|| anyhow!("cannot parse original message for inline forwarding"))?;
     let plain = message.text_body().find_map(|part| match part.kind() {
         PartKind::Text => part.text().map(|text| text.into_owned()),
@@ -77,7 +106,8 @@ pub fn inline_forward_parts(raw: &[u8]) -> Result<InlineForwardParts> {
         PartKind::Html => part.text().map(|text| text.into_owned()),
         _ => None,
     });
-    let plain = plain.or_else(|| html.as_deref().map(mail_parser::html_to_text))
+    let plain = plain
+        .or_else(|| html.as_deref().map(mail_parser::html_to_text))
         .unwrap_or_default();
     Ok(InlineForwardParts {
         plain,
@@ -96,15 +126,28 @@ pub fn forward_attribution(raw: &[u8]) -> Result<String> {
         raw.len() as u64,
         crate::model::MessageFlags::empty(),
     )?;
-    let sender = if summary.from_name.is_empty() { summary.from_address }
-        else { format!("{} <{}>", summary.from_name, summary.from_address) };
+    let sender = if summary.from_name.is_empty() {
+        summary.from_address
+    } else {
+        format!("{} <{}>", summary.from_name, summary.from_address)
+    };
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp(summary.timestamp, 0)
-        .map(|date| date.with_timezone(&chrono::Local)
-            .format("%a, %b %-d, %Y at %-I:%M %p").to_string())
+        .map(|date| {
+            date.with_timezone(&chrono::Local)
+                .format("%a, %b %-d, %Y at %-I:%M %p")
+                .to_string()
+        })
         .unwrap_or_else(|| "unknown".to_owned());
-    let mut header = format!("{FORWARD_SEPARATOR}\nFrom: {sender}\nDate: {date}\nSubject: {}\n", summary.subject);
-    if !summary.to.is_empty() { header.push_str(&format!("To: {}\n", summary.to)); }
-    if !summary.cc.is_empty() { header.push_str(&format!("Cc: {}\n", summary.cc)); }
+    let mut header = format!(
+        "{FORWARD_SEPARATOR}\nFrom: {sender}\nDate: {date}\nSubject: {}\n",
+        summary.subject
+    );
+    if !summary.to.is_empty() {
+        header.push_str(&format!("To: {}\n", summary.to));
+    }
+    if !summary.cc.is_empty() {
+        header.push_str(&format!("Cc: {}\n", summary.cc));
+    }
     Ok(header)
 }
 
@@ -113,12 +156,15 @@ pub fn forward_attribution(raw: &[u8]) -> Result<String> {
 #[must_use]
 pub fn forward_html(html: &str, attribution: &str, personal_note: &str) -> String {
     fn escape(text: &str) -> String {
-        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
             .replace('"', "&quot;")
     }
     let block = format!(
         "<div style=\"font-family:sans-serif\">{}<hr><div style=\"white-space:pre-wrap\">{}</div></div>",
-        escape(personal_note), escape(attribution)
+        escape(personal_note),
+        escape(attribution)
     );
     let lower = html.to_ascii_lowercase();
     if let Some(open) = lower.find("<body") {
@@ -131,15 +177,25 @@ pub fn forward_html(html: &str, attribution: &str, personal_note: &str) -> Strin
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplyAudience { Sender, All, List }
+pub enum ReplyAudience {
+    Sender,
+    All,
+    List,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplyRecipients { pub to: String, pub cc: String }
+pub struct ReplyRecipients {
+    pub to: String,
+    pub cc: String,
+}
 
 #[must_use]
 pub fn reply_subject(subject: &str) -> String {
     let subject = subject.trim();
-    if subject.get(..3).is_some_and(|s| s.eq_ignore_ascii_case("re:")) {
+    if subject
+        .get(..3)
+        .is_some_and(|s| s.eq_ignore_ascii_case("re:"))
+    {
         subject.to_owned()
     } else {
         format!("Re: {subject}")
@@ -149,7 +205,10 @@ pub fn reply_subject(subject: &str) -> String {
 #[must_use]
 pub fn forward_subject(subject: &str) -> String {
     let subject = subject.trim();
-    if subject.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("fwd:")) {
+    if subject
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("fwd:"))
+    {
         subject.to_owned()
     } else {
         format!("Fwd: {subject}")
@@ -159,8 +218,13 @@ pub fn forward_subject(subject: &str) -> String {
 /// Route replies using actual RFC mailbox addresses, not string splitting.
 /// Self addresses and duplicates are removed from Reply All. A list reply is
 /// strict: a missing List-Post is an error, never a silent Reply All fallback.
-pub fn reply_recipients(raw: &[u8], audience: ReplyAudience, own: &[String]) -> Result<ReplyRecipients> {
-    let message = MessageParser::new().parse(raw)
+pub fn reply_recipients(
+    raw: &[u8],
+    audience: ReplyAudience,
+    own: &[String],
+) -> Result<ReplyRecipients> {
+    let message = MessageParser::new()
+        .parse(raw)
         .ok_or_else(|| anyhow!("cannot parse original message for reply recipients"))?;
     let own: HashSet<String> = own.iter().map(|a| a.to_ascii_lowercase()).collect();
     let mut seen = HashSet::new();
@@ -168,21 +232,32 @@ pub fn reply_recipients(raw: &[u8], audience: ReplyAudience, own: &[String]) -> 
     let mut cc = Vec::new();
 
     if audience == ReplyAudience::List {
-        let header = unfold_header(raw, "list-post").ok_or_else(|| anyhow!("message has no List-Post header"))?;
+        let header = unfold_header(raw, "list-post")
+            .ok_or_else(|| anyhow!("message has no List-Post header"))?;
         if header.trim().eq_ignore_ascii_case("no") {
             bail!("mailing list does not permit list replies");
         }
-        let start = header.to_ascii_lowercase().find("mailto:").ok_or_else(|| anyhow!("List-Post does not contain a mailto URI"))?;
+        let start = header
+            .to_ascii_lowercase()
+            .find("mailto:")
+            .ok_or_else(|| anyhow!("List-Post does not contain a mailto URI"))?;
         let after = &header[start + "mailto:".len()..];
-        let address = after.split(|c: char| matches!(c, '?' | '>' | ',' | ' ')).next().unwrap_or("");
-        let decoded = percent_encoding::percent_decode_str(address).decode_utf8()
+        let address = after
+            .split(|c: char| matches!(c, '?' | '>' | ',' | ' '))
+            .next()
+            .unwrap_or("");
+        let decoded = percent_encoding::percent_decode_str(address)
+            .decode_utf8()
             .context("decoding List-Post address")?;
         let mailbox: Mailbox = decoded.parse().context("invalid List-Post address")?;
         let value = mailbox.email.to_string();
         if !seen.insert(value.to_ascii_lowercase()) {
             bail!("List-Post points to your own address");
         }
-        return Ok(ReplyRecipients { to: value, cc: String::new() });
+        return Ok(ReplyRecipients {
+            to: value,
+            cc: String::new(),
+        });
     }
 
     // Reply-To takes precedence over From. Both can legally have many
@@ -204,7 +279,9 @@ pub fn reply_recipients(raw: &[u8], audience: ReplyAudience, own: &[String]) -> 
         for addresses in [message.to(), message.cc()].into_iter().flatten() {
             for mailbox in addresses.mailboxes() {
                 if let Some(address) = mailbox.address() {
-                    if own.contains(&address.to_ascii_lowercase()) { continue; }
+                    if own.contains(&address.to_ascii_lowercase()) {
+                        continue;
+                    }
                     if to.is_empty() {
                         push_unique(&mut to, &mut seen, address);
                     } else {
@@ -217,7 +294,10 @@ pub fn reply_recipients(raw: &[u8], audience: ReplyAudience, own: &[String]) -> 
     if to.is_empty() {
         bail!("no valid non-self recipients for reply");
     }
-    Ok(ReplyRecipients { to: to.join(", "), cc: cc.join(", ") })
+    Ok(ReplyRecipients {
+        to: to.join(", "),
+        cc: cc.join(", "),
+    })
 }
 
 fn push_unique(out: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
@@ -233,7 +313,9 @@ fn unfold_header(raw: &[u8], target: &str) -> Option<String> {
     let mut found = None::<String>;
     for line in String::from_utf8_lossy(raw).lines() {
         let line = line.trim_end_matches('\r');
-        if line.is_empty() { break; }
+        if line.is_empty() {
+            break;
+        }
         if line.starts_with(' ') || line.starts_with('\t') {
             if let Some(value) = found.as_mut() {
                 value.push(' ');
@@ -253,7 +335,9 @@ fn unfold_header(raw: &[u8], target: &str) -> Option<String> {
 #[must_use]
 pub fn send_warnings(message: &OutgoingMessage) -> Vec<&'static str> {
     let mut result = Vec::new();
-    if message.subject.trim().is_empty() { result.push("Subject is empty"); }
+    if message.subject.trim().is_empty() {
+        result.push("Subject is empty");
+    }
     let mentions_attachment = message.body.to_ascii_lowercase().contains("attach");
     if mentions_attachment && message.attachments.is_empty() && message.forwarded_raw.is_none() {
         result.push("Body mentions an attachment, but none is attached");
@@ -265,7 +349,11 @@ pub fn send_warnings(message: &OutgoingMessage) -> Vec<&'static str> {
 /// envelope retains Bcc while its formatted() output strips it by default.
 /// No headers may be injected by arbitrary user text.
 pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<Message> {
-    let from_value = if message.from.trim().is_empty() { default_from } else { &message.from };
+    let from_value = if message.from.trim().is_empty() {
+        default_from
+    } else {
+        &message.from
+    };
     let from: Mailbox = from_value.parse().context("invalid From mailbox")?;
     validate_recipients(&message.to, &message.cc, &message.bcc)?;
     let message_id = new_outgoing_message_id(&sender_message_id_domain(&from));
@@ -273,10 +361,12 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
         .from(from)
         .message_id(Some(message_id))
         .subject(message.subject.clone())
-        .user_agent(format!("aerc-rs/{}", env!("CARGO_PKG_VERSION")));
+        .user_agent(format!("jerc/{}", env!("CARGO_PKG_VERSION")));
     let mut recipients = 0usize;
     for (value, kind) in [(&message.to, 0), (&message.cc, 1), (&message.bcc, 2)] {
-        if value.trim().is_empty() { continue; }
+        if value.trim().is_empty() {
+            continue;
+        }
         let mailboxes: Mailboxes = value.parse().context("invalid recipient mailbox list")?;
         for mailbox in mailboxes {
             recipients += 1;
@@ -287,7 +377,9 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
             };
         }
     }
-    if recipients == 0 { bail!("outgoing email has no To, Cc, or Bcc recipient"); }
+    if recipients == 0 {
+        bail!("outgoing email has no To, Cc, or Bcc recipient");
+    }
 
     if let Some(id) = message.in_reply_to.as_deref() {
         builder = builder.in_reply_to(format!("<{}>", normalized_message_id(id)?));
@@ -295,24 +387,56 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
     let mut refs = Vec::new();
     for id in &message.references {
         let normalized = normalized_message_id(id)?;
-        if !refs.contains(&normalized) { refs.push(normalized); }
+        if !refs.contains(&normalized) {
+            refs.push(normalized);
+        }
     }
     if !refs.is_empty() {
-        builder = builder.references(refs.iter().map(|id| format!("<{id}>")).collect::<Vec<_>>().join(" "));
+        builder = builder.references(
+            refs.iter()
+                .map(|id| format!("<{id}>"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     for (name, value) in &message.custom_headers {
         let lower = name.to_ascii_lowercase();
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') ||
-            ["from", "to", "cc", "bcc", "subject", "date", "message-id", "in-reply-to", "references", "mime-version", "content-type", "content-transfer-encoding", "return-path"].contains(&lower.as_str()) {
+        if name.is_empty()
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || [
+                "from",
+                "to",
+                "cc",
+                "bcc",
+                "subject",
+                "date",
+                "message-id",
+                "in-reply-to",
+                "references",
+                "mime-version",
+                "content-type",
+                "content-transfer-encoding",
+                "return-path",
+            ]
+            .contains(&lower.as_str())
+        {
             bail!("reserved or invalid custom header {name:?}");
         }
-        if value.contains('\r') || value.contains('\n') { bail!("newlines forbidden in custom header {name:?}"); }
-        let name = HeaderName::new_from_ascii(name.clone()).context("invalid custom header name")?;
+        if value.contains('\r') || value.contains('\n') {
+            bail!("newlines forbidden in custom header {name:?}");
+        }
+        let name =
+            HeaderName::new_from_ascii(name.clone()).context("invalid custom header name")?;
         builder = builder.raw_header(HeaderValue::new(name, value.clone()));
     }
 
-    if message.attachments.is_empty() && message.html_body.is_none() && message.forwarded_raw.is_none() {
-        return builder.body(message.body.clone()).context("building plain outgoing message");
+    if message.attachments.is_empty()
+        && message.html_body.is_none()
+        && message.forwarded_raw.is_none()
+    {
+        return builder
+            .body(message.body.clone())
+            .context("building plain outgoing message");
     }
     let mut body = if let Some(html) = message.html_body.as_ref() {
         let alternative = MultiPart::alternative()
@@ -323,21 +447,30 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
         MultiPart::mixed().singlepart(SinglePart::plain(message.body.clone()))
     };
     for file in &message.attachments {
-        if file.filename.is_empty() || (file.filename.contains('\r') || file.filename.contains('\n')) {
+        if file.filename.is_empty()
+            || (file.filename.contains('\r') || file.filename.contains('\n'))
+        {
             bail!("invalid attachment filename");
         }
         let content_type = ContentType::parse(&file.content_type)
             .with_context(|| format!("invalid attachment MIME type {:?}", file.content_type))?;
-        body = body.singlepart(Attachment::new(file.filename.clone()).body(file.data.clone(), content_type));
+        body = body.singlepart(
+            Attachment::new(file.filename.clone()).body(file.data.clone(), content_type),
+        );
     }
     if let Some(raw) = message.forwarded_raw.as_ref() {
-        if raw.is_empty() { bail!("cannot forward an empty original message"); }
+        if raw.is_empty() {
+            bail!("cannot forward an empty original message");
+        }
         let content_type = ContentType::parse("message/rfc822")?;
-        body = body.singlepart(Attachment::new("forwarded.eml".to_owned()).body(raw.clone(), content_type));
+        body = body.singlepart(
+            Attachment::new("forwarded.eml".to_owned()).body(raw.clone(), content_type),
+        );
     }
-    builder.multipart(body).context("building multipart outgoing message")
+    builder
+        .multipart(body)
+        .context("building multipart outgoing message")
 }
-
 
 /// Construct an unsent RFC 5322 message for the user's Drafts folder.
 /// Unlike SMTP mail, a draft can have incomplete/empty recipients. Lettre
@@ -346,11 +479,18 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
 /// The original To/Cc/Bcc strings are stored exclusively in the saved draft.
 /// The returned bytes must never be submitted to SMTP directly.
 pub fn build_draft(message: &OutgoingMessage, default_from: &str) -> Result<Vec<u8>> {
-    let sender = if message.from.trim().is_empty() { default_from } else { &message.from };
+    let sender = if message.from.trim().is_empty() {
+        default_from
+    } else {
+        &message.from
+    };
     if sender.trim().is_empty() {
-        bail!("no draft sender available; add `from = \"you@example.com\"` to this account in config.toml");
+        bail!(
+            "no draft sender available; add `from = \"you@example.com\"` to this account in config.toml"
+        );
     }
-    let mailbox: Mailbox = sender.parse()
+    let mailbox: Mailbox = sender
+        .parse()
         .context("invalid draft sender (check this account's `from` address in config.toml)")?;
     let mut staged = message.clone();
     staged.to = mailbox.email.to_string();
@@ -358,23 +498,37 @@ pub fn build_draft(message: &OutgoingMessage, default_from: &str) -> Result<Vec<
     staged.bcc.clear();
     let raw = build_outgoing(&staged, default_from)?.formatted();
     let separator = b"\r\n\r\n";
-    let split = raw.windows(separator.len()).position(|part| part == separator)
+    let split = raw
+        .windows(separator.len())
+        .position(|part| part == separator)
         .ok_or_else(|| anyhow!("MIME message has no header/body boundary"))?;
     let header = std::str::from_utf8(&raw[..split]).context("invalid MIME header text")?;
     let mut output = Vec::with_capacity(raw.len() + 256);
     let mut skip_to = false;
     for line in header.split("\r\n") {
         if line.starts_with(' ') || line.starts_with('\t') {
-            if skip_to { continue; }
+            if skip_to {
+                continue;
+            }
         } else {
-            skip_to = line.get(..3).is_some_and(|prefix| prefix.eq_ignore_ascii_case("to:"));
-            if skip_to { continue; }
+            skip_to = line
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("to:"));
+            if skip_to {
+                continue;
+            }
         }
         output.extend_from_slice(line.as_bytes());
         output.extend_from_slice(b"\r\n");
     }
-    for (name, value) in [("To", &message.to), ("Cc", &message.cc), ("Bcc", &message.bcc)] {
-        if value.is_empty() { continue; }
+    for (name, value) in [
+        ("To", &message.to),
+        ("Cc", &message.cc),
+        ("Bcc", &message.bcc),
+    ] {
+        if value.is_empty() {
+            continue;
+        }
         // A partially typed address may be saved, but not a header injection.
         if value.contains('\r') || value.contains('\n') || value.contains('\0') {
             bail!("invalid newline/control in draft {name} field");
@@ -388,7 +542,12 @@ pub fn build_draft(message: &OutgoingMessage, default_from: &str) -> Result<Vec<
 
 fn normalized_message_id(id: &str) -> Result<String> {
     let id = id.trim().trim_start_matches('<').trim_end_matches('>');
-    if id.is_empty() || !id.contains('@') || id.chars().any(|ch| ch.is_whitespace() || ch == '<' || ch == '>') {
+    if id.is_empty()
+        || !id.contains('@')
+        || id
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch == '<' || ch == '>')
+    {
         bail!("invalid message-id in outgoing thread headers");
     }
     Ok(id.to_owned())
@@ -402,10 +561,17 @@ mod draft_tests {
     fn message() -> OutgoingMessage {
         OutgoingMessage {
             from: "sender@example.org".to_owned(),
-            to: String::new(), cc: String::new(), bcc: String::new(),
-            subject: "Unsent 🎉".to_owned(), body: "The unsent body".to_owned(),
-            html_body: None, attachments: Vec::new(), custom_headers: Vec::new(),
-            in_reply_to: None, references: Vec::new(), forwarded_raw: None,
+            to: String::new(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Unsent 🎉".to_owned(),
+            body: "The unsent body".to_owned(),
+            html_body: None,
+            attachments: Vec::new(),
+            custom_headers: Vec::new(),
+            in_reply_to: None,
+            references: Vec::new(),
+            forwarded_raw: None,
         }
     }
 

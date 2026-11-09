@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use crossterm::event::{self, KeyEventKind, EnableMouseCapture, DisableMouseCapture};
 use crossterm::cursor::SetCursorStyle;
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -22,7 +22,6 @@ use crate::outgoing;
 use crate::ui;
 use crate::worker::{RuntimeEvent, WorkerHandle};
 
-
 pub fn run_tui(config: Config) -> Result<()> {
     let (config, configuration_warnings) = validate_account_configuration(config)?;
     let (runtime_tx, runtime_rx) = sync_channel::<RuntimeEvent>(4096);
@@ -33,7 +32,8 @@ pub fn run_tui(config: Config) -> Result<()> {
     app.startup_warnings.extend(configuration_warnings);
     if !app.startup_warnings.is_empty() {
         app.status = crate::app::StatusLine::error(format!(
-            "{} account configuration issue(s) — press ! for details", app.startup_warnings.len()
+            "{} account configuration issue(s) — press ! for details",
+            app.startup_warnings.len()
         ));
     }
 
@@ -117,16 +117,25 @@ fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<Str
 }
 
 fn safe_scheme(uri: &str) -> &str {
-    let scheme = uri.split_once("://").map_or("<invalid>", |(scheme, _)| scheme);
+    let scheme = uri
+        .split_once("://")
+        .map_or("<invalid>", |(scheme, _)| scheme);
     // Never display an entire malformed URI: it may include a password.
-    if scheme.len() > 32 || !scheme.chars().all(|ch| ch.is_ascii_alphanumeric() || "+-._".contains(ch)) {
+    if scheme.len() > 32
+        || !scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "+-._".contains(ch))
+    {
         "<invalid>"
     } else {
         scheme
     }
 }
 
-fn create_workers(config: &Config, runtime_tx: SyncSender<RuntimeEvent>) -> Result<Vec<WorkerHandle>> {
+fn create_workers(
+    config: &Config,
+    runtime_tx: SyncSender<RuntimeEvent>,
+) -> Result<Vec<WorkerHandle>> {
     config
         .accounts
         .iter()
@@ -152,16 +161,18 @@ fn create_workers(config: &Config, runtime_tx: SyncSender<RuntimeEvent>) -> Resu
 fn spawn_input_thread(runtime_tx: SyncSender<RuntimeEvent>) {
     thread::Builder::new()
         .name("terminal-input".into())
-        .spawn(move || loop {
-            match event::read() {
-                Ok(event) => {
-                    if runtime_tx.send(RuntimeEvent::Input(event)).is_err() {
+        .spawn(move || {
+            loop {
+                match event::read() {
+                    Ok(event) => {
+                        if runtime_tx.send(RuntimeEvent::Input(event)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = runtime_tx.send(RuntimeEvent::InputStopped);
                         break;
                     }
-                }
-                Err(_) => {
-                    let _ = runtime_tx.send(RuntimeEvent::InputStopped);
-                    break;
                 }
             }
         })
@@ -208,11 +219,15 @@ fn event_loop(
         // Browser OAuth and provider discovery happen on worker threads. They
         // may generate no terminal events for many seconds, so animate their
         // progress indicator on its own deadline (without blocking input).
-        let setup_busy = app.setup.as_ref()
+        let setup_busy = app
+            .setup
+            .as_ref()
             .is_some_and(|wizard| wizard.authenticating || wizard.discovering);
         if setup_busy {
             if Instant::now() >= next_setup_spinner_frame {
-                if let Some(wizard) = app.setup.as_mut() { wizard.spin(); }
+                if let Some(wizard) = app.setup.as_mut() {
+                    wizard.spin();
+                }
                 next_setup_spinner_frame = Instant::now() + Duration::from_millis(120);
                 render(terminal, app)?;
                 continue;
@@ -226,17 +241,22 @@ fn event_loop(
         } else {
             next_inbox_poll
         };
-        let deadline = if setup_busy { deadline.min(next_setup_spinner_frame) } else { deadline };
-        let deadline = app.contact_save_deadline().map_or(deadline, |due| deadline.min(due));
-        let received = match runtime_rx.recv_timeout(
-            deadline.saturating_duration_since(Instant::now())
-        ) {
-            Ok(event) => Some(event),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(anyhow::anyhow!("runtime event channel closed"));
-            }
+        let deadline = if setup_busy {
+            deadline.min(next_setup_spinner_frame)
+        } else {
+            deadline
         };
+        let deadline = app
+            .contact_save_deadline()
+            .map_or(deadline, |due| deadline.min(due));
+        let received =
+            match runtime_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(event) => Some(event),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow::anyhow!("runtime event channel closed"));
+                }
+            };
 
         let Some(event) = received else {
             // Do not advance here. The deadline check at the top of the next
@@ -245,7 +265,8 @@ fn event_loop(
             continue;
         };
 
-        let background_update = matches!(&event, RuntimeEvent::Worker(_) | RuntimeEvent::MailImage(_));
+        let background_update =
+            matches!(&event, RuntimeEvent::Worker(_) | RuntimeEvent::MailImage(_));
         match event {
             RuntimeEvent::Input(event::Event::Key(key))
                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -304,7 +325,11 @@ fn event_loop(
         // The desktop notification server owns the themed sound, not the
         // terminal. Never invoke a shell or block the TUI on a notification.
         while let Some(notice) = app.take_new_mail_notice() {
-            notify_new_mail(&notice, app.new_mail_sound_name(), app.new_mail_sound_file());
+            notify_new_mail(
+                &notice,
+                app.new_mail_sound_name(),
+                app.new_mail_sound_file(),
+            );
         }
         if app.take_new_mail_bell() {
             // Terminal bell: honors the user's terminal bell settings and
@@ -323,7 +348,9 @@ fn event_loop(
         // The animation deadline will paint them on the next ~100 Hz frame;
         // rendering once *per* completion can overwhelm a terminal and make
         // Ctrl-j/k stutter even though the mailbox worker is asynchronous.
-        if background_update && app.animation_active() { continue; }
+        if background_update && app.animation_active() {
+            continue;
+        }
         render(terminal, app)?;
     }
     app.flush_contacts(true);
@@ -336,20 +363,43 @@ fn event_loop(
 fn notification_excerpt(value: &str, limit: usize) -> String {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut excerpt = normalized.chars().take(limit).collect::<String>();
-    if normalized.chars().count() > limit { excerpt.push('…'); }
+    if normalized.chars().count() > limit {
+        excerpt.push('…');
+    }
     excerpt
 }
 
 fn notification_text(notice: &NewMailNotice) -> (String, String) {
     let subject = notification_excerpt(&notice.subject, 100);
-    let title = if subject.is_empty() { format!("New email · {}", notice.account) }
-        else { subject };
+    let title = if subject.is_empty() {
+        format!("New email · {}", notice.account)
+    } else {
+        subject
+    };
     let mut lines = Vec::new();
-    if !notice.sender.is_empty() { lines.push(format!("From: {}", notification_excerpt(&notice.sender, 80))); }
+    if !notice.sender.is_empty() {
+        lines.push(format!(
+            "From: {}",
+            notification_excerpt(&notice.sender, 80)
+        ));
+    }
     let excerpt = notification_excerpt(&notice.excerpt, 180);
-    if !excerpt.is_empty() { lines.push(excerpt); }
-    if notice.count > 1 { lines.push(format!("+{} more new messages · {}", notice.count - 1, notice.account)); }
-    if lines.is_empty() { lines.push(format!("{} new message(s) in {}", notice.count, notice.account)); }
+    if !excerpt.is_empty() {
+        lines.push(excerpt);
+    }
+    if notice.count > 1 {
+        lines.push(format!(
+            "+{} more new messages · {}",
+            notice.count - 1,
+            notice.account
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(format!(
+            "{} new message(s) in {}",
+            notice.count, notice.account
+        ));
+    }
     (title, lines.join("\n"))
 }
 
@@ -357,14 +407,18 @@ fn notify_new_mail(notice: &NewMailNotice, sound: &str, sound_file: Option<&str>
     let (title, body) = notification_text(notice);
     let sound_file = sound_file.filter(|file| std::path::Path::new(file).is_file());
     let mut command = ProcessCommand::new("notify-send");
-    command.args(["--app-name=aerc-rs", "--icon=mail-unread"]);
+    command.args(["--app-name=jerc", "--icon=mail-unread"]);
     // Explicit file playback and notification-server playback are mutually
     // exclusive to avoid playing the same alert twice.
     if sound_file.is_none() && !sound.trim().is_empty() {
-        command.arg("--hint").arg(format!("string:sound-name:{sound}"));
+        command
+            .arg("--hint")
+            .arg(format!("string:sound-name:{sound}"));
     }
     // Prevent untrusted subjects beginning with '-' from becoming CLI options.
-    command.arg("--").arg(title)
+    command
+        .arg("--")
+        .arg(title)
         .arg(body)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -374,9 +428,16 @@ fn notify_new_mail(notice: &NewMailNotice, sound: &str, sound_file: Option<&str>
         // Never shell out. If PipeWire's pw-play is absent, try PulseAudio's
         // compatible paplay command. Both run detached from terminal redraw.
         for player in ["pw-play", "paplay"] {
-            if ProcessCommand::new(player).arg(file)
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-                .spawn().is_ok() { break; }
+            if ProcessCommand::new(player)
+                .arg(file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                break;
+            }
         }
     }
 }
@@ -396,7 +457,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, SetCursorStyle::SteadyBar)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            SetCursorStyle::SteadyBar
+        )?;
         Ok(Self)
     }
 }
@@ -404,7 +470,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, SetCursorStyle::DefaultUserShape, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            SetCursorStyle::DefaultUserShape,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -415,7 +486,8 @@ mod multi_account_tests {
 
     #[test]
     fn malformed_smtp_disables_sending_without_disabling_receiving() {
-        let config: Config = toml::from_str(r#"
+        let config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Primary"
             source = "maildir:///tmp/primary"
@@ -424,7 +496,9 @@ mod multi_account_tests {
             name = "Secondary"
             source = "maildir:///tmp/secondary"
             outgoing = "imaps://sensitive:secret@imap.example.net:993"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let (validated, errors) = validate_account_configuration(config).unwrap();
         assert_eq!(validated.accounts.len(), 2);
         assert!(validated.accounts[0].outgoing.is_some());
@@ -437,14 +511,17 @@ mod multi_account_tests {
 
     #[test]
     fn invalid_incoming_skips_only_that_account() {
-        let config: Config = toml::from_str(r#"
+        let config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Broken"
             source = "pop3s://user:secret@server.example.net"
             [[accounts]]
             name = "Working"
             source = "maildir:///tmp/working"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let (validated, warnings) = validate_account_configuration(config).unwrap();
         assert_eq!(validated.accounts.len(), 1);
         assert_eq!(validated.accounts[0].name, "Working");
@@ -456,7 +533,9 @@ mod multi_account_tests {
     fn invalid_shorthand_does_not_block_other_accounts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, r#"
+        std::fs::write(
+            &path,
+            r#"
             [[accounts]]
             name = "Broken"
             email = "person@custom.example"
@@ -467,7 +546,9 @@ mod multi_account_tests {
             email = "worker@gmail.com"
             incoming = "imap"
             outgoing = "smtp"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let config = Config::load(Some(&path)).unwrap();
         let (validated, warnings) = validate_account_configuration(config).unwrap();
         assert_eq!(validated.accounts.len(), 1);
@@ -477,11 +558,14 @@ mod multi_account_tests {
 
     #[test]
     fn no_valid_incoming_accounts_returns_safe_error() {
-        let config: Config = toml::from_str(r#"
+        let config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Broken"
             source = "pop3s://user:secret@server.example.net"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let error = match validate_account_configuration(config) {
             Ok(_) => panic!("expected invalid config"),
             Err(error) => error.to_string(),
@@ -500,9 +584,13 @@ mod new_mail_notification_tests {
 
     #[test]
     fn includes_sender_subject_and_body_without_newlines_from_content() {
-        let notice = NewMailNotice { account: "University".into(), count: 2,
-            sender: "Professor\nSmith".into(), subject: "Office hours".into(),
-            excerpt: "Please   review\n the notes.".into() };
+        let notice = NewMailNotice {
+            account: "University".into(),
+            count: 2,
+            sender: "Professor\nSmith".into(),
+            subject: "Office hours".into(),
+            excerpt: "Please   review\n the notes.".into(),
+        };
         let (title, body) = notification_text(&notice);
         assert_eq!(title, "Office hours");
         assert!(body.contains("From: Professor Smith"));

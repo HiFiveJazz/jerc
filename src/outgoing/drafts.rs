@@ -1,14 +1,18 @@
 //! Per-account local postponed drafts, intentionally separate from IMAP Drafts.
 //! Write a temporary file then atomically rename it to avoid truncating an
 //! existing draft on a crash. Restrict file permissions on Unix systems.
+use crate::app::{ComposeField, Composer};
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-use anyhow::{Context, Result};
-use crate::app::{ComposeField, Composer};
 
 fn path_for(root: &Path, account: &str) -> PathBuf {
     // Hex encoding is an unambiguous, filesystem-safe account identifier.
-    let name = account.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let name = account
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     root.join(format!("{name}.json"))
 }
 
@@ -24,7 +28,9 @@ pub fn save_draft(root: &Path, account: &str, draft: &Composer) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&tmp).context("opening temporary postponed draft")?;
+    let mut file = options
+        .open(&tmp)
+        .context("opening temporary postponed draft")?;
     use std::io::Write;
     file.write_all(&bytes).context("writing postponed draft")?;
     file.sync_all().context("syncing postponed draft")?;
@@ -47,13 +53,20 @@ pub fn load_draft(root: &Path, account: &str) -> Result<Option<Composer>> {
     // Migrate drafts written when Files(;) was still an editable field.
     // The picker can now remove those selections just like newly added files.
     let legacy = std::mem::take(&mut draft.attachments);
-    for value in legacy.split(';').map(str::trim).filter(|part| !part.is_empty()) {
+    for value in legacy
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
         let path = std::fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value));
         if !draft.attachment_paths.contains(&path) {
             draft.attachment_paths.push(path);
         }
     }
-    if matches!(draft.field, ComposeField::Attachments | ComposeField::Headers) {
+    if matches!(
+        draft.field,
+        ComposeField::Attachments | ComposeField::Headers
+    ) {
         draft.field = ComposeField::Body;
         draft.cursor = draft.body.chars().count();
     }

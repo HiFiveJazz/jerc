@@ -4,7 +4,11 @@ use super::*;
 
 /// In compact mode only the sender email address is hidden when a display
 /// name is available. Mail with no sender display name must remain identifiable.
-pub(super) fn sender_header_value(from_name: &str, from_address: &str, show_details: bool) -> String {
+pub(super) fn sender_header_value(
+    from_name: &str,
+    from_address: &str,
+    show_details: bool,
+) -> String {
     if from_name.is_empty() {
         from_address.to_owned()
     } else if from_address.is_empty() || !show_details {
@@ -25,10 +29,21 @@ pub(super) fn compact_recipient_header(value: &str) -> String {
     let mut escaped = false;
     let mut angle_depth = 0usize;
     for (index, ch) in value.char_indices() {
-        if escaped { escaped = false; continue; }
-        if ch == '\\' && quoted { escaped = true; continue; }
-        if ch == '"' { quoted = !quoted; continue; }
-        if quoted { continue; }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quoted {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
         match ch {
             '<' => angle_depth += 1,
             '>' => angle_depth = angle_depth.saturating_sub(1),
@@ -44,14 +59,24 @@ pub(super) fn compact_recipient_header(value: &str) -> String {
 }
 
 pub(super) fn compact_recipient(value: &str) -> String {
-    let Some(start) = value.rfind('<') else { return value.to_owned(); };
-    let Some(end) = value[start..].find('>').map(|end| start + end) else { return value.to_owned(); };
-    if !value[start + 1..end].contains('@') { return value.to_owned(); }
+    let Some(start) = value.rfind('<') else {
+        return value.to_owned();
+    };
+    let Some(end) = value[start..].find('>').map(|end| start + end) else {
+        return value.to_owned();
+    };
+    if !value[start + 1..end].contains('@') {
+        return value.to_owned();
+    }
     // Only discard the address when we have an actual name to show. Leave
     // e.g. <someone@example.com> and malformed input untouched.
     let name = value[..start].trim();
-    if name.is_empty() { return value.to_owned(); }
-    let unquoted = name.strip_prefix('"').and_then(|name| name.strip_suffix('"'));
+    if name.is_empty() {
+        return value.to_owned();
+    }
+    let unquoted = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'));
     let name = unquoted.unwrap_or(name);
     let trailing = value[end + 1..].trim();
     format!("{name}{trailing}")
@@ -66,32 +91,58 @@ pub(super) fn reader_header_lines(
 ) -> Vec<Line<'static>> {
     let from = sender_header_value(&message.from_name, &message.from_address, show_details);
     let mut lines = vec![
-        Line::from(vec![Span::styled("From: ", theme.accent()), Span::raw(from)]),
-        Line::from(vec![Span::styled("Date: ", theme.accent()), Span::raw(
-            if message.timestamp > 0 {
+        Line::from(vec![
+            Span::styled("From: ", theme.accent()),
+            Span::raw(from),
+        ]),
+        Line::from(vec![
+            Span::styled("Date: ", theme.accent()),
+            Span::raw(if message.timestamp > 0 {
                 chrono::DateTime::<chrono::Utc>::from_timestamp(message.timestamp, 0)
-                    .map(|date| date.with_timezone(&chrono::Local)
-                        .format("%a, %b %-d, %Y at %-I:%M %p %Z").to_string())
+                    .map(|date| {
+                        date.with_timezone(&chrono::Local)
+                            .format("%a, %b %-d, %Y at %-I:%M %p %Z")
+                            .to_string()
+                    })
                     .unwrap_or_else(|| "unknown".to_owned())
-            } else { "unknown".to_owned() }
-        )]),
-        Line::from(vec![Span::styled("To: ", theme.accent()), Span::raw(
-            if message.to.is_empty() { "(not supplied)".to_owned() }
-            else if show_details { message.to.clone() }
-            else { compact_recipient_header(&message.to) }
-        )]),
+            } else {
+                "unknown".to_owned()
+            }),
+        ]),
+        Line::from(vec![
+            Span::styled("To: ", theme.accent()),
+            Span::raw(if message.to.is_empty() {
+                "(not supplied)".to_owned()
+            } else if show_details {
+                message.to.clone()
+            } else {
+                compact_recipient_header(&message.to)
+            }),
+        ]),
         Line::from(vec![
             Span::styled("Subject: ", theme.accent()),
             Span::raw(message.subject.clone()),
         ]),
     ];
     if !message.cc.is_empty() {
-        lines.push(Line::from(vec![Span::styled("Cc: ", theme.accent()), Span::raw(if show_details { message.cc.clone() }
-            else { compact_recipient_header(&message.cc) })]));
+        lines.push(Line::from(vec![
+            Span::styled("Cc: ", theme.accent()),
+            Span::raw(if show_details {
+                message.cc.clone()
+            } else {
+                compact_recipient_header(&message.cc)
+            }),
+        ]));
     }
     if !message.bcc.is_empty() {
-        lines.push(Line::from(vec![Span::styled("Bcc: ", theme.accent()), Span::raw(if show_details { message.bcc.clone() }
-            else { compact_recipient_header(&message.bcc) })]));
+        lines.push(Line::from(vec![
+            Span::styled("Bcc: ", theme.accent()),
+            Span::raw(if show_details {
+                message.bcc.clone()
+            } else {
+                compact_recipient_header(&message.bcc)
+            }),
+        ]));
     }
     if show_details {
         if let Some(message_id) = &message.message_id {
@@ -105,7 +156,11 @@ pub(super) fn reader_header_lines(
 }
 
 pub(super) fn preview_split_border_style(theme: &Theme, resizing: bool) -> Style {
-    if resizing { theme.accent() } else { theme.border() }
+    if resizing {
+        theme.accent()
+    } else {
+        theme.border()
+    }
 }
 
 pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -121,7 +176,11 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         area
     };
 
-    if app.account().and_then(|account| account.selected_message()).is_none() {
+    if app
+        .account()
+        .and_then(|account| account.selected_message())
+        .is_none()
+    {
         frame.render_widget(
             Paragraph::new("No message selected").style(theme.muted()),
             content_area,
@@ -158,7 +217,11 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             let account = app.account()?;
             let body = account.selected_body()?;
             let showing_html = body.has_html_alternative() && account.prefer_html;
-            reader_word_at(body.display_text(showing_html), reader_cursor, reader_column)
+            reader_word_at(
+                body.display_text(showing_html),
+                reader_cursor,
+                reader_column,
+            )
         })
         .flatten();
 
@@ -169,24 +232,54 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let mut lines = reader_header_lines(message, app.show_header_details, &theme);
         if let Some(body) = account.selected_body() {
             if body.attachment_count > 0 {
-                let preview = body.attachment_names.iter().take(2).cloned().collect::<Vec<_>>().join("  ·  ");
+                let preview = body
+                    .attachment_names
+                    .iter()
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("  ·  ");
                 let overflow = body.attachment_names.len().saturating_sub(2);
                 let label = if preview.is_empty() {
                     format!("{} attachment(s)", body.attachment_count)
                 } else if overflow > 0 {
                     format!("{preview}  +{overflow} more")
-                } else { preview };
+                } else {
+                    preview
+                };
                 lines.push(Line::from(vec![
-                    Span::styled("⧉  ", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "⧉  ",
+                        Style::default()
+                            .fg(theme.warning)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(label, theme.text()),
                     Span::styled("   Ctrl-a: view", theme.muted()),
                 ]));
             }
         } else if message.has_attachment_hint {
             let names = crate::mail::visible_attachment_hints(&message.attachment_names_hint)
-                .into_iter().take(2).collect::<Vec<_>>().join("  ·  ");
-            lines.push(Line::from(vec![Span::styled("⧉  ", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
-                Span::styled(if names.is_empty() { "Attachments (Ctrl-a: browse)".to_owned() } else { names }, theme.text())]));
+                .into_iter()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("  ·  ");
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "⧉  ",
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if names.is_empty() {
+                        "Attachments (Ctrl-a: browse)".to_owned()
+                    } else {
+                        names
+                    },
+                    theme.text(),
+                ),
+            ]));
         }
         lines.push(Line::styled(
             "─".repeat(usize::from(content_area.width)),
@@ -206,8 +299,15 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             if showing_html {
                 if let Some(html_lines) = &body.html_lines {
                     body_line_count = html_lines.len();
-                    let rendered = html_lines.iter().map(|line| line.spans.iter()
-                        .map(|span| span.text.as_str()).collect::<String>()).collect::<Vec<_>>();
+                    let rendered = html_lines
+                        .iter()
+                        .map(|line| {
+                            line.spans
+                                .iter()
+                                .map(|span| span.text.as_str())
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>();
                     let texts = rendered.iter().map(String::as_str).collect::<Vec<_>>();
                     let diff_lines = classify_patch_lines(&texts);
                     lines.extend(html_lines.iter().enumerate().map(|(line_index, line)| {
@@ -265,7 +365,6 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     )
                 }));
             }
-
         } else if account.is_loading_body() {
             lines.push(Line::styled("Loading message…", theme.muted()));
         } else {
@@ -284,16 +383,17 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // lines into *terminal rows*. Using body_start + reader_cursor for the
     // scroll position loses all preceding wraps and eventually leaves the
     // cursor below the viewport. Measure the row with Paragraph's own layout.
-    let visual_cursor_row = if reader_active && body_line_count > 0
-        && app.reader_needs_scroll_follow()
-    {
-        reader_visual_cursor_row(
-            &lines,
-            body_start,
-            reader_cursor.min(body_line_count - 1),
-            content_area.width,
-        )
-    } else { None };
+    let visual_cursor_row =
+        if reader_active && body_line_count > 0 && app.reader_needs_scroll_follow() {
+            reader_visual_cursor_row(
+                &lines,
+                body_start,
+                reader_cursor.min(body_line_count - 1),
+                content_area.width,
+            )
+        } else {
+            None
+        };
     let paragraph = Paragraph::new(Text::from(lines))
         .style(theme.text())
         .wrap(Wrap { trim: false });
@@ -301,7 +401,12 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let viewport_height = usize::from(content_area.height.max(1));
     let max_scroll =
         u16::try_from(visual_lines.saturating_sub(viewport_height)).unwrap_or(u16::MAX);
-    app.set_reader_layout(body_line_count, viewport_height, max_scroll, visual_cursor_row);
+    app.set_reader_layout(
+        body_line_count,
+        viewport_height,
+        max_scroll,
+        visual_cursor_row,
+    );
     let scroll = app.account().map_or(0, |account| account.preview_scroll);
     frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
 
@@ -332,12 +437,17 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 /// images, long body lines and the portion of the active line before the cursor.
 /// Use exactly the same word-wrap settings as the reader itself.
 pub(super) fn reader_visual_cursor_row(
-    lines: &[Line<'_>], body_start: usize, cursor_line: usize, width: u16,
+    lines: &[Line<'_>],
+    body_start: usize,
+    cursor_line: usize,
+    width: u16,
 ) -> Option<usize> {
     let index = body_start.checked_add(cursor_line)?;
     let current = lines.get(index)?;
     let width = width.max(1);
-    let preceding_rows = if index == 0 { 0 } else {
+    let preceding_rows = if index == 0 {
+        0
+    } else {
         Paragraph::new(Text::from(lines[..index].to_vec()))
             .wrap(Wrap { trim: false })
             .line_count(width)
@@ -348,10 +458,14 @@ pub(super) fn reader_visual_cursor_row(
     // several screen rows. When no cursor cell is present, use its first row.
     let mut prefix = Vec::new();
     for span in &current.spans {
-        if span.style == reader_cursor_style() { break; }
+        if span.style == reader_cursor_style() {
+            break;
+        }
         prefix.push(span.clone());
     }
-    let within_line = if prefix.is_empty() { 0 } else {
+    let within_line = if prefix.is_empty() {
+        0
+    } else {
         Paragraph::new(Line::from(prefix))
             .wrap(Wrap { trim: false })
             .line_count(width)
@@ -365,7 +479,12 @@ pub(super) fn reader_visual_cursor_row(
 /// Classify the entire body at once so hunk ranges and quoted patches are
 /// recognized without falsely coloring nearby prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PatchLineKind { Meta, Hunk, Add, Remove }
+pub(super) enum PatchLineKind {
+    Meta,
+    Hunk,
+    Add,
+    Remove,
+}
 
 pub(super) fn strip_mail_quotes(mut text: &str) -> &str {
     while let Some(after) = text.strip_prefix('>') {
@@ -400,22 +519,25 @@ pub(super) fn classify_patch_lines(lines: &[&str]) -> Vec<Option<PatchLineKind>>
     let (mut old_left, mut new_left) = (0usize, 0usize);
     for (index, line) in lines.iter().enumerate() {
         let text = strip_mail_quotes(line);
-        let next_is_target = lines.get(index + 1)
+        let next_is_target = lines
+            .get(index + 1)
             .is_some_and(|next| is_patch_target(strip_mail_quotes(next)));
-        let kind = if text.starts_with("diff --git ")
-            || is_patch_source(text) && next_is_target
-        {
+        let kind = if text.starts_with("diff --git ") || is_patch_source(text) && next_is_target {
             in_patch = true;
             in_hunk = false;
             Some(PatchLineKind::Meta)
         } else if !in_patch {
             None
-        } else if text.starts_with("index ") || is_patch_source(text)
-            || is_patch_target(text) || text.starts_with("new file mode ")
+        } else if text.starts_with("index ")
+            || is_patch_source(text)
+            || is_patch_target(text)
+            || text.starts_with("new file mode ")
             || text.starts_with("deleted file mode ")
-            || text.starts_with("old mode ") || text.starts_with("new mode ")
+            || text.starts_with("old mode ")
+            || text.starts_with("new mode ")
             || text.starts_with("similarity index ")
-            || text.starts_with("rename from ") || text.starts_with("rename to ")
+            || text.starts_with("rename from ")
+            || text.starts_with("rename to ")
         {
             in_hunk = false;
             Some(PatchLineKind::Meta)
@@ -448,7 +570,9 @@ pub(super) fn classify_patch_lines(lines: &[&str]) -> Vec<Option<PatchLineKind>>
                 in_hunk = false;
                 None
             };
-            if old_left == 0 && new_left == 0 { in_hunk = false; }
+            if old_left == 0 && new_left == 0 {
+                in_hunk = false;
+            }
             kind
         } else {
             if !text.trim().is_empty() && !text.starts_with("\\ No newline") {
@@ -481,7 +605,9 @@ pub(super) fn diff_line_style(kind: PatchLineKind, theme: &Theme) -> Style {
     };
     match kind {
         PatchLineKind::Meta => theme.accent(),
-        PatchLineKind::Hunk => Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        PatchLineKind::Hunk => Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
         PatchLineKind::Add => Style::default().fg(theme.unread).bg(bg(theme.unread)),
         PatchLineKind::Remove => Style::default().fg(theme.error).bg(bg(theme.error)),
     }
@@ -502,19 +628,16 @@ pub(super) fn plain_reader_line(
 ) -> Line<'static> {
     let diff = diff_kind.map(|kind| diff_line_style(kind, theme));
     let base = diff.unwrap_or_else(|| {
-        if is_quoted_line(text) { Style::default().fg(theme.muted) }
-        else { theme.text() }
+        if is_quoted_line(text) {
+            Style::default().fg(theme.muted)
+        } else {
+            theme.text()
+        }
     });
     let illuminate_ranges = illuminate_word
         .map(|word| word_match_ranges(text, word))
         .unwrap_or_default();
-    let mut spans = reader_gutter(
-        line_index,
-        line_count,
-        reader_cursor,
-        reader_active,
-        theme,
-    );
+    let mut spans = reader_gutter(line_index, line_count, reader_cursor, reader_active, theme);
     spans.extend(reader_fragments(
         text,
         base,
@@ -556,13 +679,7 @@ pub(super) fn rich_html_line(
     diff_kind: Option<PatchLineKind>,
     illuminate_word: Option<&str>,
 ) -> Line<'static> {
-    let mut spans = reader_gutter(
-        line_index,
-        line_count,
-        reader_cursor,
-        reader_active,
-        theme,
-    );
+    let mut spans = reader_gutter(line_index, line_count, reader_cursor, reader_active, theme);
     let line_len = line
         .spans
         .iter()
@@ -583,9 +700,12 @@ pub(super) fn rich_html_line(
         let mut style = rich_html_style(&span.style, &span.text, theme);
         if let Some(diff) = diff {
             style = style.fg(diff.fg.unwrap_or(theme.foreground));
-            if let Some(bg) = diff.bg { style = style.bg(bg); }
+            if let Some(bg) = diff.bg {
+                style = style.bg(bg);
+            }
+        } else if quoted {
+            style = style.fg(theme.muted);
         }
-        else if quoted { style = style.fg(theme.muted); }
         spans.extend(reader_fragments(
             &span.text,
             style,
@@ -660,8 +780,8 @@ pub(super) fn reader_fragments(
     let global_end = global_start.saturating_add(len);
     let mut boundaries = vec![global_start, global_end];
 
-    let selected_columns = reader_visual
-        .and_then(|selection| selection.columns_for_line(line_index, line_len));
+    let selected_columns =
+        reader_visual.and_then(|selection| selection.columns_for_line(line_index, line_len));
     if let Some((start, end)) = selected_columns {
         boundaries.push(start.max(global_start).min(global_end));
         boundaries.push(end.saturating_add(1).max(global_start).min(global_end));
@@ -695,7 +815,8 @@ pub(super) fn reader_fragments(
         if reader_active && line_index == reader_cursor {
             // Diff semantics remain tinted, but selection gets a stronger
             // background than ordinary additions/removals.
-            let bg = fragment_style.bg
+            let bg = fragment_style
+                .bg
                 .map(|diff_bg| reader_active_diff_bg(theme, diff_bg))
                 .unwrap_or(theme.popup_bg);
             fragment_style = fragment_style.bg(bg);
@@ -793,10 +914,7 @@ pub(super) fn reader_illuminate_bg(theme: &Theme) -> Color {
 pub(super) fn mix_channel(from: u8, to: u8, toward_to_percent: u16) -> u8 {
     let toward_to_percent = toward_to_percent.min(100);
     let toward_from_percent = 100 - toward_to_percent;
-    ((u16::from(from) * toward_from_percent
-        + u16::from(to) * toward_to_percent
-        + 50)
-        / 100) as u8
+    ((u16::from(from) * toward_from_percent + u16::from(to) * toward_to_percent + 50) / 100) as u8
 }
 
 pub(super) fn reader_cursor_style() -> Style {
@@ -824,15 +942,18 @@ pub(super) fn pad_reader_line(
     let visual_line_selected = reader_visual.is_some_and(|selection| {
         selection.start.line <= line_index && line_index <= selection.end.line
     });
-    let linewise_visual = reader_visual.is_some_and(|selection| {
-        selection.start.column == 0 && selection.end.column == usize::MAX
-    });
-    if (line_index != reader_cursor || !reader_active) && !visual_line_selected
-        && diff_background.is_none() {
+    let linewise_visual = reader_visual
+        .is_some_and(|selection| selection.start.column == 0 && selection.end.column == usize::MAX);
+    if (line_index != reader_cursor || !reader_active)
+        && !visual_line_selected
+        && diff_background.is_none()
+    {
         return;
     }
     let mut style = theme.text();
-    if let Some(bg) = diff_background { style = style.bg(bg); }
+    if let Some(bg) = diff_background {
+        style = style.bg(bg);
+    }
     if reader_active && line_index == reader_cursor {
         style = style.bg(diff_background
             .map(|bg| reader_active_diff_bg(theme, bg))
@@ -899,9 +1020,7 @@ pub(super) fn rich_html_style(
             .fg(theme.accent)
             .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
     } else if style.bold {
-        rendered = rendered
-            .fg(theme.unread)
-            .add_modifier(Modifier::BOLD);
+        rendered = rendered.fg(theme.unread).add_modifier(Modifier::BOLD);
     }
     if style.image.is_some() {
         rendered = if style.link.is_some() {
@@ -932,9 +1051,31 @@ pub(super) fn is_box_drawing_span(text: &str) -> bool {
         }
         if matches!(
             ch,
-            '─' | '│' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼'
-                | '╭' | '╮' | '╰' | '╯' | '═' | '║' | '╔' | '╗' | '╚' | '╝'
-                | '╠' | '╣' | '╦' | '╩' | '╬'
+            '─' | '│'
+                | '┌'
+                | '┐'
+                | '└'
+                | '┘'
+                | '├'
+                | '┤'
+                | '┬'
+                | '┴'
+                | '┼'
+                | '╭'
+                | '╮'
+                | '╰'
+                | '╯'
+                | '═'
+                | '║'
+                | '╔'
+                | '╗'
+                | '╚'
+                | '╝'
+                | '╠'
+                | '╣'
+                | '╦'
+                | '╩'
+                | '╬'
         ) {
             saw_box = true;
         } else {

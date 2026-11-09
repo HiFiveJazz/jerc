@@ -42,7 +42,9 @@ impl App {
                     account.normalize_search_selection();
                 }
                 KeyCode::Char(ch)
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     account.search_query.push(ch);
                     account.normalize_search_selection();
@@ -65,7 +67,11 @@ impl App {
                 "/{} • {count} match{}{}",
                 account.search_query,
                 if count == 1 { "" } else { "es" },
-                if account.has_more { " • search continues into older pages" } else { "" }
+                if account.has_more {
+                    " • search continues into older pages"
+                } else {
+                    ""
+                }
             )
         };
         self.status = if cleared {
@@ -92,8 +98,11 @@ impl App {
 
     #[must_use]
     pub fn help_matches(&self) -> Vec<usize> {
-        let entries = if self.attachment_picker_visible { ATTACHMENT_HELP_ENTRIES }
-            else { HELP_ENTRIES };
+        let entries = if self.attachment_picker_visible {
+            ATTACHMENT_HELP_ENTRIES
+        } else {
+            HELP_ENTRIES
+        };
         ranked_help_matches(entries, &self.help_query)
     }
 
@@ -103,7 +112,9 @@ impl App {
         self.themes
             .iter()
             .enumerate()
-            .filter(|(_, theme)| query.is_empty() || theme.name.to_ascii_lowercase().contains(&query))
+            .filter(|(_, theme)| {
+                query.is_empty() || theme.name.to_ascii_lowercase().contains(&query)
+            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -140,7 +151,9 @@ impl App {
                 self.reset_help_selection();
             }
             KeyCode::Char(ch)
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.help_query.push(ch);
                 self.reset_help_selection();
@@ -179,7 +192,9 @@ impl App {
                 self.reset_theme_selection();
             }
             KeyCode::Char(ch)
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.theme_query.push(ch);
                 self.reset_theme_selection();
@@ -240,7 +255,8 @@ impl App {
             if let Err(error) = crate::config::save_ui_theme(path, &id) {
                 self.status = StatusLine::error(format!("could not save [ui] theme: {error:#}"));
             } else {
-                self.status = StatusLine::temporary("theme saved in config.toml", Duration::from_secs(2));
+                self.status =
+                    StatusLine::temporary("theme saved in config.toml", Duration::from_secs(2));
             }
         } else {
             self.status = StatusLine::temporary(
@@ -256,5 +272,4 @@ impl App {
         self.theme_query.clear();
         self.theme_picker_visible = false;
     }
-
 }

@@ -1,5 +1,5 @@
-use aerc_rs::app::Composer;
-use aerc_rs::outgoing::drafts::{load_draft, save_draft, delete_draft};
+use jerc::app::Composer;
+use jerc::outgoing::drafts::{delete_draft, load_draft, save_draft};
 
 #[test]
 fn postponed_draft_round_trip_preserves_reply_and_forward_context() {
@@ -28,8 +28,18 @@ fn postponement_is_isolated_by_account_and_replaces_old_version() {
     let mut first = Composer::new();
     first.subject = "first".into();
     save_draft(temporary.path(), "personal@example.org", &first).unwrap();
-    assert!(load_draft(temporary.path(), "work@example.org").unwrap().is_none());
+    assert!(
+        load_draft(temporary.path(), "work@example.org")
+            .unwrap()
+            .is_none()
+    );
     first.subject = "second".into();
     save_draft(temporary.path(), "personal@example.org", &first).unwrap();
-    assert_eq!(load_draft(temporary.path(), "personal@example.org").unwrap().unwrap().subject, "second");
+    assert_eq!(
+        load_draft(temporary.path(), "personal@example.org")
+            .unwrap()
+            .unwrap()
+            .subject,
+        "second"
+    );
 }

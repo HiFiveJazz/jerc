@@ -30,7 +30,11 @@ pub struct ContactsConfig {
 
 impl Default for ContactsConfig {
     fn default() -> Self {
-        Self { autocomplete: true, learn_from_inbox: true, learn_from_sent: true }
+        Self {
+            autocomplete: true,
+            learn_from_inbox: true,
+            learn_from_sent: true,
+        }
     }
 }
 
@@ -69,7 +73,7 @@ pub struct AccountConfig {
     #[serde(default, alias = "folders-exclude")]
     pub exclude_mailboxes: Vec<String>,
     /// Optional command that prints the account password/refresh token/access
-    /// token on stdout. This mirrors aerc's source-cred-cmd idea and avoids
+    /// token on stdout. This supports external credential commands and avoids
     /// storing long-lived credentials in config.toml.
     #[serde(default)]
     pub source_cred_cmd: Option<String>,
@@ -77,15 +81,15 @@ pub struct AccountConfig {
     /// `Jazz Bhatia <jazz@example.com>`. If omitted, the SMTP username is used.
     #[serde(default)]
     pub from: Option<String>,
-    /// Optional aerc-style SMTP URI. Supported secure schemes are smtp://
+    /// Optional SMTP URI. Supported secure schemes are smtp://
     /// (STARTTLS) and smtps:// (implicit TLS), with +plain, +login, +xoauth2 or +oauthbearer.
     #[serde(default)]
     pub outgoing: Option<String>,
     /// Optional command that prints the outgoing password or OAuth refresh/access
-    /// token. URI credentials take precedence, mirroring aerc.
+    /// token. URI credentials take precedence, as configured.
     #[serde(default)]
     pub outgoing_cred_cmd: Option<String>,
-    /// Aerc-compatible per-account sent-copy policy. "" or "none" disables
+    /// Per-account sent-copy policy. "" or "none" disables
     /// APPEND; a comma-separated folder list forces copies to those folders.
     /// When absent, preserve legacy automatic behavior (Gmail server copy,
     /// otherwise use the first advertised Sent folder).
@@ -100,7 +104,7 @@ pub struct AccountConfig {
     pub max_messages: usize,
     /// Number of message headers fetched per interactive page. This is kept
     /// separate from max_messages so old configs that used a large initial
-    /// window become fast automatically when milestone-5 pagination is enabled.
+    /// window become fast automatically with paginated mailbox loading.
     #[serde(default = "default_page_size")]
     pub page_size: usize,
 }
@@ -109,7 +113,7 @@ pub struct AccountConfig {
 pub struct OAuthConfig {
     pub provider: String,
     /// Public client ID. Application publishers can instead embed one at build
-    /// time (AERC_RS_GOOGLE_CLIENT_ID / AERC_RS_MICROSOFT_CLIENT_ID).
+    /// time (JERC_GOOGLE_CLIENT_ID / JERC_MICROSOFT_CLIENT_ID).
     #[serde(default)]
     pub client_id: Option<String>,
     /// Microsoft tenant, default: common. Not used for Google.
@@ -149,7 +153,10 @@ pub struct OAuthConfig {
 
 impl std::fmt::Debug for AccountConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let scheme = self.source.split_once("://").map_or("<invalid>", |(scheme, _)| scheme);
+        let scheme = self
+            .source
+            .split_once("://")
+            .map_or("<invalid>", |(scheme, _)| scheme);
         f.debug_struct("AccountConfig")
             .field("name", &self.name)
             .field("source", &format_args!("{scheme}://<redacted>"))
@@ -167,7 +174,9 @@ impl std::fmt::Debug for AccountConfig {
             .field(
                 "outgoing",
                 &self.outgoing.as_ref().map(|value| {
-                    let scheme = value.split_once("://").map_or("<invalid>", |(scheme, _)| scheme);
+                    let scheme = value
+                        .split_once("://")
+                        .map_or("<invalid>", |(scheme, _)| scheme);
                     format!("{scheme}://<redacted>")
                 }),
             )
@@ -226,11 +235,11 @@ pub enum UiBorderStyle {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UiConfig {
-    /// Legacy milestone-3 setting. Kept so existing config files continue to
+    /// Legacy setting. Kept so existing config files continue to
     /// parse; the browser now uses a proportional mailbox column instead.
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u16,
-    /// Legacy split-preview width setting. Milestone 5 restored a responsive
+    /// Legacy split-preview width setting. The current UI uses a responsive
     /// preview split, but keeps this field only so older configs still parse.
     #[serde(default = "default_message_width_percent")]
     pub message_width_percent: u16,
@@ -310,7 +319,9 @@ impl Default for UiConfig {
 pub fn mailbox_is_excluded(name: &str, patterns: &[String]) -> bool {
     let name = name.to_lowercase();
     patterns.iter().any(|pattern| {
-        if pattern.is_empty() { return false; }
+        if pattern.is_empty() {
+            return false;
+        }
         let pattern = pattern.to_lowercase();
         let chars: Vec<char> = name.chars().collect();
         let mut matched = vec![false; chars.len() + 1];
@@ -325,7 +336,9 @@ pub fn mailbox_is_excluded(name: &str, patterns: &[String]) -> bool {
                     }
                 }
                 '?' => {
-                    for i in 1..=chars.len() { next[i] = matched[i - 1]; }
+                    for i in 1..=chars.len() {
+                        next[i] = matched[i - 1];
+                    }
                 }
                 literal => {
                     for i in 1..=chars.len() {
@@ -371,8 +384,10 @@ impl Config {
                 Ok(config)
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                accounts: Vec::new(), ui: UiConfig::default(),
-                contacts: ContactsConfig::default(), config_path: Some(path),
+                accounts: Vec::new(),
+                ui: UiConfig::default(),
+                contacts: ContactsConfig::default(),
+                config_path: Some(path),
             }),
             Err(err) => Err(err).with_context(|| format!("reading config {}", path.display())),
         }
@@ -433,9 +448,15 @@ enum MailPreset {
 impl MailPreset {
     fn for_account(account: &AccountConfig, email: &str) -> Option<Self> {
         let domain = email.rsplit_once('@')?.1.to_ascii_lowercase();
-        let microsoft_consumer = matches!(domain.as_str(),
-            "outlook.com" | "hotmail.com" | "live.com" | "msn.com");
-        match account.oauth.as_ref().map(|oauth| oauth.provider.to_ascii_lowercase()) {
+        let microsoft_consumer = matches!(
+            domain.as_str(),
+            "outlook.com" | "hotmail.com" | "live.com" | "msn.com"
+        );
+        match account
+            .oauth
+            .as_ref()
+            .map(|oauth| oauth.provider.to_ascii_lowercase())
+        {
             Some(provider) if provider == "google" => Some(Self::Google),
             Some(provider) if provider == "microsoft" => Some(if microsoft_consumer {
                 Self::OutlookCom
@@ -474,13 +495,24 @@ impl AccountConfig {
     /// Expand user-friendly shorthand at load time. Everything downstream still
     /// receives the same fully qualified URIs and OAuth settings as before.
     fn normalize_shorthand(&mut self) -> Result<()> {
-        let email = self.email.as_deref().map(str::trim).filter(|email| !email.is_empty());
+        let email = self
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|email| !email.is_empty());
         if let Some(value) = email {
             let Some((local, domain)) = value.rsplit_once('@') else {
-                return Err(anyhow!("email must be a complete address, e.g. you@example.com"));
+                return Err(anyhow!(
+                    "email must be a complete address, e.g. you@example.com"
+                ));
             };
-            if local.is_empty() || local.contains('@') || !valid_hostname(domain)
-                || value.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            if local.is_empty()
+                || local.contains('@')
+                || !valid_hostname(domain)
+                || value
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || ch.is_control())
+            {
                 return Err(anyhow!("email must be a valid, unescaped email address"));
             }
         }
@@ -489,7 +521,8 @@ impl AccountConfig {
             ("smtp_username", self.smtp_username.as_deref()),
         ] {
             if let Some(username) = value {
-                if username.trim().is_empty() || username != username.trim()
+                if username.trim().is_empty()
+                    || username != username.trim()
                     || username.chars().any(char::is_control)
                 {
                     return Err(anyhow!("{label} must be a nonempty single-line login name"));
@@ -503,27 +536,46 @@ impl AccountConfig {
         } else {
             self.source.trim()
         };
-        if matches!(incoming, "imap" | "imaps" | "imaps+login" | "imaps+xoauth2" | "imaps+oauthbearer") {
+        if matches!(
+            incoming,
+            "imap" | "imaps" | "imaps+login" | "imaps+xoauth2" | "imaps+oauthbearer"
+        ) {
             let email = email.ok_or_else(|| anyhow!("email is required when source = 'imap'"))?;
-            let host = self.imap_host.as_deref()
+            let host = self
+                .imap_host
+                .as_deref()
                 .or_else(|| preset.map(MailPreset::imap_host))
                 .ok_or_else(|| anyhow!("unknown mail provider: set imap_host for this account"))?;
             let port = self.imap_port.unwrap_or(993);
-            let scheme = match incoming { "imap" => "imaps", other => other };
+            let scheme = match incoming {
+                "imap" => "imaps",
+                other => other,
+            };
             let username = self.imap_username.as_deref().unwrap_or(email);
             self.source = build_mail_uri(scheme, username, host, port)?;
         } else if incoming.is_empty() {
-            return Err(anyhow!("missing incoming mail source; set email and source = 'imap', or use an IMAP/Maildir URI"));
+            return Err(anyhow!(
+                "missing incoming mail source; set email and source = 'imap', or use an IMAP/Maildir URI"
+            ));
         }
 
-        if let Some(outgoing) = self.outgoing.as_deref().map(|value| value.trim().to_owned()) {
+        if let Some(outgoing) = self
+            .outgoing
+            .as_deref()
+            .map(|value| value.trim().to_owned())
+        {
             match outgoing.as_str() {
                 "none" => self.outgoing = None,
                 "smtp" | "smtps" | "starttls" => {
-                    let email = email.ok_or_else(|| anyhow!("email is required for outgoing = 'smtp'"))?;
-                    let host = self.smtp_host.as_deref()
+                    let email =
+                        email.ok_or_else(|| anyhow!("email is required for outgoing = 'smtp'"))?;
+                    let host = self
+                        .smtp_host
+                        .as_deref()
                         .or_else(|| preset.map(MailPreset::smtp_host))
-                        .ok_or_else(|| anyhow!("unknown mail provider: set smtp_host for this account"))?;
+                        .ok_or_else(|| {
+                            anyhow!("unknown mail provider: set smtp_host for this account")
+                        })?;
                     let starttls = match outgoing.as_str() {
                         "smtps" => false,
                         "starttls" => true,
@@ -549,9 +601,15 @@ fn valid_hostname(host: &str) -> bool {
         && host.len() <= 253
         && !host.starts_with('.')
         && !host.ends_with('.')
-        && host.split('.').all(|label| !label.is_empty() && label.len() <= 63
-            && !label.starts_with('-') && !label.ends_with('-')
-            && label.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-'))
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
+        })
 }
 
 /// Use Url's userinfo encoder; an email address remains plain text in TOML and
@@ -573,8 +631,8 @@ fn build_mail_uri(scheme: &str, username: &str, host: &str, port: u16) -> Result
 pub fn save_ui_theme(path: &Path, theme: &str) -> Result<()> {
     use std::io::Write;
 
-    let file_path = fs::canonicalize(path)
-        .with_context(|| format!("resolving config {}", path.display()))?;
+    let file_path =
+        fs::canonicalize(path).with_context(|| format!("resolving config {}", path.display()))?;
     let original = fs::read_to_string(&file_path)
         .with_context(|| format!("reading config {}", file_path.display()))?;
     let quoted = toml::Value::String(theme.to_owned()).to_string();
@@ -592,8 +650,11 @@ pub fn save_ui_theme(path: &Path, theme: &str) -> Result<()> {
             in_ui = trimmed.split('#').next().unwrap_or("").trim() == "[ui]";
             found_ui |= in_ui;
         }
-        if in_ui && !trimmed.starts_with('#')
-            && line.split_once('=').is_some_and(|(key, _)| key.trim() == "theme")
+        if in_ui
+            && !trimmed.starts_with('#')
+            && line
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "theme")
         {
             updated.push_str(&format!("theme = {quoted}\n"));
             replaced = true;
@@ -609,13 +670,18 @@ pub fn save_ui_theme(path: &Path, theme: &str) -> Result<()> {
     }
     // Never write a malformed TOML file back over working account settings.
     toml::from_str::<Config>(&updated).context("validating updated theme config")?;
-    let parent = file_path.parent().ok_or_else(|| anyhow!("config path has no directory"))?;
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| anyhow!("config path has no directory"))?;
     let mut staging = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("staging config in {}", parent.display()))?;
-    staging.as_file().set_permissions(fs::metadata(&file_path)?.permissions())?;
+    staging
+        .as_file()
+        .set_permissions(fs::metadata(&file_path)?.permissions())?;
     staging.write_all(updated.as_bytes())?;
     staging.flush()?;
-    staging.persist(&file_path)
+    staging
+        .persist(&file_path)
         .map_err(|error| anyhow!("saving config {}: {}", file_path.display(), error.error))?;
     Ok(())
 }
@@ -624,7 +690,7 @@ pub fn save_ui_theme(path: &Path, theme: &str) -> Result<()> {
 pub fn default_config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("aerc-rs")
+        .join("jerc")
         .join("config.toml")
 }
 
@@ -636,7 +702,9 @@ const fn default_max_messages() -> usize {
     200
 }
 
-const fn default_inbox_poll_seconds() -> u64 { 20 }
+const fn default_inbox_poll_seconds() -> u64 {
+    20
+}
 
 const fn default_page_size() -> usize {
     100
@@ -654,11 +722,17 @@ const fn default_mailbox_width_percent() -> u16 {
     22
 }
 
-const fn default_preview_width_percent() -> u16 { 57 }
+const fn default_preview_width_percent() -> u16 {
+    57
+}
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
-fn default_mail_sound_name() -> String { "message-new-email".to_owned() }
+fn default_mail_sound_name() -> String {
+    "message-new-email".to_owned()
+}
 
 fn default_theme() -> String {
     "default".to_owned()
@@ -671,7 +745,10 @@ mod tests {
     #[test]
     fn notification_icon_style_parses_nerd_fonts_explicitly() {
         let config: Config = toml::from_str("[ui]\nnotification_icon_style = \"nerd\"").unwrap();
-        assert_eq!(config.ui.notification_icon_style, super::NotificationIconStyle::Nerd);
+        assert_eq!(
+            config.ui.notification_icon_style,
+            super::NotificationIconStyle::Nerd
+        );
     }
 
     #[test]
@@ -700,14 +777,18 @@ mod tests {
         assert_eq!(config.ui.inbox_poll_seconds, 20);
         assert!(!config.ui.new_mail_bell);
         assert!(config.ui.new_mail_notifications);
-        assert_eq!(config.ui.notification_icon_style, super::NotificationIconStyle::Unicode);
+        assert_eq!(
+            config.ui.notification_icon_style,
+            super::NotificationIconStyle::Unicode
+        );
         assert_eq!(config.ui.search_mode, super::MailSearchMode::Fuzzy);
         assert_eq!(config.ui.new_mail_sound_name, "message-new-email");
     }
 
     #[test]
     fn account_mailbox_exclusions_are_optional_and_support_globs() {
-        let config: Config = toml::from_str(r#"
+        let config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Personal"
             source = "maildir:///tmp/mail"
@@ -715,7 +796,9 @@ mod tests {
             [[accounts]]
             name = "Other"
             source = "maildir:///tmp/other"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(config.accounts[0].exclude_mailboxes.len(), 3);
         assert!(config.accounts[1].exclude_mailboxes.is_empty());
         let patterns = &config.accounts[0].exclude_mailboxes;
@@ -743,10 +826,18 @@ mod tests {
     #[test]
     fn visual_selection_style_defaults_to_gutter_and_accepts_row() {
         let default: super::Config = toml::from_str("[ui]\n").unwrap();
-        assert_eq!(default.ui.visual_selection_style, super::VisualSelectionStyle::Gutter);
+        assert_eq!(
+            default.ui.visual_selection_style,
+            super::VisualSelectionStyle::Gutter
+        );
         let row: super::Config = toml::from_str("[ui]\nvisual_selection_style = \"row\"").unwrap();
-        assert_eq!(row.ui.visual_selection_style, super::VisualSelectionStyle::Row);
-        assert!(toml::from_str::<super::Config>("[ui]\nvisual_selection_style = \"sideways\"").is_err());
+        assert_eq!(
+            row.ui.visual_selection_style,
+            super::VisualSelectionStyle::Row
+        );
+        assert!(
+            toml::from_str::<super::Config>("[ui]\nvisual_selection_style = \"sideways\"").is_err()
+        );
     }
 
     #[test]
@@ -792,14 +883,18 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.accounts[0].from.as_deref(), Some("User <user@example.com>"));
+        assert_eq!(
+            config.accounts[0].from.as_deref(),
+            Some("User <user@example.com>")
+        );
         let debug = format!("{:?}", config.accounts[0]);
         assert!(!debug.contains("secret"));
         assert!(debug.contains("smtps://<redacted>"));
     }
     #[test]
     fn per_account_copy_to_is_optional_and_alias_is_accepted() {
-        let config: Config = toml::from_str(r#"
+        let config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Google"
             source = "imaps://user@imap.gmail.com"
@@ -813,7 +908,9 @@ mod tests {
             [[accounts]]
             name = "Old"
             source = "maildir:///tmp/old"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(config.accounts[0].copy_to.as_deref(), Some(""));
         assert_eq!(config.accounts[1].copy_to.as_deref(), Some("Sent, Archive"));
         assert!(config.accounts[2].copy_to.is_none());
@@ -846,7 +943,8 @@ mod tests {
 
     #[test]
     fn parses_browser_oauth_config_without_tokens_in_debug() {
-        let config: Config = toml::from_str(r#"
+        let config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "University"
             source = "imaps://student%40example.edu@imap.example.edu"
@@ -855,7 +953,9 @@ mod tests {
             provider = "microsoft"
             tenant = "common"
             client_id = "public-client"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let account = &config.accounts[0];
         assert_eq!(account.oauth.as_ref().unwrap().provider, "microsoft");
         assert!(account.copy_to.is_none());
@@ -863,7 +963,8 @@ mod tests {
 
     #[test]
     fn gmail_shorthand_uses_plain_email_and_secure_provider_hosts() {
-        let mut config: Config = toml::from_str(r#"
+        let mut config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Personal"
             email = "first.last+tag@gmail.com"
@@ -873,11 +974,14 @@ mod tests {
             [accounts.oauth]
             provider = "google"
             client_id = "test-public-client"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         config.normalize_accounts();
         let account = &config.accounts[0];
         let incoming = crate::backend::ImapSource::parse(&account.source).unwrap();
-        let outgoing = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        let outgoing =
+            crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
         assert_eq!(incoming.username, "first.last+tag@gmail.com");
         assert_eq!(incoming.host, "imap.gmail.com");
         assert_eq!(incoming.port, 993);
@@ -892,7 +996,8 @@ mod tests {
 
     #[test]
     fn google_workspace_uses_oauth_provider_even_with_custom_email_domain() {
-        let mut config: Config = toml::from_str(r#"
+        let mut config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "University"
             email = "student@university.edu"
@@ -901,18 +1006,27 @@ mod tests {
             [accounts.oauth]
             provider = "google"
             client_id = "test-public-client"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         config.normalize_accounts();
         let account = &config.accounts[0];
-        assert_eq!(crate::backend::ImapSource::parse(&account.source).unwrap().host, "imap.gmail.com");
-        let smtp = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            crate::backend::ImapSource::parse(&account.source)
+                .unwrap()
+                .host,
+            "imap.gmail.com"
+        );
+        let smtp =
+            crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
         assert_eq!(smtp.host, "smtp.gmail.com");
         assert_eq!(smtp.port, 587);
     }
 
     #[test]
     fn microsoft_preset_uses_starttls_587() {
-        let mut config: Config = toml::from_str(r#"
+        let mut config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Work"
             email = "worker@example.edu"
@@ -921,18 +1035,27 @@ mod tests {
             [accounts.oauth]
             provider = "microsoft"
             client_id = "test-public-client"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         config.normalize_accounts();
         let account = &config.accounts[0];
-        assert_eq!(crate::backend::ImapSource::parse(&account.source).unwrap().host, "outlook.office365.com");
-        let smtp = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            crate::backend::ImapSource::parse(&account.source)
+                .unwrap()
+                .host,
+            "outlook.office365.com"
+        );
+        let smtp =
+            crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
         assert_eq!(smtp.host, "smtp.office365.com");
         assert_eq!(smtp.port, 587);
     }
 
     #[test]
     fn custom_provider_requires_explicit_hosts_and_respects_port_overrides() {
-        let mut config: Config = toml::from_str(r#"
+        let mut config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Custom"
             email = "person@example.org"
@@ -942,11 +1065,14 @@ mod tests {
             smtp_host = "relay.example.org"
             imap_port = 1993
             smtp_port = 2525
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         config.normalize_accounts();
         let account = &config.accounts[0];
         let imap = crate::backend::ImapSource::parse(&account.source).unwrap();
-        let smtp = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        let smtp =
+            crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
         assert_eq!(imap.port, 1993);
         assert_eq!(imap.host, "mail.example.org");
         assert_eq!(smtp.port, 2525);
@@ -956,27 +1082,34 @@ mod tests {
 
     #[test]
     fn shorthand_fails_closed_on_missing_hosts_or_host_injection() {
-        let mut config: Config = toml::from_str(r#"
+        let mut config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Unknown"
             email = "person@unknown.test"
             source = "imap"
             outgoing = "smtp"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert!(config.accounts[0].normalize_shorthand().is_err());
-        let mut config: Config = toml::from_str(r#"
+        let mut config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Unknown"
             email = "person@unknown.test"
             source = "imap"
             imap_host = "mail.test@evil.test"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert!(config.accounts[0].normalize_shorthand().is_err());
     }
 
     #[test]
     fn existing_uris_maildir_and_sendmail_are_not_modified() {
-        let mut config: Config = toml::from_str(r#"
+        let mut config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Legacy"
             source = "imaps+oauthbearer://user%40example.com@imap.example.com:993"
@@ -986,10 +1119,20 @@ mod tests {
             name = "Local"
             source = "maildir:///tmp/example"
             outgoing = "/usr/sbin/sendmail"
-        "#).unwrap();
-        let original = config.accounts.iter().map(|a| (a.source.clone(), a.outgoing.clone())).collect::<Vec<_>>();
+        "#,
+        )
+        .unwrap();
+        let original = config
+            .accounts
+            .iter()
+            .map(|a| (a.source.clone(), a.outgoing.clone()))
+            .collect::<Vec<_>>();
         config.normalize_accounts();
-        let updated = config.accounts.iter().map(|a| (a.source.clone(), a.outgoing.clone())).collect::<Vec<_>>();
+        let updated = config
+            .accounts
+            .iter()
+            .map(|a| (a.source.clone(), a.outgoing.clone()))
+            .collect::<Vec<_>>();
         assert_eq!(original, updated);
     }
 
@@ -1004,7 +1147,10 @@ mod tests {
         assert!(saved.contains("private-token@example.org"));
         assert!(saved.contains("# personal config"));
         assert!(saved.contains("remote_images = false"));
-        assert_eq!(super::Config::load(Some(&path)).unwrap().ui.theme, "tokyo-night");
+        assert_eq!(
+            super::Config::load(Some(&path)).unwrap().ui.theme,
+            "tokyo-night"
+        );
         assert_eq!(saved.matches("theme =").count(), 1);
     }
 
@@ -1012,7 +1158,11 @@ mod tests {
     fn writes_ui_theme_when_ui_table_missing_and_honors_custom_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("custom.toml");
-        std::fs::write(&path, "[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\"\n",
+        )
+        .unwrap();
         super::save_ui_theme(&path, "nord").unwrap();
         let config = super::Config::load(Some(&path)).unwrap();
         assert_eq!(config.ui.theme, "nord");
@@ -1031,7 +1181,8 @@ mod tests {
 
     #[test]
     fn separate_auth_usernames_preserve_display_identity() {
-        let mut config: Config = toml::from_str(r#"
+        let mut config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "University"
             email = "preferred.name@dartmouth.edu"
@@ -1042,22 +1193,29 @@ mod tests {
             [accounts.oauth]
             provider = "microsoft"
             client_id = "test-public-client"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         config.normalize_accounts();
         let account = &config.accounts[0];
         let imap = crate::backend::ImapSource::parse(&account.source).unwrap();
-        let smtp = crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
+        let smtp =
+            crate::outgoing::SmtpSource::parse(account.outgoing.as_deref().unwrap()).unwrap();
         assert_eq!(imap.username, "f00851y@dartmouth.edu");
         assert_eq!(smtp.username, "f00851y@dartmouth.edu");
         assert_eq!(smtp.host, "smtp.office365.com");
         assert_eq!(smtp.port, 587);
-        assert_eq!(crate::outgoing::sender_from_account(account), "preferred.name@dartmouth.edu");
+        assert_eq!(
+            crate::outgoing::sender_from_account(account),
+            "preferred.name@dartmouth.edu"
+        );
         assert!(!format!("{account:?}").contains("f00851y"));
     }
 
     #[test]
     fn full_smtp_uri_is_not_overwritten_by_shorthand_username() {
-        let mut config: Config = toml::from_str(r#"
+        let mut config: Config = toml::from_str(
+            r#"
             [[accounts]]
             name = "Custom"
             email = "display@example.com"
@@ -1065,10 +1223,13 @@ mod tests {
             imap_host = "imap.example.com"
             smtp_username = "override@example.com"
             outgoing = "smtp+xoauth2://explicit%40example.com@smtp.example.com:587"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         config.normalize_accounts();
-        let smtp = crate::outgoing::SmtpSource::parse(config.accounts[0].outgoing.as_deref().unwrap()).unwrap();
+        let smtp =
+            crate::outgoing::SmtpSource::parse(config.accounts[0].outgoing.as_deref().unwrap())
+                .unwrap();
         assert_eq!(smtp.username, "explicit@example.com");
     }
-
 }

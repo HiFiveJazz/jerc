@@ -1,6 +1,8 @@
 use std::fmt;
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
 pub struct MessageId(pub String);
 
 impl fmt::Display for MessageId {
@@ -220,11 +222,19 @@ impl MessageBody {
     #[must_use]
     pub fn display_text(&self, prefer_html: bool) -> &str {
         if prefer_html {
-            if let Some(html) = self.html_text.as_deref().filter(|text| !text.trim().is_empty()) {
+            if let Some(html) = self
+                .html_text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            {
                 return html;
             }
         }
-        if let Some(plain) = self.plain_text.as_deref().filter(|text| !text.trim().is_empty()) {
+        if let Some(plain) = self
+            .plain_text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
             return plain;
         }
         if let Some(plain) = self
@@ -234,7 +244,11 @@ impl MessageBody {
         {
             return plain;
         }
-        if let Some(html) = self.html_text.as_deref().filter(|text| !text.trim().is_empty()) {
+        if let Some(html) = self
+            .html_text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
             return html;
         }
         "(message has no displayable text body)"
@@ -735,7 +749,10 @@ mod tests {
             attachment_count: 0,
             attachment_names: Vec::new(),
         };
-        assert_eq!(body.html_images(), vec!["https://example.com/hero.png".to_owned()]);
+        assert_eq!(
+            body.html_images(),
+            vec!["https://example.com/hero.png".to_owned()]
+        );
     }
 
     #[test]

@@ -233,7 +233,6 @@ impl App {
             _ => false,
         }
     }
-
 }
 
 impl App {
@@ -259,10 +258,7 @@ impl App {
         let Some(body) = account.bodies.get_mut(&message_id) else {
             return;
         };
-        if !body.has_html_alternative()
-            || !prefer_html
-            || body.html_render_width == width
-        {
+        if !body.has_html_alternative() || !prefer_html || body.html_render_width == width {
             return;
         }
         // Only the derived layout is replaced. Borrow the MIME HTML source
@@ -335,9 +331,12 @@ impl App {
                 account.preview_scroll = 0;
             } else if let Some(row) = cursor_visual_row {
                 account.preview_scroll = u16::try_from(reader_scroll_for_visual_cursor(
-                    usize::from(account.preview_scroll), row, view_height.max(1),
+                    usize::from(account.preview_scroll),
+                    row,
+                    view_height.max(1),
                     usize::from(max_scroll),
-                )).unwrap_or(u16::MAX);
+                ))
+                .unwrap_or(u16::MAX);
             }
         }
     }
@@ -354,7 +353,8 @@ impl App {
     }
 
     pub(super) fn reader_line_len(&self, line: usize) -> usize {
-        self.reader_line_text(line).map_or(0, |text| text.chars().count())
+        self.reader_line_text(line)
+            .map_or(0, |text| text.chars().count())
     }
 
     pub(super) fn clamp_reader_column(&mut self) {
@@ -444,7 +444,9 @@ impl App {
                 .rev()
                 .find(|index| lines[*index].trim().is_empty())
                 .and_then(|blank| {
-                    (0..blank).rev().find(|index| !lines[*index].trim().is_empty())
+                    (0..blank)
+                        .rev()
+                        .find(|index| !lines[*index].trim().is_empty())
                 })
                 .unwrap_or(0)
         };
@@ -458,10 +460,14 @@ impl App {
         if self.reader_visual_anchor.is_none() {
             return false;
         }
-        let Some(line) = self.reader_line_text(self.reader_cursor).map(ToOwned::to_owned) else {
+        let Some(line) = self
+            .reader_line_text(self.reader_cursor)
+            .map(ToOwned::to_owned)
+        else {
             return false;
         };
-        let Some((start, end)) = inner_text_object_range(&line, self.reader_column, delimiter) else {
+        let Some((start, end)) = inner_text_object_range(&line, self.reader_column, delimiter)
+        else {
             return false;
         };
         self.reader_visual_anchor = Some(ReaderPosition {
@@ -526,7 +532,9 @@ impl App {
     }
 
     pub(super) fn start_smooth_mailbox_scroll(&mut self, delta: isize) {
-        if self.message_open { return; }
+        if self.message_open {
+            return;
+        }
         self.visual_anchor = None;
         self.message_marked.clear();
         let Some(account) = self.account_mut() else {
@@ -538,7 +546,9 @@ impl App {
         if account.smooth_mailbox_target.is_none() {
             account.save_current_cache();
         }
-        let base = account.smooth_mailbox_target.unwrap_or(account.mailbox_index);
+        let base = account
+            .smooth_mailbox_target
+            .unwrap_or(account.mailbox_index);
         account.smooth_mailbox_target = Some(bounded_index(base, account.mailboxes.len(), delta));
     }
 
@@ -557,7 +567,11 @@ impl App {
             self.reader_pending_inner_object = false;
             if let Some(account) = self.account_mut() {
                 account.smooth_preview_target = None;
-                account.preview_scroll = if bottom { account.preview_max_scroll } else { 0 };
+                account.preview_scroll = if bottom {
+                    account.preview_max_scroll
+                } else {
+                    0
+                };
             }
             return;
         }
@@ -598,7 +612,10 @@ impl App {
     pub(super) fn open_selection(&mut self) {
         match self.focus {
             Focus::Mailboxes | Focus::Messages => {
-                if self.account().is_none_or(|account| account.selected_message().is_none()) {
+                if self
+                    .account()
+                    .is_none_or(|account| account.selected_message().is_none())
+                {
                     return;
                 }
                 self.visual_anchor = None;
@@ -669,10 +686,8 @@ impl App {
 
     pub(super) fn open_reader_link(&mut self) {
         let Some(url) = self.link_under_reader_cursor() else {
-            self.status = StatusLine::temporary(
-                "reader cursor is not on a link",
-                Duration::from_secs(1),
-            );
+            self.status =
+                StatusLine::temporary("reader cursor is not on a link", Duration::from_secs(1));
             return;
         };
         let result = open_url(&url);
@@ -686,8 +701,7 @@ impl App {
         let account = self.account()?;
         let body = account.selected_body()?;
         let showing_html = body.has_html_alternative() && account.prefer_html;
-        if showing_html
-            && let Some(url) = body.html_link_at(self.reader_cursor, self.reader_column)
+        if showing_html && let Some(url) = body.html_link_at(self.reader_cursor, self.reader_column)
         {
             return Some(url.to_owned());
         }
@@ -726,5 +740,4 @@ impl App {
             Err(error) => StatusLine::error(format!("could not copy selection: {error}")),
         };
     }
-
 }

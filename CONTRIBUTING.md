@@ -1,6 +1,6 @@
-# Contributing to aerc-rs
+# Contributing to Jerc
 
-Thanks for improving aerc-rs. This is a terminal email client, so changes can
+Thanks for improving Jerc. This is a terminal email client, so changes can
 involve untrusted MIME content and private account information. Keep changes
 small, testable, and focused on one subsystem.
 

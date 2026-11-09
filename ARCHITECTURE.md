@@ -1,6 +1,6 @@
-# Architecture — milestone 5
+# Architecture
 
-The project keeps aerc's separation of UI state from blocking mail protocols while using a modal, lazygitrs-like terminal interaction model.
+Jerc separates interactive UI state from blocking mail protocol work, with modal keyboard interaction and a bounded worker queue.
 
 ```text
 Crossterm input thread ───────────────────────────┐
@@ -48,11 +48,11 @@ Bulk IMAP mutations build one UID sequence for the whole selection. Successful m
 
 ## Split preview and body loading
 
-`P` toggles a vertical preview beside the message list. Browser movement still loads only headers until a preview or full reader needs a body. Cached bodies are reused by both surfaces. `b` can hide the mailbox sidebar so the browser/preview can use the full terminal width.
+`p` toggles a vertical preview beside the message list. Browser movement still loads only headers until a preview or full reader needs a body. Cached bodies are reused by both surfaces. `b` can hide the mailbox sidebar so the browser/preview can use the full terminal width.
 
 ## HTML mail
 
-MIME parsing remains in `mail-parser`. A real HTML part is the default reader view and `html2text`'s rich line API preserves table structure plus annotations such as links, images, emphasis, strong text, strikeout and code. Those annotations are converted into model-level spans, but sender foreground/background CSS is deliberately not painted into the TUI: semantic emphasis survives while the active theme owns readability. `T` switches to the supplied text/plain part or, for HTML-only mail, a generated plain fallback.
+MIME parsing remains in `mail-parser`. A real HTML part is the default reader view and `html2text`'s rich line API preserves table structure plus annotations such as links, images, emphasis, strong text, strikeout and code. Those annotations are converted into model-level spans, but sender foreground/background CSS is deliberately not painted into the TUI: semantic emphasis survives while the active theme owns readability. `t` switches to the supplied text/plain part or, for HTML-only mail, a generated plain fallback.
 
 Before rich conversion, HTML tables explicitly marked `role="presentation"` are linearized so newsletter/grid scaffolding does not become data-table chrome. Post-processing then removes zero-width/preheader padding, Markdown-like heading markers emitted by the conversion layer, generic image labels and repeated layout-table chrome. Dense nested layout blocks are flattened as a fallback; remaining semantic tables have their outer edges closed instead of ending in dangling junctions.
 

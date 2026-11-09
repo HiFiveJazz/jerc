@@ -29,10 +29,7 @@ impl MailImageLoader {
                 while let Ok(source) = receiver.recv() {
                     let result = load_remote_image(&source);
                     if runtime_tx
-                        .send(RuntimeEvent::MailImage(MailImageEvent {
-                            source,
-                            result,
-                        }))
+                        .send(RuntimeEvent::MailImage(MailImageEvent { source, result }))
                         .is_err()
                     {
                         break;
@@ -66,8 +63,8 @@ fn load_remote_image(source: &str) -> Result<DynamicImage, String> {
         .limit(MAX_IMAGE_BYTES)
         .read_to_vec()
         .map_err(|error| format!("image download failed: {error}"))?;
-    let image = image::load_from_memory(&bytes)
-        .map_err(|error| format!("image decode failed: {error}"))?;
+    let image =
+        image::load_from_memory(&bytes).map_err(|error| format!("image decode failed: {error}"))?;
     // Ignore the classic tracking-pixel shape even if its URL did not make the
     // conservative URL filter in MessageBody::html_images().
     if image.width() <= 2 && image.height() <= 2 {

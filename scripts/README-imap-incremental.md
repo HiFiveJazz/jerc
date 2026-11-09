@@ -28,7 +28,7 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 To inspect which path runs, set the existing performance-log variable before
-starting aerc-rs. A successful cached refresh records `imap_fetch_uid_flags`
+starting jerc. A successful cached refresh records `imap_fetch_uid_flags`
 and `imap_incremental_reuse`; a message arrival additionally records
 `imap_fetch_new_headers`. A cold page records `imap_fetch_headers` instead.
 Compare several warm folder switches against your prior baseline rather than

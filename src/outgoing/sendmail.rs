@@ -22,10 +22,12 @@ impl SendmailSender {
             if url.host_str().is_some() || url.query().is_some() || url.fragment().is_some() {
                 bail!("sendmail:// must contain an absolute executable path only");
             }
-            percent_encoding::percent_decode_str(url.path()).decode_utf8()
-                .context("sendmail path is not valid UTF-8")?.into_owned()
+            percent_encoding::percent_decode_str(url.path())
+                .decode_utf8()
+                .context("sendmail path is not valid UTF-8")?
+                .into_owned()
         } else if outgoing.starts_with('/') && !outgoing.contains("://") {
-            // aerc compatibility: outgoing = "/usr/sbin/sendmail"
+            // sendmail compatibility: outgoing = "/usr/sbin/sendmail"
             outgoing.to_owned()
         } else {
             return Ok(None);
@@ -34,7 +36,9 @@ impl SendmailSender {
         if !executable.is_absolute() || !executable.is_file() {
             bail!("sendmail outgoing requires an existing absolute executable path");
         }
-        Ok(Some(Self { executable: executable.to_path_buf() }))
+        Ok(Some(Self {
+            executable: executable.to_path_buf(),
+        }))
     }
 }
 
@@ -51,20 +55,37 @@ impl MailSender for SendmailSender {
         // End options before user-provided recipients (required for Postfix's
         // sendmail compatibility interface). Never interpolate into a shell.
         command.arg("--");
-        if envelope.to().is_empty() { bail!("no envelope recipients for sendmail"); }
-        for recipient in envelope.to() { command.arg(recipient.to_string()); }
-        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
-            .spawn().context("starting sendmail executable")?;
-        let write_error = child.stdin.take().ok_or_else(|| anyhow!("sendmail stdin unavailable"))?
-            .write_all(&raw_message).err();
-        let output = child.wait_with_output().context("waiting for sendmail submission")?;
+        if envelope.to().is_empty() {
+            bail!("no envelope recipients for sendmail");
+        }
+        for recipient in envelope.to() {
+            command.arg(recipient.to_string());
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("starting sendmail executable")?;
+        let write_error = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("sendmail stdin unavailable"))?
+            .write_all(&raw_message)
+            .err();
+        let output = child
+            .wait_with_output()
+            .context("waiting for sendmail submission")?;
         if let Some(error) = write_error {
             return Err(error).context("writing email to sendmail");
         }
         if !output.status.success() {
             // Avoid echoing arbitrary stderr which could contain mail headers or
             // secrets injected by the local MTA.
-            bail!("sendmail rejected submission (exit status {})", output.status);
+            bail!(
+                "sendmail rejected submission (exit status {})",
+                output.status
+            );
         }
         Ok(SendReceipt {
             raw_message,
@@ -79,9 +100,13 @@ mod tests {
     use super::*;
     #[test]
     fn accepts_absolute_sendmail_and_url_forms() {
-        assert!(SendmailSender::from_outgoing("smtps://x@smtp.example.com").unwrap().is_none());
+        assert!(
+            SendmailSender::from_outgoing("smtps://x@smtp.example.com")
+                .unwrap()
+                .is_none()
+        );
         assert!(SendmailSender::from_outgoing("sendmail://wrong-host/usr/sbin/sendmail").is_err());
-        assert!(SendmailSender::from_outgoing("sendmail:///tmp/nonexistent-aerc-binary").is_err());
+        assert!(SendmailSender::from_outgoing("sendmail:///tmp/nonexistent-jerc-binary").is_err());
     }
     #[cfg(unix)]
     #[test]
@@ -91,10 +116,16 @@ mod tests {
         let executable = temp.path().join("fake-sendmail");
         let args_path = temp.path().join("args");
         let data_path = temp.path().join("message");
-        let script = format!("#!/bin/sh\nprintf '%s\n' \"$@\" > '{}'\ncat > '{}'\n", args_path.display(), data_path.display());
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\n' \"$@\" > '{}'\ncat > '{}'\n",
+            args_path.display(),
+            data_path.display()
+        );
         std::fs::write(&executable, script).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut sender = SendmailSender::from_outgoing(executable.to_str().unwrap()).unwrap().unwrap();
+        let mut sender = SendmailSender::from_outgoing(executable.to_str().unwrap())
+            .unwrap()
+            .unwrap();
         let message = OutgoingMessage {
             from: "Sender <sender@example.org>".into(),
             to: "Visible <to@example.org>".into(),
@@ -102,8 +133,12 @@ mod tests {
             bcc: "hidden@example.org".into(),
             subject: "Test".into(),
             body: "Hello".into(),
-            html_body: None, attachments: Vec::new(), custom_headers: Vec::new(),
-            in_reply_to: None, references: Vec::new(), forwarded_raw: None,
+            html_body: None,
+            attachments: Vec::new(),
+            custom_headers: Vec::new(),
+            in_reply_to: None,
+            references: Vec::new(),
+            forwarded_raw: None,
         };
         let receipt = sender.send(&message).unwrap();
         let args = std::fs::read_to_string(args_path).unwrap();
@@ -116,5 +151,4 @@ mod tests {
         let body = String::from_utf8_lossy(&submitted);
         assert!(!body.contains("hidden@example.org"));
     }
-
 }

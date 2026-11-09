@@ -39,12 +39,16 @@ impl Theme {
 
     #[must_use]
     pub fn accent(&self) -> Style {
-        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
     }
 
     #[must_use]
     pub fn unread(&self) -> Style {
-        Style::default().fg(self.unread).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.unread)
+            .add_modifier(Modifier::BOLD)
     }
 
     #[must_use]
@@ -59,7 +63,9 @@ impl Theme {
     /// and the Vim reader cursor line. Visual selections keep using `selected()`.
     #[must_use]
     pub fn current_line(&self) -> Style {
-        Style::default().fg(self.foreground).bg(self.popup_bg)
+        Style::default()
+            .fg(self.foreground)
+            .bg(self.popup_bg)
             .add_modifier(Modifier::BOLD)
     }
 
@@ -123,7 +129,10 @@ pub fn load_themes() -> Vec<Theme> {
         let mut paths = entries
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            })
             .collect::<Vec<_>>();
         paths.sort();
         for path in paths {
@@ -176,9 +185,11 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
             .unwrap_or("#565f89"),
     )?;
     let background = parse_color(spec.background.as_deref().unwrap_or("reset"))?;
-    let surface = parse_color(spec.surface.as_deref().unwrap_or_else(|| {
-        spec.background.as_deref().unwrap_or("reset")
-    }))?;
+    let surface = parse_color(
+        spec.surface
+            .as_deref()
+            .unwrap_or_else(|| spec.background.as_deref().unwrap_or("reset")),
+    )?;
     let border = parse_color(spec.border.as_deref().unwrap_or("#414868"))?;
     let selected_fg = parse_color(
         spec.selected_fg
@@ -186,9 +197,11 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
             .or(spec.background.as_deref())
             .unwrap_or("#1a1b26"),
     )?;
-    let selected_bg = parse_color(spec.selected_bg.as_deref().unwrap_or_else(|| {
-        spec.primary.as_deref().unwrap_or("#7aa2f7")
-    }))?;
+    let selected_bg = parse_color(
+        spec.selected_bg
+            .as_deref()
+            .unwrap_or_else(|| spec.primary.as_deref().unwrap_or("#7aa2f7")),
+    )?;
 
     Ok(Theme {
         id,
@@ -218,7 +231,9 @@ fn parse_color(value: &str) -> Result<Color> {
         .strip_prefix('#')
         .ok_or_else(|| anyhow::anyhow!("theme color must be #RRGGBB or reset: {value}"))?;
     if hex.len() != 6 {
-        return Err(anyhow::anyhow!("theme color must be six hex digits: {value}"));
+        return Err(anyhow::anyhow!(
+            "theme color must be six hex digits: {value}"
+        ));
     }
     let red = u8::from_str_radix(&hex[0..2], 16).context("parsing red theme component")?;
     let green = u8::from_str_radix(&hex[2..4], 16).context("parsing green theme component")?;
@@ -251,7 +266,8 @@ pub fn theme_index(themes: &[Theme], name: &str) -> usize {
     themes
         .iter()
         .position(|theme| {
-            theme.id.eq_ignore_ascii_case(name.trim()) || theme.name.eq_ignore_ascii_case(name.trim())
+            theme.id.eq_ignore_ascii_case(name.trim())
+                || theme.name.eq_ignore_ascii_case(name.trim())
         })
         .unwrap_or(0)
 }
@@ -260,7 +276,7 @@ pub fn theme_index(themes: &[Theme], name: &str) -> usize {
 pub fn theme_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("aerc-rs")
+        .join("jerc")
         .join("themes")
 }
 
@@ -304,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn lazygitrs_style_flat_json_is_supported() {
+    fn flat_semantic_theme_json_is_supported() {
         let theme = parse_theme(
             r##"{"id":"mine","name":"Mine","primary":"#ff6600","success":"#00ff88","error":"#ff3333","warning":"#ffcc00","text_strong":"#ffffff","background":"#1a1a2e"}"##,
             "fallback",

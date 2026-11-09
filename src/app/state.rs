@@ -1,30 +1,39 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Size;
 use ratatui::widgets::BorderType;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
-use crate::app::{ATTACHMENT_HELP_ENTRIES, CONTACT_HELP_ENTRIES, Command, Focus, HELP_ENTRIES, command_for_key, ranked_help_matches};
-use crate::setup::{SetupWizard, WizardAction};
-use crate::cache::{self, CachedMailbox};
+use crate::app::{
+    ATTACHMENT_HELP_ENTRIES, CONTACT_HELP_ENTRIES, Command, Focus, HELP_ENTRIES, command_for_key,
+    ranked_help_matches,
+};
 use crate::backend::MailboxSyncHint;
+use crate::cache::{self, CachedMailbox};
 use crate::config::{Config, UiBorderStyle, VisualSelectionStyle};
-use crate::contacts::{ContactBook, ContactsModal, ContactEdit, recipient_query, replace_recipient, replace_recipients, recipients};
+use crate::contacts::{
+    ContactBook, ContactEdit, ContactsModal, recipient_query, recipients, replace_recipient,
+    replace_recipients,
+};
 use crate::mail::{parse_body, render_html_for_terminal};
-use crate::outgoing::{ReplyAudience, reply_recipients, reply_subject, forward_subject, inline_forward_parts, forward_html, forward_attribution, FORWARD_SEPARATOR};
 use crate::mail_image::{MailImageEvent, MailImageLoader};
 use crate::model::{
-    Capabilities, HtmlLine, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessageSummary,
-    OutgoingAttachment, OutgoingMessage,
+    Capabilities, HtmlLine, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId,
+    MessageSummary, OutgoingAttachment, OutgoingMessage,
 };
+use crate::outgoing::{
+    FORWARD_SEPARATOR, ReplyAudience, forward_attribution, forward_html, forward_subject,
+    inline_forward_parts, reply_recipients, reply_subject,
+};
+use crate::setup::{SetupWizard, WizardAction};
 use crate::theme::{Theme, load_themes, theme_index};
 use crate::worker::{ActionKind, RuntimeEvent, WorkerEvent, WorkerEventKind, WorkerHandle};
 
@@ -63,56 +72,101 @@ const MAX_PREFETCH_WINDOW_RAW_BYTES: u64 = 8 * 1024 * 1024;
 
 fn preview_body_bytes(body: &MessageBody) -> usize {
     let text = [
-        body.plain_text.as_ref(), body.plain_fallback.as_ref(),
-        body.html_source.as_ref(), body.html_text.as_ref(),
-    ].into_iter().flatten().map(String::len).sum::<usize>();
-    let rich = body.html_lines.as_ref().map_or(0, |lines| lines.iter().flat_map(|line| &line.spans)
-        .map(|span| span.text.len()
-            + span.style.link.as_ref().map_or(0, String::len)
-            + span.style.image.as_ref().map_or(0, String::len))
-        .sum::<usize>());
+        body.plain_text.as_ref(),
+        body.plain_fallback.as_ref(),
+        body.html_source.as_ref(),
+        body.html_text.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::len)
+    .sum::<usize>();
+    let rich = body.html_lines.as_ref().map_or(0, |lines| {
+        lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| {
+                span.text.len()
+                    + span.style.link.as_ref().map_or(0, String::len)
+                    + span.style.image.as_ref().map_or(0, String::len)
+            })
+            .sum::<usize>()
+    });
     text.saturating_add(rich)
 }
 
-fn preview_neighbor_positions(position: usize, count: usize, direction: isize, fast: bool) -> Vec<usize> {
-    if position >= count { return Vec::new(); }
+fn preview_neighbor_positions(
+    position: usize,
+    count: usize,
+    direction: isize,
+    fast: bool,
+) -> Vec<usize> {
+    if position >= count {
+        return Vec::new();
+    }
     let (forward, backward) = if fast {
         (BODY_PREFETCH_FAST_FORWARD, BODY_PREFETCH_FAST_BACKWARD)
     } else {
         (BODY_PREFETCH_FORWARD, BODY_PREFETCH_BACKWARD)
     };
-    let (ahead, behind) = if direction < 0 { (backward, forward) } else { (forward, backward) };
-    let after = (1..=ahead).filter_map(|distance| position.checked_add(distance))
+    let (ahead, behind) = if direction < 0 {
+        (backward, forward)
+    } else {
+        (forward, backward)
+    };
+    let after = (1..=ahead)
+        .filter_map(|distance| position.checked_add(distance))
         .filter(|index| *index < count);
     let before = (1..=behind).filter_map(|distance| position.checked_sub(distance));
-    if direction < 0 { before.chain(after).collect() }
-    else { after.chain(before).collect() }
+    if direction < 0 {
+        before.chain(after).collect()
+    } else {
+        after.chain(before).collect()
+    }
 }
 
 /// Put imminent rows first, but also schedule the destination early enough
 /// that a long neoscroll has a chance to arrive on a warm body. Never preload
 /// unrelated rows between a far-away destination and the current viewport.
 fn preview_travel_positions(position: usize, destination: usize, count: usize) -> Vec<usize> {
-    if position >= count || destination >= count { return Vec::new(); }
+    if position >= count || destination >= count {
+        return Vec::new();
+    }
     let direction = if destination < position { -1 } else { 1 };
     let mut positions = vec![position];
     for distance in 1..=3 {
-        let next = if direction < 0 { position.checked_sub(distance) }
-            else { position.checked_add(distance).filter(|p| *p < count) };
-        if let Some(next) = next { positions.push(next); }
+        let next = if direction < 0 {
+            position.checked_sub(distance)
+        } else {
+            position.checked_add(distance).filter(|p| *p < count)
+        };
+        if let Some(next) = next {
+            positions.push(next);
+        }
     }
     positions.push(destination);
     let distance = position.abs_diff(destination);
     if distance > 4 {
         // Also warm the row just before arrival, and the next row if the
         // animation continues after another Ctrl-j/k press.
-        let before = if direction < 0 { destination.checked_add(1) }
-            else { destination.checked_sub(1) };
-        let after = if direction < 0 { destination.checked_sub(1) }
-            else { destination.checked_add(1) };
+        let before = if direction < 0 {
+            destination.checked_add(1)
+        } else {
+            destination.checked_sub(1)
+        };
+        let after = if direction < 0 {
+            destination.checked_sub(1)
+        } else {
+            destination.checked_add(1)
+        };
         positions.extend(before.into_iter().chain(after).filter(|p| *p < count));
     }
-    positions.extend(preview_neighbor_positions(destination, count, direction, true));
+    positions.extend(preview_neighbor_positions(
+        destination,
+        count,
+        direction,
+        true,
+    ));
     let mut seen = HashSet::new();
     positions.into_iter().filter(|p| seen.insert(*p)).collect()
 }
@@ -121,9 +175,12 @@ fn preview_travel_positions(position: usize, destination: usize, count: usize) -
 /// trigger a new-message alert. STATUS counts are not message identities;
 /// an equal count with concurrent arrival/deletion needs future UID tracking.
 fn inbox_new_mail_count(from_poll: bool, known: bool, previous: usize, now: usize) -> usize {
-    if from_poll && known { now.saturating_sub(previous) } else { 0 }
+    if from_poll && known {
+        now.saturating_sub(previous)
+    } else {
+        0
+    }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReaderPosition {
@@ -198,7 +255,8 @@ impl StatusLine {
 
     #[must_use]
     pub fn expired(&self) -> bool {
-        self.expires_at.is_some_and(|deadline| Instant::now() >= deadline)
+        self.expires_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 }
 
@@ -260,8 +318,13 @@ fn compose_body_rows(body: &str, width: usize) -> Vec<ComposeBodyRow> {
     for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(body, true) {
         if grapheme.ends_with('\n') {
             let trailing = grapheme.chars().count().saturating_sub(1);
-            rows.push(ComposeBodyRow { start, end: position + trailing, line_start,
-                logical_line, continuation });
+            rows.push(ComposeBodyRow {
+                start,
+                end: position + trailing,
+                line_start,
+                logical_line,
+                continuation,
+            });
             position += grapheme.chars().count();
             start = position;
             line_start = position;
@@ -272,8 +335,13 @@ fn compose_body_rows(body: &str, width: usize) -> Vec<ComposeBodyRow> {
         }
         let char_width = unicode_width::UnicodeWidthStr::width(grapheme).min(width);
         if cells > 0 && cells + char_width > width {
-            rows.push(ComposeBodyRow { start, end: position, line_start,
-                logical_line, continuation });
+            rows.push(ComposeBodyRow {
+                start,
+                end: position,
+                line_start,
+                logical_line,
+                continuation,
+            });
             start = position;
             cells = 0;
             continuation = true;
@@ -281,18 +349,29 @@ fn compose_body_rows(body: &str, width: usize) -> Vec<ComposeBodyRow> {
         cells += char_width;
         position += grapheme.chars().count();
     }
-    rows.push(ComposeBodyRow { start, end: position, line_start,
-        logical_line, continuation });
+    rows.push(ComposeBodyRow {
+        start,
+        end: position,
+        line_start,
+        logical_line,
+        continuation,
+    });
     rows
 }
 
 fn compose_body_cursor_row(rows: &[ComposeBodyRow], cursor: usize) -> usize {
     // At a soft-wrap boundary the cursor belongs to the next visual row.
-    rows.iter().rposition(|row| row.start <= cursor).unwrap_or(0)
+    rows.iter()
+        .rposition(|row| row.start <= cursor)
+        .unwrap_or(0)
 }
 
 fn compose_body_column(body: &str, start: usize, cursor: usize) -> usize {
-    let text = body.chars().skip(start).take(cursor.saturating_sub(start)).collect::<String>();
+    let text = body
+        .chars()
+        .skip(start)
+        .take(cursor.saturating_sub(start))
+        .collect::<String>();
     unicode_width::UnicodeWidthStr::width(text.as_str())
 }
 
@@ -378,15 +457,22 @@ fn compose_read_dir(directory: &Path, show_hidden: bool) -> anyhow::Result<Vec<C
     for item in std::fs::read_dir(directory)? {
         let item = item?;
         let name = item.file_name().to_string_lossy().into_owned();
-        if !show_hidden && name.starts_with('.') { continue; }
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
         let path = item.path();
         let is_directory = path.is_dir();
         if is_directory || path.is_file() {
-            entries.push(ComposeFileEntry { path, name, is_directory });
+            entries.push(ComposeFileEntry {
+                path,
+                name,
+                is_directory,
+            });
         }
     }
     entries.sort_by(|a, b| {
-        b.is_directory.cmp(&a.is_directory)
+        b.is_directory
+            .cmp(&a.is_directory)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.name.cmp(&b.name))
     });
@@ -400,15 +486,30 @@ fn compose_pdf_thumbnail(path: &Path) -> anyhow::Result<Vec<u8>> {
     let temp = tempfile::tempdir()?;
     let output = temp.path().join("preview");
     let mut child = ProcessCommand::new("pdftoppm")
-        .args(["-f", "1", "-l", "1", "-singlefile", "-scale-to", "850", "-jpeg",
-            "-jpegopt", "quality=70"])
-        .arg(path).arg(&output)
-        .stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        .args([
+            "-f",
+            "1",
+            "-l",
+            "1",
+            "-singlefile",
+            "-scale-to",
+            "850",
+            "-jpeg",
+            "-jpegopt",
+            "quality=70",
+        ])
+        .arg(path)
+        .arg(&output)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|error| anyhow::anyhow!("PDF preview requires Poppler's pdftoppm: {error}"))?;
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            if !status.success() { anyhow::bail!("PDF preview could not render page one"); }
+            if !status.success() {
+                anyhow::bail!("PDF preview could not render page one");
+            }
             break;
         }
         if start.elapsed() > Duration::from_secs(3) {
@@ -420,20 +521,29 @@ fn compose_pdf_thumbnail(path: &Path) -> anyhow::Result<Vec<u8>> {
     }
     let rendered = output.with_extension("jpg");
     let metadata = std::fs::metadata(&rendered)?;
-    if metadata.len() > 16 * 1024 * 1024 { anyhow::bail!("PDF thumbnail too large"); }
+    if metadata.len() > 16 * 1024 * 1024 {
+        anyhow::bail!("PDF thumbnail too large");
+    }
     Ok(std::fs::read(rendered)?)
 }
 
 fn compose_image_extension(path: &Path) -> bool {
-    path.extension().and_then(|extension| extension.to_str())
-        .is_some_and(|extension| ["png", "jpg", "jpeg", "gif", "webp"]
-            .iter().any(|supported| extension.eq_ignore_ascii_case(supported)))
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["png", "jpg", "jpeg", "gif", "webp"]
+                .iter()
+                .any(|supported| extension.eq_ignore_ascii_case(supported))
+        })
 }
 
 fn validate_picker_attachment(path: &Path) -> anyhow::Result<()> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
-        anyhow::bail!("attachment must be a file of at most 16 MiB: {}", path.display());
+        anyhow::bail!(
+            "attachment must be a file of at most 16 MiB: {}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -539,10 +649,12 @@ pub struct Composer {
     redo_history: Vec<(ComposeField, String, usize)>,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposeIntent {
-    Reply { quote: bool, audience: ReplyAudience },
+    Reply {
+        quote: bool,
+        audience: ReplyAudience,
+    },
     Forward,
 }
 
@@ -553,7 +665,6 @@ struct PendingCompose {
     intent: ComposeIntent,
 }
 
-
 /// Match a query as an ordered, case-insensitive subsequence. Consecutive
 /// characters, word boundaries and exact substrings rank ahead of scattered
 /// matches; no external search dependency or indexing is required for a page.
@@ -561,22 +672,31 @@ fn mail_fuzzy_score(field: &str, query_lower: &str) -> Option<i64> {
     let lower = field.to_lowercase();
     let hay = lower.chars().collect::<Vec<_>>();
     let needle = query_lower.chars().collect::<Vec<_>>();
-    if needle.is_empty() { return Some(0); }
+    if needle.is_empty() {
+        return Some(0);
+    }
     let mut at = 0usize;
     let mut previous = None;
     let mut score = 0i64;
     for wanted in needle {
         let position = (at..hay.len()).find(|&index| hay[index] == wanted)?;
         score += 10;
-        if position == 0 || !hay[position - 1].is_alphanumeric() { score += 9; }
+        if position == 0 || !hay[position - 1].is_alphanumeric() {
+            score += 9;
+        }
         if let Some(prev) = previous {
-            if position == prev + 1 { score += 12; }
-            else { score -= i64::try_from(position - prev - 1).unwrap_or(100).min(12); }
+            if position == prev + 1 {
+                score += 12;
+            } else {
+                score -= i64::try_from(position - prev - 1).unwrap_or(100).min(12);
+            }
         }
         previous = Some(position);
         at = position + 1;
     }
-    if lower.contains(query_lower) { score += 80; }
+    if lower.contains(query_lower) {
+        score += 80;
+    }
     score -= i64::try_from(hay.len() / 20).unwrap_or(10).min(10);
     Some(score)
 }
@@ -685,21 +805,30 @@ impl AccountState {
         if query.is_empty() {
             return (0..self.messages.len()).collect();
         }
-        let mut matches = self.messages.iter().enumerate().filter_map(|(index, message)| {
-            let fields = [
-                message.subject.as_str(), message.from_name.as_str(),
-                message.from_address.as_str(), message.date_label.as_str(),
-            ];
-            match self.search_mode {
-                crate::config::MailSearchMode::Strict => {
-                    fields.iter().any(|field| field.to_lowercase().contains(&query))
-                        .then_some((index, 0i64))
+        let mut matches = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                let fields = [
+                    message.subject.as_str(),
+                    message.from_name.as_str(),
+                    message.from_address.as_str(),
+                    message.date_label.as_str(),
+                ];
+                match self.search_mode {
+                    crate::config::MailSearchMode::Strict => fields
+                        .iter()
+                        .any(|field| field.to_lowercase().contains(&query))
+                        .then_some((index, 0i64)),
+                    crate::config::MailSearchMode::Fuzzy => fields
+                        .iter()
+                        .filter_map(|field| mail_fuzzy_score(field, &query))
+                        .max()
+                        .map(|score| (index, score)),
                 }
-                crate::config::MailSearchMode::Fuzzy => fields.iter()
-                    .filter_map(|field| mail_fuzzy_score(field, &query))
-                    .max().map(|score| (index, score)),
-            }
-        }).collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
         if self.search_mode == crate::config::MailSearchMode::Fuzzy {
             // Stable for ties; keep server date order whenever scores agree.
             matches.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
@@ -729,7 +858,10 @@ impl AccountState {
 
     fn keep_message_cursor_visible(&mut self) {
         let visible = self.visible_message_indices();
-        let Some(position) = visible.iter().position(|index| *index == self.message_index) else {
+        let Some(position) = visible
+            .iter()
+            .position(|index| *index == self.message_index)
+        else {
             self.message_view_offset = 0;
             return;
         };
@@ -769,26 +901,44 @@ impl AccountState {
     }
 
     fn persist_current_cache(&mut self) {
-        let Some(name) = self.current_mailbox.as_ref() else { return; };
-        let Some(writer) = &self.cache_writer else { return; };
+        let Some(name) = self.current_mailbox.as_ref() else {
+            return;
+        };
+        let Some(writer) = &self.cache_writer else {
+            return;
+        };
         // Don't clone 80 warm preview bodies into the in-session cache and
         // then clone them *again* for a disk writer that can only keep 12.
         // In-session snapshots are captured separately when changing folders.
-        let Some(uid_validity) = self.uid_validities.get(name).copied() else { return; };
-        if self.unverified_mailboxes.contains(name) { return; }
+        let Some(uid_validity) = self.uid_validities.get(name).copied() else {
+            return;
+        };
+        if self.unverified_mailboxes.contains(name) {
+            return;
+        }
         let truncated = self.messages.len() > cache::MAX_MESSAGES_PER_FOLDER;
-        writer.send(cache::Change::Folder(name.clone(), CachedMailbox {
-            messages: self.messages.iter().take(cache::MAX_MESSAGES_PER_FOLDER)
-                .cloned().collect(),
-            bodies: cache::persistable_bodies(&self.messages, &self.bodies),
-            message_index: self.message_index,
-            message_view_offset: self.message_view_offset,
-            next_page_offset: if truncated { cache::MAX_MESSAGES_PER_FOLDER }
-                else { self.next_page_offset },
-            has_more: truncated || self.has_more,
-            uid_validity: Some(uid_validity),
-            uid_next: self.uid_nexts.get(name).copied(),
-        }));
+        writer.send(cache::Change::Folder(
+            name.clone(),
+            CachedMailbox {
+                messages: self
+                    .messages
+                    .iter()
+                    .take(cache::MAX_MESSAGES_PER_FOLDER)
+                    .cloned()
+                    .collect(),
+                bodies: cache::persistable_bodies(&self.messages, &self.bodies),
+                message_index: self.message_index,
+                message_view_offset: self.message_view_offset,
+                next_page_offset: if truncated {
+                    cache::MAX_MESSAGES_PER_FOLDER
+                } else {
+                    self.next_page_offset
+                },
+                has_more: truncated || self.has_more,
+                uid_validity: Some(uid_validity),
+                uid_next: self.uid_nexts.get(name).copied(),
+            },
+        ));
     }
 
     fn remove_persistent_folder(&self, name: &str) {
@@ -806,7 +956,9 @@ impl AccountState {
         self.current_mailbox = Some(name.to_owned());
         self.messages = cached.messages;
         self.bodies = cached.bodies;
-        self.message_index = cached.message_index.min(self.messages.len().saturating_sub(1));
+        self.message_index = cached
+            .message_index
+            .min(self.messages.len().saturating_sub(1));
         self.message_view_offset = cached.message_view_offset;
         self.next_page_offset = cached.next_page_offset;
         self.has_more = cached.has_more;
@@ -854,7 +1006,11 @@ impl AccountState {
         }
 
         for name in unknown {
-            if !self.mailbox_status_queue.iter().any(|queued| queued == &name) {
+            if !self
+                .mailbox_status_queue
+                .iter()
+                .any(|queued| queued == &name)
+            {
                 self.mailbox_status_queue.push_back(name);
             }
         }
@@ -878,18 +1034,22 @@ impl AccountState {
         } else if self.current_mailbox.as_deref() == Some(name.as_str()) {
             // The active folder is no longer duplicated in mailbox_cache.
             // Use its most recent live headers for IMAP incremental sync.
-            self.uid_validities.get(&name).copied().map(|uid_validity| MailboxSyncHint {
-                uid_validity,
-                uid_next: self.uid_nexts.get(&name).copied(),
-                messages: self.messages.clone(),
-            })
+            self.uid_validities
+                .get(&name)
+                .copied()
+                .map(|uid_validity| MailboxSyncHint {
+                    uid_validity,
+                    uid_next: self.uid_nexts.get(&name).copied(),
+                    messages: self.messages.clone(),
+                })
         } else {
-            self.mailbox_cache.get(&name)
-                .and_then(|folder| folder.uid_validity.map(|uid_validity| MailboxSyncHint {
+            self.mailbox_cache.get(&name).and_then(|folder| {
+                folder.uid_validity.map(|uid_validity| MailboxSyncHint {
                     uid_validity,
                     uid_next: folder.uid_next,
                     messages: folder.messages.clone(),
-                }))
+                })
+            })
         };
         if let Ok(request_id) = self.worker.post(ActionKind::OpenMailbox {
             name,
@@ -900,7 +1060,13 @@ impl AccountState {
             self.page_inflight = Some((pending_name, offset));
             self.page_request_id = Some(request_id);
             self.messages_loading = offset == 0;
-            crate::perf::record_request("ui_mailbox_request", request_id, None, Duration::ZERO, true);
+            crate::perf::record_request(
+                "ui_mailbox_request",
+                request_id,
+                None,
+                Duration::ZERO,
+                true,
+            );
             true
         } else {
             false
@@ -949,7 +1115,10 @@ impl AccountState {
     /// coalesced by the background worker; the foreground always wins.
     fn prefetch_near_cursor(&mut self, direction: isize) {
         let visible = self.visible_message_indices();
-        let Some(position) = visible.iter().position(|index| *index == self.message_index) else {
+        let Some(position) = visible
+            .iter()
+            .position(|index| *index == self.message_index)
+        else {
             return;
         };
         self.prefetch_around_position(position, direction);
@@ -960,40 +1129,64 @@ impl AccountState {
     }
 
     fn prefetch_for_scroll(&mut self, position: usize, destination: usize) {
-        if position == destination { return; }
-        self.prefetch_window(position, if destination < position { -1 } else { 1 }, Some(destination));
+        if position == destination {
+            return;
+        }
+        self.prefetch_window(
+            position,
+            if destination < position { -1 } else { 1 },
+            Some(destination),
+        );
     }
 
     fn prefetch_window(&mut self, position: usize, direction: isize, destination: Option<usize>) {
-        let Some(mailbox) = self.current_mailbox.clone() else { return; };
-        if self.unverified_mailboxes.contains(&mailbox) { return; }
+        let Some(mailbox) = self.current_mailbox.clone() else {
+            return;
+        };
+        if self.unverified_mailboxes.contains(&mailbox) {
+            return;
+        }
         let visible = self.visible_message_indices();
-        if position >= visible.len() { return; }
+        if position >= visible.len() {
+            return;
+        }
         let direction = if direction < 0 { -1 } else { 1 };
         let destination = destination.filter(|target| *target < visible.len());
         let anchor = destination.unwrap_or(position);
         // Keep the existing window while it covers the moving cursor; a new
         // window every animation frame would cancel almost every useful fetch.
         if self.last_prefetch_window.is_some()
-            && self.last_prefetch_anchor.as_ref().is_some_and(|(name, last, dir)| {
-                name == &mailbox && *dir == direction
-                    && last.abs_diff(anchor) < PREFETCH_WINDOW_REARM_ROWS
-            }) {
+            && self
+                .last_prefetch_anchor
+                .as_ref()
+                .is_some_and(|(name, last, dir)| {
+                    name == &mailbox
+                        && *dir == direction
+                        && last.abs_diff(anchor) < PREFETCH_WINDOW_REARM_ROWS
+                })
+        {
             return;
         }
         let positions = if let Some(target) = destination {
             preview_travel_positions(position, target, visible.len())
         } else {
             std::iter::once(position)
-                .chain(preview_neighbor_positions(position, visible.len(), direction, false))
+                .chain(preview_neighbor_positions(
+                    position,
+                    visible.len(),
+                    direction,
+                    false,
+                ))
                 .collect::<Vec<_>>()
         };
         let mut raw_bytes = 0u64;
-        let ids = positions.into_iter()
+        let ids = positions
+            .into_iter()
             .filter_map(|position| self.messages.get(visible[position]))
             .filter(|message| message.size > 0 && message.size <= MAX_PREFETCH_MESSAGE_BYTES)
-            .filter(|message| !self.bodies.contains_key(&message.id)
-                && !self.pending_bodies.contains(&message.id))
+            .filter(|message| {
+                !self.bodies.contains_key(&message.id) && !self.pending_bodies.contains(&message.id)
+            })
             .filter(|message| {
                 if raw_bytes.saturating_add(message.size) > MAX_PREFETCH_WINDOW_RAW_BYTES {
                     false
@@ -1010,8 +1203,17 @@ impl AccountState {
             return;
         }
         let window = (mailbox.clone(), ids.clone());
-        if self.last_prefetch_window.as_ref() == Some(&window) { return; }
-        if self.worker.post(ActionKind::PrefetchBodies { mailbox: mailbox.clone(), ids }).is_ok() {
+        if self.last_prefetch_window.as_ref() == Some(&window) {
+            return;
+        }
+        if self
+            .worker
+            .post(ActionKind::PrefetchBodies {
+                mailbox: mailbox.clone(),
+                ids,
+            })
+            .is_ok()
+        {
             crate::perf::record("ui_prefetch_window_submitted", None, Duration::ZERO, true);
             self.last_prefetch_window = Some(window);
             self.last_prefetch_anchor = Some((mailbox, anchor, direction));
@@ -1026,7 +1228,10 @@ impl AccountState {
         if self.bodies.len() <= MAX_CACHED_PREVIEW_BODIES && bytes <= MAX_CACHED_PREVIEW_BYTES {
             return;
         }
-        let mut ranked = self.messages.iter().enumerate()
+        let mut ranked = self
+            .messages
+            .iter()
+            .enumerate()
             .filter(|(_, message)| self.bodies.contains_key(&message.id))
             .map(|(position, message)| (position.abs_diff(self.message_index), message.id.clone()))
             .collect::<Vec<_>>();
@@ -1034,11 +1239,15 @@ impl AccountState {
         let mut used = 0usize;
         let mut keep = HashSet::new();
         for (_, id) in ranked {
-            let Some(body) = self.bodies.get(&id) else { continue; };
+            let Some(body) = self.bodies.get(&id) else {
+                continue;
+            };
             let weight = preview_body_bytes(body);
             if keep.len() >= MAX_CACHED_PREVIEW_BODIES
                 || (!keep.is_empty() && used.saturating_add(weight) > MAX_CACHED_PREVIEW_BYTES)
-            { continue; }
+            {
+                continue;
+            }
             used = used.saturating_add(weight);
             keep.insert(id);
         }
@@ -1087,17 +1296,24 @@ pub struct ReviewScroll {
 impl ReviewScroll {
     pub fn queue(&mut self, count: usize, delta: isize) {
         let origin = self.target.unwrap_or(self.position);
-        let next = origin.saturating_add_signed(delta).min(count.saturating_sub(1));
+        let next = origin
+            .saturating_add_signed(delta)
+            .min(count.saturating_sub(1));
         self.target = (next != self.position).then_some(next);
     }
 
-    pub fn active(&self) -> bool { self.target.is_some() }
+    pub fn active(&self) -> bool {
+        self.target.is_some()
+    }
 
     pub fn advance(&mut self) {
         if let Some(target) = self.target {
-            self.position = self.position.saturating_add_signed(
-                if target > self.position { 1 } else { -1 });
-            if self.position == target { self.target = None; }
+            self.position = self
+                .position
+                .saturating_add_signed(if target > self.position { 1 } else { -1 });
+            if self.position == target {
+                self.target = None;
+            }
         }
     }
 }
@@ -1260,7 +1476,10 @@ pub struct App {
     // browser instantaneous instead of refetching the entire raw email.
     // Include UIDVALIDITY to avoid reusing a recycled IMAP UID.
     attachment_source: Option<(usize, String, Option<u32>, MessageId)>,
-    attachment_cache: VecDeque<((usize, String, Option<u32>, MessageId), Arc<Vec<OutgoingAttachment>>)>,
+    attachment_cache: VecDeque<(
+        (usize, String, Option<u32>, MessageId),
+        Arc<Vec<OutgoingAttachment>>,
+    )>,
     pub attachment_marked: HashSet<usize>,
     pub attachment_visual_anchor: Option<usize>,
     pub attachment_save_directory: Option<String>, // legacy path field, no longer used by save UI
@@ -1321,77 +1540,99 @@ impl App {
             .zip(workers)
             .map(|(config, worker)| {
                 let (snapshot, cache_writer) = cache::open(config);
-                let uid_validities = snapshot.folders.iter().filter_map(|(name, folder)| {
-                    folder.uid_validity.map(|validity| (name.clone(), validity))
-                }).collect();
-                let uid_nexts = snapshot.folders.iter().filter_map(|(name, folder)| {
-                    folder.uid_next.map(|uid_next| (name.clone(), uid_next))
-                }).collect();
+                let uid_validities = snapshot
+                    .folders
+                    .iter()
+                    .filter_map(|(name, folder)| {
+                        folder.uid_validity.map(|validity| (name.clone(), validity))
+                    })
+                    .collect();
+                let uid_nexts = snapshot
+                    .folders
+                    .iter()
+                    .filter_map(|(name, folder)| {
+                        folder.uid_next.map(|uid_next| (name.clone(), uid_next))
+                    })
+                    .collect();
                 let unverified_mailboxes = snapshot.folders.keys().cloned().collect();
                 let mut account = AccountState {
-                name: config.name.clone(),
-                default_mailbox: config.default_mailbox.clone(),
-                exclude_mailboxes: config.exclude_mailboxes.clone(),
-                from: crate::outgoing::sender_from_account(config),
-                outgoing_configured: config.outgoing.is_some(),
-                copy_to: config.copy_to.clone(),
-                capabilities: None,
-                mailboxes: snapshot.mailboxes.into_iter()
-                    .filter(|mailbox| !crate::config::mailbox_is_excluded(
-                        &mailbox.name, &config.exclude_mailboxes)).collect(),
-                mailbox_index: 0,
-                mailbox_view_offset: 0,
-                mailbox_view_height: 1,
-                current_mailbox: None,
-                messages: Vec::new(),
-                message_index: 0,
-                preview_scroll: 0,
-                message_view_offset: 0,
-                message_view_height: 1,
-                smooth_message_target: None,
-                smooth_mailbox_target: None,
-                smooth_preview_target: None,
-                preview_max_scroll: 0,
-                prefer_html: true,
-                // Interactive pagination has its own small page size, so an old
-                // `max_messages = 500` config no longer makes All Mail block on
-                // five hundred headers before first paint.
-                page_size: config.page_size.max(1),
-                next_page_offset: 0,
-                has_more: false,
-                page_inflight: None,
-                page_request_id: None,
-                body_request_id: None,
-                last_prefetch_window: None,
-                last_prefetch_anchor: None,
-                mailbox_cache: snapshot.folders,
-                cache_writer,
-                uid_validities,
-                uid_nexts,
-                unverified_mailboxes,
-                search_query: String::new(),
-                search_editing: false,
-                search_mode: app_search_mode,
-                bodies: HashMap::new(),
-                pending_bodies: HashSet::new(),
-                pending_seen: HashSet::new(),
-                mailbox_status_queue: VecDeque::new(),
-                mailbox_status_inflight: None,
-                inbox_poll_inflight: None,
-                pending_inbox_refresh: false,
-                pending_mutation_labels: HashMap::new(),
-                connecting: false,
-                mailboxes_loading: false,
-                messages_loading: false,
-                last_scan_micros: None,
-                restore_message_index: None,
-                pending_mutations: 0,
-                worker,
+                    name: config.name.clone(),
+                    default_mailbox: config.default_mailbox.clone(),
+                    exclude_mailboxes: config.exclude_mailboxes.clone(),
+                    from: crate::outgoing::sender_from_account(config),
+                    outgoing_configured: config.outgoing.is_some(),
+                    copy_to: config.copy_to.clone(),
+                    capabilities: None,
+                    mailboxes: snapshot
+                        .mailboxes
+                        .into_iter()
+                        .filter(|mailbox| {
+                            !crate::config::mailbox_is_excluded(
+                                &mailbox.name,
+                                &config.exclude_mailboxes,
+                            )
+                        })
+                        .collect(),
+                    mailbox_index: 0,
+                    mailbox_view_offset: 0,
+                    mailbox_view_height: 1,
+                    current_mailbox: None,
+                    messages: Vec::new(),
+                    message_index: 0,
+                    preview_scroll: 0,
+                    message_view_offset: 0,
+                    message_view_height: 1,
+                    smooth_message_target: None,
+                    smooth_mailbox_target: None,
+                    smooth_preview_target: None,
+                    preview_max_scroll: 0,
+                    prefer_html: true,
+                    // Interactive pagination has its own small page size, so an old
+                    // `max_messages = 500` config no longer makes All Mail block on
+                    // five hundred headers before first paint.
+                    page_size: config.page_size.max(1),
+                    next_page_offset: 0,
+                    has_more: false,
+                    page_inflight: None,
+                    page_request_id: None,
+                    body_request_id: None,
+                    last_prefetch_window: None,
+                    last_prefetch_anchor: None,
+                    mailbox_cache: snapshot.folders,
+                    cache_writer,
+                    uid_validities,
+                    uid_nexts,
+                    unverified_mailboxes,
+                    search_query: String::new(),
+                    search_editing: false,
+                    search_mode: app_search_mode,
+                    bodies: HashMap::new(),
+                    pending_bodies: HashSet::new(),
+                    pending_seen: HashSet::new(),
+                    mailbox_status_queue: VecDeque::new(),
+                    mailbox_status_inflight: None,
+                    inbox_poll_inflight: None,
+                    pending_inbox_refresh: false,
+                    pending_mutation_labels: HashMap::new(),
+                    connecting: false,
+                    mailboxes_loading: false,
+                    messages_loading: false,
+                    last_scan_micros: None,
+                    restore_message_index: None,
+                    pending_mutations: 0,
+                    worker,
                 };
-                if let Some(index) = account.mailboxes.iter().position(|m| m.name == account.default_mailbox) {
+                if let Some(index) = account
+                    .mailboxes
+                    .iter()
+                    .position(|m| m.name == account.default_mailbox)
+                {
                     account.mailbox_index = index;
                 }
-                if let Some(name) = account.selected_mailbox().map(|mailbox| mailbox.name.clone()) {
+                if let Some(name) = account
+                    .selected_mailbox()
+                    .map(|mailbox| mailbox.name.clone())
+                {
                     let _ = account.restore_cached_mailbox(&name);
                 }
                 account
@@ -1409,8 +1650,9 @@ impl App {
         let contacts_path = ContactBook::default_path();
         let loaded_contacts = ContactBook::load(&contacts_path);
         let contacts_writable = loaded_contacts.is_ok();
-        let contacts_warning = loaded_contacts.as_ref().err().map(|error|
-            format!("Contacts file could not be loaded; preserving it unchanged: {error:#}"));
+        let contacts_warning = loaded_contacts.as_ref().err().map(|error| {
+            format!("Contacts file could not be loaded; preserving it unchanged: {error:#}")
+        });
         let contacts = loaded_contacts.unwrap_or_default();
         Self {
             accounts,
@@ -1422,7 +1664,9 @@ impl App {
             should_quit: false,
             setup: config.accounts.is_empty().then(|| SetupWizard::new(true)),
             remove_account_confirmation: None,
-            setup_config_path: config.config_path.clone()
+            setup_config_path: config
+                .config_path
+                .clone()
                 .unwrap_or_else(crate::config::default_config_path),
             setup_reload_requested: false,
             setup_sender: None,
@@ -1435,9 +1679,13 @@ impl App {
             new_mail_sound_name: config.ui.new_mail_sound_name.clone(),
             new_mail_sound_file: config.ui.new_mail_sound_file.clone(),
             new_mail_notices: VecDeque::new(),
-            mailbox_width_percent: stored_mailbox_width().unwrap_or(config.ui.mailbox_width_percent).clamp(12, 50),
+            mailbox_width_percent: stored_mailbox_width()
+                .unwrap_or(config.ui.mailbox_width_percent)
+                .clamp(12, 50),
             mailbox_resizing: false,
-            preview_width_percent: stored_preview_width().unwrap_or(config.ui.preview_width_percent).clamp(25, 75),
+            preview_width_percent: stored_preview_width()
+                .unwrap_or(config.ui.preview_width_percent)
+                .clamp(25, 75),
             preview_resizing: false,
             sidebar_visible: true,
             preview_split: false,
@@ -1532,20 +1780,30 @@ impl App {
     }
 
     #[must_use]
-    pub fn inbox_poll_interval(&self) -> Duration { self.inbox_poll_interval }
+    pub fn inbox_poll_interval(&self) -> Duration {
+        self.inbox_poll_interval
+    }
 
     /// Poll only Inbox counts, not every message body or folder. IMAP servers
     /// without IDLE can still report new mail with one inexpensive STATUS.
     pub fn poll_inboxes(&mut self) {
         for account in &mut self.accounts {
-            if account.capabilities.is_none() || account.mailboxes_loading
+            if account.capabilities.is_none()
+                || account.mailboxes_loading
                 || account.inbox_poll_inflight.is_some()
                 || account.mailbox_status_inflight.is_some()
                 || account.pending_mutations > 0
-            { continue; }
-            let Some(inbox) = account.mailboxes.iter()
+            {
+                continue;
+            }
+            let Some(inbox) = account
+                .mailboxes
+                .iter()
                 .find(|mailbox| mailbox.role == MailboxRole::Inbox)
-                .map(|mailbox| mailbox.name.clone()) else { continue; };
+                .map(|mailbox| mailbox.name.clone())
+            else {
+                continue;
+            };
             if let Ok(request) = account.worker.post(ActionKind::MailboxStatus(inbox)) {
                 account.inbox_poll_inflight = Some(request);
             }
@@ -1563,7 +1821,9 @@ impl App {
     }
 
     /// Desktop banners and their associated sound; independent of the terminal BEL setting.
-    pub fn notifications_enabled(&self) -> bool { self.new_mail_notifications_enabled }
+    pub fn notifications_enabled(&self) -> bool {
+        self.new_mail_notifications_enabled
+    }
 
     pub fn notification_icon_style(&self) -> crate::config::NotificationIconStyle {
         self.notification_icon_style
@@ -1571,10 +1831,16 @@ impl App {
 
     /// Count only arrivals detected during this session; older unread mail is
     /// not incorrectly presented as a new notification.
-    pub fn new_mail_count(&self) -> usize { self.new_mail_since_launch }
+    pub fn new_mail_count(&self) -> usize {
+        self.new_mail_since_launch
+    }
 
-    pub fn new_mail_sound_name(&self) -> &str { &self.new_mail_sound_name }
-    pub fn new_mail_sound_file(&self) -> Option<&str> { self.new_mail_sound_file.as_deref() }
+    pub fn new_mail_sound_name(&self) -> &str {
+        &self.new_mail_sound_name
+    }
+    pub fn new_mail_sound_file(&self) -> Option<&str> {
+        self.new_mail_sound_file.as_deref()
+    }
 
     pub fn bootstrap(&mut self) {
         for account in &mut self.accounts {
@@ -1596,18 +1862,33 @@ impl App {
         self.image_loader = previous.image_loader.take();
     }
 
-    pub fn setup_discovered(&mut self, email: String, result: Result<crate::discovery::MailConfiguration, String>) {
-        let Some(wizard) = self.setup.as_mut() else { return; };
-        if !wizard.discovering || wizard.authenticating || wizard.saved ||
-            !wizard.fields[crate::setup::EMAIL].trim().eq_ignore_ascii_case(&email) { return; }
+    pub fn setup_discovered(
+        &mut self,
+        email: String,
+        result: Result<crate::discovery::MailConfiguration, String>,
+    ) {
+        let Some(wizard) = self.setup.as_mut() else {
+            return;
+        };
+        if !wizard.discovering
+            || wizard.authenticating
+            || wizard.saved
+            || !wizard.fields[crate::setup::EMAIL]
+                .trim()
+                .eq_ignore_ascii_case(&email)
+        {
+            return;
+        }
         match result {
             Ok(config) => wizard.apply_discovery(config),
             Err(error) => wizard.discovery_failed(&error),
         }
         // An alias doesn't establish which Exchange mailbox identity to use
         // for SMTP. Authenticate first, then offer the login UPN for review.
-        if self.setup.as_ref().is_some_and(|wizard|
-            wizard.step == crate::setup::SetupStep::Authenticating)
+        if self
+            .setup
+            .as_ref()
+            .is_some_and(|wizard| wizard.step == crate::setup::SetupStep::Authenticating)
         {
             self.start_setup_oauth();
         }
@@ -1623,9 +1904,8 @@ impl App {
                     wizard.selected = crate::setup::PROVIDER;
                     wizard.login_failed = true;
                     wizard.error = true;
-                    wizard.message = format!(
-                        "OAuth failed: {error}. Ctrl-S/F6 retry; F7 saves offline."
-                    );
+                    wizard.message =
+                        format!("OAuth failed: {error}. Ctrl-S/F6 retry; F7 saves offline.");
                 }
             }
         }
@@ -1635,19 +1915,33 @@ impl App {
     /// Used both for a Microsoft alias (before settings review) and for the
     /// explicit Continue action in the settings step.
     fn start_setup_oauth(&mut self) {
-        let Some(wizard) = self.setup.as_mut() else { return; };
-        if wizard.authenticating || wizard.authenticated { return; }
+        let Some(wizard) = self.setup.as_mut() else {
+            return;
+        };
+        if wizard.authenticating || wizard.authenticated {
+            return;
+        }
         match wizard.preview_account() {
             Ok(account) => {
                 // OAuth tokens are keyed by account name, so never let wizard
                 // setup overwrite a configured account's credentials.
-                let duplicate = self.accounts.iter().any(|existing| existing.name == account.name)
+                let duplicate = self
+                    .accounts
+                    .iter()
+                    .any(|existing| existing.name == account.name)
                     || crate::config::Config::load_or_empty(Some(&self.setup_config_path))
-                        .is_ok_and(|config| config.accounts.iter().any(|existing| existing.name == account.name));
+                        .is_ok_and(|config| {
+                            config
+                                .accounts
+                                .iter()
+                                .any(|existing| existing.name == account.name)
+                        });
                 if duplicate {
                     wizard.step = crate::setup::SetupStep::Settings;
                     wizard.error = true;
-                    wizard.message = "This account name is already in use. Choose another before signing in.".into();
+                    wizard.message =
+                        "This account name is already in use. Choose another before signing in."
+                            .into();
                     return;
                 }
                 let Some(sender) = self.setup_sender.clone() else {
@@ -1665,7 +1959,9 @@ impl App {
                                 .ok_or_else(|| anyhow::anyhow!("OAuth is not configured"))?;
                             if settings.provider == "microsoft" {
                                 settings.suggested_login_username()
-                            } else { Ok(None) }
+                            } else {
+                                Ok(None)
+                            }
                         })
                         .map_err(|error| format!("{}", error.root_cause()));
                     let _ = sender.send(RuntimeEvent::SetupLoginFinished(result));
@@ -1675,7 +1971,8 @@ impl App {
                 wizard.step = crate::setup::SetupStep::Settings;
                 wizard.selected = crate::setup::PROVIDER;
                 wizard.error = true;
-                wizard.message = format!("Check settings: {error:#}. F3 opens advanced OAuth settings.");
+                wizard.message =
+                    format!("Check settings: {error:#}. F3 opens advanced OAuth settings.");
             }
         }
     }
@@ -1687,7 +1984,9 @@ impl App {
                 return;
             }
             wizard.key(key)
-        } else { return; };
+        } else {
+            return;
+        };
         match action {
             WizardAction::Nothing => {}
             WizardAction::Close => {
@@ -1698,9 +1997,15 @@ impl App {
                 }
             }
             WizardAction::Discover => {
-                let Some(sender) = self.setup_sender.clone() else { return; };
-                let Some(wizard) = self.setup.as_mut() else { return; };
-                if wizard.discovering { return; }
+                let Some(sender) = self.setup_sender.clone() else {
+                    return;
+                };
+                let Some(wizard) = self.setup.as_mut() else {
+                    return;
+                };
+                if wizard.discovering {
+                    return;
+                }
                 if let Err(error) = wizard.discovery_ready() {
                     wizard.error = true;
                     wizard.message = format!("Cannot discover settings: {error}");
@@ -1719,7 +2024,9 @@ impl App {
                 });
             }
             WizardAction::SaveOffline => {
-                let Some(wizard) = self.setup.as_mut() else { return; };
+                let Some(wizard) = self.setup.as_mut() else {
+                    return;
+                };
                 match wizard.save(&self.setup_config_path) {
                     Ok(_) => {
                         wizard.saved = true;
@@ -1734,12 +2041,20 @@ impl App {
                 }
             }
             WizardAction::Save => {
-                if self.setup.as_ref().is_some_and(|wizard| wizard.saved) { return; }
-                if self.setup.as_ref().is_some_and(|wizard| !wizard.authenticated) {
+                if self.setup.as_ref().is_some_and(|wizard| wizard.saved) {
+                    return;
+                }
+                if self
+                    .setup
+                    .as_ref()
+                    .is_some_and(|wizard| !wizard.authenticated)
+                {
                     self.start_setup_oauth();
                     return;
                 }
-                let Some(wizard) = self.setup.as_mut() else { return; };
+                let Some(wizard) = self.setup.as_mut() else {
+                    return;
+                };
                 match wizard.save(&self.setup_config_path) {
                     Ok(_) => {
                         wizard.saved = true;
@@ -1762,14 +2077,26 @@ impl App {
             self.handle_setup_key(key);
             return;
         }
-        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('c')
-            && self.contacts_modal.is_none() && self.confirmation.is_none()
-            && self.setup.is_none() && !self.attachment_picker_visible
-            && !self.help_visible && !self.theme_picker_visible
-            && !self.show_startup_warnings && self.remove_account_confirmation.is_none()
-            && self.composer.as_ref().is_none_or(|c| !c.sending && !c.confirm_send
-                && !c.exit_prompt && !c.help_visible && !c.attachment_manager_open
-                && c.file_picker.is_none() && !c.advanced_headers_open) {
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && key.code == KeyCode::Char('c')
+            && self.contacts_modal.is_none()
+            && self.confirmation.is_none()
+            && self.setup.is_none()
+            && !self.attachment_picker_visible
+            && !self.help_visible
+            && !self.theme_picker_visible
+            && !self.show_startup_warnings
+            && self.remove_account_confirmation.is_none()
+            && self.composer.as_ref().is_none_or(|c| {
+                !c.sending
+                    && !c.confirm_send
+                    && !c.exit_prompt
+                    && !c.help_visible
+                    && !c.attachment_manager_open
+                    && c.file_picker.is_none()
+                    && !c.advanced_headers_open
+            })
+        {
             self.open_contacts();
             return;
         }
@@ -1779,23 +2106,34 @@ impl App {
         }
         // Account actions share Alt shortcuts. Ctrl-a remains available for
         // the compose attachment picker, not the account setup wizard.
-        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('a')
-            && self.composer.is_none() && self.confirmation.is_none()
-            && !self.help_visible && !self.theme_picker_visible
+        if key.modifiers == KeyModifiers::ALT
+            && key.code == KeyCode::Char('a')
+            && self.composer.is_none()
+            && self.confirmation.is_none()
+            && !self.help_visible
+            && !self.theme_picker_visible
             && !self.attachment_picker_visible
         {
             self.setup = Some(SetupWizard::new(false));
             return;
         }
         if self.show_startup_warnings {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('!')) {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('!')
+            ) {
                 self.show_startup_warnings = false;
             }
             return;
         }
-        if !self.startup_warnings.is_empty() && key.code == KeyCode::Char('!')
-            && self.composer.is_none() && !self.attachment_picker_visible
-            && !self.help_visible && !self.theme_picker_visible && self.confirmation.is_none() {
+        if !self.startup_warnings.is_empty()
+            && key.code == KeyCode::Char('!')
+            && self.composer.is_none()
+            && !self.attachment_picker_visible
+            && !self.help_visible
+            && !self.theme_picker_visible
+            && self.confirmation.is_none()
+        {
             self.show_startup_warnings = true;
             return;
         }
@@ -1803,31 +2141,39 @@ impl App {
             self.handle_attachment_picker_key(key);
             return;
         }
-        if self.composer.is_none() && !self.message_open && self.preview_split
-            && key.modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) {
+        if self.composer.is_none()
+            && !self.message_open
+            && self.preview_split
+            && key
+                .modifiers
+                .contains(KeyModifiers::ALT | KeyModifiers::SHIFT)
+        {
             let adjustment = match key.code {
                 KeyCode::Char('h') | KeyCode::Char('H') => Some(3_i32),
                 KeyCode::Char('l') | KeyCode::Char('L') => Some(-3_i32),
                 _ => None,
             };
             if let Some(adjustment) = adjustment {
-                self.preview_width_percent = (i32::from(self.preview_width_percent) + adjustment)
-                    .clamp(25, 75) as u16;
+                self.preview_width_percent =
+                    (i32::from(self.preview_width_percent) + adjustment).clamp(25, 75) as u16;
                 let _ = persist_preview_width(self.preview_width_percent);
                 return;
             }
         }
-        if self.composer.is_none() && !self.message_open && self.sidebar_visible
+        if self.composer.is_none()
+            && !self.message_open
+            && self.sidebar_visible
             && key.modifiers.contains(KeyModifiers::ALT)
-            && !key.modifiers.contains(KeyModifiers::SHIFT) {
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
             let adjustment = match key.code {
                 KeyCode::Char('h') => Some(-2_i32),
                 KeyCode::Char('l') => Some(2_i32),
                 _ => None,
             };
             if let Some(adjustment) = adjustment {
-                self.mailbox_width_percent = (i32::from(self.mailbox_width_percent) + adjustment)
-                    .clamp(12, 50) as u16;
+                self.mailbox_width_percent =
+                    (i32::from(self.mailbox_width_percent) + adjustment).clamp(12, 50) as u16;
                 let _ = persist_mailbox_width(self.mailbox_width_percent);
                 return;
             }
@@ -1858,8 +2204,10 @@ impl App {
         }
         // Alt-d removes the currently selected *local account*, never a remote
         // IMAP folder. Only available from the mailbox browser, with a prompt.
-        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d')
-            && !self.message_open && self.sidebar_visible
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && key.code == KeyCode::Char('d')
+            && !self.message_open
+            && self.sidebar_visible
         {
             if let Some(account) = self.account() {
                 self.remove_account_confirmation = Some(account.name.clone());
@@ -1874,7 +2222,10 @@ impl App {
         // list, but must not steal input from compose or modal dialogs.
         if key.modifiers.contains(KeyModifiers::ALT) {
             let command = command_for_key(key);
-            if matches!(command, Command::NextAccount | Command::PreviousAccount | Command::SelectAccount(_)) {
+            if matches!(
+                command,
+                Command::NextAccount | Command::PreviousAccount | Command::SelectAccount(_)
+            ) {
                 self.handle_command(command);
                 return;
             }
@@ -2056,8 +2407,11 @@ impl App {
                     self.new_mail_since_launch = 0;
                 }
                 self.status = StatusLine::temporary(
-                    if self.new_mail_notifications_enabled { "new-mail notifications enabled" }
-                    else { "new-mail notifications muted" },
+                    if self.new_mail_notifications_enabled {
+                        "new-mail notifications enabled"
+                    } else {
+                        "new-mail notifications muted"
+                    },
                     Duration::from_secs(2),
                 );
             }
@@ -2065,8 +2419,11 @@ impl App {
                 self.count_prefix = None;
                 self.new_mail_bell_enabled = !self.new_mail_bell_enabled;
                 self.status = StatusLine::temporary(
-                    if self.new_mail_bell_enabled { "new-mail bell enabled" }
-                    else { "new-mail bell muted" },
+                    if self.new_mail_bell_enabled {
+                        "new-mail bell enabled"
+                    } else {
+                        "new-mail bell muted"
+                    },
                     Duration::from_secs(2),
                 );
             }
@@ -2110,7 +2467,8 @@ impl App {
                 self.message_marked.clear();
                 self.reader_visual_linewise = false;
                 if had_selection {
-                    self.status = StatusLine::temporary("selection cleared", Duration::from_secs(1));
+                    self.status =
+                        StatusLine::temporary("selection cleared", Duration::from_secs(1));
                 } else if self.message_open {
                     self.close_message();
                 } else {
@@ -2133,14 +2491,26 @@ impl App {
     /// conversions less often to avoid redrawing the whole TUI 100 times/sec.
     #[must_use]
     pub fn animation_frame_interval(&self) -> Duration {
-        if self.attachment_picker_visible && self.attachment_smooth_target.is_none()
-            && self.attachment_destination_picker.as_ref().is_none_or(|picker| picker.smooth_target.is_none())
-            && (self.attachment_preview_due.is_some() || !self.attachment_preview_inflight.is_empty()) {
+        if self.attachment_picker_visible
+            && self.attachment_smooth_target.is_none()
+            && self
+                .attachment_destination_picker
+                .as_ref()
+                .is_none_or(|picker| picker.smooth_target.is_none())
+            && (self.attachment_preview_due.is_some()
+                || !self.attachment_preview_inflight.is_empty())
+        {
             return Duration::from_millis(40);
         }
-        if self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
-            .is_some_and(|picker| picker.smooth_target.is_none()
-                && (picker.pdf_preview_due.is_some() || !picker.pdf_preview_inflight.is_empty())) {
+        if self
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.file_picker.as_ref())
+            .is_some_and(|picker| {
+                picker.smooth_target.is_none()
+                    && (picker.pdf_preview_due.is_some() || !picker.pdf_preview_inflight.is_empty())
+            })
+        {
             Duration::from_millis(60)
         } else {
             Duration::from_millis(10) // 100 FPS for smooth cursor animation.
@@ -2156,23 +2526,39 @@ impl App {
             return confirmation.review.active();
         }
         if let Some(modal) = &self.contacts_modal {
-            if modal.confirm_delete { return modal.delete_review.active(); }
+            if modal.confirm_delete {
+                return modal.delete_review.active();
+            }
             // A modal pauses animations behind it. Otherwise an existing mail
             // scroll could keep redrawing contacts at 100 FPS indefinitely.
             return modal.smooth_target.is_some();
         }
-        self.composer.as_ref().is_some_and(|composer| composer.body_smooth_target.is_some())
-            || (self.attachment_picker_visible && (self.attachment_smooth_target.is_some()
-            || self.attachment_preview_due.is_some() || !self.attachment_preview_inflight.is_empty()
-            || self.attachment_destination_picker.as_ref().is_some_and(|picker| picker.smooth_target.is_some())))
-            || self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
-            .is_some_and(|picker| picker.smooth_target.is_some()
-                || picker.pdf_preview_due.is_some() || !picker.pdf_preview_inflight.is_empty())
-            || self.reader_smooth_target.is_some() || self.account().is_some_and(|account| {
-            account.smooth_message_target.is_some()
-                || account.smooth_mailbox_target.is_some()
-                || account.smooth_preview_target.is_some()
-        })
+        self.composer
+            .as_ref()
+            .is_some_and(|composer| composer.body_smooth_target.is_some())
+            || (self.attachment_picker_visible
+                && (self.attachment_smooth_target.is_some()
+                    || self.attachment_preview_due.is_some()
+                    || !self.attachment_preview_inflight.is_empty()
+                    || self
+                        .attachment_destination_picker
+                        .as_ref()
+                        .is_some_and(|picker| picker.smooth_target.is_some())))
+            || self
+                .composer
+                .as_ref()
+                .and_then(|composer| composer.file_picker.as_ref())
+                .is_some_and(|picker| {
+                    picker.smooth_target.is_some()
+                        || picker.pdf_preview_due.is_some()
+                        || !picker.pdf_preview_inflight.is_empty()
+                })
+            || self.reader_smooth_target.is_some()
+            || self.account().is_some_and(|account| {
+                account.smooth_message_target.is_some()
+                    || account.smooth_mailbox_target.is_some()
+                    || account.smooth_preview_target.is_some()
+            })
     }
 
     /// Advance one row of a pending smooth-scroll animation. Message targets
@@ -2204,10 +2590,17 @@ impl App {
         }
         if self.attachment_picker_visible {
             if let Some(picker) = &mut self.attachment_destination_picker {
-                if picker.smooth_target.is_some() { picker.advance_smooth_scroll(); }
+                if picker.smooth_target.is_some() {
+                    picker.advance_smooth_scroll();
+                }
             } else if let Some(target) = self.attachment_smooth_target {
                 let next = self.attachment_selection.saturating_add_signed(
-                    if target > self.attachment_selection { 1 } else { -1 });
+                    if target > self.attachment_selection {
+                        1
+                    } else {
+                        -1
+                    },
+                );
                 // Move the visual cursor, but don't start a decode at every
                 // intermediate row. Render only the destination thumbnail.
                 self.attachment_selection = next;
@@ -2221,12 +2614,18 @@ impl App {
             self.advance_attachment_preview();
             return;
         }
-        if let Some(picker) = self.composer.as_mut().and_then(|composer| composer.file_picker.as_mut()) {
+        if let Some(picker) = self
+            .composer
+            .as_mut()
+            .and_then(|composer| composer.file_picker.as_mut())
+        {
             // Advance one row and check PDF completions on each scheduled frame.
             // Neither operation waits for the PDF renderer. If the picker is
             // idle, let animations beneath the popup settle normally.
-            if picker.smooth_target.is_some() || picker.pdf_preview_due.is_some()
-                || !picker.pdf_preview_inflight.is_empty() {
+            if picker.smooth_target.is_some()
+                || picker.pdf_preview_due.is_some()
+                || !picker.pdf_preview_inflight.is_empty()
+            {
                 if picker.smooth_target.is_some() {
                     picker.advance_smooth_scroll();
                 }
@@ -2317,7 +2716,11 @@ impl App {
                     // Large windows already cover intermediate rows. Do not
                     // interrupt an active IMAP batch every few animation frames.
                     if next % PREFETCH_WINDOW_REARM_ROWS == 0 || next == target_position {
-                        account.prefetch_near_cursor(if target_position >= current { 1 } else { -1 });
+                        account.prefetch_near_cursor(if target_position >= current {
+                            1
+                        } else {
+                            -1
+                        });
                     }
                     if next == target_position {
                         account.smooth_message_target = None;
@@ -2354,10 +2757,7 @@ impl App {
             {
                 continue;
             }
-            if let Ok(request_id) = account
-                .worker
-                .post(ActionKind::MailboxStatus(name.clone()))
-            {
+            if let Ok(request_id) = account.worker.post(ActionKind::MailboxStatus(name.clone())) {
                 account.mailbox_status_inflight = Some(request_id);
             }
             break;
@@ -2365,13 +2765,17 @@ impl App {
     }
 
     fn change_account(&mut self, delta: isize) {
-        if self.accounts.is_empty() { return; }
+        if self.accounts.is_empty() {
+            return;
+        }
         let target = offset_index(self.account_index, self.accounts.len(), delta);
         self.select_account(target);
     }
 
     fn select_account(&mut self, index: usize) {
-        if index >= self.accounts.len() || index == self.account_index { return; }
+        if index >= self.accounts.len() || index == self.account_index {
+            return;
+        }
         if let Some(account) = self.account_mut() {
             // Each account retains its own live mailbox while inactive; do
             // not copy its preview bodies into an additional in-memory cache.
@@ -2391,10 +2795,8 @@ impl App {
             account.last_prefetch_window = None;
         }
         if let Some(account) = self.account() {
-            self.status = StatusLine::temporary(
-                format!("account: {}", account.name),
-                Duration::from_secs(2),
-            );
+            self.status =
+                StatusLine::temporary(format!("account: {}", account.name), Duration::from_secs(2));
         }
     }
 
@@ -2451,10 +2853,16 @@ impl App {
     }
 
     fn move_mailbox_list(&mut self, delta: isize) {
-        if self.message_open { return; }
-        let will_change = self.account().is_some_and(|account|
-            bounded_index(account.mailbox_index, account.mailboxes.len(), delta) != account.mailbox_index);
-        if !will_change { return; }
+        if self.message_open {
+            return;
+        }
+        let will_change = self.account().is_some_and(|account| {
+            bounded_index(account.mailbox_index, account.mailboxes.len(), delta)
+                != account.mailbox_index
+        });
+        if !will_change {
+            return;
+        }
         self.visual_anchor = None;
         self.message_marked.clear();
         let preview_split = self.preview_split;
@@ -2463,7 +2871,9 @@ impl App {
         };
         let previous = account.mailbox_index;
         let next = bounded_index(previous, account.mailboxes.len(), delta);
-        if next == previous { return; }
+        if next == previous {
+            return;
+        }
         account.save_current_cache();
         account.persist_current_cache();
         account.smooth_mailbox_target = None;
@@ -2473,7 +2883,10 @@ impl App {
     }
 
     fn activate_selected_mailbox(account: &mut AccountState, preview_split: bool) {
-        let Some(name) = account.selected_mailbox().map(|mailbox| mailbox.name.clone()) else {
+        let Some(name) = account
+            .selected_mailbox()
+            .map(|mailbox| mailbox.name.clone())
+        else {
             return;
         };
         account.smooth_message_target = None;
@@ -2527,7 +2940,7 @@ impl App {
     fn export_selected_raw(&mut self) {
         let path = dirs::cache_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join("aerc-rs")
+            .join("jerc")
             .join("debug-message.eml");
         let Some(account) = self.account_mut() else {
             return;
@@ -2538,7 +2951,10 @@ impl App {
         let Some(id) = account.selected_message().map(|message| message.id.clone()) else {
             return;
         };
-        match account.worker.post(ActionKind::ExportRaw { mailbox, id, path }) {
+        match account
+            .worker
+            .post(ActionKind::ExportRaw { mailbox, id, path })
+        {
             Ok(_) => self.status = StatusLine::info("exporting raw message…"),
             Err(_) => {
                 self.status = StatusLine::error("mail worker queue is busy; export not started");
@@ -2563,7 +2979,7 @@ impl App {
 
         let directory = dirs::cache_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join("aerc-rs")
+            .join("jerc")
             .join("browser");
         if let Err(error) = std::fs::create_dir_all(&directory) {
             self.status = StatusLine::error(format!(
@@ -2573,9 +2989,7 @@ impl App {
         }
         let path = directory.join("message.html");
         if let Err(error) = std::fs::write(&path, html.as_bytes()) {
-            self.status = StatusLine::error(format!(
-                "could not write browser preview: {error}"
-            ));
+            self.status = StatusLine::error(format!("could not write browser preview: {error}"));
             return;
         }
 
@@ -2587,9 +3001,8 @@ impl App {
                 );
             }
             Err(error) => {
-                self.status = StatusLine::error(format!(
-                    "could not open original HTML email: {error}"
-                ));
+                self.status =
+                    StatusLine::error(format!("could not open original HTML email: {error}"));
             }
         }
     }
@@ -2599,9 +3012,10 @@ impl App {
             let Some(account) = self.account_mut() else {
                 return;
             };
-            if !account.selected_body().is_some_and(|body| {
-                body.has_html_alternative() && body.has_plain_view()
-            }) {
+            if !account
+                .selected_body()
+                .is_some_and(|body| body.has_html_alternative() && body.has_plain_view())
+            {
                 None
             } else {
                 account.prefer_html = !account.prefer_html;
@@ -2643,7 +3057,11 @@ impl App {
     fn toggle_header_details(&mut self) {
         self.show_header_details = !self.show_header_details;
         self.status = StatusLine::temporary(
-            if self.show_header_details { "email addresses and Message-ID shown" } else { "email addresses and Message-ID hidden" },
+            if self.show_header_details {
+                "email addresses and Message-ID shown"
+            } else {
+                "email addresses and Message-ID hidden"
+            },
             Duration::from_secs(2),
         );
     }
@@ -2658,19 +3076,32 @@ impl App {
                 let (popup_width, popup_height) = wizard.popup_size(width, height);
                 let popup_y = height.saturating_sub(popup_height) / 2;
                 let popup_x = width.saturating_sub(popup_width) / 2;
-                let header_height = if wizard.step == crate::setup::SetupStep::Identity { 1 } else { 3 };
-                let list_y = popup_y.saturating_add(1 + crate::setup::PROGRESS_ROWS + header_height);
-                let list_height = usize::from(popup_height.saturating_sub(5 + crate::setup::PROGRESS_ROWS + header_height));
+                let header_height = if wizard.step == crate::setup::SetupStep::Identity {
+                    1
+                } else {
+                    3
+                };
+                let list_y =
+                    popup_y.saturating_add(1 + crate::setup::PROGRESS_ROWS + header_height);
+                let list_height = usize::from(
+                    popup_height.saturating_sub(5 + crate::setup::PROGRESS_ROWS + header_height),
+                );
                 let rows = wizard.display_rows();
                 let selected_pos = rows.iter().position(|row|
                     matches!(row, crate::setup::SetupDisplayRow::Field(index) if *index == wizard.selected))
                     .unwrap_or(0);
-                let first = selected_pos.saturating_sub(list_height.saturating_sub(1))
+                let first = selected_pos
+                    .saturating_sub(list_height.saturating_sub(1))
                     .min(rows.len().saturating_sub(list_height));
                 if mouse.column > popup_x && mouse.column < popup_x.saturating_add(popup_width) {
-                    if mouse.row >= list_y && usize::from(mouse.row - list_y) < list_height
-                        && !wizard.authenticating && !wizard.discovering {
-                        if let Some(crate::setup::SetupDisplayRow::Field(field)) = rows.get(first + usize::from(mouse.row - list_y)) {
+                    if mouse.row >= list_y
+                        && usize::from(mouse.row - list_y) < list_height
+                        && !wizard.authenticating
+                        && !wizard.discovering
+                    {
+                        if let Some(crate::setup::SetupDisplayRow::Field(field)) =
+                            rows.get(first + usize::from(mouse.row - list_y))
+                        {
                             wizard.selected = *field;
                         }
                     }
@@ -2682,19 +3113,32 @@ impl App {
                         // Primary button occupies the last inner row.
                         popup_y.saturating_add(popup_height).saturating_sub(2)
                     };
-                    let label = if wizard.saved { "Open account" }
-                        else if wizard.step == crate::setup::SetupStep::Identity { "Continue" }
-                        else if wizard.authenticated { "Save and open account" }
-                        else if wizard.login_failed { "Retry sign-in" }
-                        else { "Continue to Browser Sign-In" };
-                    let button_width = (if wizard.saved { 26 }
-                        else { (label.chars().count() as u16).saturating_add(6) })
-                        .min(popup_width.saturating_sub(2));
-                    let button_x = popup_x.saturating_add(1)
-                        .saturating_add(popup_width.saturating_sub(2).saturating_sub(button_width) / 2);
-                    if mouse.row == button_y && mouse.column >= button_x
+                    let label = if wizard.saved {
+                        "Open account"
+                    } else if wizard.step == crate::setup::SetupStep::Identity {
+                        "Continue"
+                    } else if wizard.authenticated {
+                        "Save and open account"
+                    } else if wizard.login_failed {
+                        "Retry sign-in"
+                    } else {
+                        "Continue to Browser Sign-In"
+                    };
+                    let button_width = (if wizard.saved {
+                        26
+                    } else {
+                        (label.chars().count() as u16).saturating_add(6)
+                    })
+                    .min(popup_width.saturating_sub(2));
+                    let button_x = popup_x.saturating_add(1).saturating_add(
+                        popup_width.saturating_sub(2).saturating_sub(button_width) / 2,
+                    );
+                    if mouse.row == button_y
+                        && mouse.column >= button_x
                         && mouse.column < button_x.saturating_add(button_width)
-                        && !wizard.authenticating && !wizard.discovering {
+                        && !wizard.authenticating
+                        && !wizard.discovering
+                    {
                         continue_clicked = true;
                     }
                 }
@@ -2709,33 +3153,52 @@ impl App {
             }
             return;
         }
-        if self.show_startup_warnings || self.remove_account_confirmation.is_some() { return; }
+        if self.show_startup_warnings || self.remove_account_confirmation.is_some() {
+            return;
+        }
         // The rightmost footer bell is an action as well as a status indicator.
         // Never steal clicks from compose, confirmation, or other open dialogs.
-        if height > 0 && width >= crate::ui::NOTIFICATION_INDICATOR_WIDTH
-            && mouse.row == height - 1 && mouse.column < width
+        if height > 0
+            && width >= crate::ui::NOTIFICATION_INDICATOR_WIDTH
+            && mouse.row == height - 1
+            && mouse.column < width
             && mouse.column >= width - crate::ui::NOTIFICATION_INDICATOR_WIDTH
-            && self.composer.is_none() && !self.attachment_picker_visible
-            && !self.help_visible && !self.theme_picker_visible && self.confirmation.is_none()
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            && self.composer.is_none()
+            && !self.attachment_picker_visible
+            && !self.help_visible
+            && !self.theme_picker_visible
+            && self.confirmation.is_none()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
             self.handle_command(Command::ToggleNotifications);
             return;
         }
-        if mouse.row == 0 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.composer.is_none() && !self.attachment_picker_visible
-            && !self.help_visible && !self.theme_picker_visible && self.confirmation.is_none() {
+        if mouse.row == 0
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.composer.is_none()
+            && !self.attachment_picker_visible
+            && !self.help_visible
+            && !self.theme_picker_visible
+            && self.confirmation.is_none()
+        {
             let mut left = 0usize;
             for index in 0..self.accounts.len() {
-                let cells = unicode_width::UnicodeWidthStr::width(self.accounts[index].name.as_str()) + 2;
+                let cells =
+                    unicode_width::UnicodeWidthStr::width(self.accounts[index].name.as_str()) + 2;
                 if usize::from(mouse.column) >= left && usize::from(mouse.column) < left + cells {
                     self.select_account(index);
                     return;
                 }
                 left += cells;
-                if index + 1 < self.accounts.len() { left += 2; }
+                if index + 1 < self.accounts.len() {
+                    left += 2;
+                }
             }
             if !self.startup_warnings.is_empty() {
-                let label = format!("  ! {} config issue(s) [! to inspect]", self.startup_warnings.len());
+                let label = format!(
+                    "  ! {} config issue(s) [! to inspect]",
+                    self.startup_warnings.len()
+                );
                 let len = unicode_width::UnicodeWidthStr::width(label.as_str());
                 if (left..left + len).contains(&usize::from(mouse.column)) {
                     self.show_startup_warnings = true;
@@ -2744,40 +3207,57 @@ impl App {
             }
         }
         if self.attachment_picker_visible {
-            if self.help_visible { return; }
+            if self.help_visible {
+                return;
+            }
             if self.attachment_destination_picker.is_some() {
                 let (_, _, files, _, footer) = crate::ui::attachment_destination_regions(
-                    ratatui::layout::Rect::new(0, 0, width, height));
+                    ratatui::layout::Rect::new(0, 0, width, height),
+                );
                 // Only the [s] Save here button is actionable; clicking
                 // the Cancel instructions must never unexpectedly write files.
-                if mouse.row == footer.y && mouse.column >= footer.x
+                if mouse.row == footer.y
+                    && mouse.column >= footer.x
                     && mouse.column < footer.x.saturating_add(15)
-                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                {
                     self.save_selected_attachments();
                     return;
                 }
-                let Some(picker) = self.attachment_destination_picker.as_mut() else { return; };
+                let Some(picker) = self.attachment_destination_picker.as_mut() else {
+                    return;
+                };
                 match mouse.kind {
                     MouseEventKind::ScrollDown => picker.move_selection(3),
                     MouseEventKind::ScrollUp => picker.move_selection(-3),
                     MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
-                        if mouse.column >= files.x && mouse.column < files.right()
-                            && mouse.row >= files.y && mouse.row < files.bottom() {
+                        if mouse.column >= files.x
+                            && mouse.column < files.right()
+                            && mouse.row >= files.y
+                            && mouse.row < files.bottom()
+                        {
                             let visible = usize::from(files.height);
-                            let start = picker.selected.saturating_sub(visible / 2)
+                            let start = picker
+                                .selected
+                                .saturating_sub(visible / 2)
                                 .min(picker.entries.len().saturating_sub(visible));
-                            let next = start.saturating_add(usize::from(mouse.row - files.y))
+                            let next = start
+                                .saturating_add(usize::from(mouse.row - files.y))
                                 .min(picker.entries.len().saturating_sub(1));
                             let already_selected = next == picker.selected;
                             if !already_selected {
                                 picker.selected = next;
                                 picker.refresh_preview();
-                            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                            {
                                 // Hover selects; clicking a selected folder enters it.
                                 if let Some(entry) = picker.entries.get(next) {
                                     if entry.is_directory {
-                                        if let Err(error) = picker.enter_directory(entry.path.clone()) {
-                                            self.status = StatusLine::error(format!("file browser: {error}"));
+                                        if let Err(error) =
+                                            picker.enter_directory(entry.path.clone())
+                                        {
+                                            self.status =
+                                                StatusLine::error(format!("file browser: {error}"));
                                         }
                                     }
                                 }
@@ -2788,18 +3268,37 @@ impl App {
                 }
                 return;
             }
-            let (_, list, _, _) = crate::ui::attachment_regions(ratatui::layout::Rect::new(0, 0, width, height));
-            let inside_list = mouse.column >= list.x && mouse.column < list.x.saturating_add(list.width)
-                && mouse.row > list.y && mouse.row < list.y.saturating_add(list.height);
-            if inside_list && matches!(mouse.kind,
-                MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)) {
+            let (_, list, _, _) =
+                crate::ui::attachment_regions(ratatui::layout::Rect::new(0, 0, width, height));
+            let inside_list = mouse.column >= list.x
+                && mouse.column < list.x.saturating_add(list.width)
+                && mouse.row > list.y
+                && mouse.row < list.y.saturating_add(list.height);
+            if inside_list
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::Moved
+                        | MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Drag(MouseButton::Left)
+                )
+            {
                 let rows = usize::from(list.height.saturating_sub(1));
-                let start = attachment_list_start(self.attachment_selection, self.attachment_files.len(), rows);
-                self.move_attachment_selection(start.saturating_add(usize::from(mouse.row - list.y).saturating_sub(1)));
+                let start = attachment_list_start(
+                    self.attachment_selection,
+                    self.attachment_files.len(),
+                    rows,
+                );
+                self.move_attachment_selection(
+                    start.saturating_add(usize::from(mouse.row - list.y).saturating_sub(1)),
+                );
             }
             match mouse.kind {
-                MouseEventKind::ScrollDown => self.move_attachment_selection(self.attachment_selection.saturating_add(3)),
-                MouseEventKind::ScrollUp => self.move_attachment_selection(self.attachment_selection.saturating_sub(3)),
+                MouseEventKind::ScrollDown => {
+                    self.move_attachment_selection(self.attachment_selection.saturating_add(3))
+                }
+                MouseEventKind::ScrollUp => {
+                    self.move_attachment_selection(self.attachment_selection.saturating_sub(3))
+                }
                 _ => {}
             }
             return;
@@ -2811,47 +3310,61 @@ impl App {
                 MouseEventKind::ScrollUp => Some(KeyCode::Up),
                 _ => None,
             };
-            if let Some(code) = key { self.handle_key(KeyEvent::new(code, KeyModifiers::NONE)); }
+            if let Some(code) = key {
+                self.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
             self.mailbox_resizing = false;
             return;
         }
-        if self.composer.is_some() || self.help_visible || self.theme_picker_visible
-            || self.confirmation.is_some() {
+        if self.composer.is_some()
+            || self.help_visible
+            || self.theme_picker_visible
+            || self.confirmation.is_some()
+        {
             self.mailbox_resizing = false;
             self.preview_resizing = false;
             return;
         }
         let sidebar_width = if self.sidebar_visible {
             crate::ui::mailbox_column_width(width, self.mailbox_width_percent)
-        } else { 0 };
+        } else {
+            0
+        };
         let separator = sidebar_width.saturating_sub(1);
         let right_width = width.saturating_sub(sidebar_width);
         let preview_separator = sidebar_width.saturating_add(right_width.saturating_sub(
-            crate::ui::preview_column_width(right_width, self.preview_width_percent)
+            crate::ui::preview_column_width(right_width, self.preview_width_percent),
         ));
         if self.preview_split {
             match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) if mouse.row > 0
-                    && mouse.row < height.saturating_sub(1)
-                    && mouse.column.abs_diff(preview_separator) <= 1 => {
-                        self.preview_resizing = true;
-                        self.mailbox_resizing = false;
-                        return;
-                    }
+                MouseEventKind::Down(MouseButton::Left)
+                    if mouse.row > 0
+                        && mouse.row < height.saturating_sub(1)
+                        && mouse.column.abs_diff(preview_separator) <= 1 =>
+                {
+                    self.preview_resizing = true;
+                    self.mailbox_resizing = false;
+                    return;
+                }
                 MouseEventKind::Drag(MouseButton::Left) if self.preview_resizing => {
-                    self.preview_width_percent = preview_percent_at(mouse.column, sidebar_width, right_width);
+                    self.preview_width_percent =
+                        preview_percent_at(mouse.column, sidebar_width, right_width);
                     return;
                 }
                 MouseEventKind::Up(MouseButton::Left) if self.preview_resizing => {
                     self.preview_resizing = false;
-                    self.preview_width_percent = preview_percent_at(mouse.column, sidebar_width, right_width);
+                    self.preview_width_percent =
+                        preview_percent_at(mouse.column, sidebar_width, right_width);
                     let _ = persist_preview_width(self.preview_width_percent);
                     return;
                 }
                 _ => {}
             }
         }
-        if !self.sidebar_visible { self.mailbox_resizing = false; return; }
+        if !self.sidebar_visible {
+            self.mailbox_resizing = false;
+            return;
+        }
         if mouse.row > 0 && mouse.row < height.saturating_sub(1) {
             let scrolling = match mouse.kind {
                 MouseEventKind::ScrollDown => Some(true),
@@ -2871,8 +3384,13 @@ impl App {
             }
         }
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if mouse.row > 0 && mouse.row < height.saturating_sub(1)
-                && mouse.column.abs_diff(separator) <= 1 => self.mailbox_resizing = true,
+            MouseEventKind::Down(MouseButton::Left)
+                if mouse.row > 0
+                    && mouse.row < height.saturating_sub(1)
+                    && mouse.column.abs_diff(separator) <= 1 =>
+            {
+                self.mailbox_resizing = true
+            }
             MouseEventKind::Drag(MouseButton::Left) if self.mailbox_resizing => {
                 self.mailbox_width_percent = mouse_width_percent(mouse.column, width);
             }
@@ -2888,29 +3406,56 @@ impl App {
     /// Terminal graphics for the compose picker. Cached by path and cell size;
     /// selection changes never decode images on each render frame.
     pub fn ensure_compose_file_preview(&mut self, width: u16, height: u16) {
-        if self.composer.as_ref().and_then(|composer| composer.file_picker.as_ref())
-            .is_some_and(|picker| picker.smooth_target.is_some()) {
+        if self
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.file_picker.as_ref())
+            .is_some_and(|picker| picker.smooth_target.is_some())
+        {
             return;
         }
-        let candidate = self.composer.as_ref()
+        let candidate = self
+            .composer
+            .as_ref()
             .and_then(|composer| composer.file_picker.as_ref())
-            .and_then(|picker| picker.entries.get(picker.selected)
-                .map(|entry| (entry.path.clone(), &picker.preview)));
+            .and_then(|picker| {
+                picker
+                    .entries
+                    .get(picker.selected)
+                    .map(|entry| (entry.path.clone(), &picker.preview))
+            });
         let Some((path, ComposeFilePreview::Image(bytes))) = candidate else {
             self.compose_file_preview_image = None;
             self.compose_file_preview_identity = None;
             return;
         };
         let identity = (path, width, height);
-        if self.compose_file_preview_identity.as_ref() == Some(&identity) { return; }
+        if self.compose_file_preview_identity.as_ref() == Some(&identity) {
+            return;
+        }
         self.compose_file_preview_identity = Some(identity);
         self.compose_file_preview_image = None;
-        let Some(picker) = &self.image_picker else { return; };
+        let Some(picker) = &self.image_picker else {
+            return;
+        };
         if let Ok(image) = image::load_from_memory(bytes) {
-            let target = reader_image_target_size(image.width(), image.height(), None, None,
-                picker.font_size().width, picker.font_size().height, width.max(1), height.max(1));
-            self.compose_file_preview_image = picker.new_protocol(image, target,
-                Resize::Fit(Some(image::imageops::FilterType::Lanczos3))).ok();
+            let target = reader_image_target_size(
+                image.width(),
+                image.height(),
+                None,
+                None,
+                picker.font_size().width,
+                picker.font_size().height,
+                width.max(1),
+                height.max(1),
+            );
+            self.compose_file_preview_image = picker
+                .new_protocol(
+                    image,
+                    target,
+                    Resize::Fit(Some(image::imageops::FilterType::Lanczos3)),
+                )
+                .ok();
         }
     }
 
@@ -2920,25 +3465,33 @@ impl App {
     }
 
     #[must_use]
-    pub fn attachment_preview(&self) -> Option<&Protocol> { self.attachment_preview.as_ref() }
+    pub fn attachment_preview(&self) -> Option<&Protocol> {
+        self.attachment_preview.as_ref()
+    }
 
     fn open_attachment(&mut self) {
-        let Some(file) = self.attachment_files.get(self.attachment_selection) else { return; };
+        let Some(file) = self.attachment_files.get(self.attachment_selection) else {
+            return;
+        };
         match export_attachment_for_open(file) {
             Ok(path) => match open_url(&path.to_string_lossy()) {
-                Ok(()) => self.status = StatusLine::temporary(
-                    format!("opened {} with system viewer", file.filename), Duration::from_secs(3)),
-                Err(error) => self.status = StatusLine::error(format!("could not open attachment: {error}")),
+                Ok(()) => {
+                    self.status = StatusLine::temporary(
+                        format!("opened {} with system viewer", file.filename),
+                        Duration::from_secs(3),
+                    )
+                }
+                Err(error) => {
+                    self.status = StatusLine::error(format!("could not open attachment: {error}"))
+                }
             },
-            Err(error) => self.status = StatusLine::error(format!("could not export attachment: {error:#}")),
+            Err(error) => {
+                self.status = StatusLine::error(format!("could not export attachment: {error:#}"))
+            }
         }
     }
 
-    pub fn configure_mail_images(
-        &mut self,
-        picker: Picker,
-        runtime_tx: SyncSender<RuntimeEvent>,
-    ) {
+    pub fn configure_mail_images(&mut self, picker: Picker, runtime_tx: SyncSender<RuntimeEvent>) {
         self.image_picker = Some(picker);
         self.image_loader = Some(MailImageLoader::spawn(runtime_tx));
     }
@@ -3090,12 +3643,11 @@ impl App {
     }
 }
 
-
-
 /// Shared MIME-input assembly for SMTP and IMAP Drafts. The draft builder
 /// allows unfinished addresses; the Send path validates them separately.
 fn outgoing_from_composer(composer: &Composer, from: &str) -> anyhow::Result<OutgoingMessage> {
-    let mut attachments = load_compose_attachments(&composer.attachments, &composer.attachment_paths)?;
+    let mut attachments =
+        load_compose_attachments(&composer.attachments, &composer.attachment_paths)?;
     let custom_headers = parse_compose_headers(&composer.headers)?;
     let mut html_body = None;
     if let Some(raw) = composer.forwarded_raw.as_deref() {
@@ -3103,34 +3655,59 @@ fn outgoing_from_composer(composer: &Composer, from: &str) -> anyhow::Result<Out
         attachments.extend(parts.attachments);
         if let Some(html) = parts.html {
             let personal_note = composer.body.split(FORWARD_SEPARATOR).next().unwrap_or("");
-            let original_headers = composer.body.split(FORWARD_SEPARATOR)
-                .nth(1).and_then(|tail| tail.split("\n\n").next()).unwrap_or("");
-            html_body = Some(forward_html(&html,
-                &format!("{FORWARD_SEPARATOR}{original_headers}"), personal_note));
+            let original_headers = composer
+                .body
+                .split(FORWARD_SEPARATOR)
+                .nth(1)
+                .and_then(|tail| tail.split("\n\n").next())
+                .unwrap_or("");
+            html_body = Some(forward_html(
+                &html,
+                &format!("{FORWARD_SEPARATOR}{original_headers}"),
+                personal_note,
+            ));
         }
     }
     Ok(OutgoingMessage {
-        from: from.to_owned(), to: composer.to.clone(), cc: composer.cc.clone(),
-        bcc: composer.bcc.clone(), subject: composer.subject.clone(), body: composer.body.clone(),
-        html_body, attachments, custom_headers,
-        in_reply_to: composer.in_reply_to.clone(), references: composer.references.clone(),
+        from: from.to_owned(),
+        to: composer.to.clone(),
+        cc: composer.cc.clone(),
+        bcc: composer.bcc.clone(),
+        subject: composer.subject.clone(),
+        body: composer.body.clone(),
+        html_body,
+        attachments,
+        custom_headers,
+        in_reply_to: composer.in_reply_to.clone(),
+        references: composer.references.clone(),
         forwarded_raw: None,
     })
 }
 
 fn parse_compose_headers(raw: &str) -> anyhow::Result<Vec<(String, String)>> {
-    raw.split(';').filter(|part| !part.trim().is_empty()).map(|part| {
-        let (name, value) = part.split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("use Header-Name: value; separated by semicolons"))?;
-        Ok((name.trim().to_owned(), value.trim().to_owned()))
-    }).collect()
+    raw.split(';')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let (name, value) = part.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!("use Header-Name: value; separated by semicolons")
+            })?;
+            Ok((name.trim().to_owned(), value.trim().to_owned()))
+        })
+        .collect()
 }
 
-fn load_compose_attachments(legacy: &str, selected: &[PathBuf]) -> anyhow::Result<Vec<OutgoingAttachment>> {
+fn load_compose_attachments(
+    legacy: &str,
+    selected: &[PathBuf],
+) -> anyhow::Result<Vec<OutgoingAttachment>> {
     let mut output = Vec::new();
     // Older postponed drafts used a semicolon-delimited string. New selections
     // are distinct paths, so filenames containing semicolons work correctly.
-    for part in legacy.split(';').map(str::trim).filter(|part| !part.is_empty()) {
+    for part in legacy
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
         output.push(load_compose_file(Path::new(part))?);
     }
     for path in selected {
@@ -3142,34 +3719,49 @@ fn load_compose_attachments(legacy: &str, selected: &[PathBuf]) -> anyhow::Resul
 fn load_compose_file(path: &Path) -> anyhow::Result<OutgoingAttachment> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
-        anyhow::bail!("attachment must be a file of at most 16 MiB: {}", path.display());
+        anyhow::bail!(
+            "attachment must be a file of at most 16 MiB: {}",
+            path.display()
+        );
     }
-    let filename = path.file_name().and_then(|name| name.to_str())
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("attachment has no valid UTF-8 filename"))?
         .to_owned();
     let content_type = if ["LICENSE", "COPYING", "Makefile", "Dockerfile", ".gitignore"]
-        .iter().any(|name| filename.eq_ignore_ascii_case(name)) {
+        .iter()
+        .any(|name| filename.eq_ignore_ascii_case(name))
+    {
         "text/plain"
-    } else { match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
-        "txt" | "patch" | "diff" | "log" | "md" | "rst" | "lock" | "rs"
-        | "c" | "h" | "cpp" | "hpp" | "py" | "sh" | "bash" | "zsh" | "fish"
-        | "ini" | "conf" | "cfg" | "gitignore" => "text/plain",
-        "toml" => "application/toml",
-        "json" => "application/json",
-        "yaml" | "yml" => "application/yaml",
-        "csv" => "text/csv",
-        "xml" => "application/xml",
-        "css" => "text/css",
-        "js" | "mjs" => "text/javascript",
-        "html" | "htm" => "text/html",
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "eml" => "message/rfc822",
-        "zip" => "application/zip",
-        _ => "application/octet-stream",
-    }};
+    } else {
+        match path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "txt" | "patch" | "diff" | "log" | "md" | "rst" | "lock" | "rs" | "c" | "h" | "cpp"
+            | "hpp" | "py" | "sh" | "bash" | "zsh" | "fish" | "ini" | "conf" | "cfg"
+            | "gitignore" => "text/plain",
+            "toml" => "application/toml",
+            "json" => "application/json",
+            "yaml" | "yml" => "application/yaml",
+            "csv" => "text/csv",
+            "xml" => "application/xml",
+            "css" => "text/css",
+            "js" | "mjs" => "text/javascript",
+            "html" | "htm" => "text/html",
+            "pdf" => "application/pdf",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "eml" => "message/rfc822",
+            "zip" => "application/zip",
+            _ => "application/octet-stream",
+        }
+    };
     Ok(OutgoingAttachment {
         filename,
         content_type: content_type.to_owned(),
@@ -3238,14 +3830,20 @@ fn copy_text_to_clipboard(_text: &str) -> std::io::Result<()> {
 /// A malicious MIME filename must never escape the chosen destination folder.
 fn received_attachment_is_pdf(file: &OutgoingAttachment) -> bool {
     file.content_type.eq_ignore_ascii_case("application/pdf")
-        || file.filename.rsplit('.').next().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        || file
+            .filename
+            .rsplit('.')
+            .next()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
 }
 
 fn received_attachment_is_image(file: &OutgoingAttachment) -> bool {
     file.content_type.starts_with("image/")
 }
 
-fn decode_received_attachment_preview(file: &OutgoingAttachment) -> Result<image::DynamicImage, String> {
+fn decode_received_attachment_preview(
+    file: &OutgoingAttachment,
+) -> Result<image::DynamicImage, String> {
     // No unbounded PDF subprocess inputs or huge speculative image decodes.
     if file.data.len() > 24 * 1024 * 1024 {
         return Err("preview over 24 MiB; press o to open the original".into());
@@ -3255,12 +3853,16 @@ fn decode_received_attachment_preview(file: &OutgoingAttachment) -> Result<image
         let input = temp.path().join("received.pdf");
         std::fs::write(&input, &file.data).map_err(|err| err.to_string())?;
         std::borrow::Cow::Owned(compose_pdf_thumbnail(&input).map_err(|err| err.to_string())?)
-    } else { std::borrow::Cow::Borrowed(&file.data) };
+    } else {
+        std::borrow::Cow::Borrowed(&file.data)
+    };
     // Check declared dimensions before allocating decoded pixels. Huge
     // compressed images must not expand into gigabytes of cache data.
     let dimensions = image::ImageReader::new(std::io::Cursor::new(image_bytes.as_ref()))
-        .with_guessed_format().map_err(|err| err.to_string())?
-        .into_dimensions().map_err(|err| err.to_string())?;
+        .with_guessed_format()
+        .map_err(|err| err.to_string())?
+        .into_dimensions()
+        .map_err(|err| err.to_string())?;
     if u64::from(dimensions.0) * u64::from(dimensions.1) > 24_000_000 {
         return Err("image has too many pixels for automatic preview; press o to open".into());
     }
@@ -3269,31 +3871,49 @@ fn decode_received_attachment_preview(file: &OutgoingAttachment) -> Result<image
     // Cache a terminal-sized image, not an enormous decoded camera original.
     Ok(if decoded.width() > 1_200 || decoded.height() > 1_200 {
         decoded.thumbnail(1_200, 1_200)
-    } else { decoded })
+    } else {
+        decoded
+    })
 }
 
 fn attachment_safe_name(name: &str, index: usize) -> String {
-    let basename = name.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("");
-    let safe = basename.chars().filter(|ch| !ch.is_control() && *ch != '/' && *ch != '\\')
+    let basename = name
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or("");
+    let safe = basename
+        .chars()
+        .filter(|ch| !ch.is_control() && *ch != '/' && *ch != '\\')
         .collect::<String>();
     let safe = safe.trim().trim_matches('.');
-    if safe.is_empty() { format!("attachment-{}.bin", index + 1) } else { safe.to_owned() }
+    if safe.is_empty() {
+        format!("attachment-{}.bin", index + 1)
+    } else {
+        safe.to_owned()
+    }
 }
 
 /// Create-only save with collision suffixes; existing files and symlinks are
 /// never truncated. Duplicate MIME filenames are common in message threads.
 fn save_attachment_without_overwrite(
-    directory: &Path, file: &OutgoingAttachment, index: usize,
+    directory: &Path,
+    file: &OutgoingAttachment,
+    index: usize,
 ) -> anyhow::Result<PathBuf> {
     use std::fs::OpenOptions;
     let name = attachment_safe_name(&file.filename, index);
-    let (stem, suffix) = name.rsplit_once('.')
+    let (stem, suffix) = name
+        .rsplit_once('.')
         .filter(|(stem, suffix)| !stem.is_empty() && !suffix.is_empty())
         .map_or((name.as_str(), ""), |(stem, suffix)| (stem, suffix));
     for attempt in 0..10_000 {
-        let candidate = if attempt == 0 { name.clone() }
-            else if suffix.is_empty() { format!("{stem} ({attempt})") }
-            else { format!("{stem} ({attempt}).{suffix}") };
+        let candidate = if attempt == 0 {
+            name.clone()
+        } else if suffix.is_empty() {
+            format!("{stem} ({attempt})")
+        } else {
+            format!("{stem} ({attempt}).{suffix}")
+        };
         let path = directory.join(candidate);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut handle) => {
@@ -3313,47 +3933,69 @@ fn save_attachment_without_overwrite(
 }
 
 fn attachment_list_start(selected: usize, count: usize, visible: usize) -> usize {
-    selected.saturating_sub(visible / 2).min(count.saturating_sub(visible))
+    selected
+        .saturating_sub(visible / 2)
+        .min(count.saturating_sub(visible))
 }
 
 fn mouse_width_percent(column: u16, total: u16) -> u16 {
-    if total == 0 { return 22; }
+    if total == 0 {
+        return 22;
+    }
     (((u32::from(column) + 1) * 100 / u32::from(total)) as u16).clamp(12, 50)
 }
 
 fn preview_percent_at(column: u16, sidebar_width: u16, remaining: u16) -> u16 {
-    if remaining == 0 { return 57; }
+    if remaining == 0 {
+        return 57;
+    }
     let inside = column.saturating_sub(sidebar_width).min(remaining);
     (100 - (u32::from(inside) * 100 / u32::from(remaining)) as u16).clamp(25, 75)
 }
 
 fn preview_width_state_file() -> Option<PathBuf> {
-    dirs::config_dir().map(|directory| directory.join("aerc-rs").join("preview-width"))
+    dirs::config_dir().map(|directory| directory.join("jerc").join("preview-width"))
 }
 
 fn stored_preview_width() -> Option<u16> {
-    std::fs::read_to_string(preview_width_state_file()?).ok()?
-        .trim().parse::<u16>().ok().filter(|value| (25..=75).contains(value))
+    std::fs::read_to_string(preview_width_state_file()?)
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|value| (25..=75).contains(value))
 }
 
 fn persist_preview_width(width: u16) -> std::io::Result<()> {
-    let Some(path) = preview_width_state_file() else { return Ok(()); };
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let Some(path) = preview_width_state_file() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(path, format!("{}\n", width.clamp(25, 75)))
 }
 
 fn mailbox_width_state_file() -> Option<PathBuf> {
-    dirs::config_dir().map(|directory| directory.join("aerc-rs").join("mailbox-width"))
+    dirs::config_dir().map(|directory| directory.join("jerc").join("mailbox-width"))
 }
 
 fn stored_mailbox_width() -> Option<u16> {
-    std::fs::read_to_string(mailbox_width_state_file()?).ok()?
-        .trim().parse::<u16>().ok().filter(|value| (12..=50).contains(value))
+    std::fs::read_to_string(mailbox_width_state_file()?)
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|value| (12..=50).contains(value))
 }
 
 fn persist_mailbox_width(width: u16) -> std::io::Result<()> {
-    let Some(path) = mailbox_width_state_file() else { return Ok(()); };
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let Some(path) = mailbox_width_state_file() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(path, format!("{}\n", width.clamp(12, 50)))
 }
 
@@ -3364,12 +4006,18 @@ fn export_attachment_for_open(file: &OutgoingAttachment) -> anyhow::Result<std::
     if file.data.len() > 32 * 1024 * 1024 {
         anyhow::bail!("attachment is larger than the 32 MiB open limit");
     }
-    let extension = file.filename.rsplit_once('.').map(|(_, extension)| extension)
-        .filter(|extension| !extension.is_empty() && extension.len() <= 12
-            && extension.bytes().all(|c| c.is_ascii_alphanumeric()))
+    let extension = file
+        .filename
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 12
+                && extension.bytes().all(|c| c.is_ascii_alphanumeric())
+        })
         .unwrap_or("bin");
     let mut file_out = tempfile::Builder::new()
-        .prefix("aerc-rs-attachment-")
+        .prefix("jerc-attachment-")
         .suffix(&format!(".{extension}"))
         .tempfile()?;
     file_out.write_all(&file.data)?;
@@ -3461,7 +4109,10 @@ fn reader_word_target(
                 index += 1;
             }
             if index < chars.len() {
-                return Some(ReaderPosition { line, column: index });
+                return Some(ReaderPosition {
+                    line,
+                    column: index,
+                });
             }
             for (next_line, text) in lines.iter().enumerate().skip(line + 1) {
                 if let Some(column) = text.chars().position(is_reader_word_char) {
@@ -3482,7 +4133,10 @@ fn reader_word_target(
                     while index > 0 && is_reader_word_char(chars[index - 1]) {
                         index -= 1;
                     }
-                    return Some(ReaderPosition { line, column: index });
+                    return Some(ReaderPosition {
+                        line,
+                        column: index,
+                    });
                 }
             }
             for previous_line in (0..line).rev() {
@@ -3610,7 +4264,10 @@ fn url_at_cursor(line: &str, column: usize) -> Option<String> {
     }
     let token = chars[start..end].iter().collect::<String>();
     let token = token.trim_matches(|ch: char| {
-        matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\'' | '"' | ',' | ';')
+        matches!(
+            ch,
+            '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\'' | '"' | ',' | ';'
+        )
     });
     let token = token.trim_end_matches(|ch: char| matches!(ch, '.' | ':' | '!' | '?'));
     (token.starts_with("https://") || token.starts_with("http://")).then(|| token.to_owned())
@@ -3641,7 +4298,11 @@ fn reply_attribution(message: &MessageSummary) -> String {
 fn toggle_message_marks(marked: &mut HashSet<MessageId>, ids: &[MessageId]) {
     let all_marked = ids.iter().all(|id| marked.contains(id));
     for id in ids {
-        if all_marked { marked.remove(id); } else { marked.insert(id.clone()); }
+        if all_marked {
+            marked.remove(id);
+        } else {
+            marked.insert(id.clone());
+        }
     }
 }
 
@@ -3668,7 +4329,8 @@ fn reader_scroll_for_visual_cursor(
     if cursor_row < upper_guard {
         cursor_row.saturating_sub(scrolloff).min(max_scroll)
     } else if cursor_row > lower_guard {
-        cursor_row.saturating_add(scrolloff + 1)
+        cursor_row
+            .saturating_add(scrolloff + 1)
             .saturating_sub(view_height)
             .min(max_scroll)
     } else {
@@ -3688,15 +4350,14 @@ fn offset_index(current: usize, len: usize, delta: isize) -> usize {
 mod tests {
     use super::{
         ComposeField, ComposeMode, Composer, ReaderPosition, ReaderSelection, ReaderWordMotion,
-        SMOOTH_SCROLL_ROWS,
-        bounded_index, inner_text_object_range, message_view_offset, offset_index,
-        reader_scroll_for_visual_cursor,
-        preview_neighbor_positions, preview_travel_positions, reader_image_target_size, reader_selection_text,
+        SMOOTH_SCROLL_ROWS, bounded_index, inner_text_object_range, message_view_offset,
+        offset_index, preview_neighbor_positions, preview_travel_positions,
+        reader_image_target_size, reader_scroll_for_visual_cursor, reader_selection_text,
         reader_word_target, reply_attribution, url_at_cursor,
     };
     use crate::model::{MessageFlags, MessageId, MessageSummary};
     use ratatui::layout::Size;
-use ratatui::widgets::BorderType;
+    use ratatui::widgets::BorderType;
     use std::path::PathBuf;
 
     #[test]
@@ -3704,12 +4365,20 @@ use ratatui::widgets::BorderType;
         let config: crate::config::Config =
             toml::from_str("[ui]\nborder_style = \"rounded\"").unwrap();
         let app = super::App::new(&config, vec![]);
-        assert!(app.themes.iter().all(|theme| theme.border_type == BorderType::Rounded));
+        assert!(
+            app.themes
+                .iter()
+                .all(|theme| theme.border_type == BorderType::Rounded)
+        );
     }
 
     #[test]
     fn space_marking_a_mail_range_is_idempotent_and_toggleable() {
-        let ids = [MessageId("1".into()), MessageId("2".into()), MessageId("3".into())];
+        let ids = [
+            MessageId("1".into()),
+            MessageId("2".into()),
+            MessageId("3".into()),
+        ];
         let mut marked = std::collections::HashSet::new();
         super::toggle_message_marks(&mut marked, &ids[0..1]);
         assert!(marked.contains(&ids[0]));
@@ -3770,11 +4439,15 @@ use ratatui::widgets::BorderType;
         // Repeated Ctrl-j extends the destination from the existing target.
         composer.queue_body_smooth_scroll(SMOOTH_SCROLL_ROWS);
         assert_eq!(composer.body_smooth_target, Some(44));
-        for _ in 0..43 { composer.advance_body_smooth_scroll(); }
+        for _ in 0..43 {
+            composer.advance_body_smooth_scroll();
+        }
         assert!(composer.body_smooth_target.is_none());
         assert_eq!(composer.cursor, 88);
         composer.queue_body_smooth_scroll(-SMOOTH_SCROLL_ROWS);
-        for _ in 0..22 { composer.advance_body_smooth_scroll(); }
+        for _ in 0..22 {
+            composer.advance_body_smooth_scroll();
+        }
         assert_eq!(composer.cursor, 44);
     }
 
@@ -3786,9 +4459,14 @@ use ratatui::widgets::BorderType;
         composer.body_view_width = 5;
         composer.cursor = 0;
         composer.queue_body_smooth_scroll(SMOOTH_SCROLL_ROWS);
-        for _ in 0..10 { composer.advance_body_smooth_scroll(); }
+        for _ in 0..10 {
+            composer.advance_body_smooth_scroll();
+        }
         assert!(composer.body_smooth_target.is_none());
-        assert_eq!(super::compose_body_cursor_row(&composer.body_rows(), composer.cursor), 5);
+        assert_eq!(
+            super::compose_body_cursor_row(&composer.body_rows(), composer.cursor),
+            5
+        );
     }
 
     #[test]
@@ -3797,8 +4475,12 @@ use ratatui::widgets::BorderType;
         let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
         let mut app = super::App::new(&config, vec![]);
         app.contacts_autocomplete = true;
-        app.contacts.upsert("Alex One", "alex1@example.org", true).unwrap();
-        app.contacts.upsert("Alex Two", "alex2@example.org", true).unwrap();
+        app.contacts
+            .upsert("Alex One", "alex1@example.org", true)
+            .unwrap();
+        app.contacts
+            .upsert("Alex Two", "alex2@example.org", true)
+            .unwrap();
         let mut composer = Composer::new();
         composer.to = "Alex".into();
         composer.cursor = 4;
@@ -3838,11 +4520,15 @@ use ratatui::widgets::BorderType;
             app.handle_contacts_modal_key(&mut modal, key(ch));
         }
         assert_eq!(modal.help_query, "favorite");
-        let matches = crate::app::ranked_help_matches(crate::app::CONTACT_HELP_ENTRIES, &modal.help_query);
+        let matches =
+            crate::app::ranked_help_matches(crate::app::CONTACT_HELP_ENTRIES, &modal.help_query);
         assert!(!matches.is_empty());
-        assert!(crate::app::CONTACT_HELP_ENTRIES[matches[0]].description.contains("favorite"));
-        app.handle_contacts_modal_key(&mut modal,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            crate::app::CONTACT_HELP_ENTRIES[matches[0]]
+                .description
+                .contains("favorite")
+        );
+        app.handle_contacts_modal_key(&mut modal, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!modal.help);
         assert!(app.contacts_modal.is_none());
     }
@@ -3855,11 +4541,18 @@ use ratatui::widgets::BorderType;
         app.contacts_writable = true;
         app.contacts.entries.clear();
         for index in 0..30 {
-            app.contacts.upsert(&format!("Name{index:02}"),
-                &format!("name{index:02}@example.org"), true).unwrap();
+            app.contacts
+                .upsert(
+                    &format!("Name{index:02}"),
+                    &format!("name{index:02}@example.org"),
+                    true,
+                )
+                .unwrap();
         }
         let mut modal = crate::contacts::ContactsModal {
-            matches: app.contacts.filtered(""), view_height: 10, ..Default::default()
+            matches: app.contacts.filtered(""),
+            view_height: 10,
+            ..Default::default()
         };
         let key = |ch, modifiers| KeyEvent::new(KeyCode::Char(ch), modifiers);
         app.handle_contacts_modal_key(&mut modal, key('V', KeyModifiers::SHIFT));
@@ -3870,7 +4563,10 @@ use ratatui::widgets::BorderType;
         assert!(modal.visual_range().is_none());
         assert_eq!(modal.marked.len(), 4);
         app.handle_contacts_modal_key(&mut modal, key('p', KeyModifiers::NONE));
-        assert_eq!(app.contacts.entries.iter().filter(|c| c.favorite).count(), 4);
+        assert_eq!(
+            app.contacts.entries.iter().filter(|c| c.favorite).count(),
+            4
+        );
         assert!(modal.marked.is_empty());
         app.handle_contacts_modal_key(&mut modal, key('v', KeyModifiers::NONE));
         app.handle_contacts_modal_key(&mut modal, key('2', KeyModifiers::NONE));
@@ -3904,8 +4600,10 @@ use ratatui::widgets::BorderType;
         let query = "calinv";
         assert!(super::mail_fuzzy_score("Calendar invitation", query).is_some());
         assert!(super::mail_fuzzy_score("Invoice", query).is_none());
-        assert!(super::mail_fuzzy_score("calendar", "cal")
-            > super::mail_fuzzy_score("c a l service", "cal"));
+        assert!(
+            super::mail_fuzzy_score("calendar", "cal")
+                > super::mail_fuzzy_score("c a l service", "cal")
+        );
         assert!(super::mail_fuzzy_score("Patch from Takashi", "pft").is_some());
     }
 
@@ -3917,18 +4615,20 @@ use ratatui::widgets::BorderType;
         let max_scroll = 160;
         let mut scroll = 0;
         for visual_cursor_row in 12..145 {
-            scroll = reader_scroll_for_visual_cursor(
-                scroll, visual_cursor_row, view_height, max_scroll,
+            scroll =
+                reader_scroll_for_visual_cursor(scroll, visual_cursor_row, view_height, max_scroll);
+            assert!(
+                visual_cursor_row >= scroll,
+                "cursor scrolled above viewport at row {visual_cursor_row}"
             );
-            assert!(visual_cursor_row >= scroll,
-                "cursor scrolled above viewport at row {visual_cursor_row}");
-            assert!(visual_cursor_row < scroll + view_height,
-                "cursor disappeared below viewport at row {visual_cursor_row}");
+            assert!(
+                visual_cursor_row < scroll + view_height,
+                "cursor disappeared below viewport at row {visual_cursor_row}"
+            );
         }
         for visual_cursor_row in (12..145).rev() {
-            scroll = reader_scroll_for_visual_cursor(
-                scroll, visual_cursor_row, view_height, max_scroll,
-            );
+            scroll =
+                reader_scroll_for_visual_cursor(scroll, visual_cursor_row, view_height, max_scroll);
             assert!(visual_cursor_row >= scroll && visual_cursor_row < scroll + view_height);
         }
     }
@@ -3943,9 +4643,9 @@ use ratatui::widgets::BorderType;
     #[test]
     fn alt_a_opens_account_setup_without_stealing_compose_ctrl_a() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let config: crate::config::Config = toml::from_str(
-            "[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\""
-        ).unwrap();
+        let config: crate::config::Config =
+            toml::from_str("[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\"")
+                .unwrap();
         let mut app = super::App::new(&config, vec![]);
         assert!(app.setup.is_none());
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
@@ -3957,9 +4657,9 @@ use ratatui::widgets::BorderType;
     #[test]
     fn received_attachment_help_is_searchable_and_keeps_viewer_open() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let config: crate::config::Config = toml::from_str(
-            "[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\""
-        ).unwrap();
+        let config: crate::config::Config =
+            toml::from_str("[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\"")
+                .unwrap();
         let mut app = super::App::new(&config, vec![]);
         app.attachment_picker_visible = true;
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
@@ -3967,8 +4667,11 @@ use ratatui::widgets::BorderType;
         assert!(app.attachment_picker_visible);
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.help_query, "s");
-        assert!(app.help_matches().iter().any(|&index|
-            super::ATTACHMENT_HELP_ENTRIES[index].description.contains("save")));
+        assert!(app.help_matches().iter().any(|&index| {
+            super::ATTACHMENT_HELP_ENTRIES[index]
+                .description
+                .contains("save")
+        }));
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.help_visible);
         assert!(app.attachment_picker_visible);
@@ -3978,13 +4681,16 @@ use ratatui::widgets::BorderType;
 
     #[test]
     fn mute_toggle_drops_queued_alerts_and_restores_desktop_notifications() {
-        let config: crate::config::Config = toml::from_str(
-            "[ui]\nnew_mail_notifications = true\nnew_mail_bell = true"
-        ).expect("valid config");
+        let config: crate::config::Config =
+            toml::from_str("[ui]\nnew_mail_notifications = true\nnew_mail_bell = true")
+                .expect("valid config");
         let mut app = super::App::new(&config, vec![]);
         app.new_mail_notices.push_back(super::NewMailNotice {
-            account: "University".into(), count: 1, sender: String::new(),
-            subject: "test".into(), excerpt: String::new(),
+            account: "University".into(),
+            count: 1,
+            sender: String::new(),
+            subject: "test".into(),
+            excerpt: String::new(),
         });
         app.new_mail_bell_pending = true;
         app.new_mail_since_launch = 3;
@@ -3999,8 +4705,14 @@ use ratatui::widgets::BorderType;
 
     #[test]
     fn nearby_previews_favor_direction_with_bounded_normal_and_fast_windows() {
-        assert_eq!(preview_neighbor_positions(5, 10, 1, false), vec![6, 7, 8, 9, 4, 3, 2, 1, 0]);
-        assert_eq!(preview_neighbor_positions(5, 10, -1, false), vec![4, 3, 2, 1, 0, 6, 7, 8, 9]);
+        assert_eq!(
+            preview_neighbor_positions(5, 10, 1, false),
+            vec![6, 7, 8, 9, 4, 3, 2, 1, 0]
+        );
+        assert_eq!(
+            preview_neighbor_positions(5, 10, -1, false),
+            vec![4, 3, 2, 1, 0, 6, 7, 8, 9]
+        );
         let normal = preview_neighbor_positions(50, 200, 1, false);
         assert_eq!(&normal[..12], &(51..=62).collect::<Vec<_>>());
         assert_eq!(&normal[12..], &(44..=49).rev().collect::<Vec<_>>());
@@ -4019,7 +4731,14 @@ use ratatui::widgets::BorderType;
     fn smooth_scroll_prefetches_immediate_rows_then_destination_without_duplicates() {
         let positions = preview_travel_positions(5, 27, 100);
         assert_eq!(&positions[..7], &[5, 6, 7, 8, 27, 26, 28]);
-        assert_eq!(positions.len(), positions.iter().copied().collect::<std::collections::HashSet<_>>().len());
+        assert_eq!(
+            positions.len(),
+            positions
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
         let backwards = preview_travel_positions(30, 8, 100);
         assert_eq!(&backwards[..7], &[30, 29, 28, 27, 8, 9, 7]);
         assert!(preview_travel_positions(100, 0, 100).is_empty());
@@ -4033,14 +4752,23 @@ use ratatui::widgets::BorderType;
         use crate::model::{HtmlLine, HtmlSpan, HtmlSpanStyle, MessageBody};
         let body = MessageBody {
             id: MessageId("test".into()),
-            plain_text: Some("plain".into()), plain_fallback: None,
-            html_source: Some("<p>html</p>".into()), html_text: Some("html".into()),
-            html_lines: Some(vec![HtmlLine { spans: vec![HtmlSpan {
-                text: "rich".into(),
-                style: HtmlSpanStyle { link: Some("https://example.org".into()), ..Default::default() },
-            }] }]),
-            html_renderer: None, html_render_width: 80,
-            attachment_count: 0, attachment_names: Vec::new(),
+            plain_text: Some("plain".into()),
+            plain_fallback: None,
+            html_source: Some("<p>html</p>".into()),
+            html_text: Some("html".into()),
+            html_lines: Some(vec![HtmlLine {
+                spans: vec![HtmlSpan {
+                    text: "rich".into(),
+                    style: HtmlSpanStyle {
+                        link: Some("https://example.org".into()),
+                        ..Default::default()
+                    },
+                }],
+            }]),
+            html_renderer: None,
+            html_render_width: 80,
+            attachment_count: 0,
+            attachment_names: Vec::new(),
         };
         assert_eq!(preview_body_bytes(&body), 5 + 11 + 4 + 4 + 19);
     }
@@ -4107,11 +4835,15 @@ use ratatui::widgets::BorderType;
         assert_eq!(review.position, 0);
         review.advance();
         assert_eq!(review.position, 1);
-        for _ in 1..22 { review.advance(); }
+        for _ in 1..22 {
+            review.advance();
+        }
         assert_eq!(review.position, 22);
         assert!(!review.active());
         review.queue(80, -super::SMOOTH_SCROLL_ROWS);
-        for _ in 0..22 { review.advance(); }
+        for _ in 0..22 {
+            review.advance();
+        }
         assert_eq!(review.position, 0);
         assert!(!review.active());
     }
@@ -4123,7 +4855,9 @@ use ratatui::widgets::BorderType;
         let mut app = super::App::new(&config, vec![]);
         let mut composer = super::Composer::new();
         composer.attachment_paths = ["first.png", "second.pdf", "third.txt"]
-            .into_iter().map(PathBuf::from).collect();
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         composer.attachment_manager_open = true;
         app.composer = Some(composer);
         app.detach_confirmation = Some(super::DetachConfirmation {
@@ -4131,13 +4865,21 @@ use ratatui::widgets::BorderType;
             review: super::ReviewScroll::default(),
         });
         app.handle_detach_confirmation_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('y'), crossterm::event::KeyModifiers::NONE));
+            crossterm::event::KeyCode::Char('y'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let composer = app.composer.as_mut().unwrap();
         assert_eq!(composer.attachment_paths, vec![PathBuf::from("second.pdf")]);
         composer.undo_managed_attachment();
         composer.undo_managed_attachment();
-        assert_eq!(composer.attachment_paths, vec![
-            PathBuf::from("first.png"), PathBuf::from("second.pdf"), PathBuf::from("third.txt")]);
+        assert_eq!(
+            composer.attachment_paths,
+            vec![
+                PathBuf::from("first.png"),
+                PathBuf::from("second.pdf"),
+                PathBuf::from("third.txt")
+            ]
+        );
     }
 
     #[test]
@@ -4161,9 +4903,15 @@ use ratatui::widgets::BorderType;
         let mut composer = Composer::new();
         composer.attachments = "/tmp/old-a.txt;/tmp/old-b.txt".to_owned();
         composer.attachment_manager_selected = 0;
-        assert_eq!(composer.remove_managed_attachment(), Some(PathBuf::from("/tmp/old-a.txt")));
+        assert_eq!(
+            composer.remove_managed_attachment(),
+            Some(PathBuf::from("/tmp/old-a.txt"))
+        );
         assert_eq!(composer.attachment_count(), 1);
-        assert_eq!(composer.undo_managed_attachment(), Some(PathBuf::from("/tmp/old-a.txt")));
+        assert_eq!(
+            composer.undo_managed_attachment(),
+            Some(PathBuf::from("/tmp/old-a.txt"))
+        );
         assert_eq!(composer.attachments, "/tmp/old-a.txt;/tmp/old-b.txt");
     }
 
@@ -4174,10 +4922,13 @@ use ratatui::widgets::BorderType;
         composer.to = "someone@example.org".to_owned();
         assert!(composer.has_unsent_content());
         composer.to.clear();
-        composer.attachment_paths.push("/tmp/some-attachment.pdf".into());
+        composer
+            .attachment_paths
+            .push("/tmp/some-attachment.pdf".into());
         assert!(composer.has_unsent_content());
         composer.exit_prompt = true;
-        let restored: Composer = serde_json::from_slice(&serde_json::to_vec(&composer).unwrap()).unwrap();
+        let restored: Composer =
+            serde_json::from_slice(&serde_json::to_vec(&composer).unwrap()).unwrap();
         assert!(!restored.exit_prompt);
     }
 
@@ -4185,8 +4936,11 @@ use ratatui::widgets::BorderType;
     fn smooth_picker_scroll_only_refreshes_preview_at_destination() {
         let temp = tempfile::tempdir().unwrap();
         for index in 0..30 {
-            std::fs::write(temp.path().join(format!("file-{index:02}.txt")),
-                format!("file content {index}")).unwrap();
+            std::fs::write(
+                temp.path().join(format!("file-{index:02}.txt")),
+                format!("file content {index}"),
+            )
+            .unwrap();
         }
         let mut picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
         let first = match &picker.preview {
@@ -4213,18 +4967,31 @@ use ratatui::widgets::BorderType;
     fn picker_has_parent_and_file_preview_and_count_navigation() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("alpha")).unwrap();
-        std::fs::write(temp.path().join("hello.txt"), b"hello from aerc").unwrap();
+        std::fs::write(temp.path().join("hello.txt"), b"hello from jerc").unwrap();
         let mut picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
-        let index = picker.entries.iter().position(|entry| entry.name == "hello.txt").unwrap();
+        let index = picker
+            .entries
+            .iter()
+            .position(|entry| entry.name == "hello.txt")
+            .unwrap();
         picker.move_selection(index as isize);
-        assert!(matches!(picker.preview, super::ComposeFilePreview::Text { .. }));
+        assert!(matches!(
+            picker.preview,
+            super::ComposeFilePreview::Text { .. }
+        ));
         assert!(!picker.parent_entries.is_empty());
         let mut composer = Composer::new();
         composer.file_picker = Some(picker);
-        composer.file_picker_key(crossterm::event::KeyCode::Char('g')).unwrap();
-        composer.file_picker_key(crossterm::event::KeyCode::Char('g')).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Char('g'))
+            .unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Char('g'))
+            .unwrap();
         assert_eq!(composer.file_picker.as_ref().unwrap().selected, 0);
-        composer.file_picker_key(crossterm::event::KeyCode::Char('G')).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Char('G'))
+            .unwrap();
         assert_eq!(composer.file_picker.as_ref().unwrap().selected, index);
     }
 
@@ -4260,52 +5027,80 @@ use ratatui::widgets::BorderType;
         std::fs::create_dir(temp.path().join("folder")).unwrap();
         let mut picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
         assert!(picker.entries[0].is_directory);
-        let file_index = picker.entries.iter().position(|entry| entry.name == "report;v2.txt").unwrap();
+        let file_index = picker
+            .entries
+            .iter()
+            .position(|entry| entry.name == "report;v2.txt")
+            .unwrap();
         picker.selected = file_index;
         let mut composer = Composer::new();
         composer.file_picker = Some(picker);
-        composer.file_picker_key(crossterm::event::KeyCode::Char(' ')).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Char(' '))
+            .unwrap();
         assert_eq!(composer.attachment_count(), 1);
         let loaded = super::load_compose_attachments("", &composer.attachment_paths).unwrap();
         assert_eq!(loaded[0].filename, "report;v2.txt");
         assert_eq!(loaded[0].data.as_slice(), b"attachment test");
         // Space on the final file does not jump back to the previous item.
         composer.file_picker.as_mut().unwrap().selected = file_index;
-        composer.file_picker_key(crossterm::event::KeyCode::Char(' ')).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Char(' '))
+            .unwrap();
         assert_eq!(composer.attachment_count(), 0);
     }
 
     #[test]
     fn picker_visual_range_attaches_files_after_count_motion() {
         let temp = tempfile::tempdir().unwrap();
-        for index in 0..7 { std::fs::write(temp.path().join(format!("{index}.txt")), b"hi").unwrap(); }
+        for index in 0..7 {
+            std::fs::write(temp.path().join(format!("{index}.txt")), b"hi").unwrap();
+        }
         let mut composer = Composer::new();
-        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        composer.file_picker =
+            Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
         let key = |ch| crossterm::event::KeyCode::Char(ch);
         composer.file_picker_key(key('v')).unwrap();
         composer.file_picker_key(key('5')).unwrap();
         composer.file_picker_key(key('j')).unwrap();
         assert_eq!(composer.file_picker.as_ref().unwrap().selected, 5);
-        assert_eq!(composer.file_picker.as_ref().unwrap().visual_anchor, Some(0));
-        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        assert_eq!(
+            composer.file_picker.as_ref().unwrap().visual_anchor,
+            Some(0)
+        );
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Enter)
+            .unwrap();
         assert_eq!(composer.attachment_count(), 6);
-        assert!(composer.file_picker.as_ref().unwrap().visual_anchor.is_none());
+        assert!(
+            composer
+                .file_picker
+                .as_ref()
+                .unwrap()
+                .visual_anchor
+                .is_none()
+        );
         // Re-selecting the same range does not add duplicates.
         composer.file_picker_key(key('g')).unwrap();
         composer.file_picker_key(key('g')).unwrap();
         composer.file_picker_key(key('v')).unwrap();
         composer.file_picker_key(key('5')).unwrap();
         composer.file_picker_key(key('j')).unwrap();
-        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Enter)
+            .unwrap();
         assert_eq!(composer.attachment_count(), 6);
     }
 
     #[test]
     fn picker_space_advances_and_stays_at_end_and_search_help_is_local() {
         let temp = tempfile::tempdir().unwrap();
-        for name in ["a.txt", "b.txt", "c.txt"] { std::fs::write(temp.path().join(name), b"ok").unwrap(); }
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(temp.path().join(name), b"ok").unwrap();
+        }
         let mut composer = Composer::new();
-        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        composer.file_picker =
+            Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
         let key = |ch| crossterm::event::KeyCode::Char(ch);
         composer.file_picker_key(key(' ')).unwrap();
         assert_eq!(composer.file_picker.as_ref().unwrap().selected, 1);
@@ -4321,11 +5116,22 @@ use ratatui::widgets::BorderType;
         composer.file_picker_key(key('v')).unwrap();
         assert!(composer.file_picker.as_ref().unwrap().help_visible);
         assert_eq!(composer.file_picker.as_ref().unwrap().help_query, "v");
-        composer.file_picker_key(crossterm::event::KeyCode::Esc).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Esc)
+            .unwrap();
         assert!(!composer.file_picker.as_ref().unwrap().help_visible);
         composer.file_picker_key(key('v')).unwrap();
-        composer.file_picker_key(crossterm::event::KeyCode::Esc).unwrap();
-        assert!(composer.file_picker.as_ref().unwrap().visual_anchor.is_none());
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Esc)
+            .unwrap();
+        assert!(
+            composer
+                .file_picker
+                .as_ref()
+                .unwrap()
+                .visual_anchor
+                .is_none()
+        );
     }
 
     #[test]
@@ -4336,17 +5142,24 @@ use ratatui::widgets::BorderType;
         }
         std::fs::write(temp.path().join("photos.txt"), b"hello").unwrap();
         let mut composer = Composer::new();
-        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        composer.file_picker =
+            Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
         let key = |ch| crossterm::event::KeyCode::Char(ch);
         composer.file_picker_key(key('/')).unwrap();
-        for ch in "photos".chars() { composer.file_picker_key(key(ch)).unwrap(); }
+        for ch in "photos".chars() {
+            composer.file_picker_key(key(ch)).unwrap();
+        }
         let picker = composer.file_picker.as_ref().unwrap();
         assert_eq!(picker.search_matches().len(), 2); // folder results take precedence
         assert_eq!(picker.entries[picker.selected].name, "photos-2025");
-        composer.file_picker_key(crossterm::event::KeyCode::Down).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Down)
+            .unwrap();
         let picker = composer.file_picker.as_ref().unwrap();
         assert_eq!(picker.entries[picker.selected].name, "photos-2026");
-        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Enter)
+            .unwrap();
         let picker = composer.file_picker.as_ref().unwrap();
         assert_eq!(picker.entries[picker.selected].name, "photos-2026");
         assert!(picker.search_query.is_none());
@@ -4355,8 +5168,17 @@ use ratatui::widgets::BorderType;
         let picker = composer.file_picker.as_ref().unwrap();
         assert!(picker.directory.ends_with("photos-2026"));
         composer.file_picker_key(key('/')).unwrap();
-        composer.file_picker_key(crossterm::event::KeyCode::Esc).unwrap();
-        assert!(composer.file_picker.as_ref().unwrap().search_query.is_none());
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Esc)
+            .unwrap();
+        assert!(
+            composer
+                .file_picker
+                .as_ref()
+                .unwrap()
+                .search_query
+                .is_none()
+        );
         assert!(composer.file_picker.is_some());
     }
 
@@ -4367,12 +5189,15 @@ use ratatui::widgets::BorderType;
             std::fs::write(temp.path().join(name), b"ok").unwrap();
         }
         let mut composer = Composer::new();
-        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        composer.file_picker =
+            Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
         let key = |ch| crossterm::event::KeyCode::Char(ch);
         composer.file_picker_key(key('v')).unwrap();
         composer.file_picker_key(key('2')).unwrap();
         composer.file_picker_key(key('j')).unwrap();
-        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Enter)
+            .unwrap();
         assert_eq!(composer.attachment_count(), 3);
         composer.file_picker_key(key('g')).unwrap();
         composer.file_picker_key(key('g')).unwrap();
@@ -4381,7 +5206,14 @@ use ratatui::widgets::BorderType;
         composer.file_picker_key(key('x')).unwrap();
         assert_eq!(composer.attachment_count(), 1);
         assert_eq!(composer.attachment_paths[0].file_name().unwrap(), "c.txt");
-        assert!(composer.file_picker.as_ref().unwrap().visual_anchor.is_none());
+        assert!(
+            composer
+                .file_picker
+                .as_ref()
+                .unwrap()
+                .visual_anchor
+                .is_none()
+        );
     }
 
     #[test]
@@ -4392,14 +5224,17 @@ use ratatui::widgets::BorderType;
             std::fs::write(temp.path().join(name), b"hello").unwrap();
         }
         let mut composer = Composer::new();
-        composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+        composer.file_picker =
+            Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
         let key = |ch| crossterm::event::KeyCode::Char(ch);
         assert!(composer.file_picker.as_ref().unwrap().entries[0].is_directory);
         // Attach a and b while selecting a directory too (which must be ignored).
         composer.file_picker_key(key('v')).unwrap();
         composer.file_picker_key(key('2')).unwrap();
         composer.file_picker_key(key('j')).unwrap();
-        composer.file_picker_key(crossterm::event::KeyCode::Enter).unwrap();
+        composer
+            .file_picker_key(crossterm::event::KeyCode::Enter)
+            .unwrap();
         assert_eq!(composer.attachment_count(), 2);
         composer.file_picker_key(key('g')).unwrap();
         composer.file_picker_key(key('g')).unwrap();
@@ -4408,7 +5243,14 @@ use ratatui::widgets::BorderType;
         composer.file_picker_key(key('j')).unwrap();
         composer.file_picker_key(key(' ')).unwrap();
         assert_eq!(composer.attachment_count(), 0); // folder is ignored
-        assert!(composer.file_picker.as_ref().unwrap().visual_anchor.is_none());
+        assert!(
+            composer
+                .file_picker
+                .as_ref()
+                .unwrap()
+                .visual_anchor
+                .is_none()
+        );
 
         // A mixed range should attach the missing file without detaching an
         // already attached file.
@@ -4436,21 +5278,36 @@ use ratatui::widgets::BorderType;
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         std::fs::write(&text, b"text file").unwrap();
         let mut picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
-        assert!(matches!(picker.preview, super::ComposeFilePreview::Loading(_)));
+        assert!(matches!(
+            picker.preview,
+            super::ComposeFilePreview::Loading(_)
+        ));
         assert!(picker.pdf_preview_due.is_some());
         // Navigate away before the debounce expires: no converter was started.
         picker.move_selection(1);
         assert!(picker.pdf_preview_due.is_none());
         assert!(picker.pdf_preview_inflight.is_empty());
-        assert!(matches!(picker.preview, super::ComposeFilePreview::Text { .. }));
+        assert!(matches!(
+            picker.preview,
+            super::ComposeFilePreview::Text { .. }
+        ));
         // Pretend an earlier conversion completed while the selection changed.
         picker.pdf_preview_inflight.insert(pdf.clone());
-        picker.pdf_preview_results.lock().unwrap().push_back((pdf.clone(), Ok(vec![7, 8, 9])));
+        picker
+            .pdf_preview_results
+            .lock()
+            .unwrap()
+            .push_back((pdf.clone(), Ok(vec![7, 8, 9])));
         picker.advance_pdf_preview();
-        assert!(matches!(picker.preview, super::ComposeFilePreview::Text { .. }));
+        assert!(matches!(
+            picker.preview,
+            super::ComposeFilePreview::Text { .. }
+        ));
         assert!(picker.pdf_preview_inflight.is_empty());
         picker.move_selection(-1);
-        assert!(matches!(picker.preview, super::ComposeFilePreview::Image(ref bytes) if bytes == &[7, 8, 9]));
+        assert!(
+            matches!(picker.preview, super::ComposeFilePreview::Image(ref bytes) if bytes == &[7, 8, 9])
+        );
         assert!(picker.pdf_preview_due.is_none());
     }
 
@@ -4461,12 +5318,26 @@ use ratatui::widgets::BorderType;
         let second = std::path::PathBuf::from("/home/example/elsewhere/second.txt");
         composer.attachment_paths = vec![first, second.clone()];
         composer.attachment_manager_selected = 0;
-        assert_eq!(composer.remove_managed_attachment().unwrap().file_name().unwrap(), "first.txt");
+        assert_eq!(
+            composer
+                .remove_managed_attachment()
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "first.txt"
+        );
         assert_eq!(composer.attachment_paths, vec![second]);
         assert_eq!(composer.attachment_manager_selected, 0);
         composer.attachments = "/tmp/legacy/old.txt".to_owned();
         composer.attachment_manager_selected = 1;
-        assert_eq!(composer.remove_managed_attachment().unwrap().file_name().unwrap(), "old.txt");
+        assert_eq!(
+            composer
+                .remove_managed_attachment()
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "old.txt"
+        );
         assert_eq!(composer.attachment_count(), 1);
     }
 
@@ -4474,11 +5345,15 @@ use ratatui::widgets::BorderType;
     fn picker_recognizes_image_files_for_terminal_preview() {
         let temp = tempfile::tempdir().unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(1, 1).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
         std::fs::write(temp.path().join("photo.png"), png.into_inner()).unwrap();
         let picker = super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap();
         match &picker.preview {
-            super::ComposeFilePreview::Image(bytes) => assert!(image::load_from_memory(bytes).is_ok()),
+            super::ComposeFilePreview::Image(bytes) => {
+                assert!(image::load_from_memory(bytes).is_ok())
+            }
             preview => panic!("expected a decodable image, got {preview:?}"),
         }
         assert!(super::compose_image_extension(&temp.path().join("a.WEBP")));
@@ -4487,12 +5362,19 @@ use ratatui::widgets::BorderType;
     #[test]
     fn picker_detects_known_source_file_mime_types() {
         let temp = tempfile::tempdir().unwrap();
-        for (name, expected) in [("Cargo.toml", "application/toml"),
-            ("Cargo.lock", "text/plain"), ("lib.rs", "text/plain"),
-            ("sample.json", "application/json"), ("LICENSE", "text/plain")] {
+        for (name, expected) in [
+            ("Cargo.toml", "application/toml"),
+            ("Cargo.lock", "text/plain"),
+            ("lib.rs", "text/plain"),
+            ("sample.json", "application/json"),
+            ("LICENSE", "text/plain"),
+        ] {
             let path = temp.path().join(name);
             std::fs::write(&path, "content").unwrap();
-            assert_eq!(super::load_compose_file(&path).unwrap().content_type, expected);
+            assert_eq!(
+                super::load_compose_file(&path).unwrap().content_type,
+                expected
+            );
         }
     }
 
@@ -4505,15 +5387,20 @@ use ratatui::widgets::BorderType;
         let message = crate::model::OutgoingMessage {
             from: "sender@example.com".to_owned(),
             to: "receiver@example.com".to_owned(),
-            cc: String::new(), bcc: String::new(),
+            cc: String::new(),
+            bcc: String::new(),
             subject: "attachment smoke test".to_owned(),
             body: "See the attachment".to_owned(),
-            html_body: None, attachments: files,
-            custom_headers: Vec::new(), in_reply_to: None,
-            references: Vec::new(), forwarded_raw: None,
+            html_body: None,
+            attachments: files,
+            custom_headers: Vec::new(),
+            in_reply_to: None,
+            references: Vec::new(),
+            forwarded_raw: None,
         };
         let raw = crate::outgoing::build_outgoing(&message, "sender@example.com")
-            .unwrap().formatted();
+            .unwrap()
+            .formatted();
         let wire = String::from_utf8_lossy(&raw);
         assert!(wire.contains("multipart/mixed"));
         assert!(wire.contains("hello.txt"));
@@ -4523,7 +5410,9 @@ use ratatui::widgets::BorderType;
     #[test]
     fn compose_selected_file_paths_survive_postponed_draft_encoding() {
         let mut composer = Composer::new();
-        composer.attachment_paths.push(std::path::PathBuf::from("/tmp/a file.pdf"));
+        composer
+            .attachment_paths
+            .push(std::path::PathBuf::from("/tmp/a file.pdf"));
         let bytes = serde_json::to_vec(&composer).unwrap();
         let restored: Composer = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored.attachment_paths, composer.attachment_paths);
@@ -4620,15 +5509,26 @@ use ratatui::widgets::BorderType;
         let matches = composer.compose_help_matches();
         assert!(!matches.is_empty());
         assert!(matches.iter().all(|&index| {
-            super::super::input::COMPOSE_HELP_ENTRIES[index].description.contains("attachment")
+            super::super::input::COMPOSE_HELP_ENTRIES[index]
+                .description
+                .contains("attachment")
         }));
     }
 
     #[test]
     fn reader_inner_text_objects_support_quotes_and_brackets() {
-        assert_eq!(inner_text_object_range(r#"say "hello" now"#, 6, '"'), Some((5, 9)));
-        assert_eq!(inner_text_object_range("call(foo[bar])", 9, ']'), Some((9, 11)));
-        assert_eq!(inner_text_object_range("call(foo[bar])", 9, ')'), Some((5, 12)));
+        assert_eq!(
+            inner_text_object_range(r#"say "hello" now"#, 6, '"'),
+            Some((5, 9))
+        );
+        assert_eq!(
+            inner_text_object_range("call(foo[bar])", 9, ']'),
+            Some((9, 11))
+        );
+        assert_eq!(
+            inner_text_object_range("call(foo[bar])", 9, ')'),
+            Some((5, 12))
+        );
         assert_eq!(inner_text_object_range("'{value}'", 4, '\''), Some((1, 7)));
     }
 
@@ -4638,7 +5538,10 @@ use ratatui::widgets::BorderType;
             start: ReaderPosition { line: 0, column: 2 },
             end: ReaderPosition { line: 1, column: 2 },
         };
-        assert_eq!(reader_selection_text("abcdef\nghijkl", selection), "cdef\nghi");
+        assert_eq!(
+            reader_selection_text("abcdef\nghijkl", selection),
+            "cdef\nghi"
+        );
     }
 
     #[test]
@@ -4718,7 +5621,7 @@ use ratatui::widgets::BorderType;
     }
 
     #[test]
-    fn quoted_reply_attribution_matches_aerc_shape() {
+    fn quoted_reply_attribution_matches_expected_shape() {
         let message = MessageSummary {
             id: MessageId("reply".into()),
             message_id: Some("message@example.com".into()),
@@ -4747,10 +5650,18 @@ use ratatui::widgets::BorderType;
     fn forwarded_message_contains_gmail_attribution_and_original_recipient() {
         let raw = b"From: Yuzu Keycaps <contact@example.org>\r\nTo: Person <person@example.net>\r\nCc: Friend <friend@example.net>\r\nDate: Fri, 23 Oct 2026 14:02:00 -0700\r\nSubject: Ends Saturday\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nA great deal";
         let message = crate::mail::parse_summary(
-            MessageId("forward".into()), raw, raw.len() as u64, MessageFlags::empty(),
-        ).unwrap();
+            MessageId("forward".into()),
+            raw,
+            raw.len() as u64,
+            MessageFlags::empty(),
+        )
+        .unwrap();
         let composer = Composer::forward(&message, raw.to_vec()).unwrap();
-        assert!(composer.body.contains("---------- Forwarded message ---------"));
+        assert!(
+            composer
+                .body
+                .contains("---------- Forwarded message ---------")
+        );
         assert!(composer.body.contains("To: Person <person@example.net>"));
         assert!(composer.body.contains("Cc: Friend <friend@example.net>"));
         assert!(composer.body.contains("A great deal"));
@@ -4782,12 +5693,19 @@ mod received_attachment_browser_tests {
     use super::*;
 
     fn attachment(name: &str, bytes: &[u8]) -> OutgoingAttachment {
-        OutgoingAttachment { filename: name.into(), content_type: "text/plain".into(), data: bytes.to_vec() }
+        OutgoingAttachment {
+            filename: name.into(),
+            content_type: "text/plain".into(),
+            data: bytes.to_vec(),
+        }
     }
 
     #[test]
     fn received_attachment_filenames_cannot_escape_destination() {
-        assert_eq!(attachment_safe_name("../../important.txt", 0), "important.txt");
+        assert_eq!(
+            attachment_safe_name("../../important.txt", 0),
+            "important.txt"
+        );
         assert_eq!(attachment_safe_name("..\\..\\secret.pdf", 2), "secret.pdf");
         assert_eq!(attachment_safe_name("..", 1), "attachment-2.bin");
         assert_eq!(attachment_safe_name("\n", 0), "attachment-1.bin");
@@ -4828,10 +5746,23 @@ mod received_attachment_browser_tests {
     fn saving_multiple_same_named_attachments_never_overwrites() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("report.txt"), "existing").unwrap();
-        let first = save_attachment_without_overwrite(directory.path(), &attachment("report.txt", b"first"), 0).unwrap();
-        let second = save_attachment_without_overwrite(directory.path(), &attachment("../../report.txt", b"second"), 1).unwrap();
+        let first = save_attachment_without_overwrite(
+            directory.path(),
+            &attachment("report.txt", b"first"),
+            0,
+        )
+        .unwrap();
+        let second = save_attachment_without_overwrite(
+            directory.path(),
+            &attachment("../../report.txt", b"second"),
+            1,
+        )
+        .unwrap();
         assert_ne!(first, second);
-        assert_eq!(std::fs::read_to_string(directory.path().join("report.txt")).unwrap(), "existing");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("report.txt")).unwrap(),
+            "existing"
+        );
         assert_eq!(std::fs::read(first).unwrap(), b"first");
         assert_eq!(std::fs::read(second).unwrap(), b"second");
     }

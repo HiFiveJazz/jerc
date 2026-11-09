@@ -10,7 +10,11 @@ pub(super) fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(if app.mailbox_resizing { theme.accent() } else { theme.border() });
+        .border_style(if app.mailbox_resizing {
+            theme.accent()
+        } else {
+            theme.border()
+        });
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -57,7 +61,9 @@ pub(super) fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 /// Visual ranges are purple, while persistent Space marks retain the theme's
 /// blue accent. In gutter mode the active row stays the usual dark gray.
 pub(super) fn visual_row_style(theme: &Theme) -> Style {
-    Style::default().fg(theme.selected_fg).bg(theme.visual)
+    Style::default()
+        .fg(theme.selected_fg)
+        .bg(theme.visual)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -66,8 +72,14 @@ pub(super) fn editor_current_line_style(theme: &Theme) -> Style {
     theme.text().bg(theme.popup_bg)
 }
 
-pub(super) fn browser_row_style(theme: &Theme, mode: VisualSelectionStyle,
-    visual: bool, marked: bool, active: bool, unread: bool) -> Style {
+pub(super) fn browser_row_style(
+    theme: &Theme,
+    mode: VisualSelectionStyle,
+    visual: bool,
+    marked: bool,
+    active: bool,
+    unread: bool,
+) -> Style {
     if active && unread {
         theme.unread().bg(theme.popup_bg)
     } else if active {
@@ -83,13 +95,22 @@ pub(super) fn browser_row_style(theme: &Theme, mode: VisualSelectionStyle,
     }
 }
 
-pub(super) fn selection_check_style(theme: &Theme, mode: VisualSelectionStyle,
-    visual: bool, marked: bool, active: bool) -> Style {
+pub(super) fn selection_check_style(
+    theme: &Theme,
+    mode: VisualSelectionStyle,
+    visual: bool,
+    marked: bool,
+    active: bool,
+) -> Style {
     if mode == VisualSelectionStyle::Row && (visual || marked) && !active {
         // On a filled row, retain contrast rather than purple-on-purple.
-        Style::default().fg(theme.selected_fg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.selected_fg)
+            .add_modifier(Modifier::BOLD)
     } else if visual {
-        Style::default().fg(theme.visual).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.visual)
+            .add_modifier(Modifier::BOLD)
     } else if marked {
         theme.accent()
     } else {
@@ -99,23 +120,40 @@ pub(super) fn selection_check_style(theme: &Theme, mode: VisualSelectionStyle,
 
 /// Shared thin selection marker for attachments and the mail number column.
 pub(super) fn browser_gutter(theme: &Theme, visual: bool, marked: bool) -> Span<'static> {
-    Span::styled(if visual || marked { "▍" } else { "▏" },
-        if visual { Style::default().fg(theme.visual) }
-        else if marked { theme.accent() } else { theme.border() })
+    Span::styled(
+        if visual || marked { "▍" } else { "▏" },
+        if visual {
+            Style::default().fg(theme.visual)
+        } else if marked {
+            theme.accent()
+        } else {
+            theme.border()
+        },
+    )
 }
 
 /// Contacts share the mail marker's size and colors but never draw a
 /// continuous line through unmarked rows.
 pub(super) fn contact_gutter(theme: &Theme, visual: bool, marked: bool) -> Span<'static> {
-    if visual || marked { browser_gutter(theme, visual, marked) }
-    else { Span::raw(" ") }
+    if visual || marked {
+        browser_gutter(theme, visual, marked)
+    } else {
+        Span::raw(" ")
+    }
 }
 
 /// With the mailbox sidebar visible, the marker is on the *right* of its
 /// divider, in the message number column; unselected rows add no extra rule.
-pub(super) fn mail_gutter(theme: &Theme, visual: bool, marked: bool, sidebar: bool) -> Span<'static> {
+pub(super) fn mail_gutter(
+    theme: &Theme,
+    visual: bool,
+    marked: bool,
+    sidebar: bool,
+) -> Span<'static> {
     let mut marker = browser_gutter(theme, visual, marked);
-    if sidebar && !visual && !marked { marker.content = " ".into(); }
+    if sidebar && !visual && !marked {
+        marker.content = " ".into();
+    }
     marker
 }
 
@@ -156,7 +194,10 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else if !search_query.is_empty() {
             format!(" No loaded messages match /{search_query}")
         } else {
-            format!(" No messages in {}.", account.current_mailbox.as_deref().unwrap_or("mailbox"))
+            format!(
+                " No messages in {}.",
+                account.current_mailbox.as_deref().unwrap_or("mailbox")
+            )
         };
         frame.render_widget(Paragraph::new(message).style(theme.muted()), list_area);
         return;
@@ -173,7 +214,11 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         height,
         |index| {
             let message = &account.messages[index];
-            if message.has_attachment(account.bodies.get(&message.id)) { 2 } else { 1 }
+            if message.has_attachment(account.bodies.get(&message.id)) {
+                2
+            } else {
+                1
+            }
         },
     );
     // Resolve the visual range once; calling message_is_visual_selected() for
@@ -197,52 +242,96 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .spacing(1)
         .split(list_area);
     // Use the actual subject width to preserve wide emoji graphemes.
-    let subject_width = column_areas.get(3).map_or(0, |area| usize::from(area.width));
+    let subject_width = column_areas
+        .get(3)
+        .map_or(0, |area| usize::from(area.width));
     let rows = shown.iter().enumerate().map(|(row_position, &index)| {
         let message = &account.messages[index];
         let absolute_position = start + row_position;
         let number = relative_number(absolute_position, current_position);
-        let visual_selected = visual_range.is_some_and(|(first, last)| {
-            (first..=last).contains(&absolute_position)
-        });
+        let visual_selected =
+            visual_range.is_some_and(|(first, last)| (first..=last).contains(&absolute_position));
         let marked = app.message_marked.contains(&message.id);
         let is_selected = visual_selected || marked;
         let current = absolute_position == current_position;
-        let unread_mark = if is_selected { "✓" } else if message.flags.contains(MessageFlags::SEEN) { " " } else { "●" };
+        let unread_mark = if is_selected {
+            "✓"
+        } else if message.flags.contains(MessageFlags::SEEN) {
+            " "
+        } else {
+            "●"
+        };
         let attachment_mark = message.has_attachment(account.bodies.get(&message.id));
         let mark = Line::from(vec![
-            Span::styled(unread_mark, selection_check_style(&theme,
-                app.visual_selection_style, visual_selected, marked, current)),
+            Span::styled(
+                unread_mark,
+                selection_check_style(
+                    &theme,
+                    app.visual_selection_style,
+                    visual_selected,
+                    marked,
+                    current,
+                ),
+            ),
             if in_junk {
-                Span::styled("!", Style::default().fg(theme.error).add_modifier(Modifier::BOLD))
-            } else { Span::raw(" ") },
+                Span::styled(
+                    "!",
+                    Style::default()
+                        .fg(theme.error)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(" ")
+            },
             if attachment_mark {
-                Span::styled("⧉", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))
-            } else { Span::raw(" ") },
+                Span::styled(
+                    "⧉",
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(" ")
+            },
         ]);
         let sender = if message.from_name.is_empty() {
             message.from_address.as_str()
         } else {
             message.from_name.as_str()
         };
-        let style = browser_row_style(&theme, app.visual_selection_style,
-            visual_selected, marked, current, message.unread());
+        let style = browser_row_style(
+            &theme,
+            app.visual_selection_style,
+            visual_selected,
+            marked,
+            current,
+            message.unread(),
+        );
         // Borrow unchanged subjects and strings from the message. Own text
         // only when normalization or display-width truncation actually changes it.
         let subject_line = match subject_for_list_cow(&message.subject) {
-            std::borrow::Cow::Borrowed(subject) =>
-                Line::raw(truncate_display_width_cow(subject, subject_width)),
-            std::borrow::Cow::Owned(normalized) =>
-                Line::raw(truncate_display_width_cow(&normalized, subject_width).into_owned()),
+            std::borrow::Cow::Borrowed(subject) => {
+                Line::raw(truncate_display_width_cow(subject, subject_width))
+            }
+            std::borrow::Cow::Owned(normalized) => {
+                Line::raw(truncate_display_width_cow(&normalized, subject_width).into_owned())
+            }
         };
         let subject_cell = if attachment_mark {
             let subtitle = account.bodies.get(&message.id).map_or_else(
-                || attachment_subtitle(&crate::mail::visible_attachment_hints(&message.attachment_names_hint)),
+                || {
+                    attachment_subtitle(&crate::mail::visible_attachment_hints(
+                        &message.attachment_names_hint,
+                    ))
+                },
                 |body| attachment_subtitle(&body.attachment_names),
             );
             Cell::from(Text::from(vec![
                 subject_line,
-                Line::styled(truncate_display_width(&subtitle, subject_width), theme.muted()),
+                Line::styled(
+                    truncate_display_width(&subtitle, subject_width),
+                    theme.muted(),
+                ),
             ]))
         } else {
             Cell::from(subject_line)
@@ -251,13 +340,22 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         // occupies the first cell to its right, followed by aligned numbers.
         let number_line = Line::from(vec![
             mail_gutter(&theme, visual_selected, marked, app.sidebar_visible),
-            Span::raw(format!("{number:>width$}", width = usize::from(number_width))),
+            Span::raw(format!(
+                "{number:>width$}",
+                width = usize::from(number_width)
+            )),
         ]);
         let number_cell = if attachment_mark {
             let subtitle_gutter = Line::from(mail_gutter(
-                &theme, visual_selected, marked, app.sidebar_visible));
+                &theme,
+                visual_selected,
+                marked,
+                app.sidebar_visible,
+            ));
             Cell::from(Text::from(vec![number_line, subtitle_gutter]))
-        } else { Cell::from(number_line) };
+        } else {
+            Cell::from(number_line)
+        };
         Row::new(vec![
             number_cell,
             Cell::from(mark),
@@ -279,19 +377,39 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         for (row_position, &index) in shown.iter().enumerate() {
             let message = &account.messages[index];
             let position = start + row_position;
-            let visual = visual_range.is_some_and(|(first, last)|
-                (first..=last).contains(&position));
+            let visual =
+                visual_range.is_some_and(|(first, last)| (first..=last).contains(&position));
             let marked = app.message_marked.contains(&message.id);
-            let row_height = if message.has_attachment(account.bodies.get(&message.id)) { 2 } else { 1 };
+            let row_height = if message.has_attachment(account.bodies.get(&message.id)) {
+                2
+            } else {
+                1
+            };
             if (visual || marked) && y < list_area.bottom() {
                 let current = position == current_position;
                 let style = if current {
-                    browser_row_style(&theme, app.visual_selection_style,
-                        visual, marked, true, message.unread())
-                } else if visual { visual_row_style(&theme) } else { theme.selected() };
-                frame.render_widget(Block::default().style(style),
-                    Rect::new(list_area.x, y, list_area.width,
-                        row_height.min(list_area.bottom().saturating_sub(y))));
+                    browser_row_style(
+                        &theme,
+                        app.visual_selection_style,
+                        visual,
+                        marked,
+                        true,
+                        message.unread(),
+                    )
+                } else if visual {
+                    visual_row_style(&theme)
+                } else {
+                    theme.selected()
+                };
+                frame.render_widget(
+                    Block::default().style(style),
+                    Rect::new(
+                        list_area.x,
+                        y,
+                        list_area.width,
+                        row_height.min(list_area.bottom().saturating_sub(y)),
+                    ),
+                );
             }
             y = y.saturating_add(row_height);
         }
@@ -311,14 +429,18 @@ pub(super) fn message_list_viewport(
     height: usize,
     mut row_height: impl FnMut(usize) -> usize,
 ) -> (usize, usize) {
-    if visible.is_empty() { return (0, 0); }
+    if visible.is_empty() {
+        return (0, 0);
+    }
     let current = current_position.min(visible.len() - 1);
     let min_start = offset.min(visible.len() - 1).min(current);
     let mut start = current;
     let mut used = row_height(visible[current]);
     while start > min_start {
         let previous = row_height(visible[start - 1]);
-        if used.saturating_add(previous) > height { break; }
+        if used.saturating_add(previous) > height {
+            break;
+        }
         used += previous;
         start -= 1;
     }
@@ -326,11 +448,15 @@ pub(super) fn message_list_viewport(
     used = 0;
     while end < visible.len() {
         let next = row_height(visible[end]);
-        if used.saturating_add(next) > height { break; }
+        if used.saturating_add(next) > height {
+            break;
+        }
         used += next;
         end += 1;
     }
-    if end == start { end = (start + 1).min(visible.len()); }
+    if end == start {
+        end = (start + 1).min(visible.len());
+    }
     (start, end)
 }
 
@@ -343,12 +469,22 @@ pub(super) fn message_list_visual_range(
     let anchor = anchor?;
     let current_position = current_position?;
     let anchor_position = visible.iter().position(|&index| index == anchor)?;
-    Some((anchor_position.min(current_position), anchor_position.max(current_position)))
+    Some((
+        anchor_position.min(current_position),
+        anchor_position.max(current_position),
+    ))
 }
 
 /// Attachment chips share the same left edge as the first subject character.
 pub(super) fn attachment_subtitle(names: &[String]) -> String {
-    if names.is_empty() { "Attachment".to_owned() }
-    else { names.iter().take(2).map(String::as_str).collect::<Vec<_>>().join(" · ") }
+    if names.is_empty() {
+        "Attachment".to_owned()
+    } else {
+        names
+            .iter()
+            .take(2)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
 }
-

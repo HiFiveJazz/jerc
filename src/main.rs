@@ -4,14 +4,14 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use aerc_rs::backend;
-use aerc_rs::config::Config;
-use aerc_rs::runtime::run_tui;
+use jerc::backend;
+use jerc::config::Config;
+use jerc::runtime::run_tui;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "A fast terminal email client foundation inspired by aerc")]
+#[command(version, about = "A keyboard-driven terminal email client")]
 struct Cli {
-    /// Config file. Defaults to ~/.config/aerc-rs/config.toml.
+    /// Config file. Defaults to ~/.config/jerc/config.toml.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -59,12 +59,22 @@ struct Cli {
     discover_provider: Option<String>,
 
     /// Suggest a separate IMAP/SMTP username in the generated config (no OAuth request).
-    #[arg(long, value_name = "LOGIN_UPN", requires = "discover_email", conflicts_with = "discover_oauth_account")]
+    #[arg(
+        long,
+        value_name = "LOGIN_UPN",
+        requires = "discover_email",
+        conflicts_with = "discover_oauth_account"
+    )]
     discover_username: Option<String>,
 
     /// Suggest a Microsoft login from a configured account's OAuth token.
     /// Requires a previous --oauth-login; never changes account config.
-    #[arg(long, value_name = "ACCOUNT_NAME", requires = "discover_email", conflicts_with = "discover_username")]
+    #[arg(
+        long,
+        value_name = "ACCOUNT_NAME",
+        requires = "discover_email",
+        conflicts_with = "discover_username"
+    )]
     discover_oauth_account: Option<String>,
 
     /// Validate accounts and benchmark folder/header scanning without opening the TUI.
@@ -77,24 +87,32 @@ fn main() -> Result<()> {
     if cli.oauth_build_info {
         // This works on a completely fresh machine; never print client IDs
         // or Google desktop public secrets into terminal logs.
-        let google = aerc_rs::oauth::embedded_client_id("google");
+        let google = jerc::oauth::embedded_client_id("google");
         let google_status = match google {
-            Some(id) if aerc_rs::oauth::valid_google_desktop_client_id(id) => "embedded",
+            Some(id) if jerc::oauth::valid_google_desktop_client_id(id) => "embedded",
             Some(_) => "embedded, but not a valid Google desktop client ID",
             None => "not embedded",
         };
         println!("Google OAuth client ID: {google_status}");
-        println!("Microsoft OAuth client ID: {}", if aerc_rs::oauth::embedded_client_id("microsoft").is_some() {
-            "embedded"
-        } else {
-            "not embedded"
-        });
-        println!("Google desktop public client secret: {}", if aerc_rs::oauth::embedded_google_client_secret().is_some() {
-            "embedded"
-        } else {
-            "not embedded (optional for some registrations)"
-        });
-        println!("These are compile-time settings. Account-specific OAuth values can override them.");
+        println!(
+            "Microsoft OAuth client ID: {}",
+            if jerc::oauth::embedded_client_id("microsoft").is_some() {
+                "embedded"
+            } else {
+                "not embedded"
+            }
+        );
+        println!(
+            "Google desktop public client secret: {}",
+            if jerc::oauth::embedded_google_client_secret().is_some() {
+                "embedded"
+            } else {
+                "not embedded (optional for some registrations)"
+            }
+        );
+        println!(
+            "These are compile-time settings. Account-specific OAuth values can override them."
+        );
         return Ok(());
     }
     if let Some(email) = &cli.discover_email {
@@ -103,23 +121,35 @@ fn main() -> Result<()> {
         let mut configured_logins = (None, None);
         if let Some(name) = &cli.discover_oauth_account {
             let config = Config::load(cli.config.as_deref())?;
-            let account = config.accounts.iter().find(|account| &account.name == name)
+            let account = config
+                .accounts
+                .iter()
+                .find(|account| &account.name == name)
                 .with_context(|| format!("no configured account named {name:?}"))?;
             anyhow::ensure!(
-                account.email.as_deref().is_some_and(|address| address.eq_ignore_ascii_case(email)),
+                account
+                    .email
+                    .as_deref()
+                    .is_some_and(|address| address.eq_ignore_ascii_case(email)),
                 "--discover-oauth-account must refer to an account with the same visible email address"
             );
-            let settings = aerc_rs::oauth::OAuthSettings::for_account(account)?
+            let settings = jerc::oauth::OAuthSettings::for_account(account)?
                 .with_context(|| format!("account {name:?} has no OAuth configuration"))?;
-            anyhow::ensure!(settings.provider == "microsoft",
-                "OAuth identity suggestions currently support Microsoft accounts only");
-            if provider == "auto" { provider = "microsoft"; }
-            anyhow::ensure!(provider == "microsoft",
-                "--discover-provider must be microsoft when using a Microsoft OAuth account");
+            anyhow::ensure!(
+                settings.provider == "microsoft",
+                "OAuth identity suggestions currently support Microsoft accounts only"
+            );
+            if provider == "auto" {
+                provider = "microsoft";
+            }
+            anyhow::ensure!(
+                provider == "microsoft",
+                "--discover-provider must be microsoft when using a Microsoft OAuth account"
+            );
             configured_logins = (account.imap_username.clone(), account.smtp_username.clone());
             oauth_settings = Some(settings);
         }
-        let mut proposal = aerc_rs::discovery::discover_with_provider(email, provider)?;
+        let mut proposal = jerc::discovery::discover_with_provider(email, provider)?;
         if let Some(username) = &cli.discover_username {
             proposal = proposal.with_login_username(username)?;
             println!("# Login username supplied explicitly; verify before applying.");
@@ -141,10 +171,14 @@ fn main() -> Result<()> {
                 println!("# Existing explicitly configured IMAP/SMTP usernames preserved.");
             }
             if hint.is_some() {
-                println!("# Missing login username(s) suggested from Microsoft access-token claims (unverified).");
+                println!(
+                    "# Missing login username(s) suggested from Microsoft access-token claims (unverified)."
+                );
                 println!("# Confirm the UPN against your provider before applying this config.");
             } else if imap_login.is_none() || smtp_login.is_none() {
-                println!("# Access token has no readable login hint; use --discover-username LOGIN_UPN if needed.");
+                println!(
+                    "# Access token has no readable login hint; use --discover-username LOGIN_UPN if needed."
+                );
             }
         }
         println!("{}", proposal.to_toml());
@@ -152,10 +186,10 @@ fn main() -> Result<()> {
     }
     let config = load_config(&cli)?;
     if let Some(name) = &cli.oauth_login {
-        return aerc_rs::oauth::login_account(&config.accounts, name);
+        return jerc::oauth::login_account(&config.accounts, name);
     }
     if let Some(name) = &cli.oauth_inspect {
-        return aerc_rs::oauth::inspect_account(&config.accounts, name);
+        return jerc::oauth::inspect_account(&config.accounts, name);
     }
     if let Some(name) = &cli.oauth_probe {
         return oauth_probe(&config, name, cli.oauth_probe_smtp_challenge);
@@ -170,8 +204,10 @@ fn load_config(cli: &Cli) -> Result<Config> {
     if let Some(maildir) = &cli.maildir {
         return Ok(Config::single_maildir(cli.name.clone(), maildir.clone()));
     }
-    if cli.oauth_login.is_none() && cli.oauth_inspect.is_none()
-        && cli.oauth_probe.is_none() && !cli.headless_check
+    if cli.oauth_login.is_none()
+        && cli.oauth_inspect.is_none()
+        && cli.oauth_probe.is_none()
+        && !cli.headless_check
     {
         Config::load_or_empty(cli.config.as_deref())
     } else {
@@ -180,15 +216,19 @@ fn load_config(cli: &Cli) -> Result<Config> {
 }
 
 fn oauth_probe(config: &Config, name: &str, smtp_challenge: bool) -> Result<()> {
-    let account = config.accounts.iter().find(|account| account.name == name)
+    let account = config
+        .accounts
+        .iter()
+        .find(|account| account.name == name)
         .with_context(|| format!("no account named {name:?} in config"))?;
-    let settings = aerc_rs::oauth::OAuthSettings::for_account(account)?
+    let settings = jerc::oauth::OAuthSettings::for_account(account)?
         .with_context(|| format!("account {name:?} has no [accounts.oauth] configuration"))?;
     println!("Testing OAuth for {name:?} (no email will be sent)");
 
     // Refresh the token and inspect the response's scope metadata without
     // exposing bearer tokens, refresh tokens, or the full response payload.
-    let reported_scopes = settings.reported_protocol_scopes()
+    let reported_scopes = settings
+        .reported_protocol_scopes()
         .context("refreshing OAuth token / inspecting reported scopes")?;
     println!("  OAuth refresh: OK");
     if settings.provider == "microsoft" {
@@ -198,28 +238,32 @@ fn oauth_probe(config: &Config, name: &str, smtp_challenge: bool) -> Result<()> 
                 if imap { "yes" } else { "no" },
                 if smtp { "yes" } else { "no" },
             ),
-            None => println!(
-                "  Token response did not include scope metadata (inconclusive)"
-            ),
+            None => println!("  Token response did not include scope metadata (inconclusive)"),
         }
     }
 
     let mut backend = backend::from_account(account)?;
-    backend.connect().context("connecting/authenticating to IMAP using XOAUTH2")?;
+    backend
+        .connect()
+        .context("connecting/authenticating to IMAP using XOAUTH2")?;
     println!("  IMAP XOAUTH2: OK");
     let mailboxes = backend.list_mailboxes().context("listing IMAP mailboxes")?;
     println!("  IMAP mailbox LIST: OK ({} folders)", mailboxes.len());
 
     if let Some(outgoing) = account.outgoing.as_deref() {
-        if outgoing.starts_with("smtp://") || outgoing.starts_with("smtps://") ||
-           outgoing.starts_with("smtp+") || outgoing.starts_with("smtps+") {
-            let source = aerc_rs::outgoing::SmtpSource::parse(outgoing)?
-                .with_account_oauth(account)?;
-            let sender = aerc_rs::outgoing::SmtpSender::new(source, account.outgoing_cred_cmd.clone());
+        if outgoing.starts_with("smtp://")
+            || outgoing.starts_with("smtps://")
+            || outgoing.starts_with("smtp+")
+            || outgoing.starts_with("smtps+")
+        {
+            let source =
+                jerc::outgoing::SmtpSource::parse(outgoing)?.with_account_oauth(account)?;
+            let sender = jerc::outgoing::SmtpSender::new(source, account.outgoing_cred_cmd.clone());
             if smtp_challenge {
                 println!("  SMTP OAuth mode: two-step XOAUTH2 challenge/response");
             }
-            sender.probe_oauth_with_challenge(smtp_challenge)
+            sender
+                .probe_oauth_with_challenge(smtp_challenge)
                 .context("authenticating to SMTP without sending a message")?;
             println!("  SMTP OAuth authentication: OK (no message sent)");
         } else {
@@ -256,7 +300,10 @@ fn headless_check(config: &Config) -> Result<()> {
         let body_metric = if let Some(message) = messages.first() {
             let body_start = Instant::now();
             backend.fetch_body(&target.name, &message.id)?;
-            format!(" body={:.3} ms", body_start.elapsed().as_secs_f64() * 1000.0)
+            format!(
+                " body={:.3} ms",
+                body_start.elapsed().as_secs_f64() * 1000.0
+            )
         } else {
             String::new()
         };
@@ -279,4 +326,3 @@ fn headless_check(config: &Config) -> Result<()> {
     }
     Ok(())
 }
-

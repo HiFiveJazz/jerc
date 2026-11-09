@@ -5,25 +5,49 @@ use super::*;
 pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let theme = app.theme().clone();
     let mut spans = Vec::new();
-    if let Some(composer) = app.composer.as_ref().filter(|_| app.contacts_modal.is_none()) {
-        spans.push(Span::styled(format!("[{}] ",
-            app.account().map_or("Compose", |account| account.name.as_str())), theme.accent()));
-        spans.push(Span::styled(format!(" {} ", composer.mode.label()),
-            compose_mode_style(composer.mode, &theme)));
+    if let Some(composer) = app
+        .composer
+        .as_ref()
+        .filter(|_| app.contacts_modal.is_none())
+    {
+        spans.push(Span::styled(
+            format!(
+                "[{}] ",
+                app.account()
+                    .map_or("Compose", |account| account.name.as_str())
+            ),
+            theme.accent(),
+        ));
+        spans.push(Span::styled(
+            format!(" {} ", composer.mode.label()),
+            compose_mode_style(composer.mode, &theme),
+        ));
         spans.push(Span::raw(" "));
         if !app.status.text.is_empty() {
-            spans.push(Span::styled(app.status.text.as_str(),
-                if app.status.is_error { theme.error() } else { theme.muted() }));
+            spans.push(Span::styled(
+                app.status.text.as_str(),
+                if app.status.is_error {
+                    theme.error()
+                } else {
+                    theme.muted()
+                },
+            ));
         }
     } else if let Some(account) = app.account() {
         spans.push(Span::styled(format!("[{}] ", account.name), theme.accent()));
         let mode = if app.message_open {
-            if app.reader_visual_anchor.is_some() { "VISUAL" } else { "NORMAL" }
+            if app.reader_visual_anchor.is_some() {
+                "VISUAL"
+            } else {
+                "NORMAL"
+            }
         } else if account.search_editing {
             "SEARCH"
         } else if app.visual_anchor.is_some() {
             "VISUAL"
-        } else { "NORMAL" };
+        } else {
+            "NORMAL"
+        };
         spans.push(Span::styled(format!(" {mode} "), mode_style(mode, &theme)));
         spans.push(Span::raw(" "));
         if account.search_editing {
@@ -33,7 +57,10 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 theme.muted(),
             ));
         } else if !account.search_query.is_empty() {
-            spans.push(Span::styled(format!("filter:/{}  ", account.search_query), theme.accent()));
+            spans.push(Span::styled(
+                format!("filter:/{}  ", account.search_query),
+                theme.accent(),
+            ));
         }
         if account.search_editing {
             // The editable query is already rendered in the message-list search
@@ -47,11 +74,18 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else if account.is_loading_body() {
             spans.push(Span::raw("Loading message…"));
         } else {
-            let style = if app.status.is_error { theme.error() } else { theme.text() };
+            let style = if app.status.is_error {
+                theme.error()
+            } else {
+                theme.text()
+            };
             spans.push(Span::styled(app.status.text.as_str(), style));
         }
         if !app.message_marked.is_empty() {
-            spans.push(Span::styled(format!("    {} marked", app.message_marked.len()), theme.accent()));
+            spans.push(Span::styled(
+                format!("    {} marked", app.message_marked.len()),
+                theme.accent(),
+            ));
         }
         if app.preview_split {
             spans.push(Span::styled("    SPLIT", theme.muted()));
@@ -69,12 +103,21 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(modal) = app.contacts_modal.as_ref() {
         // Contacts use the same global status row and mode slot as mail.
         // The contact count belongs inside the Contacts window, not here.
-        let mut mode_spans = contact_status_spans(&theme,
-            app.account().map(|account| account.name.as_str()), modal);
+        let mut mode_spans = contact_status_spans(
+            &theme,
+            app.account().map(|account| account.name.as_str()),
+            modal,
+        );
         mode_spans.extend(contact_footer_details(&theme, modal));
-        frame.render_widget(Paragraph::new(Line::from(mode_spans)).style(theme.status()), status_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(mode_spans)).style(theme.status()),
+            status_area,
+        );
     } else {
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.status()), status_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(theme.status()),
+            status_area,
+        );
     }
     if indicator_width == crate::ui::NOTIFICATION_INDICATOR_WIDTH {
         let (glyph, style) = notification_indicator(app, &theme);
@@ -82,7 +125,12 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Paragraph::new(Line::from(Span::styled(glyph, style)))
                 .alignment(Alignment::Right)
                 .style(theme.status()),
-            Rect::new(area.right().saturating_sub(indicator_width), area.y, indicator_width, area.height),
+            Rect::new(
+                area.right().saturating_sub(indicator_width),
+                area.y,
+                indicator_width,
+                area.height,
+            ),
         );
     }
 }
@@ -98,10 +146,21 @@ pub(super) fn notification_indicator(app: &App, theme: &Theme) -> (String, Style
         (crate::config::NotificationIconStyle::Unicode, false) => "○",
     };
     let count = if enabled { app.new_mail_count() } else { 0 };
-    let label = if count > 99 { format!("{glyph} 99+") }
-        else if count > 0 { format!("{glyph} {count}") }
-        else { glyph.to_owned() };
-    (format!(" {label} "), if enabled { theme.accent() } else { theme.muted() })
+    let label = if count > 99 {
+        format!("{glyph} 99+")
+    } else if count > 0 {
+        format!("{glyph} {count}")
+    } else {
+        glyph.to_owned()
+    };
+    (
+        format!(" {label} "),
+        if enabled {
+            theme.accent()
+        } else {
+            theme.muted()
+        },
+    )
 }
 
 pub(super) fn draw_search_header(frame: &mut Frame<'_>, area: Rect, query: &str, app: &App) {
@@ -111,8 +170,16 @@ pub(super) fn draw_search_header(frame: &mut Frame<'_>, area: Rect, query: &str,
 /// Reused by the mail browser and Contacts so / opens the same dedicated
 /// search row without borrowing App while the contacts modal is mutable.
 pub(super) fn draw_search_prompt(frame: &mut Frame<'_>, area: Rect, query: &str, theme: &Theme) {
-    let prompt = if query.is_empty() { "type to search…" } else { query };
-    let style = if query.is_empty() { theme.muted() } else { theme.text() };
+    let prompt = if query.is_empty() {
+        "type to search…"
+    } else {
+        query
+    };
+    let style = if query.is_empty() {
+        theme.muted()
+    } else {
+        theme.text()
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" / ", theme.accent()),

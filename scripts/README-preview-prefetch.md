@@ -31,7 +31,7 @@ or Gmail-specific mechanisms are introduced.
 Validation on a host with Rust:
 
     cargo test -- --test-threads=1
-    AERC_RS_PERF_LOG=/tmp/aerc-scroll-priority.log cargo run --release
+    JERC_PERF_LOG=/tmp/jerc-scroll-priority.log cargo run --release
 
 Compare `worker_priority_fetch_body queue_ms` and preview hit/miss rates during
 Ctrl-j/k, and inspect `ui_animation_tick` p95. Existing renderer timings under

@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-use aerc_rs::backend::{MailBackend, MaildirBackend};
-use aerc_rs::model::MessageFlags;
+use jerc::backend::{MailBackend, MaildirBackend};
+use jerc::model::MessageFlags;
 use tempfile::TempDir;
 
 fn make_maildir(root: &Path) {
@@ -48,7 +48,9 @@ fn maildir_is_usable_end_to_end() {
     assert_eq!(first_page.messages.len(), 1);
     assert_eq!(first_page.next_offset, 1);
     assert!(first_page.has_more);
-    let second_page = backend.open_mailbox("INBOX", first_page.next_offset, 1).unwrap();
+    let second_page = backend
+        .open_mailbox("INBOX", first_page.next_offset, 1)
+        .unwrap();
     assert_eq!(second_page.messages.len(), 1);
     assert_eq!(second_page.next_offset, 2);
     assert!(!second_page.has_more);
@@ -67,6 +69,20 @@ fn maildir_is_usable_end_to_end() {
     assert!(updated.flags.contains(MessageFlags::SEEN));
 
     backend.move_to("INBOX", "Archive", &updated.id).unwrap();
-    assert_eq!(backend.open_mailbox("INBOX", 0, 100).unwrap().messages.len(), 1);
-    assert_eq!(backend.open_mailbox("Archive", 0, 100).unwrap().messages.len(), 1);
+    assert_eq!(
+        backend
+            .open_mailbox("INBOX", 0, 100)
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    assert_eq!(
+        backend
+            .open_mailbox("Archive", 0, 100)
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
 }

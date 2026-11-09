@@ -1,7 +1,7 @@
 //! Wire-format regression tests. These are intentionally transport-free: the
 //! exact bytes handed to SMTP and appended to Sent are verified before any I/O.
-use aerc_rs::model::{OutgoingAttachment, OutgoingMessage};
-use aerc_rs::outgoing::{ReplyAudience, build_outgoing, reply_recipients, reply_subject};
+use jerc::model::{OutgoingAttachment, OutgoingMessage};
+use jerc::outgoing::{ReplyAudience, build_outgoing, reply_recipients, reply_subject};
 use mail_parser::MessageParser;
 
 fn draft() -> OutgoingMessage {
@@ -33,7 +33,10 @@ fn outgoing_message_has_unique_id_and_utf8_headers() {
     let (_, bytes) = wire(&first);
     let parsed = MessageParser::new().parse(&bytes).unwrap();
     assert!(parsed.message_id().is_some());
-    assert_eq!(parsed.subject().unwrap(), "[PATCH v2 2/3] Introduce ünicode");
+    assert_eq!(
+        parsed.subject().unwrap(),
+        "[PATCH v2 2/3] Introduce ünicode"
+    );
     assert!(String::from_utf8_lossy(&bytes).contains("Date:"));
     let (_, second) = wire(&first);
     let parsed2 = MessageParser::new().parse(&second).unwrap();
@@ -45,9 +48,22 @@ fn bcc_envelope_contains_secret_recipient_but_header_does_not() {
     let mut draft = draft();
     draft.bcc = "Secret <secret@example.net>".into();
     let (built, bytes) = wire(&draft);
-    let recipients = built.envelope().to().iter().map(ToString::to_string).collect::<Vec<_>>();
-    assert!(recipients.iter().any(|x| x.eq_ignore_ascii_case("secret@example.net")));
-    assert!(!String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains("secret@example.net"));
+    let recipients = built
+        .envelope()
+        .to()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        recipients
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case("secret@example.net"))
+    );
+    assert!(
+        !String::from_utf8_lossy(&bytes)
+            .to_ascii_lowercase()
+            .contains("secret@example.net")
+    );
 }
 
 #[test]
@@ -66,8 +82,16 @@ fn mime_alternative_and_multiple_attachments_have_correct_hierarchy() {
     let mut draft = draft();
     draft.html_body = Some("<p>héllo</p>".into());
     draft.attachments = vec![
-        OutgoingAttachment { filename: "résumé.txt".into(), content_type: "text/plain".into(), data: b"alpha".to_vec() },
-        OutgoingAttachment { filename: "second.bin".into(), content_type: "application/octet-stream".into(), data: vec![0, 1, 2, 255] },
+        OutgoingAttachment {
+            filename: "résumé.txt".into(),
+            content_type: "text/plain".into(),
+            data: b"alpha".to_vec(),
+        },
+        OutgoingAttachment {
+            filename: "second.bin".into(),
+            content_type: "application/octet-stream".into(),
+            data: vec![0, 1, 2, 255],
+        },
     ];
     let (_, bytes) = wire(&draft);
     let raw = String::from_utf8_lossy(&bytes);
@@ -84,7 +108,8 @@ fn mime_alternative_and_multiple_attachments_have_correct_hierarchy() {
 #[test]
 fn attached_forward_preserves_original_bytes_not_renderer_text() {
     let mut draft = draft();
-    let original = b"Message-ID: <original@kernel.org>\r\nContent-Type: text/html\r\n\r\n<b>RAW HTML</b>\r\n";
+    let original =
+        b"Message-ID: <original@kernel.org>\r\nContent-Type: text/html\r\n\r\n<b>RAW HTML</b>\r\n";
     draft.forwarded_raw = Some(original.to_vec());
     let (_, bytes) = wire(&draft);
     let parsed = MessageParser::new().parse(&bytes).unwrap();
@@ -93,15 +118,27 @@ fn attached_forward_preserves_original_bytes_not_renderer_text() {
     let attached = parsed.attachments().collect::<Vec<_>>();
     assert_eq!(attached.len(), 1);
     assert_eq!(attached[0].decoded().as_ref(), original);
-    assert_eq!(attached[0].nested().expect("nested original MIME message").message_id(), Some("original@kernel.org"));
+    assert_eq!(
+        attached[0]
+            .nested()
+            .expect("nested original MIME message")
+            .message_id(),
+        Some("original@kernel.org")
+    );
     // MIME encapsulation includes original body, even when the user sees a rich rendered projection.
     assert!(raw.contains("forwarded.eml"));
 }
 
 #[test]
 fn no_duplicate_reply_prefix_and_patch_series_preserved() {
-    assert_eq!(reply_subject("Re: [PATCH v2 2/3] foo"), "Re: [PATCH v2 2/3] foo");
-    assert_eq!(reply_subject("[PATCH v2 2/3] foo"), "Re: [PATCH v2 2/3] foo");
+    assert_eq!(
+        reply_subject("Re: [PATCH v2 2/3] foo"),
+        "Re: [PATCH v2 2/3] foo"
+    );
+    assert_eq!(
+        reply_subject("[PATCH v2 2/3] foo"),
+        "Re: [PATCH v2 2/3] foo"
+    );
 }
 
 #[test]
@@ -145,9 +182,13 @@ fn missing_subject_and_missing_attachment_are_send_warnings() {
     let mut message = draft();
     message.subject.clear();
     message.body = "Please find the attachment included".into();
-    let warnings = aerc_rs::outgoing::send_warnings(&message);
+    let warnings = jerc::outgoing::send_warnings(&message);
     assert!(warnings.contains(&"Subject is empty"));
-    assert!(warnings.iter().any(|warning| warning.contains("attachment")));
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("attachment"))
+    );
 }
 
 #[test]

@@ -18,15 +18,24 @@ impl App {
     }
 
     pub(super) fn begin_reply(&mut self, quote: bool) {
-        self.begin_compose_from_selected(ComposeIntent::Reply { quote, audience: ReplyAudience::Sender });
+        self.begin_compose_from_selected(ComposeIntent::Reply {
+            quote,
+            audience: ReplyAudience::Sender,
+        });
     }
 
     pub(super) fn begin_reply_all(&mut self) {
-        self.begin_compose_from_selected(ComposeIntent::Reply { quote: true, audience: ReplyAudience::All });
+        self.begin_compose_from_selected(ComposeIntent::Reply {
+            quote: true,
+            audience: ReplyAudience::All,
+        });
     }
 
     pub(super) fn begin_reply_list(&mut self) {
-        self.begin_compose_from_selected(ComposeIntent::Reply { quote: true, audience: ReplyAudience::List });
+        self.begin_compose_from_selected(ComposeIntent::Reply {
+            quote: true,
+            audience: ReplyAudience::List,
+        });
     }
 
     pub(super) fn begin_forward(&mut self) {
@@ -35,7 +44,10 @@ impl App {
 
     pub(super) fn begin_compose_from_selected(&mut self, intent: ComposeIntent) {
         let account_index = self.account_index;
-        if !self.account().is_some_and(|account| account.outgoing_configured) {
+        if !self
+            .account()
+            .is_some_and(|account| account.outgoing_configured)
+        {
             self.status = StatusLine::error(
                 "no outgoing SMTP transport configured; add `outgoing = ...` to this account",
             );
@@ -46,15 +58,28 @@ impl App {
         // come from the real To/Cc/Reply-To/List-Post headers, not the reader
         // projection or the sender summary. Forwarding preserves raw bytes.
         let Some((message_id, mailbox)) = self.account().and_then(|account| {
-            Some((account.selected_message()?.id.clone(), account.current_mailbox.clone()?))
-        }) else { return; };
+            Some((
+                account.selected_message()?.id.clone(),
+                account.current_mailbox.clone()?,
+            ))
+        }) else {
+            return;
+        };
         let queued = self.account().is_some_and(|account| {
-            account.worker.post(ActionKind::FetchRawForCompose {
-                mailbox, id: message_id.clone(),
-            }).is_ok()
+            account
+                .worker
+                .post(ActionKind::FetchRawForCompose {
+                    mailbox,
+                    id: message_id.clone(),
+                })
+                .is_ok()
         });
         if queued {
-            self.pending_compose = Some(PendingCompose { account: account_index, message_id, intent });
+            self.pending_compose = Some(PendingCompose {
+                account: account_index,
+                message_id,
+                intent,
+            });
             self.status = StatusLine::info("loading original message headers…");
         } else {
             self.status = StatusLine::error("mail worker queue is busy; reply/forward not opened");
@@ -65,7 +90,10 @@ impl App {
         let suggestions = self.contact_suggestions();
         if !suggestions.is_empty() {
             if matches!(key.code, KeyCode::Tab | KeyCode::Enter) {
-                let selected = self.composer.as_ref().map_or(0, |composer| composer.contact_suggestion);
+                let selected = self
+                    .composer
+                    .as_ref()
+                    .map_or(0, |composer| composer.contact_suggestion);
                 let id = suggestions[selected.min(suggestions.len() - 1)];
                 self.accept_contact_suggestion(id);
                 return;
@@ -73,27 +101,35 @@ impl App {
             if let Some(composer) = self.composer.as_mut() {
                 match key.code {
                     KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        composer.contact_suggestion = (composer.contact_suggestion + 1) % suggestions.len();
+                        composer.contact_suggestion =
+                            (composer.contact_suggestion + 1) % suggestions.len();
                         return;
                     }
                     KeyCode::Char('p' | 'k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        composer.contact_suggestion = (composer.contact_suggestion + suggestions.len() - 1) % suggestions.len();
+                        composer.contact_suggestion =
+                            (composer.contact_suggestion + suggestions.len() - 1)
+                                % suggestions.len();
                         return;
                     }
                     KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        composer.contact_suggestion = (composer.contact_suggestion + 1) % suggestions.len();
+                        composer.contact_suggestion =
+                            (composer.contact_suggestion + 1) % suggestions.len();
                         return;
                     }
                     KeyCode::Down => {
-                        composer.contact_suggestion = (composer.contact_suggestion + 1) % suggestions.len();
+                        composer.contact_suggestion =
+                            (composer.contact_suggestion + 1) % suggestions.len();
                         return;
                     }
                     KeyCode::Up => {
-                        composer.contact_suggestion = (composer.contact_suggestion + suggestions.len() - 1) % suggestions.len();
+                        composer.contact_suggestion =
+                            (composer.contact_suggestion + suggestions.len() - 1)
+                                % suggestions.len();
                         return;
                     }
                     KeyCode::Esc => {
-                        composer.dismissed_contact_query = Some(recipient_query(composer.field_value(), composer.cursor));
+                        composer.dismissed_contact_query =
+                            Some(recipient_query(composer.field_value(), composer.cursor));
                         return;
                     }
                     _ => {
@@ -108,26 +144,34 @@ impl App {
             self.handle_detach_confirmation_key(key);
             return;
         }
-        let Some(composer) = self.composer.as_ref() else { return; };
+        let Some(composer) = self.composer.as_ref() else {
+            return;
+        };
         if composer.sending {
             if key.code == KeyCode::Esc {
-                self.status = StatusLine::temporary("send is already in progress", Duration::from_secs(2));
+                self.status =
+                    StatusLine::temporary("send is already in progress", Duration::from_secs(2));
             }
             return;
         }
         if composer.exit_prompt {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    if let Some(composer) = self.composer.as_mut() { composer.exit_prompt = false; }
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.exit_prompt = false;
+                    }
                     self.postpone_composer();
                 }
                 KeyCode::Char('d') | KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.composer = None;
                     self.resumed_draft_account = None;
-                    self.status = StatusLine::temporary("unsent email discarded", Duration::from_secs(2));
+                    self.status =
+                        StatusLine::temporary("unsent email discarded", Duration::from_secs(2));
                 }
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    if let Some(composer) = self.composer.as_mut() { composer.exit_prompt = false; }
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.exit_prompt = false;
+                    }
                 }
                 _ => {}
             }
@@ -137,11 +181,15 @@ impl App {
             // The user reviews headers and the body before the final Send key.
             match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(composer) = self.composer.as_mut() { composer.confirm_send = false; }
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.confirm_send = false;
+                    }
                     self.send_composer();
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    if let Some(composer) = self.composer.as_mut() { composer.confirm_send = false; }
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.confirm_send = false;
+                    }
                 }
                 KeyCode::Char('t') => {
                     if let Some(composer) = self.composer.as_mut() {
@@ -161,10 +209,14 @@ impl App {
                     }
                 }
                 KeyCode::Char('G') | KeyCode::End => {
-                    if let Some(composer) = self.composer.as_mut() { composer.preview_scroll = usize::MAX; }
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.preview_scroll = usize::MAX;
+                    }
                 }
                 KeyCode::Char('g') | KeyCode::Home => {
-                    if let Some(composer) = self.composer.as_mut() { composer.preview_scroll = 0; }
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.preview_scroll = 0;
+                    }
                 }
                 KeyCode::PageDown => {
                     if let Some(composer) = self.composer.as_mut() {
@@ -193,17 +245,27 @@ impl App {
                     composer.help_scroll = 0;
                 }
                 KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k')
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) && composer.help_query.is_empty() => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && composer.help_query.is_empty() =>
+                {
                     let matches = composer.compose_help_matches();
-                    if let Some(position) = matches.iter().position(|&i| i == composer.help_selected) {
+                    if let Some(position) =
+                        matches.iter().position(|&i| i == composer.help_selected)
+                    {
                         let next = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
                             position.saturating_sub(1)
-                        } else { (position + 1).min(matches.len().saturating_sub(1)) };
+                        } else {
+                            (position + 1).min(matches.len().saturating_sub(1))
+                        };
                         composer.help_selected = matches[next];
                         composer.help_scroll = next.saturating_sub(5);
                     }
                 }
-                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     composer.help_query.push(ch);
                     composer.help_selected = *composer.compose_help_matches().first().unwrap_or(&0);
                     composer.help_scroll = 0;
@@ -215,8 +277,10 @@ impl App {
         if composer.attachment_manager_open {
             let composer = self.composer.as_mut().expect("composer exists");
             match key.code {
-                KeyCode::Esc if composer.attachment_manager_visual_anchor.is_some()
-                    || !composer.attachment_manager_marked.is_empty() => {
+                KeyCode::Esc
+                    if composer.attachment_manager_visual_anchor.is_some()
+                        || !composer.attachment_manager_marked.is_empty() =>
+                {
                     composer.attachment_manager_visual_anchor = None;
                     composer.attachment_manager_marked.clear();
                 }
@@ -224,11 +288,16 @@ impl App {
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     composer.attachment_manager_open = false;
                 }
-                KeyCode::Char('j') | KeyCode::Down => composer.attachment_manager_selected =
-                    composer.attachment_manager_selected.saturating_add(1)
-                        .min(composer.attachment_count().saturating_sub(1)),
-                KeyCode::Char('k') | KeyCode::Up => composer.attachment_manager_selected =
-                    composer.attachment_manager_selected.saturating_sub(1),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    composer.attachment_manager_selected = composer
+                        .attachment_manager_selected
+                        .saturating_add(1)
+                        .min(composer.attachment_count().saturating_sub(1))
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    composer.attachment_manager_selected =
+                        composer.attachment_manager_selected.saturating_sub(1)
+                }
                 KeyCode::Char('?') => {
                     composer.help_visible = true;
                     composer.help_query.clear();
@@ -237,45 +306,72 @@ impl App {
                 }
                 KeyCode::Char('v' | 'V') => {
                     if composer.attachment_manager_visual_anchor.take().is_none() {
-                        composer.attachment_manager_visual_anchor = Some(composer.attachment_manager_selected);
+                        composer.attachment_manager_visual_anchor =
+                            Some(composer.attachment_manager_selected);
                     }
                 }
                 KeyCode::Char(' ') => {
                     if let Some(anchor) = composer.attachment_manager_visual_anchor.take() {
-                        let (first, last) = (anchor.min(composer.attachment_manager_selected),
-                            anchor.max(composer.attachment_manager_selected));
-                        for index in first..=last { composer.attachment_manager_marked.insert(index); }
+                        let (first, last) = (
+                            anchor.min(composer.attachment_manager_selected),
+                            anchor.max(composer.attachment_manager_selected),
+                        );
+                        for index in first..=last {
+                            composer.attachment_manager_marked.insert(index);
+                        }
                     } else {
                         let index = composer.attachment_manager_selected;
                         if !composer.attachment_manager_marked.insert(index) {
                             composer.attachment_manager_marked.remove(&index);
                         }
-                        composer.attachment_manager_selected = index.saturating_add(1)
+                        composer.attachment_manager_selected = index
+                            .saturating_add(1)
                             .min(composer.attachment_count().saturating_sub(1));
                     }
                 }
                 KeyCode::Char('x' | 'd') | KeyCode::Delete | KeyCode::Backspace => {
-                    let files = composer.attachment_paths.iter().cloned()
-                        .chain(composer.attachments.split(';').map(str::trim)
-                            .filter(|part| !part.is_empty()).map(PathBuf::from))
+                    let files = composer
+                        .attachment_paths
+                        .iter()
+                        .cloned()
+                        .chain(
+                            composer
+                                .attachments
+                                .split(';')
+                                .map(str::trim)
+                                .filter(|part| !part.is_empty())
+                                .map(PathBuf::from),
+                        )
                         .collect::<Vec<_>>();
                     let selected = composer.attachment_manager_selected;
                     let anchor = composer.attachment_manager_visual_anchor;
-                    let paths = files.into_iter().enumerate().filter(|(index, _)| {
-                        composer.attachment_manager_marked.contains(index)
-                            || anchor.is_some_and(|anchor| (anchor.min(selected)..=anchor.max(selected)).contains(index))
-                            || (composer.attachment_manager_marked.is_empty() && anchor.is_none() && *index == selected)
-                    }).map(|(_, path)| path).collect::<Vec<_>>();
+                    let paths = files
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(index, _)| {
+                            composer.attachment_manager_marked.contains(index)
+                                || anchor.is_some_and(|anchor| {
+                                    (anchor.min(selected)..=anchor.max(selected)).contains(index)
+                                })
+                                || (composer.attachment_manager_marked.is_empty()
+                                    && anchor.is_none()
+                                    && *index == selected)
+                        })
+                        .map(|(_, path)| path)
+                        .collect::<Vec<_>>();
                     if !paths.is_empty() {
                         self.detach_confirmation = Some(DetachConfirmation {
-                            paths, review: ReviewScroll::default(),
+                            paths,
+                            review: ReviewScroll::default(),
                         });
                     }
                 }
                 KeyCode::Char('u') => {
                     if let Some(path) = composer.undo_managed_attachment() {
                         self.status = StatusLine::temporary(
-                            format!("reattached {}", path.display()), Duration::from_secs(2));
+                            format!("reattached {}", path.display()),
+                            Duration::from_secs(2),
+                        );
                     }
                 }
                 _ => {}
@@ -288,7 +384,10 @@ impl App {
                 return;
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) {
-                let picker = self.composer.as_mut().and_then(|composer| composer.file_picker.as_mut());
+                let picker = self
+                    .composer
+                    .as_mut()
+                    .and_then(|composer| composer.file_picker.as_mut());
                 if let Some(picker) = picker {
                     match key.code {
                         KeyCode::Char('j') => picker.queue_smooth_scroll(SMOOTH_SCROLL_ROWS),
@@ -301,26 +400,45 @@ impl App {
             if key.code == KeyCode::Char('x') {
                 let composer = self.composer.as_ref().expect("composer exists");
                 if let Some(picker) = composer.file_picker.as_ref() {
-                    let (first, last) = picker.visual_anchor.map(|anchor|
-                        (anchor.min(picker.selected), anchor.max(picker.selected)))
+                    let (first, last) = picker
+                        .visual_anchor
+                        .map(|anchor| (anchor.min(picker.selected), anchor.max(picker.selected)))
                         .unwrap_or((picker.selected, picker.selected));
-                    let paths = picker.entries.iter().skip(first).take(last - first + 1)
+                    let paths = picker
+                        .entries
+                        .iter()
+                        .skip(first)
+                        .take(last - first + 1)
                         .filter(|entry| !entry.is_directory)
                         .map(|entry| entry.path.clone())
-                        .filter(|path| composer.attachment_paths.contains(path) ||
-                            composer.attachments.split(';').map(str::trim).any(|part| Path::new(part) == path.as_path()))
+                        .filter(|path| {
+                            composer.attachment_paths.contains(path)
+                                || composer
+                                    .attachments
+                                    .split(';')
+                                    .map(str::trim)
+                                    .any(|part| Path::new(part) == path.as_path())
+                        })
                         .collect::<Vec<_>>();
                     if !paths.is_empty() {
                         self.detach_confirmation = Some(DetachConfirmation {
-                            paths, review: ReviewScroll::default(),
+                            paths,
+                            review: ReviewScroll::default(),
                         });
                         return;
                     }
                 }
             }
-            match self.composer.as_mut().expect("composer exists").file_picker_key(key.code) {
-                Ok(Some(message)) => self.status = StatusLine::temporary(message, Duration::from_secs(2)),
-                Ok(None) => {},
+            match self
+                .composer
+                .as_mut()
+                .expect("composer exists")
+                .file_picker_key(key.code)
+            {
+                Ok(Some(message)) => {
+                    self.status = StatusLine::temporary(message, Duration::from_secs(2))
+                }
+                Ok(None) => {}
                 Err(error) => self.status = StatusLine::error(format!("file picker: {error:#}")),
             }
             return;
@@ -329,15 +447,23 @@ impl App {
             let composer = self.composer.as_mut().expect("composer exists");
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => composer.toggle_advanced_headers(),
-                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => composer.toggle_advanced_headers(),
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    composer.toggle_advanced_headers()
+                }
                 KeyCode::Backspace => composer.backspace(),
                 KeyCode::Delete => composer.delete_at_cursor(),
                 KeyCode::Left => composer.move_horizontal(-1),
                 KeyCode::Right => composer.move_horizontal(1),
                 KeyCode::Home => composer.cursor = 0,
                 KeyCode::End => composer.cursor = composer.char_count(),
-                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => composer.insert_char(ch),
-                _ => {},
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    composer.insert_char(ch)
+                }
+                _ => {}
             }
             return;
         }
@@ -348,13 +474,21 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
-            if let Err(error) = self.composer.as_mut().expect("composer exists").open_file_picker() {
+            if let Err(error) = self
+                .composer
+                .as_mut()
+                .expect("composer exists")
+                .open_file_picker()
+            {
                 self.status = StatusLine::error(format!("file picker: {error:#}"));
             }
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-            self.composer.as_mut().expect("composer exists").toggle_advanced_headers();
+            self.composer
+                .as_mut()
+                .expect("composer exists")
+                .toggle_advanced_headers();
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
@@ -378,7 +512,9 @@ impl App {
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             let next = if key.code == KeyCode::Tab {
                 composer.field.next()
-            } else { composer.field.previous() };
+            } else {
+                composer.field.previous()
+            };
             composer.switch_field(next);
             return;
         }
@@ -389,7 +525,9 @@ impl App {
                     composer.visual_anchor = None;
                     composer.visual_linewise = false;
                 }
-                KeyCode::Enter if composer.field == ComposeField::Body => composer.insert_char('\n'),
+                KeyCode::Enter if composer.field == ComposeField::Body => {
+                    composer.insert_char('\n')
+                }
                 KeyCode::Enter => composer.switch_field(composer.field.next()),
                 KeyCode::Backspace => composer.backspace(),
                 KeyCode::Delete => composer.delete_at_cursor(),
@@ -397,12 +535,18 @@ impl App {
                 KeyCode::Right => composer.move_horizontal(1),
                 KeyCode::Up if composer.field != ComposeField::Body => {
                     let previous = composer.field.previous();
-                    if previous != ComposeField::Body { composer.switch_field(previous); }
+                    if previous != ComposeField::Body {
+                        composer.switch_field(previous);
+                    }
                 }
-                KeyCode::Down if composer.field != ComposeField::Body => composer.switch_field(composer.field.next()),
+                KeyCode::Down if composer.field != ComposeField::Body => {
+                    composer.switch_field(composer.field.next())
+                }
                 KeyCode::Up => composer.move_line(-1),
                 KeyCode::Down => composer.move_line(1),
-                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::ALT) => composer.insert_char(ch),
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::ALT) => {
+                    composer.insert_char(ch)
+                }
                 _ => {}
             }
             return;
@@ -426,12 +570,18 @@ impl App {
         }
         if composer.pending_inner {
             composer.pending_inner = false;
-            if let KeyCode::Char(delim) = key.code { composer.select_inner_object(delim); }
+            if let KeyCode::Char(delim) = key.code {
+                composer.select_inner_object(delim);
+            }
             return;
         }
         if composer.pending_g {
             composer.pending_g = false;
-            if key.code == KeyCode::Char('g') { composer.cursor = 0; composer.count = None; return; }
+            if key.code == KeyCode::Char('g') {
+                composer.cursor = 0;
+                composer.count = None;
+                return;
+            }
         }
         if composer.pending_delete {
             composer.pending_delete = false;
@@ -448,16 +598,30 @@ impl App {
             return;
         }
         if let KeyCode::Char(digit @ '1'..='9') = key.code {
-            composer.count = Some(composer.count.unwrap_or(0)
-                .saturating_mul(10).saturating_add(digit.to_digit(10).unwrap_or(0) as usize)
-                .min(MAX_COUNT_PREFIX));
+            composer.count = Some(
+                composer
+                    .count
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(digit.to_digit(10).unwrap_or(0) as usize)
+                    .min(MAX_COUNT_PREFIX),
+            );
             return;
         }
         if key.code == KeyCode::Char('0') && composer.count.is_some() {
-            composer.count = Some(composer.count.unwrap_or(0).saturating_mul(10).min(MAX_COUNT_PREFIX));
+            composer.count = Some(
+                composer
+                    .count
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .min(MAX_COUNT_PREFIX),
+            );
             return;
         }
-        if matches!(key.code, KeyCode::Char('g')) { composer.pending_g = true; return; }
+        if matches!(key.code, KeyCode::Char('g')) {
+            composer.pending_g = true;
+            return;
+        }
         if matches!(key.code, KeyCode::Char('f' | 'F')) {
             composer.pending_find = Some(key.code == KeyCode::Char('f'));
             return;
@@ -469,14 +633,17 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if composer.move_header_field(false, count) => return,
             _ => {}
         }
-        if composer.apply_motion(key.code, count) { return; }
+        if composer.apply_motion(key.code, count) {
+            return;
+        }
         match composer.mode {
             ComposeMode::Normal => match key.code {
                 KeyCode::Enter => {
                     if let Err(error) = composer.prepare_send_preview() {
-                        self.status = StatusLine::error(format!("cannot preview outgoing email: {error:#}"));
+                        self.status =
+                            StatusLine::error(format!("cannot preview outgoing email: {error:#}"));
                     }
-                },
+                }
                 KeyCode::Esc | KeyCode::Char('q') => {
                     if composer.has_unsent_content() {
                         composer.exit_prompt = true;
@@ -485,9 +652,18 @@ impl App {
                     }
                 }
                 KeyCode::Char('i') => composer.mode = ComposeMode::Insert,
-                KeyCode::Char('a') => { composer.move_horizontal(1); composer.mode = ComposeMode::Insert; }
-                KeyCode::Char('I') => { composer.cursor = composer.first_nonblank(); composer.mode = ComposeMode::Insert; }
-                KeyCode::Char('A') => { composer.cursor = composer.line_end(); composer.mode = ComposeMode::Insert; }
+                KeyCode::Char('a') => {
+                    composer.move_horizontal(1);
+                    composer.mode = ComposeMode::Insert;
+                }
+                KeyCode::Char('I') => {
+                    composer.cursor = composer.first_nonblank();
+                    composer.mode = ComposeMode::Insert;
+                }
+                KeyCode::Char('A') => {
+                    composer.cursor = composer.line_end();
+                    composer.mode = ComposeMode::Insert;
+                }
                 KeyCode::Char('v') => {
                     composer.visual_anchor = Some(composer.cursor.min(composer.char_count()));
                     composer.visual_linewise = false;
@@ -499,17 +675,26 @@ impl App {
                     composer.mode = ComposeMode::Visual;
                 }
                 KeyCode::Char('u') => composer.undo_edit(false),
-                KeyCode::Char('x') | KeyCode::Delete => for _ in 0..count { composer.delete_at_cursor(); },
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    for _ in 0..count {
+                        composer.delete_at_cursor();
+                    }
+                }
                 KeyCode::Char('D') => {
                     let end = composer.line_end();
                     composer.delete_range(composer.cursor, end);
                 }
-                KeyCode::Char('d') => { composer.pending_delete = true; composer.count = Some(count); }
+                KeyCode::Char('d') => {
+                    composer.pending_delete = true;
+                    composer.count = Some(count);
+                }
                 KeyCode::Char('o') if composer.field == ComposeField::Body => {
-                    composer.open_line_below(); composer.mode = ComposeMode::Insert;
+                    composer.open_line_below();
+                    composer.mode = ComposeMode::Insert;
                 }
                 KeyCode::Char('O') if composer.field == ComposeField::Body => {
-                    composer.open_line_above(); composer.mode = ComposeMode::Insert;
+                    composer.open_line_above();
+                    composer.mode = ComposeMode::Insert;
                 }
                 _ => {}
             },
@@ -522,13 +707,17 @@ impl App {
                 KeyCode::Char('V') => composer.visual_linewise = !composer.visual_linewise,
                 KeyCode::Char('i') => composer.pending_inner = true,
                 KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
-                    if let Some((start, end)) = composer.visual_range() { composer.delete_range(start, end); }
+                    if let Some((start, end)) = composer.visual_range() {
+                        composer.delete_range(start, end);
+                    }
                     composer.visual_anchor = None;
                     composer.visual_linewise = false;
                     composer.mode = ComposeMode::Normal;
                 }
                 KeyCode::Char('c') => {
-                    if let Some((start, end)) = composer.visual_range() { composer.delete_range(start, end); }
+                    if let Some((start, end)) = composer.visual_range() {
+                        composer.delete_range(start, end);
+                    }
                     composer.visual_anchor = None;
                     composer.visual_linewise = false;
                     composer.mode = ComposeMode::Insert;
@@ -540,14 +729,21 @@ impl App {
     }
 
     pub(super) fn open_compose_browser_preview(&mut self) {
-        let Some(composer) = self.composer.as_ref() else { return; };
+        let Some(composer) = self.composer.as_ref() else {
+            return;
+        };
         let html = match composer.outgoing_html_preview() {
             Ok(Some(html)) => html,
             Ok(None) => {
                 // Plain-text-only emails still have a safe HTML browser projection.
-                let escaped = composer.body.replace('&', "&amp;")
-                    .replace('<', "&lt;").replace('>', "&gt;");
-                format!("<html><meta charset=\"utf-8\"><body><pre style=\"white-space:pre-wrap\">{escaped}</pre></body></html>")
+                let escaped = composer
+                    .body
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                format!(
+                    "<html><meta charset=\"utf-8\"><body><pre style=\"white-space:pre-wrap\">{escaped}</pre></body></html>"
+                )
             }
             Err(error) => {
                 self.status = StatusLine::error(format!("cannot preview HTML: {error:#}"));
@@ -555,8 +751,10 @@ impl App {
             }
         };
         let result = (|| -> anyhow::Result<()> {
-            let directory = dirs::cache_dir().unwrap_or_else(std::env::temp_dir)
-                .join("aerc-rs").join("browser");
+            let directory = dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("jerc")
+                .join("browser");
             std::fs::create_dir_all(&directory)?;
             let path = directory.join("compose-preview.html");
             std::fs::write(&path, html.as_bytes())?;
@@ -564,7 +762,12 @@ impl App {
             Ok(())
         })();
         match result {
-            Ok(()) => self.status = StatusLine::temporary("opened outgoing email preview in browser", Duration::from_secs(2)),
+            Ok(()) => {
+                self.status = StatusLine::temporary(
+                    "opened outgoing email preview in browser",
+                    Duration::from_secs(2),
+                )
+            }
             Err(error) => self.status = StatusLine::error(format!("browser preview: {error:#}")),
         }
     }
@@ -572,22 +775,27 @@ impl App {
     pub(super) fn postponed_drafts_root() -> anyhow::Result<std::path::PathBuf> {
         let root = dirs::data_local_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot find local application data directory"))?;
-        Ok(root.join("aerc-rs").join("postponed"))
+        Ok(root.join("jerc").join("postponed"))
     }
 
     pub(super) fn postpone_composer(&mut self) {
-        let Some(account) = self.account() else { return; };
-        let Some(composer) = self.composer.as_ref() else { return; };
+        let Some(account) = self.account() else {
+            return;
+        };
+        let Some(composer) = self.composer.as_ref() else {
+            return;
+        };
         // Always write a local recovery copy first. If IMAP is offline or the
         // Drafts APPEND fails, Ctrl+N can still recover the unsent message.
-        let result = Self::postponed_drafts_root().and_then(|root| {
-            crate::outgoing::drafts::save_draft(&root, &account.name, composer)
-        });
+        let result = Self::postponed_drafts_root()
+            .and_then(|root| crate::outgoing::drafts::save_draft(&root, &account.name, composer));
         if let Err(error) = result {
             self.status = StatusLine::error(format!("could not save draft: {error:#}"));
             return;
         }
-        let draft_mailbox = account.mailboxes.iter()
+        let draft_mailbox = account
+            .mailboxes
+            .iter()
             .find(|mailbox| mailbox.role == MailboxRole::Drafts)
             .map(|mailbox| mailbox.name.clone());
         let draft_queued = if let Some(mailbox) = draft_mailbox {
@@ -595,16 +803,22 @@ impl App {
                 Ok(message) => message,
                 Err(error) => {
                     self.status = StatusLine::error(format!(
-                        "saved local recovery copy, but could not prepare IMAP draft: {error:#}"));
+                        "saved local recovery copy, but could not prepare IMAP draft: {error:#}"
+                    ));
                     return;
                 }
             };
-            if self.account().is_some_and(|account|
-                account.worker.post(ActionKind::SaveDraft { message, mailbox }).is_ok()) {
+            if self.account().is_some_and(|account| {
+                account
+                    .worker
+                    .post(ActionKind::SaveDraft { message, mailbox })
+                    .is_ok()
+            }) {
                 true
             } else {
                 self.status = StatusLine::error(
-                    "saved local recovery copy; Drafts worker is busy (Ctrl+n resumes)");
+                    "saved local recovery copy; Drafts worker is busy (Ctrl+n resumes)",
+                );
                 return;
             }
         } else {
@@ -620,22 +834,30 @@ impl App {
     }
 
     pub(super) fn restore_postponed_composer(&mut self) {
-        let Some(account) = self.account() else { return; };
+        let Some(account) = self.account() else {
+            return;
+        };
         if !account.outgoing_configured {
             self.status = StatusLine::error("configure outgoing SMTP before resuming a draft");
             return;
         }
-        let result = Self::postponed_drafts_root().and_then(|root| {
-            crate::outgoing::drafts::load_draft(&root, &account.name)
-        });
+        let result = Self::postponed_drafts_root()
+            .and_then(|root| crate::outgoing::drafts::load_draft(&root, &account.name));
         match result {
             Ok(Some(draft)) => {
                 self.composer = Some(draft);
                 self.resumed_draft_account = Some(self.account_index);
                 self.status = StatusLine::info("resumed locally postponed draft");
             }
-            Ok(None) => self.status = StatusLine::temporary("no postponed draft for this account", Duration::from_secs(2)),
-            Err(error) => self.status = StatusLine::error(format!("cannot resume draft: {error:#}")),
+            Ok(None) => {
+                self.status = StatusLine::temporary(
+                    "no postponed draft for this account",
+                    Duration::from_secs(2),
+                )
+            }
+            Err(error) => {
+                self.status = StatusLine::error(format!("cannot resume draft: {error:#}"))
+            }
         }
     }
 
@@ -646,15 +868,22 @@ impl App {
         if composer.sending {
             return;
         }
-        if composer.to.trim().is_empty() && composer.cc.trim().is_empty() && composer.bcc.trim().is_empty() {
+        if composer.to.trim().is_empty()
+            && composer.cc.trim().is_empty()
+            && composer.bcc.trim().is_empty()
+        {
             self.status = StatusLine::error("Add at least one To, Cc or Bcc recipient");
             return;
         }
-        if let Err(error) = crate::outgoing::validate_recipients(&composer.to, &composer.cc, &composer.bcc) {
+        if let Err(error) =
+            crate::outgoing::validate_recipients(&composer.to, &composer.cc, &composer.bcc)
+        {
             self.status = StatusLine::error(format!("invalid recipient: {error:#}"));
             return;
         }
-        let Some(account) = self.account() else { return; };
+        let Some(account) = self.account() else {
+            return;
+        };
         let message = match outgoing_from_composer(composer, &account.from) {
             Ok(message) => message,
             Err(error) => {
@@ -685,5 +914,4 @@ impl App {
             self.status = StatusLine::error("mail worker queue is busy; message was not sent");
         }
     }
-
 }

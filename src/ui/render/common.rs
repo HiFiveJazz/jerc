@@ -41,16 +41,24 @@ pub(super) fn truncate_display_width(text: &str, width: usize) -> String {
 /// Keep borrowed mail-list text when it fits rather than allocating every row.
 pub(super) fn truncate_display_width_cow(text: &str, width: usize) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
-    if width == 0 { return Cow::Borrowed(""); }
-    if UnicodeWidthStr::width(text) <= width { return Cow::Borrowed(text); }
-    if width == 1 { return Cow::Borrowed("…"); }
+    if width == 0 {
+        return Cow::Borrowed("");
+    }
+    if UnicodeWidthStr::width(text) <= width {
+        return Cow::Borrowed(text);
+    }
+    if width == 1 {
+        return Cow::Borrowed("…");
+    }
 
     let budget = width.saturating_sub(1);
     let mut used = 0usize;
     let mut out = String::new();
     for grapheme in UnicodeSegmentation::graphemes(text, true) {
         let grapheme_width = UnicodeWidthStr::width(grapheme);
-        if used.saturating_add(grapheme_width) > budget { break; }
+        if used.saturating_add(grapheme_width) > budget {
+            break;
+        }
         out.push_str(grapheme);
         used = used.saturating_add(grapheme_width);
     }
@@ -111,8 +119,24 @@ pub(super) fn subject_for_list_cow(subject: &str) -> std::borrow::Cow<'_, str> {
 /// presentation can fit a normal terminal cell. Emoji-only pictographs stay
 /// untouched because not all terminals/font stacks provide a text glyph.
 pub(super) fn supports_safe_text_presentation(ch: char) -> bool {
-    matches!(ch, '☀' | '☁' | '☂' | '☃' | '☎' | '☘' | '☺' | '☹'
-        | '✂' | '✈' | '✉' | '✌' | '❤' | '❄' | '✔' | '✖')
+    matches!(
+        ch,
+        '☀' | '☁'
+            | '☂'
+            | '☃'
+            | '☎'
+            | '☘'
+            | '☺'
+            | '☹'
+            | '✂'
+            | '✈'
+            | '✉'
+            | '✌'
+            | '❤'
+            | '❄'
+            | '✔'
+            | '✖'
+    )
 }
 
 pub(super) fn relative_number(index: usize, current: usize) -> String {

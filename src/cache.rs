@@ -73,8 +73,14 @@ pub(crate) fn persistable_bodies(
         if selected.len() >= MAX_BODIES_PER_FOLDER {
             break;
         }
-        let Some(body) = bodies.get(&message.id) else { continue; };
-        let bytes = body.plain_text.as_deref().unwrap_or_default().len()
+        let Some(body) = bodies.get(&message.id) else {
+            continue;
+        };
+        let bytes = body
+            .plain_text
+            .as_deref()
+            .unwrap_or_default()
+            .len()
             .saturating_add(body.html_source.as_deref().unwrap_or_default().len())
             .saturating_add(body.html_text.as_deref().unwrap_or_default().len());
         if bytes <= MAX_BODY_BYTES {
@@ -116,11 +122,12 @@ impl Drop for Writer {
 /// The key uses the account's name and non-secret IMAP identity, not tokens or
 /// credential commands. Files contain message metadata, so permissions matter.
 pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
-    if std::env::var_os("AERC_RS_DISABLE_CACHE").is_some()
-        || !crate::backend::ImapSource::supports(&account.source) {
+    if std::env::var_os("JERC_DISABLE_CACHE").is_some()
+        || !crate::backend::ImapSource::supports(&account.source)
+    {
         return (Snapshot::default(), None);
     }
-    let Some(dir) = dirs::cache_dir().map(|path| path.join("aerc-rs").join("mail-index")) else {
+    let Some(dir) = dirs::cache_dir().map(|path| path.join("jerc").join("mail-index")) else {
         return (Snapshot::default(), None);
     };
     let identity = crate::backend::redact_source(&account.source);
@@ -131,8 +138,12 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
     // A successful disk read with no usable folders is not a warm mailbox
     // cache. The log contains timing only, never account or message details.
     crate::perf::record(
-        "cache_read", None, cache_start.elapsed(),
-        loaded.as_ref().is_some_and(|snapshot| !snapshot.folders.is_empty()),
+        "cache_read",
+        None,
+        cache_start.elapsed(),
+        loaded
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.folders.is_empty()),
     );
     let snapshot = loaded.unwrap_or_default();
     let (tx, rx) = mpsc::channel::<Change>();
@@ -151,7 +162,13 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
             }
         });
     match join {
-        Ok(join) => (snapshot, Some(Writer { tx: Some(tx), join: Some(join) })),
+        Ok(join) => (
+            snapshot,
+            Some(Writer {
+                tx: Some(tx),
+                join: Some(join),
+            }),
+        ),
         Err(_) => (snapshot, None),
     }
 }
@@ -161,7 +178,9 @@ fn apply(snapshot: &mut Snapshot, change: Change) {
         Change::Mailboxes(mailboxes) => snapshot.mailboxes = mailboxes,
         Change::Folder(name, mut folder) => {
             // Never cache UID-based IMAP data without a server UIDVALIDITY.
-            if folder.uid_validity.is_none() { return; }
+            if folder.uid_validity.is_none() {
+                return;
+            }
             if folder.messages.len() > MAX_MESSAGES_PER_FOLDER {
                 folder.messages.truncate(MAX_MESSAGES_PER_FOLDER);
                 folder.next_page_offset = folder.messages.len();
@@ -175,16 +194,26 @@ fn apply(snapshot: &mut Snapshot, change: Change) {
                         <= MAX_BODY_BYTES
             });
             if folder.bodies.len() > MAX_BODIES_PER_FOLDER {
-                let keep = folder.messages.iter().filter_map(|message| {
-                    folder.bodies.contains_key(&message.id).then_some(message.id.clone())
-                }).take(MAX_BODIES_PER_FOLDER).collect::<Vec<_>>();
+                let keep = folder
+                    .messages
+                    .iter()
+                    .filter_map(|message| {
+                        folder
+                            .bodies
+                            .contains_key(&message.id)
+                            .then_some(message.id.clone())
+                    })
+                    .take(MAX_BODIES_PER_FOLDER)
+                    .collect::<Vec<_>>();
                 folder.bodies.retain(|id, _| keep.contains(id));
             }
             if snapshot.folders.len() < MAX_FOLDERS || snapshot.folders.contains_key(&name) {
                 snapshot.folders.insert(name, folder);
             }
         }
-        Change::RemoveFolder(name) => { snapshot.folders.remove(&name); }
+        Change::RemoveFolder(name) => {
+            snapshot.folders.remove(&name);
+        }
     }
 }
 
@@ -199,22 +228,33 @@ fn stable_key(value: &str) -> u64 {
 
 fn read_snapshot(path: &PathBuf) -> Option<Snapshot> {
     let file = File::open(path).ok()?;
-    if file.metadata().ok()?.len() > MAX_CACHE_BYTES { return None; }
+    if file.metadata().ok()?.len() > MAX_CACHE_BYTES {
+        return None;
+    }
     let mut bytes = Vec::new();
-    file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut bytes).ok()?;
-    if bytes.len() as u64 > MAX_CACHE_BYTES { return None; }
+    file.take(MAX_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CACHE_BYTES {
+        return None;
+    }
     let file: CacheFile = serde_json::from_slice(&bytes).ok()?;
     if file.version != VERSION || file.snapshot.folders.len() > MAX_FOLDERS {
         return None;
     }
     // Discard any legacy or invalid records lacking UIDVALIDITY.
     let mut snapshot = file.snapshot;
-    snapshot.folders.retain(|_, folder| folder.uid_validity.is_some_and(|validity| {
-        let prefix = format!("imap-uid:{validity}:");
-        folder.messages.len() <= MAX_MESSAGES_PER_FOLDER
-            && folder.messages.iter().all(|message| message.id.0.starts_with(&prefix))
-            && folder.bodies.keys().all(|id| id.0.starts_with(&prefix))
-    }));
+    snapshot.folders.retain(|_, folder| {
+        folder.uid_validity.is_some_and(|validity| {
+            let prefix = format!("imap-uid:{validity}:");
+            folder.messages.len() <= MAX_MESSAGES_PER_FOLDER
+                && folder
+                    .messages
+                    .iter()
+                    .all(|message| message.id.0.starts_with(&prefix))
+                && folder.bodies.keys().all(|id| id.0.starts_with(&prefix))
+        })
+    });
     Some(snapshot)
 }
 
@@ -223,17 +263,26 @@ fn write_snapshot(path: &PathBuf, snapshot: &Snapshot) -> std::io::Result<()> {
         return Err(std::io::Error::other("no cache parent directory"));
     };
     fs::create_dir_all(parent)?;
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
-        tmp.as_file().set_permissions(fs::Permissions::from_mode(0o600))?;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    serde_json::to_writer(&mut tmp, &CacheFileRef { version: VERSION, snapshot })
-        .map_err(std::io::Error::other)?;
+    serde_json::to_writer(
+        &mut tmp,
+        &CacheFileRef {
+            version: VERSION,
+            snapshot,
+        },
+    )
+    .map_err(std::io::Error::other)?;
     tmp.flush()?;
     if tmp.as_file().metadata()?.len() > MAX_CACHE_BYTES {
         return Err(std::io::Error::other("mail cache size limit exceeded"));
@@ -250,14 +299,20 @@ mod tests {
     fn snapshot_roundtrip_and_private_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.json");
-        let data = Snapshot { mailboxes: vec![Mailbox::new("INBOX", crate::model::MailboxRole::Inbox)],
-            folders: HashMap::new() };
+        let data = Snapshot {
+            mailboxes: vec![Mailbox::new("INBOX", crate::model::MailboxRole::Inbox)],
+            folders: HashMap::new(),
+        };
         write_snapshot(&path, &data).unwrap();
         let loaded = read_snapshot(&path).unwrap();
         assert_eq!(loaded.mailboxes[0].name, "INBOX");
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
@@ -271,7 +326,9 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let mut value = value;
-        value["snapshot"]["folders"]["INBOX"].as_object_mut().unwrap()
+        value["snapshot"]["folders"]["INBOX"]
+            .as_object_mut()
+            .unwrap()
             .remove("uid_next");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let loaded = read_snapshot(&path).unwrap();
@@ -292,13 +349,31 @@ mod tests {
     #[test]
     fn cache_requires_uidvalidity() {
         let mut snapshot = Snapshot::default();
-        let folder = CachedMailbox { messages: vec![], bodies: HashMap::new(), message_index: 0,
-            message_view_offset: 0, next_page_offset: 0, has_more: false, uid_validity: None, uid_next: None };
-        apply(&mut snapshot, Change::Folder("INBOX".into(), folder.clone()));
+        let folder = CachedMailbox {
+            messages: vec![],
+            bodies: HashMap::new(),
+            message_index: 0,
+            message_view_offset: 0,
+            next_page_offset: 0,
+            has_more: false,
+            uid_validity: None,
+            uid_next: None,
+        };
+        apply(
+            &mut snapshot,
+            Change::Folder("INBOX".into(), folder.clone()),
+        );
         assert!(!snapshot.folders.contains_key("INBOX"));
-        apply(&mut snapshot, Change::Folder("INBOX".into(), CachedMailbox {
-            uid_validity: Some(42), ..folder
-        }));
+        apply(
+            &mut snapshot,
+            Change::Folder(
+                "INBOX".into(),
+                CachedMailbox {
+                    uid_validity: Some(42),
+                    ..folder
+                },
+            ),
+        );
         assert!(snapshot.folders.contains_key("INBOX"));
     }
 
@@ -358,9 +433,13 @@ mod tests {
         let mut snapshot = Snapshot::default();
         let mut inbox = folder(12, 2);
         inbox.messages[0].subject = "Unicode: café ☃".into();
-        inbox.messages[0].flags.set(crate::model::MessageFlags::SEEN, true);
+        inbox.messages[0]
+            .flags
+            .set(crate::model::MessageFlags::SEEN, true);
         let first_id = inbox.messages[0].id.clone();
-        inbox.bodies.insert(first_id.clone(), body(first_id, "cached offline text"));
+        inbox
+            .bodies
+            .insert(first_id.clone(), body(first_id, "cached offline text"));
         apply(&mut snapshot, Change::Folder("INBOX".into(), inbox));
         write_snapshot(&path, &snapshot).unwrap();
 
@@ -409,10 +488,17 @@ mod tests {
         let mut inbox = folder(7, MAX_MESSAGES_PER_FOLDER as u32 + 2);
         let first_id = inbox.messages[0].id.clone();
         let removed_id = inbox.messages[MAX_MESSAGES_PER_FOLDER].id.clone();
-        inbox.bodies.insert(first_id.clone(), body(first_id.clone(), "keep"));
-        inbox.bodies.insert(removed_id.clone(), body(removed_id, "drop"));
+        inbox
+            .bodies
+            .insert(first_id.clone(), body(first_id.clone(), "keep"));
+        inbox
+            .bodies
+            .insert(removed_id.clone(), body(removed_id, "drop"));
         let too_large_id = inbox.messages[1].id.clone();
-        inbox.bodies.insert(too_large_id.clone(), body(too_large_id, &"x".repeat(MAX_BODY_BYTES + 1)));
+        inbox.bodies.insert(
+            too_large_id.clone(),
+            body(too_large_id, &"x".repeat(MAX_BODY_BYTES + 1)),
+        );
         apply(&mut snapshot, Change::Folder("INBOX".into(), inbox));
 
         let cached = snapshot.folders.get("INBOX").unwrap();
@@ -426,7 +512,8 @@ mod tests {
     #[test]
     fn persistence_clones_only_bodies_that_survive_disk_limits() {
         let messages = (1..=MAX_MESSAGES_PER_FOLDER as u32 + 2)
-            .map(|uid| summary(7, uid)).collect::<Vec<_>>();
+            .map(|uid| summary(7, uid))
+            .collect::<Vec<_>>();
         let mut live_bodies = HashMap::new();
         for message in &messages {
             let id = message.id.clone();
@@ -434,7 +521,10 @@ mod tests {
         }
         // This oversized body is skipped, allowing the next eligible body in.
         let large_id = messages[0].id.clone();
-        live_bodies.insert(large_id.clone(), body(large_id.clone(), &"x".repeat(MAX_BODY_BYTES + 1)));
+        live_bodies.insert(
+            large_id.clone(),
+            body(large_id.clone(), &"x".repeat(MAX_BODY_BYTES + 1)),
+        );
         let disk_bodies = persistable_bodies(&messages, &live_bodies);
         assert_eq!(disk_bodies.len(), MAX_BODIES_PER_FOLDER);
         assert!(!disk_bodies.contains_key(&large_id));
@@ -447,19 +537,43 @@ mod tests {
         // The existing writer's validation should produce exactly the same
         // persisted set as cloning the entire working set before filtering.
         let mut expected = Snapshot::default();
-        apply(&mut expected, Change::Folder("INBOX".into(), CachedMailbox {
-            messages: messages.clone(), bodies: live_bodies,
-            message_index: 0, message_view_offset: 0, next_page_offset: messages.len(),
-            has_more: false, uid_validity: Some(7), uid_next: None,
-        }));
+        apply(
+            &mut expected,
+            Change::Folder(
+                "INBOX".into(),
+                CachedMailbox {
+                    messages: messages.clone(),
+                    bodies: live_bodies,
+                    message_index: 0,
+                    message_view_offset: 0,
+                    next_page_offset: messages.len(),
+                    has_more: false,
+                    uid_validity: Some(7),
+                    uid_next: None,
+                },
+            ),
+        );
         let mut reduced = Snapshot::default();
-        apply(&mut reduced, Change::Folder("INBOX".into(), CachedMailbox {
-            messages: messages.iter().take(MAX_MESSAGES_PER_FOLDER).cloned().collect(),
-            bodies: disk_bodies,
-            message_index: 0, message_view_offset: 0,
-            next_page_offset: MAX_MESSAGES_PER_FOLDER, has_more: true,
-            uid_validity: Some(7), uid_next: None,
-        }));
+        apply(
+            &mut reduced,
+            Change::Folder(
+                "INBOX".into(),
+                CachedMailbox {
+                    messages: messages
+                        .iter()
+                        .take(MAX_MESSAGES_PER_FOLDER)
+                        .cloned()
+                        .collect(),
+                    bodies: disk_bodies,
+                    message_index: 0,
+                    message_view_offset: 0,
+                    next_page_offset: MAX_MESSAGES_PER_FOLDER,
+                    has_more: true,
+                    uid_validity: Some(7),
+                    uid_next: None,
+                },
+            ),
+        );
         assert_eq!(
             serde_json::to_value(&expected).unwrap(),
             serde_json::to_value(&reduced).unwrap()
@@ -472,7 +586,10 @@ mod tests {
         let path = dir.path().join("index.json");
         let mut snapshot = Snapshot::default();
         apply(&mut snapshot, Change::Folder("INBOX".into(), folder(8, 1)));
-        apply(&mut snapshot, Change::Folder("Archive".into(), folder(8, 1)));
+        apply(
+            &mut snapshot,
+            Change::Folder("Archive".into(), folder(8, 1)),
+        );
         apply(&mut snapshot, Change::RemoveFolder("Archive".into()));
         write_snapshot(&path, &snapshot).unwrap();
 

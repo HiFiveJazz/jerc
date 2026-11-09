@@ -10,10 +10,12 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, ComposeField, ComposeMode, ATTACHMENT_HELP_ENTRIES, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, PICKER_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, ranked_help_matches, ReaderSelection,
+    ATTACHMENT_HELP_ENTRIES, App, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, ComposeField,
+    ComposeMode, HELP_ENTRIES, HelpEntry, PICKER_HELP_ENTRIES, ReaderSelection,
+    ranked_help_matches,
 };
-use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
 use crate::config::VisualSelectionStyle;
+use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
 use crate::theme::Theme;
 
 // Feature renderers share the original theme and layout helpers through this
@@ -43,7 +45,11 @@ use self::status::*;
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(frame.area());
 
     draw_tabs(frame, app, outer[0]);
@@ -74,17 +80,41 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.composer.is_some() {
         draw_composer(frame, app);
-        if app.composer.as_ref().is_some_and(|composer| composer.exit_prompt) {
+        if app
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.exit_prompt)
+        {
             draw_compose_exit_prompt(frame, app.theme());
-        } else if app.composer.as_ref().is_some_and(|composer| composer.confirm_send) {
+        } else if app
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.confirm_send)
+        {
             draw_send_confirmation(frame, app);
-        } else if app.composer.as_ref().is_some_and(|composer| composer.help_visible) {
+        } else if app
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.help_visible)
+        {
             draw_compose_help(frame, app);
-        } else if app.composer.as_ref().is_some_and(|composer| composer.attachment_manager_open) {
+        } else if app
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.attachment_manager_open)
+        {
             draw_compose_attachment_manager(frame, app);
-        } else if app.composer.as_ref().is_some_and(|composer| composer.file_picker.is_some()) {
+        } else if app
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.file_picker.is_some())
+        {
             draw_compose_file_picker(frame, app);
-        } else if app.composer.as_ref().is_some_and(|composer| composer.advanced_headers_open) {
+        } else if app
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.advanced_headers_open)
+        {
             draw_compose_advanced_options(frame, app);
         }
     }
@@ -117,13 +147,15 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
     if !app.startup_warnings.is_empty() {
         spans.push(Span::styled(
-            format!("  ! {} config issue(s) [! to inspect]", app.startup_warnings.len()),
+            format!(
+                "  ! {} config issue(s) [! to inspect]",
+                app.startup_warnings.len()
+            ),
             theme.error(),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.text()), area);
 }
-
 
 fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let Some(_account) = app.account() else {
@@ -158,7 +190,13 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .split(area);
             let right = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(1), Constraint::Length(super::preview_column_width(columns[1].width, app.preview_width_percent))])
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(super::preview_column_width(
+                        columns[1].width,
+                        app.preview_width_percent,
+                    )),
+                ])
                 .split(columns[1]);
             draw_mailboxes(frame, app, columns[0]);
             draw_messages(frame, app, right[0]);
@@ -167,7 +205,13 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         (false, true) => {
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(1), Constraint::Length(super::preview_column_width(area.width, app.preview_width_percent))])
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(super::preview_column_width(
+                        area.width,
+                        app.preview_width_percent,
+                    )),
+                ])
                 .split(area);
             draw_messages(frame, app, columns[0]);
             draw_message(frame, app, columns[1]);
@@ -189,19 +233,49 @@ mod tests {
     #[test]
     fn visual_ranges_are_purple_and_marks_remain_blue() {
         use crate::config::VisualSelectionStyle;
-        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
-        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Gutter,
-            true, false, true, false), theme.current_line());
-        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Gutter,
-            true, false, false, false), theme.text());
-        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
-            true, false, false, false).bg, Some(theme.visual));
-        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
-            false, true, true, false), theme.current_line());
-        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
-            true, true, true, false), theme.current_line());
-        assert_eq!(super::browser_row_style(&theme, VisualSelectionStyle::Row,
-            false, true, true, true), theme.unread().bg(theme.popup_bg));
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
+        assert_eq!(
+            super::browser_row_style(
+                &theme,
+                VisualSelectionStyle::Gutter,
+                true,
+                false,
+                true,
+                false
+            ),
+            theme.current_line()
+        );
+        assert_eq!(
+            super::browser_row_style(
+                &theme,
+                VisualSelectionStyle::Gutter,
+                true,
+                false,
+                false,
+                false
+            ),
+            theme.text()
+        );
+        assert_eq!(
+            super::browser_row_style(&theme, VisualSelectionStyle::Row, true, false, false, false)
+                .bg,
+            Some(theme.visual)
+        );
+        assert_eq!(
+            super::browser_row_style(&theme, VisualSelectionStyle::Row, false, true, true, false),
+            theme.current_line()
+        );
+        assert_eq!(
+            super::browser_row_style(&theme, VisualSelectionStyle::Row, true, true, true, false),
+            theme.current_line()
+        );
+        assert_eq!(
+            super::browser_row_style(&theme, VisualSelectionStyle::Row, false, true, true, true),
+            theme.unread().bg(theme.popup_bg)
+        );
         let visual = super::browser_gutter(&theme, true, false);
         assert_eq!(visual.content.as_ref(), "▍");
         assert_eq!(visual.style.fg, Some(theme.visual));
@@ -210,12 +284,19 @@ mod tests {
         let normal = super::browser_gutter(&theme, false, false);
         assert_eq!(normal.content.as_ref(), "▏");
         assert_eq!(normal.style.fg, Some(theme.border));
-        assert_eq!(super::selection_check_style(&theme, VisualSelectionStyle::Gutter,
-            true, false, false).fg, Some(theme.visual));
-        assert_eq!(super::selection_check_style(&theme, VisualSelectionStyle::Row,
-            true, false, true).fg, Some(theme.visual));
-        assert_eq!(super::selection_check_style(&theme, VisualSelectionStyle::Row,
-            false, true, true).fg, Some(theme.accent));
+        assert_eq!(
+            super::selection_check_style(&theme, VisualSelectionStyle::Gutter, true, false, false)
+                .fg,
+            Some(theme.visual)
+        );
+        assert_eq!(
+            super::selection_check_style(&theme, VisualSelectionStyle::Row, true, false, true).fg,
+            Some(theme.visual)
+        );
+        assert_eq!(
+            super::selection_check_style(&theme, VisualSelectionStyle::Row, false, true, true).fg,
+            Some(theme.accent)
+        );
     }
 
     #[test]
@@ -229,8 +310,14 @@ mod tests {
 
     #[test]
     fn contacts_have_markers_only_on_selected_rows() {
-        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
-        assert_eq!(super::contact_gutter(&theme, false, false).content.as_ref(), " ");
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
+        assert_eq!(
+            super::contact_gutter(&theme, false, false).content.as_ref(),
+            " "
+        );
         let visual = super::contact_gutter(&theme, true, false);
         assert_eq!(visual.content.as_ref(), "▍");
         assert_eq!(visual.style.fg, Some(theme.visual));
@@ -242,7 +329,10 @@ mod tests {
     #[test]
     fn editor_highlight_keeps_ordinary_text_unbolded() {
         use ratatui::style::Modifier;
-        let theme = load_themes().into_iter().find(|t| t.id == "tokyo-night").unwrap();
+        let theme = load_themes()
+            .into_iter()
+            .find(|t| t.id == "tokyo-night")
+            .unwrap();
         let style = super::editor_current_line_style(&theme);
         assert_eq!(style.bg, Some(theme.popup_bg));
         assert!(!style.add_modifier.contains(Modifier::BOLD));
@@ -255,55 +345,93 @@ mod tests {
         let inner = width - 2; // outer popup borders
         let (category, shortcut, max_description) = super::help_columns(inner);
         assert_eq!((category, shortcut, max_description), (13, 27, 36));
-        for entries in [crate::app::HELP_ENTRIES, crate::app::CONTACT_HELP_ENTRIES,
-            crate::app::ATTACHMENT_HELP_ENTRIES, crate::app::PICKER_HELP_ENTRIES,
-            crate::app::COMPOSE_HELP_ENTRIES] {
+        for entries in [
+            crate::app::HELP_ENTRIES,
+            crate::app::CONTACT_HELP_ENTRIES,
+            crate::app::ATTACHMENT_HELP_ENTRIES,
+            crate::app::PICKER_HELP_ENTRIES,
+            crate::app::COMPOSE_HELP_ENTRIES,
+        ] {
             for entry in entries {
-                assert!(UnicodeWidthStr::width(entry.description) <= usize::from(max_description),
-                    "key {} description too wide: {}", entry.key, entry.description);
-                assert!(UnicodeWidthStr::width(entry.key) <= usize::from(shortcut),
-                    "key label too wide: {}", entry.key);
-                assert!(UnicodeWidthStr::width(entry.category) <= usize::from(category),
-                    "category too wide: {}", entry.category);
+                assert!(
+                    UnicodeWidthStr::width(entry.description) <= usize::from(max_description),
+                    "key {} description too wide: {}",
+                    entry.key,
+                    entry.description
+                );
+                assert!(
+                    UnicodeWidthStr::width(entry.key) <= usize::from(shortcut),
+                    "key label too wide: {}",
+                    entry.key
+                );
+                assert!(
+                    UnicodeWidthStr::width(entry.category) <= usize::from(category),
+                    "category too wide: {}",
+                    entry.category
+                );
             }
         }
         for screen_width in 3u16..80 {
             let (category, key, description) = super::help_columns(screen_width.saturating_sub(2));
-            assert!(category + key + description + 2 <= screen_width,
-                "columns overflow width {screen_width}");
+            assert!(
+                category + key + description + 2 <= screen_width,
+                "columns overflow width {screen_width}"
+            );
         }
     }
 
     #[test]
     fn preview_resize_highlights_the_existing_divider_only_while_dragging() {
-        let theme = load_themes().into_iter().find(|t| t.id == "tokyo-night").unwrap();
-        assert_eq!(super::preview_split_border_style(&theme, false).fg, Some(theme.border));
-        assert_eq!(super::preview_split_border_style(&theme, true).fg, Some(theme.accent));
+        let theme = load_themes()
+            .into_iter()
+            .find(|t| t.id == "tokyo-night")
+            .unwrap();
+        assert_eq!(
+            super::preview_split_border_style(&theme, false).fg,
+            Some(theme.border)
+        );
+        assert_eq!(
+            super::preview_split_border_style(&theme, true).fg,
+            Some(theme.accent)
+        );
     }
 
     #[test]
     fn mail_marker_is_thin_and_stays_right_of_sidebar_divider() {
-        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
         let visual = super::mail_gutter(&theme, true, false, true);
         assert_eq!(visual.content.as_ref(), "▍");
         assert_eq!(visual.style.fg, Some(theme.visual));
-        assert_eq!(super::mail_gutter(&theme, false, false, true).content.as_ref(), " ");
-        assert_eq!(super::mail_gutter(&theme, false, false, false).content.as_ref(), "▏");
+        assert_eq!(
+            super::mail_gutter(&theme, false, false, true)
+                .content
+                .as_ref(),
+            " "
+        );
+        assert_eq!(
+            super::mail_gutter(&theme, false, false, false)
+                .content
+                .as_ref(),
+            "▏"
+        );
     }
 
     #[test]
     fn compose_exit_uses_configured_square_or_rounded_corners() {
         use ratatui::{Terminal, backend::TestBackend, widgets::BorderType};
-        for (border_type, expected) in [
-            (BorderType::Plain, '┌'),
-            (BorderType::Rounded, '╭'),
-        ] {
+        for (border_type, expected) in [(BorderType::Plain, '┌'), (BorderType::Rounded, '╭')] {
             let mut theme = load_themes().into_iter().next().unwrap();
             theme.border_type = border_type;
             let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-            terminal.draw(|frame| super::draw_compose_exit_prompt(frame, &theme)).unwrap();
+            terminal
+                .draw(|frame| super::draw_compose_exit_prompt(frame, &theme))
+                .unwrap();
             let buffer = terminal.backend().buffer();
-            let actual = (0u16..24).flat_map(|y| (0u16..80).map(move |x| (x, y)))
+            let actual = (0u16..24)
+                .flat_map(|y| (0u16..80).map(move |x| (x, y)))
                 .find_map(|(x, y)| {
                     let symbol = buffer[(x, y)].symbol();
                     matches!(symbol, "┌" | "╭").then(|| symbol.chars().next().unwrap())
@@ -315,12 +443,23 @@ mod tests {
     #[test]
     fn compose_exit_uses_yes_no_buttons_and_no_escape_hint() {
         use ratatui::{Terminal, backend::TestBackend};
-        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| super::draw_compose_exit_prompt(frame, &theme)).unwrap();
+        terminal
+            .draw(|frame| super::draw_compose_exit_prompt(frame, &theme))
+            .unwrap();
         let buffer = terminal.backend().buffer();
-        let lines = (0u16..24).map(|y| (0u16..80).map(|x|
-            buffer[(x, y)].symbol()).collect::<Vec<_>>().concat()).collect::<Vec<_>>();
+        let lines = (0u16..24)
+            .map(|y| {
+                (0u16..80)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<Vec<_>>()
+                    .concat()
+            })
+            .collect::<Vec<_>>();
         let rendered = lines.join("\n");
         assert!(rendered.contains("[Y]es"));
         assert!(rendered.contains("[N]o"));
@@ -331,7 +470,10 @@ mod tests {
 
     #[test]
     fn delete_review_names_align_for_single_and_double_digit_indices() {
-        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
         let one = super::review_item_line(1, 2, "First", 40, &theme);
         let ten = super::review_item_line(10, 2, "Tenth", 40, &theme);
         assert_eq!(one.spans.len(), 2); // no colored selection gutter
@@ -340,12 +482,18 @@ mod tests {
         assert_eq!(ten.spans[0].content.as_ref(), " 10  ");
         assert_eq!(one.spans[1].content.as_ref(), "First");
         assert_eq!(ten.spans[1].content.as_ref(), "Tenth");
-        assert_eq!(super::destructive_button_style(&theme).bg, Some(theme.error));
+        assert_eq!(
+            super::destructive_button_style(&theme).bg,
+            Some(theme.error)
+        );
     }
 
     #[test]
     fn contacts_status_uses_account_and_same_mode_slot_as_mail() {
-        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
         let mut modal = crate::contacts::ContactsModal::default();
         let normal = super::contact_status_spans(&theme, Some("Gmail"), &modal);
         assert_eq!(normal.len(), 2);
@@ -367,12 +515,20 @@ mod tests {
         assert_eq!(search[1].style, super::search_mode_style(&theme));
         assert_eq!(search[1].style.bg, visual[1].style.bg);
         assert_eq!(search[2].content.as_ref(), " 2 matches");
-        assert!(!search.iter().any(|span| span.content.contains("/john")),
-            "the editable query belongs above the contacts list");
+        assert!(
+            !search.iter().any(|span| span.content.contains("/john")),
+            "the editable query belongs above the contacts list"
+        );
         let details = super::contact_footer_details(&theme, &modal);
-        assert!(details.is_empty(), "matches belong beside SEARCH, not at mid-footer");
+        assert!(
+            details.is_empty(),
+            "matches belong beside SEARCH, not at mid-footer"
+        );
         modal.searching = false;
-        assert_eq!(super::contact_status_spans(&theme, Some("Gmail"), &modal).len(), 2);
+        assert_eq!(
+            super::contact_status_spans(&theme, Some("Gmail"), &modal).len(),
+            2
+        );
         let filtered = super::contact_footer_details(&theme, &modal);
         assert!(filtered[0].content.contains("filter:/john"));
         modal.marked.insert("test@example.com".to_owned());
@@ -380,8 +536,11 @@ mod tests {
         status.extend(super::contact_footer_details(&theme, &modal));
         assert_eq!(status[0].content.as_ref(), "[Gmail] ");
         assert_eq!(status[1].content.as_ref(), " NORMAL ");
-        assert_eq!(status[2].content.as_ref(), " 1 marked ",
-            "marked count should follow the mode immediately at the left");
+        assert_eq!(
+            status[2].content.as_ref(),
+            " 1 marked ",
+            "marked count should follow the mode immediately at the left"
+        );
     }
 
     #[test]
@@ -409,13 +568,15 @@ mod tests {
 
     #[test]
     fn contact_count_is_not_part_of_global_status_mode() {
-        let theme = load_themes().into_iter().find(|theme| theme.id == "tokyo-night").unwrap();
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
         let modal = crate::contacts::ContactsModal::default();
         let spans = super::contact_status_spans(&theme, Some("Gmail"), &modal);
         assert!(spans.iter().all(|span| !span.content.contains("contacts")));
         assert_eq!(spans[1].content.as_ref(), " NORMAL ");
     }
-
 
     #[test]
     fn contact_modals_use_the_terminal_background() {
@@ -430,19 +591,62 @@ mod tests {
         use super::{PatchLineKind, diff_line_style, plain_reader_line};
         let theme = load_themes().into_iter().next().expect("theme");
         let diff = diff_line_style(PatchLineKind::Remove, &theme);
-        let normal = plain_reader_line("- old text", 0, 10, 40, 9, 0, None, true, &theme,
-            Some(PatchLineKind::Remove), None);
-        let active = plain_reader_line("- old text", 0, 10, 40, 0, 0, None, true, &theme,
-            Some(PatchLineKind::Remove), None);
+        let normal = plain_reader_line(
+            "- old text",
+            0,
+            10,
+            40,
+            9,
+            0,
+            None,
+            true,
+            &theme,
+            Some(PatchLineKind::Remove),
+            None,
+        );
+        let active = plain_reader_line(
+            "- old text",
+            0,
+            10,
+            40,
+            0,
+            0,
+            None,
+            true,
+            &theme,
+            Some(PatchLineKind::Remove),
+            None,
+        );
         assert_eq!(normal.spans.last().and_then(|s| s.style.bg), diff.bg);
-        assert_eq!(active.spans.last().and_then(|s| s.style.bg), theme.current_line().bg);
-        assert!(!active.spans.last().is_some_and(|s|
-            s.style.add_modifier.contains(ratatui::style::Modifier::BOLD)),
-            "only the current relative line number should be bold");
+        assert_eq!(
+            active.spans.last().and_then(|s| s.style.bg),
+            theme.current_line().bg
+        );
+        assert!(
+            !active.spans.last().is_some_and(|s| s
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)),
+            "only the current relative line number should be bold"
+        );
 
-        let added = plain_reader_line("+ new text", 0, 10, 40, 0, 0, None, true,
-            &theme, Some(PatchLineKind::Add), None);
-        assert_eq!(added.spans.last().and_then(|s| s.style.bg), theme.current_line().bg);
+        let added = plain_reader_line(
+            "+ new text",
+            0,
+            10,
+            40,
+            0,
+            0,
+            None,
+            true,
+            &theme,
+            Some(PatchLineKind::Add),
+            None,
+        );
+        assert_eq!(
+            added.spans.last().and_then(|s| s.style.bg),
+            theme.current_line().bg
+        );
     }
 
     #[test]
@@ -461,11 +665,18 @@ mod tests {
             ]),
         ];
         let preceding_rows = Paragraph::new(Text::from(lines[..2].to_vec()))
-            .wrap(Wrap { trim: false }).line_count(20);
+            .wrap(Wrap { trim: false })
+            .line_count(20);
         let cursor_row = reader_visual_cursor_row(&lines, 1, 1, 20).unwrap();
         assert!(cursor_row >= preceding_rows);
-        assert!(cursor_row > 2, "wrapped rows must contribute to the scroll position");
-        assert_eq!(super::reader_active_diff_bg(&theme, theme.error), theme.popup_bg);
+        assert!(
+            cursor_row > 2,
+            "wrapped rows must contribute to the scroll position"
+        );
+        assert_eq!(
+            super::reader_active_diff_bg(&theme, theme.error),
+            theme.popup_bg
+        );
     }
 
     #[test]
@@ -490,10 +701,18 @@ mod tests {
             has_attachment_hint: false,
             attachment_names_hint: vec![],
         };
-        let text = |show_details| super::reader_header_lines(&message, show_details, &theme)
-            .into_iter()
-            .map(|line| line.spans.into_iter().map(|span| span.content.into_owned()).collect::<String>())
-            .collect::<Vec<_>>().join("\n");
+        let text = |show_details| {
+            super::reader_header_lines(&message, show_details, &theme)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.content.into_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let compact = text(false);
         let expanded = text(true);
         assert!(compact.contains("From: Alex Sender\n"));
@@ -508,9 +727,17 @@ mod tests {
         ] {
             assert!(compact.contains(header), "missing compact header: {header}");
         }
-        for address in ["one@example.org", "two@example.org", "cc@example.org", "bcc@example.org"] {
+        for address in [
+            "one@example.org",
+            "two@example.org",
+            "cc@example.org",
+            "bcc@example.org",
+        ] {
             assert!(!compact.contains(address), "leaked address: {address}");
-            assert!(expanded.contains(address), "missing expanded address: {address}");
+            assert!(
+                expanded.contains(address),
+                "missing expanded address: {address}"
+            );
         }
         assert!(expanded.contains("From: Alex Sender <alex@example.org>"));
         assert!(expanded.contains("Message-ID: <message@example.org>"));
@@ -518,24 +745,41 @@ mod tests {
 
     #[test]
     fn compact_recipients_support_quoted_commas_and_bare_addresses() {
-        assert_eq!(super::compact_recipient_header(
-            "\"Doe, Jane\" <jane@example.com>, bare@example.com, <only@example.com>"),
-            "Doe, Jane, bare@example.com, <only@example.com>");
-        assert_eq!(super::compact_recipient_header("Research Team <team@example.com>;"),
-            "Research Team;");
+        assert_eq!(
+            super::compact_recipient_header(
+                "\"Doe, Jane\" <jane@example.com>, bare@example.com, <only@example.com>"
+            ),
+            "Doe, Jane, bare@example.com, <only@example.com>"
+        );
+        assert_eq!(
+            super::compact_recipient_header("Research Team <team@example.com>;"),
+            "Research Team;"
+        );
     }
 
     #[test]
     fn missing_sender_name_keeps_address_even_when_compact() {
-        assert_eq!(super::sender_header_value("", "nobody@example.org", false), "nobody@example.org");
-        assert_eq!(super::sender_header_value("Alex", "alex@example.org", false), "Alex");
-        assert_eq!(super::sender_header_value("Alex", "alex@example.org", true), "Alex <alex@example.org>");
+        assert_eq!(
+            super::sender_header_value("", "nobody@example.org", false),
+            "nobody@example.org"
+        );
+        assert_eq!(
+            super::sender_header_value("Alex", "alex@example.org", false),
+            "Alex"
+        );
+        assert_eq!(
+            super::sender_header_value("Alex", "alex@example.org", true),
+            "Alex <alex@example.org>"
+        );
     }
 
     #[test]
     fn message_attachment_subtitle_has_no_extra_indentation() {
         let names = vec!["config.example.toml".to_owned(), "LICENSE".to_owned()];
-        assert_eq!(super::attachment_subtitle(&names), "config.example.toml · LICENSE");
+        assert_eq!(
+            super::attachment_subtitle(&names),
+            "config.example.toml · LICENSE"
+        );
         assert_eq!(super::attachment_subtitle(&[]), "Attachment");
     }
 
@@ -545,24 +789,46 @@ mod tests {
         let mut composer = Composer::new();
         composer.field = ComposeField::To;
         composer.mode = ComposeMode::Insert;
-        composer.to = "Jane Doe <jane@example.org>, Björk <bjork@example.org>, Zoe <zoe@example.org>".into();
+        composer.to =
+            "Jane Doe <jane@example.org>, Björk <bjork@example.org>, Zoe <zoe@example.org>".into();
         composer.cursor = composer.to.chars().count();
         let theme = load_themes().into_iter().next().unwrap();
-        let display = super::compose_header_display(ComposeField::To, "To", &composer.to, &composer, &theme, 24);
+        let display = super::compose_header_display(
+            ComposeField::To,
+            "To",
+            &composer.to,
+            &composer,
+            &theme,
+            24,
+        );
         assert!(display.lines.len() > 2);
         // Strip only layout indentation, never characters from the input.
         let mut reconstructed = String::new();
         for (row_number, line) in display.lines.iter().enumerate() {
-            let text = line.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
-            if row_number == 0 { reconstructed.push_str(text.strip_prefix("▸ To: ").unwrap()); }
-            else { reconstructed.push_str(text.strip_prefix("      ").unwrap()); }
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            if row_number == 0 {
+                reconstructed.push_str(text.strip_prefix("▸ To: ").unwrap());
+            } else {
+                reconstructed.push_str(text.strip_prefix("      ").unwrap());
+            }
         }
         assert_eq!(reconstructed, composer.to);
         assert!(display.cursor_row > 0);
         assert!(display.cursor_col < 24);
         for row in &display.lines {
-            let text = row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
-            assert!(UnicodeWidthStr::width(text.as_str()) <= 24, "overflow: {text:?}");
+            let text = row
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(
+                UnicodeWidthStr::width(text.as_str()) <= 24,
+                "overflow: {text:?}"
+            );
         }
     }
 
@@ -575,12 +841,30 @@ mod tests {
         composer.subject = "Hello 👨\u{200d}💻 Zoe".into();
         composer.cursor = composer.subject.chars().count();
         let theme = load_themes().into_iter().next().unwrap();
-        let display = super::compose_header_display(ComposeField::Subject, "Subject", &composer.subject, &composer, &theme, 15);
+        let display = super::compose_header_display(
+            ComposeField::Subject,
+            "Subject",
+            &composer.subject,
+            &composer,
+            &theme,
+            15,
+        );
         assert!(display.lines.len() >= 2);
-        let rows = display.lines.iter().map(|line| line.spans.iter()
-            .map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+        let rows = display
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
         assert!(rows.iter().any(|row| row.contains("👨\u{200d}💻")));
-        assert!(rows.iter().all(|row| UnicodeWidthStr::width(row.as_str()) <= 15));
+        assert!(
+            rows.iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 15)
+        );
     }
 
     #[test]
@@ -595,30 +879,49 @@ mod tests {
 
     #[test]
     fn insert_cursor_does_not_insert_a_character_into_editor_spans() {
-        use crate::app::{Composer, ComposeMode};
+        use crate::app::{ComposeMode, Composer};
         let mut composer = Composer::new();
         composer.mode = ComposeMode::Insert;
         composer.cursor = 1;
         let theme = load_themes().into_iter().next().unwrap();
         let rendered = super::editor_spans("abc", &composer, true, &theme);
-        assert_eq!(rendered.iter().map(|span| span.content.as_ref()).collect::<String>(), "abc");
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "abc"
+        );
         let rendered = super::editor_text("abc", &composer, true, &theme);
-        assert_eq!(rendered.lines[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>(), "abc");
+        assert_eq!(
+            rendered.lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "abc"
+        );
     }
 
     #[test]
     fn notification_indicator_has_unicode_fallback_and_nerd_opt_in() {
         let config: crate::config::Config = toml::from_str(
-            "[ui]\nnew_mail_notifications = true\nnotification_icon_style = \"unicode\""
-        ).unwrap();
+            "[ui]\nnew_mail_notifications = true\nnotification_icon_style = \"unicode\"",
+        )
+        .unwrap();
         let app = crate::app::App::new(&config, vec![]);
         let theme = load_themes().into_iter().next().unwrap();
         assert!(super::notification_indicator(&app, &theme).0.contains('●'));
         let nerd_config: crate::config::Config = toml::from_str(
-            "[ui]\nnew_mail_notifications = true\nnotification_icon_style = \"nerd\""
-        ).unwrap();
+            "[ui]\nnew_mail_notifications = true\nnotification_icon_style = \"nerd\"",
+        )
+        .unwrap();
         let nerd_app = crate::app::App::new(&nerd_config, vec![]);
-        assert!(super::notification_indicator(&nerd_app, &theme).0.contains("󰂚"));
+        assert!(
+            super::notification_indicator(&nerd_app, &theme)
+                .0
+                .contains("󰂚")
+        );
     }
 
     #[test]
@@ -659,7 +962,15 @@ mod tests {
     #[test]
     fn adjacent_unified_headers_allow_non_git_patches() {
         use super::{PatchLineKind, classify_patch_lines};
-        let lines = ["--- a/foo", "+++ b/foo", "@@ -1 +1 @@", "-before", "+after", "--", "-EIO"];
+        let lines = [
+            "--- a/foo",
+            "+++ b/foo",
+            "@@ -1 +1 @@",
+            "-before",
+            "+after",
+            "--",
+            "-EIO",
+        ];
         let kinds = classify_patch_lines(&lines);
         assert_eq!(kinds[3], Some(PatchLineKind::Remove));
         assert_eq!(kinds[4], Some(PatchLineKind::Add));
@@ -671,9 +982,16 @@ mod tests {
     fn message_viewport_matches_full_height_scan() {
         // Reference: previous implementation, which scanned/allotted heights
         // for the entire mailbox on every terminal redraw.
-        fn old_viewport(heights: &[usize], offset: usize, current: usize, height: usize) -> (usize, usize) {
+        fn old_viewport(
+            heights: &[usize],
+            offset: usize,
+            current: usize,
+            height: usize,
+        ) -> (usize, usize) {
             let mut start = offset.min(heights.len() - 1);
-            if current < start { start = current; }
+            if current < start {
+                start = current;
+            }
             let mut rows = heights[start..=current].iter().sum::<usize>();
             while start < current && rows > height {
                 rows -= heights[start];
@@ -685,7 +1003,9 @@ mod tests {
                 used += heights[end];
                 end += 1;
             }
-            if end == start { end = (start + 1).min(heights.len()); }
+            if end == start {
+                end = (start + 1).min(heights.len());
+            }
             (start, end)
         }
         for mask in 0..256usize {
@@ -695,7 +1015,13 @@ mod tests {
                 for offset in 0..=heights.len() {
                     for current in 0..heights.len() {
                         assert_eq!(
-                            super::message_list_viewport(&visible, offset, current, height, |index| heights[index]),
+                            super::message_list_viewport(
+                                &visible,
+                                offset,
+                                current,
+                                height,
+                                |index| heights[index]
+                            ),
                             old_viewport(&heights, offset, current, height),
                             "mask={mask} height={height} offset={offset} current={current}"
                         );
@@ -709,18 +1035,36 @@ mod tests {
     #[test]
     fn visual_mail_selection_uses_view_positions_without_repeated_searches() {
         let visible = [6, 2, 9, 1];
-        assert_eq!(super::message_list_visual_range(&visible, Some(9), Some(1)), Some((1, 2)));
-        assert_eq!(super::message_list_visual_range(&visible, Some(6), Some(3)), Some((0, 3)));
-        assert_eq!(super::message_list_visual_range(&visible, Some(8), Some(1)), None);
-        assert_eq!(super::message_list_visual_range(&visible, None, Some(1)), None);
+        assert_eq!(
+            super::message_list_visual_range(&visible, Some(9), Some(1)),
+            Some((1, 2))
+        );
+        assert_eq!(
+            super::message_list_visual_range(&visible, Some(6), Some(3)),
+            Some((0, 3))
+        );
+        assert_eq!(
+            super::message_list_visual_range(&visible, Some(8), Some(1)),
+            None
+        );
+        assert_eq!(
+            super::message_list_visual_range(&visible, None, Some(1)),
+            None
+        );
     }
 
     #[test]
     fn mail_list_borrows_unchanged_subjects_and_truncation() {
         use std::borrow::Cow;
-        assert!(matches!(super::subject_for_list_cow("Hello 👋"), Cow::Borrowed(_)));
+        assert!(matches!(
+            super::subject_for_list_cow("Hello 👋"),
+            Cow::Borrowed(_)
+        ));
         assert_eq!(super::subject_for_list_cow("❤️"), "❤\u{fe0e}");
-        assert!(matches!(super::truncate_display_width_cow("Hello", 10), Cow::Borrowed(_)));
+        assert!(matches!(
+            super::truncate_display_width_cow("Hello", 10),
+            Cow::Borrowed(_)
+        ));
         assert_eq!(super::truncate_display_width_cow("Hello", 4), "Hel…");
     }
 
@@ -733,7 +1077,10 @@ mod tests {
 
     #[test]
     fn mailbox_rows_keep_counts_at_the_right_edge() {
-        assert_eq!(mailbox_row_text("[Gmail]/Trash", "5", 20), "[Gmail]/Trash      5");
+        assert_eq!(
+            mailbox_row_text("[Gmail]/Trash", "5", 20),
+            "[Gmail]/Trash      5"
+        );
         assert_eq!(mailbox_row_text("INBOX", "", 10), "INBOX     ");
     }
 
@@ -753,8 +1100,14 @@ mod tests {
         assert_eq!(subject_for_list("❤️ Mail ☀️"), "❤\u{fe0e} Mail ☀\u{fe0e}");
         // Preserve emoji-only/wide glyphs and joined emoji. FE0E fallback
         // caused half-glyph clipping with the user's Apple Color Emoji font.
-        assert_eq!(subject_for_list("👋 Welcome to KLIPY!"), "👋 Welcome to KLIPY!");
-        assert_eq!(subject_for_list("👨\u{200d}💻 Status"), "👨\u{200d}💻 Status");
+        assert_eq!(
+            subject_for_list("👋 Welcome to KLIPY!"),
+            "👋 Welcome to KLIPY!"
+        );
+        assert_eq!(
+            subject_for_list("👨\u{200d}💻 Status"),
+            "👨\u{200d}💻 Status"
+        );
     }
 
     #[test]
@@ -768,10 +1121,15 @@ mod tests {
     #[test]
     fn attachment_summary_wraps_and_clips_without_splitting_emoji() {
         let rows = super::clipped_wrap_text(
-            "Attachments (4): a.txt · image👨\u{200d}💻.png · very-long-filename.pdf · z.zip", 22, 2,
+            "Attachments (4): a.txt · image👨\u{200d}💻.png · very-long-filename.pdf · z.zip",
+            22,
+            2,
         );
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| UnicodeWidthStr::width(row.as_str()) <= 22));
+        assert!(
+            rows.iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 22)
+        );
         assert!(rows.last().unwrap().ends_with('…'));
         assert!(!rows.iter().any(|row| row.ends_with('\u{200d}')));
     }
@@ -779,7 +1137,10 @@ mod tests {
     #[test]
     fn compose_mode_badges_use_distinct_filled_colors() {
         use crate::app::ComposeMode;
-        let theme = crate::theme::load_themes().into_iter().find(|t| t.id == "tokyo-night").unwrap();
+        let theme = crate::theme::load_themes()
+            .into_iter()
+            .find(|t| t.id == "tokyo-night")
+            .unwrap();
         let normal = super::compose_mode_colors(ComposeMode::Normal, &theme);
         let insert = super::compose_mode_colors(ComposeMode::Insert, &theme);
         let visual = super::compose_mode_colors(ComposeMode::Visual, &theme);
@@ -798,7 +1159,10 @@ mod tests {
             assert_eq!(super::mode_style("VISUAL", &theme).bg, Some(theme.visual));
             assert_eq!(super::mode_style("SEARCH", &theme).bg, Some(theme.visual));
             assert_eq!(super::mode_style("INSERT", &theme).bg, Some(theme.unread));
-            assert_eq!(super::compose_mode_style(crate::app::ComposeMode::Insert, &theme).bg, Some(theme.unread));
+            assert_eq!(
+                super::compose_mode_style(crate::app::ComposeMode::Insert, &theme).bg,
+                Some(theme.unread)
+            );
         }
     }
 
@@ -846,11 +1210,16 @@ mod tests {
             &[(0, 4)],
         );
         assert_eq!(fragments.len(), 1);
-        assert!(!fragments[0]
-            .style
-            .add_modifier
-            .contains(ratatui::style::Modifier::UNDERLINED));
-        assert_eq!(fragments[0].style.bg, Some(super::reader_illuminate_bg(&theme)));
+        assert!(
+            !fragments[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+        assert_eq!(
+            fragments[0].style.bg,
+            Some(super::reader_illuminate_bg(&theme))
+        );
         assert_eq!(fragments[0].style.fg, theme.text().fg);
     }
 
@@ -881,7 +1250,10 @@ mod tests {
         assert_eq!(fragments.len(), 2);
         assert_eq!(fragments[0].style.bg, Some(Color::White));
         assert_eq!(fragments[0].style.fg, Some(Color::Black));
-        assert_eq!(fragments[1].style.bg, Some(super::reader_illuminate_bg(&theme)));
+        assert_eq!(
+            fragments[1].style.bg,
+            Some(super::reader_illuminate_bg(&theme))
+        );
     }
 
     #[test]
@@ -895,7 +1267,6 @@ mod tests {
         assert_eq!(spans[0].style.bg, Some(Color::White));
         assert_eq!(spans[0].style.fg, Some(Color::Black));
     }
-
 }
 
 #[cfg(test)]
@@ -906,14 +1277,16 @@ mod attachment_preview_tests {
     #[test]
     fn preview_text_is_bounded_and_does_not_display_binary() {
         let file = OutgoingAttachment {
-            filename: "notes.txt".into(), content_type: "text/plain".into(),
+            filename: "notes.txt".into(),
+            content_type: "text/plain".into(),
             data: vec![b'a'; 64 * 1024],
         };
         let preview = attachment_text_preview(&file).unwrap();
         assert!(preview.len() < file.data.len());
         assert!(preview.contains("truncated"));
         let binary = OutgoingAttachment {
-            filename: "file.bin".into(), content_type: "application/octet-stream".into(),
+            filename: "file.bin".into(),
+            content_type: "application/octet-stream".into(),
             data: vec![0, 1, 2],
         };
         assert!(attachment_text_preview(&binary).is_none());

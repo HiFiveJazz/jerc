@@ -7,12 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use io_imap::client::{ImapClient, ImapClientStd, ImapClientStdConnectOptions};
 use io_imap::rfc3501::{
-    append::ImapMessageAppendOptions,
-    copy::ImapMessageCopyOptions,
-    fetch::ImapMessageFetchOptions,
-    login::ImapLoginOptions,
-    select::ImapMailboxSelectOptions,
-    store::ImapMessageStoreOptions,
+    append::ImapMessageAppendOptions, copy::ImapMessageCopyOptions, fetch::ImapMessageFetchOptions,
+    login::ImapLoginOptions, select::ImapMailboxSelectOptions, store::ImapMessageStoreOptions,
 };
 use io_imap::rfc6851::r#move::ImapMessageMoveOptions;
 use io_imap::rfc7628::auth_oauthbearer::ImapAuthOauthbearerOptions;
@@ -208,7 +204,12 @@ impl ImapSource {
             }
             Ok(token.access_token)
         })();
-        crate::perf::record("imap_oauth_http_refresh", None, started.elapsed(), refreshed.is_ok());
+        crate::perf::record(
+            "imap_oauth_http_refresh",
+            None,
+            started.elapsed(),
+            refreshed.is_ok(),
+        );
         refreshed
     }
 }
@@ -291,7 +292,12 @@ impl ImapBackend {
             .session()?
             .select(mailbox_name, ImapMailboxSelectOptions::default())
             .with_context(|| format!("selecting IMAP mailbox {mailbox:?}"));
-        crate::perf::record("imap_select", None, started.elapsed(), selected_result.is_ok());
+        crate::perf::record(
+            "imap_select",
+            None,
+            started.elapsed(),
+            selected_result.is_ok(),
+        );
         let selected = selected_result?;
         self.selected_mailbox = Some(mailbox.to_owned());
         self.selected_exists = Some(selected.exists.unwrap_or(0));
@@ -313,13 +319,16 @@ impl ImapBackend {
     fn note_removed(&mut self, mailbox: &str, count: usize) {
         if self.selected_mailbox.as_deref() == Some(mailbox) {
             let count = u32::try_from(count).unwrap_or(u32::MAX);
-            self.selected_exists = self.selected_exists.map(|exists| exists.saturating_sub(count));
+            self.selected_exists = self
+                .selected_exists
+                .map(|exists| exists.saturating_sub(count));
         }
     }
 
     fn decode_uid(id: &MessageId) -> Result<(Option<u32>, u32)> {
-        let raw = id.0.strip_prefix("imap-uid:")
-            .ok_or_else(|| anyhow!("message ID is not an IMAP UID"))?;
+        let raw =
+            id.0.strip_prefix("imap-uid:")
+                .ok_or_else(|| anyhow!("message ID is not an IMAP UID"))?;
         if let Some((validity, uid)) = raw.split_once(':') {
             let validity = validity.parse::<u32>().context("parsing UIDVALIDITY")?;
             let uid = uid.parse::<u32>().context("parsing IMAP UID")?;
@@ -340,14 +349,18 @@ impl ImapBackend {
         let (expected, _) = Self::decode_uid(id)?;
         if let Some(expected) = expected {
             if self.selected_uid_validity != Some(expected) {
-                bail!("mailbox UIDVALIDITY changed; refresh this folder before acting on cached mail");
+                bail!(
+                    "mailbox UIDVALIDITY changed; refresh this folder before acting on cached mail"
+                );
             }
         }
         Ok(())
     }
 
     fn check_many_uid_generations(&self, ids: &[MessageId]) -> Result<()> {
-        for id in ids { self.check_uid_generation(id)?; }
+        for id in ids {
+            self.check_uid_generation(id)?;
+        }
         Ok(())
     }
 
@@ -376,29 +389,44 @@ impl ImapBackend {
             .context("building IMAP UID sequence set")
     }
 
-
     /// Reuse immutable headers and BODYSTRUCTURE only for server-confirmed
     /// UIDs. A first FLAGS-only FETCH identifies the actual current page;
     /// only unknown UIDs need an RFC822.HEADER / BODYSTRUCTURE FETCH.
     /// Incomplete results (e.g. EXPUNGE races) trigger the full fallback.
-    fn try_incremental_page(&mut self, exists: u32, limit: usize,
-        hint: &MailboxSyncHint) -> Result<Option<MessagePage>> {
+    fn try_incremental_page(
+        &mut self,
+        exists: u32,
+        limit: usize,
+        hint: &MailboxSyncHint,
+    ) -> Result<Option<MessagePage>> {
         let window = if limit == 0 { self.max_messages } else { limit };
-        let width = if window == 0 { exists } else {
+        let width = if window == 0 {
+            exists
+        } else {
             u32::try_from(window).unwrap_or(u32::MAX).min(exists)
         };
         let start = exists.saturating_sub(width.saturating_sub(1)).max(1);
         let range_text = format!("{start}:{exists}");
-        let range: SequenceSet = range_text.as_str().try_into()
+        let range: SequenceSet = range_text
+            .as_str()
+            .try_into()
             .context("building incremental IMAP range")?;
-        let items: MacroOrMessageDataItemNames<'static> = vec![
-            MessageDataItemName::Uid, MessageDataItemName::Flags,
-        ].into();
+        let items: MacroOrMessageDataItemNames<'static> =
+            vec![MessageDataItemName::Uid, MessageDataItemName::Flags].into();
         let started = Instant::now();
-        let fetched = self.session()?.fetch(range, items, ImapMessageFetchOptions::default());
-        crate::perf::record("imap_fetch_uid_flags", None, started.elapsed(), fetched.is_ok());
+        let fetched = self
+            .session()?
+            .fetch(range, items, ImapMessageFetchOptions::default());
+        crate::perf::record(
+            "imap_fetch_uid_flags",
+            None,
+            started.elapsed(),
+            fetched.is_ok(),
+        );
         let fetched = fetched?;
-        if fetched.len() != width as usize { return Ok(None); }
+        if fetched.len() != width as usize {
+            return Ok(None);
+        }
 
         let mut seen = HashSet::new();
         let mut current = Vec::with_capacity(fetched.len());
@@ -411,21 +439,33 @@ impl ImapBackend {
                     _ => {}
                 }
             }
-            let (Some(uid), Some(flags)) = (uid, flags) else { return Ok(None); };
-            if !seen.insert(uid) { return Ok(None); }
+            let (Some(uid), Some(flags)) = (uid, flags) else {
+                return Ok(None);
+            };
+            if !seen.insert(uid) {
+                return Ok(None);
+            }
             current.push((uid, flags));
         }
 
         let known = cached_uid_map(hint.uid_validity, &hint.messages);
-        let missing = current.iter()
+        let missing = current
+            .iter()
             .filter(|(uid, _)| !known.contains_key(uid))
-            .map(|(uid, _)| *uid).collect::<Vec<_>>();
+            .map(|(uid, _)| *uid)
+            .collect::<Vec<_>>();
         let mut new_summaries = HashMap::new();
         if !missing.is_empty() {
             // UID FETCH is essential: sequence numbers are not stable across
             // EXPUNGE, while UIDVALIDITY+UID unambiguously identify a message.
-            let text = missing.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-            let sequence: SequenceSet = text.as_str().try_into()
+            let text = missing
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let sequence: SequenceSet = text
+                .as_str()
+                .try_into()
                 .context("building UID FETCH for uncached headers")?;
             let items: MacroOrMessageDataItemNames<'static> = vec![
                 MessageDataItemName::Uid,
@@ -433,33 +473,52 @@ impl ImapBackend {
                 MessageDataItemName::Rfc822Size,
                 MessageDataItemName::Rfc822Header,
                 MessageDataItemName::BodyStructure,
-            ].into();
+            ]
+            .into();
             let mut opts = ImapMessageFetchOptions::default();
             opts.uid = true;
             let started = Instant::now();
             let fetched = self.session()?.fetch(sequence, items, opts);
-            crate::perf::record("imap_fetch_new_headers", None, started.elapsed(), fetched.is_ok());
+            crate::perf::record(
+                "imap_fetch_new_headers",
+                None,
+                started.elapsed(),
+                fetched.is_ok(),
+            );
             let fetched = fetched?;
             for data in fetched.values() {
-                if let Some(summary) = summary_from_fetch(data.as_ref(), self.selected_uid_validity) {
+                if let Some(summary) = summary_from_fetch(data.as_ref(), self.selected_uid_validity)
+                {
                     if let Ok((_, uid)) = Self::decode_uid(&summary.id) {
                         new_summaries.insert(uid, summary);
                     }
                 }
             }
-            if new_summaries.len() != missing.len() { return Ok(None); }
+            if new_summaries.len() != missing.len() {
+                return Ok(None);
+            }
         }
 
-        let Some(messages) = merge_uid_page(hint.uid_validity,
-            &hint.messages, &current, new_summaries) else {
+        let Some(messages) =
+            merge_uid_page(hint.uid_validity, &hint.messages, &current, new_summaries)
+        else {
             return Ok(None);
         };
-        Ok(Some(MessagePage { messages, offset: 0,
-            next_offset: width as usize, has_more: start > 1 }))
+        Ok(Some(MessagePage {
+            messages,
+            offset: 0,
+            next_offset: width as usize,
+            has_more: start > 1,
+        }))
     }
 
-    fn open_mailbox_impl(&mut self, name: &str, offset: usize, limit: usize,
-        hint: Option<&MailboxSyncHint>) -> Result<MessagePage> {
+    fn open_mailbox_impl(
+        &mut self,
+        name: &str,
+        offset: usize,
+        limit: usize,
+        hint: Option<&MailboxSyncHint>,
+    ) -> Result<MessagePage> {
         // Always re-SELECT the first page so a manual refresh sees new arrivals.
         // Later pages can reuse the selected mailbox's EXISTS count without an
         // extra round trip.
@@ -468,16 +527,25 @@ impl ImapBackend {
         } else {
             self.mailbox_exists(name)?
         };
-        if offset == 0 && exists > 0 && let Some(hint) = hint {
+        if offset == 0
+            && exists > 0
+            && let Some(hint) = hint
+        {
             if !hint.messages.is_empty()
                 && self.selected_uid_validity == Some(hint.uid_validity)
-                && self.selected_uid_next.zip(hint.uid_next)
+                && self
+                    .selected_uid_next
+                    .zip(hint.uid_next)
                     .is_none_or(|(server, previous)| server >= previous)
             {
                 let started = Instant::now();
                 let candidate = self.try_incremental_page(exists, limit, hint);
-                crate::perf::record("imap_incremental_reuse", None, started.elapsed(),
-                    matches!(&candidate, Ok(Some(_))));
+                crate::perf::record(
+                    "imap_incremental_reuse",
+                    None,
+                    started.elapsed(),
+                    matches!(&candidate, Ok(Some(_))),
+                );
                 if let Ok(Some(page)) = candidate {
                     return Ok(page);
                 }
@@ -490,8 +558,13 @@ impl ImapBackend {
         self.fetch_full_page(name, exists, offset, limit)
     }
 
-    fn fetch_full_page(&mut self, name: &str, exists: u32,
-        offset: usize, limit: usize) -> Result<MessagePage> {
+    fn fetch_full_page(
+        &mut self,
+        name: &str,
+        exists: u32,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MessagePage> {
         if exists == 0 || offset >= exists as usize {
             return Ok(MessagePage {
                 messages: Vec::new(),
@@ -538,18 +611,21 @@ impl ImapBackend {
             .session()?
             .fetch(sequence, items, ImapMessageFetchOptions::default())
             .with_context(|| format!("fetching headers from {name:?}"));
-        crate::perf::record("imap_fetch_headers", None, started.elapsed(), fetched_result.is_ok());
+        crate::perf::record(
+            "imap_fetch_headers",
+            None,
+            started.elapsed(),
+            fetched_result.is_ok(),
+        );
         let fetched = fetched_result?;
 
-        let mut messages = fetched.values()
+        let mut messages = fetched
+            .values()
             .filter_map(|items| summary_from_fetch(items.as_ref(), self.selected_uid_validity))
             .collect::<Vec<_>>();
-        messages.sort_by(|a, b| {
-            b.timestamp
-                .cmp(&a.timestamp)
-                .then_with(|| b.id.cmp(&a.id))
-        });
-        let consumed = usize::try_from(end.saturating_sub(start).saturating_add(1)).unwrap_or(usize::MAX);
+        messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
+        let consumed =
+            usize::try_from(end.saturating_sub(start).saturating_add(1)).unwrap_or(usize::MAX);
         let next_offset = offset.saturating_add(consumed);
         Ok(MessagePage {
             messages,
@@ -558,7 +634,6 @@ impl ImapBackend {
             has_more: start > 1,
         })
     }
-
 
     fn ensure_selected(&mut self, mailbox: &str) -> Result<()> {
         if self.selected_mailbox.as_deref() != Some(mailbox) {
@@ -570,18 +645,25 @@ impl ImapBackend {
 
 /// Map only UIDs from the expected mailbox generation. Legacy IDs cannot
 /// participate in incremental synchronization, even if their UID matches.
-fn cached_uid_map(validity: u32, summaries: &[crate::model::MessageSummary])
-    -> HashMap<u32, &crate::model::MessageSummary> {
-    summaries.iter().filter_map(|message| {
-        let (generation, uid) = ImapBackend::decode_uid(&message.id).ok()?;
-        (generation == Some(validity)).then_some((uid, message))
-    }).collect()
+fn cached_uid_map(
+    validity: u32,
+    summaries: &[crate::model::MessageSummary],
+) -> HashMap<u32, &crate::model::MessageSummary> {
+    summaries
+        .iter()
+        .filter_map(|message| {
+            let (generation, uid) = ImapBackend::decode_uid(&message.id).ok()?;
+            (generation == Some(validity)).then_some((uid, message))
+        })
+        .collect()
 }
 
 /// Pure reconciliation used by the network path and regression tests. Only
 /// server-confirmed UIDs are retained, stale flags are overwritten, and each
 /// new UID must have a freshly fetched summary. Returns None on any gap.
-fn merge_uid_page(validity: u32, cached: &[crate::model::MessageSummary],
+fn merge_uid_page(
+    validity: u32,
+    cached: &[crate::model::MessageSummary],
     current: &[(u32, MessageFlags)],
     mut newly_fetched: HashMap<u32, crate::model::MessageSummary>,
 ) -> Option<Vec<crate::model::MessageSummary>> {
@@ -589,21 +671,28 @@ fn merge_uid_page(validity: u32, cached: &[crate::model::MessageSummary],
     let mut seen = HashSet::new();
     let mut messages = Vec::with_capacity(current.len());
     for &(uid, flags) in current {
-        if !seen.insert(uid) { return None; }
-        let mut summary = known.get(&uid).map(|item| (**item).clone())
+        if !seen.insert(uid) {
+            return None;
+        }
+        let mut summary = known
+            .get(&uid)
+            .map(|item| (**item).clone())
             .or_else(|| newly_fetched.remove(&uid))?;
         let (generation, summary_uid) = ImapBackend::decode_uid(&summary.id).ok()?;
-        if generation != Some(validity) || summary_uid != uid { return None; }
+        if generation != Some(validity) || summary_uid != uid {
+            return None;
+        }
         summary.flags = flags;
         messages.push(summary);
     }
-    messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)
-        .then_with(|| b.id.cmp(&a.id)));
+    messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
     Some(messages)
 }
 
-fn summary_from_fetch(items: &[MessageDataItem<'_>],
-    uid_validity: Option<u32>) -> Option<crate::model::MessageSummary> {
+fn summary_from_fetch(
+    items: &[MessageDataItem<'_>],
+    uid_validity: Option<u32>,
+) -> Option<crate::model::MessageSummary> {
     let (mut uid, mut flags, mut size) = (None, MessageFlags::empty(), 0u64);
     let mut headers = None;
     let mut attachment_hints = Vec::new();
@@ -612,10 +701,12 @@ fn summary_from_fetch(items: &[MessageDataItem<'_>],
             MessageDataItem::Uid(value) => uid = Some(value.get()),
             MessageDataItem::Flags(value) => flags = flags_from_imap(value),
             MessageDataItem::Rfc822Size(value) => size = u64::from(*value),
-            MessageDataItem::Rfc822Header(value) =>
-                headers = value.clone().into_option().map(Cow::into_owned),
-            MessageDataItem::BodyStructure(structure) =>
-                collect_bodystructure_attachments(structure, &mut attachment_hints),
+            MessageDataItem::Rfc822Header(value) => {
+                headers = value.clone().into_option().map(Cow::into_owned)
+            }
+            MessageDataItem::BodyStructure(structure) => {
+                collect_bodystructure_attachments(structure, &mut attachment_hints)
+            }
             _ => {}
         }
     }
@@ -628,11 +719,14 @@ fn summary_from_fetch(items: &[MessageDataItem<'_>],
     // BODYSTRUCTURE provides no decoded bytes. Prefer named .ics over an
     // additional unnamed calendar alternative in the summary, and let the
     // full MIME parser decide by byte comparison when the email is opened.
-    let has_named_calendar = attachment_hints.iter().any(|(name, _)|
-        name.to_ascii_lowercase().ends_with(".ics"));
-    let attachment_names = attachment_hints.into_iter()
+    let has_named_calendar = attachment_hints
+        .iter()
+        .any(|(name, _)| name.to_ascii_lowercase().ends_with(".ics"));
+    let attachment_names = attachment_hints
+        .into_iter()
         .filter(|(_, unnamed_calendar)| !(has_named_calendar && *unnamed_calendar))
-        .map(|(name, _)| name).collect::<Vec<_>>();
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
     summary.has_attachment_hint |= !attachment_names.is_empty();
     summary.attachment_names_hint = attachment_names;
     Some(summary)
@@ -646,7 +740,12 @@ impl MailBackend for ImapBackend {
     fn connect(&mut self) -> Result<()> {
         let started = Instant::now();
         let credential_result = self.source.credential(self.credential_command.as_deref());
-        crate::perf::record("imap_credential", None, started.elapsed(), credential_result.is_ok());
+        crate::perf::record(
+            "imap_credential",
+            None,
+            started.elapsed(),
+            credential_result.is_ok(),
+        );
         let credential = credential_result?;
         let connect_url = Url::parse(&format!(
             "imaps://{}:{}",
@@ -654,12 +753,15 @@ impl MailBackend for ImapBackend {
         ))
         .context("building IMAP connection URL")?;
         let started = Instant::now();
-        let client_result = ImapClientStd::connect(
-            &connect_url,
-            ImapClientStdConnectOptions::default(),
-        )
-        .context("connecting to IMAP server");
-        crate::perf::record("imap_tls_connect", None, started.elapsed(), client_result.is_ok());
+        let client_result =
+            ImapClientStd::connect(&connect_url, ImapClientStdConnectOptions::default())
+                .context("connecting to IMAP server");
+        crate::perf::record(
+            "imap_tls_connect",
+            None,
+            started.elapsed(),
+            client_result.is_ok(),
+        );
         let (mut client, _) = client_result?;
         client
             .stream
@@ -678,7 +780,12 @@ impl MailBackend for ImapBackend {
                             ImapLoginOptions::default(),
                         )
                         .context("IMAP authentication failed");
-                    crate::perf::record("imap_login_exchange", None, sasl_started.elapsed(), result.is_ok());
+                    crate::perf::record(
+                        "imap_login_exchange",
+                        None,
+                        sasl_started.elapsed(),
+                        result.is_ok(),
+                    );
                     result?;
                 }
                 ImapAuth::OAuthBearer => {
@@ -693,7 +800,12 @@ impl MailBackend for ImapBackend {
                             ImapAuthOauthbearerOptions::default(),
                         )
                         .context("IMAP OAUTHBEARER authentication failed");
-                    crate::perf::record("imap_oauthbearer_exchange", None, sasl_started.elapsed(), result.is_ok());
+                    crate::perf::record(
+                        "imap_oauthbearer_exchange",
+                        None,
+                        sasl_started.elapsed(),
+                        result.is_ok(),
+                    );
                     result?;
                 }
                 ImapAuth::XOAuth2 => {
@@ -706,7 +818,12 @@ impl MailBackend for ImapBackend {
                             ImapAuthXoauth2Options::default(),
                         )
                         .context("IMAP XOAUTH2 authentication failed");
-                    crate::perf::record("imap_xoauth2_exchange", None, sasl_started.elapsed(), result.is_ok());
+                    crate::perf::record(
+                        "imap_xoauth2_exchange",
+                        None,
+                        sasl_started.elapsed(),
+                        result.is_ok(),
+                    );
                     result?;
                 }
             }
@@ -724,8 +841,12 @@ impl MailBackend for ImapBackend {
     }
 
     fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>> {
-        let reference: ImapMailbox<'static> = "".to_owned().try_into().context("building LIST reference")?;
-        let pattern: ListMailbox<'static> = "*".to_owned().try_into().context("building LIST pattern")?;
+        let reference: ImapMailbox<'static> = ""
+            .to_owned()
+            .try_into()
+            .context("building LIST reference")?;
+        let pattern: ListMailbox<'static> =
+            "*".to_owned().try_into().context("building LIST pattern")?;
         let started = Instant::now();
         let names_result = self
             .session()?
@@ -736,11 +857,15 @@ impl MailBackend for ImapBackend {
 
         let mut selectable: Vec<(String, MailboxRole)> = names
             .into_iter()
-            .filter(|(_, _, attrs)| !attrs.iter().any(|attr| matches!(attr, FlagNameAttribute::Noselect)))
+            .filter(|(_, _, attrs)| {
+                !attrs
+                    .iter()
+                    .any(|attr| matches!(attr, FlagNameAttribute::Noselect))
+            })
             .map(|(mailbox, _, attrs)| {
                 let mailbox_name = mailbox_to_name(&mailbox);
-                let role = role_from_attributes(&attrs)
-                    .unwrap_or_else(|| role_for_name(&mailbox_name));
+                let role =
+                    role_from_attributes(&attrs).unwrap_or_else(|| role_for_name(&mailbox_name));
                 (mailbox_name, role)
             })
             .collect();
@@ -760,7 +885,8 @@ impl MailBackend for ImapBackend {
 
     fn mailbox_uid_validity(&self, name: &str) -> Option<u32> {
         (self.selected_mailbox.as_deref() == Some(name))
-            .then_some(self.selected_uid_validity).flatten()
+            .then_some(self.selected_uid_validity)
+            .flatten()
     }
 
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)> {
@@ -770,7 +896,10 @@ impl MailBackend for ImapBackend {
             .session()?
             .status(
                 mailbox,
-                Cow::Owned(vec![StatusDataItemName::Messages, StatusDataItemName::Unseen]),
+                Cow::Owned(vec![
+                    StatusDataItemName::Messages,
+                    StatusDataItemName::Unseen,
+                ]),
             )
             .with_context(|| format!("reading status for {name:?}"));
         crate::perf::record("imap_status", None, started.elapsed(), items_result.is_ok());
@@ -789,15 +918,21 @@ impl MailBackend for ImapBackend {
 
     fn mailbox_uid_next(&self, name: &str) -> Option<u32> {
         (self.selected_mailbox.as_deref() == Some(name))
-            .then_some(self.selected_uid_next).flatten()
+            .then_some(self.selected_uid_next)
+            .flatten()
     }
 
     fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage> {
         self.open_mailbox_impl(name, offset, limit, None)
     }
 
-    fn open_mailbox_with_hint(&mut self, name: &str, offset: usize, limit: usize,
-        hint: Option<MailboxSyncHint>) -> Result<MessagePage> {
+    fn open_mailbox_with_hint(
+        &mut self,
+        name: &str,
+        offset: usize,
+        limit: usize,
+        hint: Option<MailboxSyncHint>,
+    ) -> Result<MessagePage> {
         self.open_mailbox_impl(name, offset, limit, hint.as_ref())
     }
 
@@ -813,10 +948,16 @@ impl MailBackend for ImapBackend {
         let uid = NonZeroU32::new(uid).ok_or_else(|| anyhow!("IMAP UID cannot be zero"))?;
         let mut raw = Vec::new();
         let started = Instant::now();
-        let fetched_result = self.session()?
+        let fetched_result = self
+            .session()?
             .fetch_body_stream(uid, true, &mut raw)
             .with_context(|| format!("fetching IMAP message UID {uid}"));
-        crate::perf::record("imap_fetch_body", None, started.elapsed(), fetched_result.is_ok());
+        crate::perf::record(
+            "imap_fetch_body",
+            None,
+            started.elapsed(),
+            fetched_result.is_ok(),
+        );
         fetched_result?;
         if raw.is_empty() {
             bail!("IMAP server did not return requested UID {uid}");
@@ -848,10 +989,13 @@ impl MailBackend for ImapBackend {
             flags: vec![Flag::Seen, Flag::Draft],
             ..Default::default()
         };
-        let (exists, _) = self.session()?.append(mailbox_name, raw, options)
+        let (exists, _) = self
+            .session()?
+            .append(mailbox_name, raw, options)
             .with_context(|| format!("saving draft to IMAP mailbox {mailbox:?}"))?;
         if self.selected_mailbox.as_deref() == Some(mailbox)
-            && let Some(exists) = exists {
+            && let Some(exists) = exists
+        {
             self.selected_exists = Some(exists);
         }
         Ok(())
@@ -863,7 +1007,11 @@ impl MailBackend for ImapBackend {
         let sequence = Self::uid_sequence(id)?;
         let mut opts = ImapMessageStoreOptions::default();
         opts.uid = true;
-        let kind = if seen { StoreType::Add } else { StoreType::Remove };
+        let kind = if seen {
+            StoreType::Add
+        } else {
+            StoreType::Remove
+        };
         self.session()?
             .store(sequence, kind, vec![Flag::Seen], opts)
             .context("updating IMAP seen flag")?;
@@ -906,7 +1054,9 @@ impl MailBackend for ImapBackend {
     }
 
     fn archive_many(&mut self, source: &str, destination: &str, ids: &[MessageId]) -> Result<()> {
-        if ids.is_empty() { return Ok(()); }
+        if ids.is_empty() {
+            return Ok(());
+        }
         if is_gmail_archive(&self.source.host, source, destination) {
             // In Gmail, All Mail is a virtual view that already contains INBOX
             // messages. Copy/MOVE into All Mail need not remove the INBOX label.
@@ -918,10 +1068,11 @@ impl MailBackend for ImapBackend {
             let uids = Self::uid_sequence_many(ids)?;
             let mut options = ImapMessageStoreOptions::default();
             options.uid = true;
-            self.session()?.store(uids.clone(), StoreType::Add,
-                vec![Flag::Deleted], options)
+            self.session()?
+                .store(uids.clone(), StoreType::Add, vec![Flag::Deleted], options)
                 .context("marking Gmail INBOX labels for removal")?;
-            self.session()?.uid_expunge(uids)
+            self.session()?
+                .uid_expunge(uids)
                 .context("removing Gmail INBOX labels")?;
             self.note_removed(source, ids.len());
             Ok(())
@@ -931,7 +1082,9 @@ impl MailBackend for ImapBackend {
     }
 
     fn unarchive_many(&mut self, source: &str, destination: &str, ids: &[MessageId]) -> Result<()> {
-        if ids.is_empty() { return Ok(()); }
+        if ids.is_empty() {
+            return Ok(());
+        }
         if is_gmail_unarchive(&self.source.host, source, destination) {
             // Adding INBOX in Gmail must not remove the message from the All Mail
             // view, so COPY (add label) instead of MOVE (remove source).
@@ -940,7 +1093,8 @@ impl MailBackend for ImapBackend {
             let uids = Self::uid_sequence_many(ids)?;
             let mut options = ImapMessageCopyOptions::default();
             options.uid = true;
-            self.session()?.copy(uids, mailbox_from_name(destination)?, options)
+            self.session()?
+                .copy(uids, mailbox_from_name(destination)?, options)
                 .context("restoring Gmail message to INBOX")?;
             Ok(())
         } else {
@@ -1013,7 +1167,12 @@ impl MailBackend for ImapBackend {
         let mut store_opts = ImapMessageStoreOptions::default();
         store_opts.uid = true;
         self.session()?
-            .store(sequence.clone(), StoreType::Add, vec![Flag::Deleted], store_opts)
+            .store(
+                sequence.clone(),
+                StoreType::Add,
+                vec![Flag::Deleted],
+                store_opts,
+            )
             .context("marking moved IMAP messages deleted")?;
         self.session()?
             .uid_expunge(sequence)
@@ -1026,7 +1185,10 @@ impl MailBackend for ImapBackend {
 // Gmail's All Mail is a view, not a separate message store. Do not apply
 // these label semantics to arbitrary IMAP servers or user-created Archive dirs.
 fn gmail_host(host: &str) -> bool {
-    matches!(host.to_ascii_lowercase().as_str(), "imap.gmail.com" | "imap.googlemail.com")
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "imap.gmail.com" | "imap.googlemail.com"
+    )
 }
 fn gmail_all_mail(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -1089,20 +1251,30 @@ fn run_credential_command(command: &str) -> Result<String> {
 /// wrapper alone is not proof of any attachment. Only parts with an attachment
 /// disposition, or a genuine filename/name parameter, count. This deliberately
 /// does not count remote <img> URLs or CID inline images with no filename.
-fn collect_bodystructure_attachments(structure: &BodyStructure<'_>, names: &mut Vec<(String, bool)>) {
+fn collect_bodystructure_attachments(
+    structure: &BodyStructure<'_>,
+    names: &mut Vec<(String, bool)>,
+) {
     match structure {
         BodyStructure::Multi { bodies, .. } => {
-            for part in bodies.as_ref().iter() { collect_bodystructure_attachments(part, names); }
+            for part in bodies.as_ref().iter() {
+                collect_bodystructure_attachments(part, names);
+            }
         }
-        BodyStructure::Single { body, extension_data } => {
-            let disposition = extension_data.as_ref()
+        BodyStructure::Single {
+            body,
+            extension_data,
+        } => {
+            let disposition = extension_data
+                .as_ref()
                 .and_then(|data| data.tail.as_ref())
                 .and_then(|data| data.disposition.as_ref());
             let is_file = disposition.is_some_and(|(kind, _)| {
                 let bytes: &[u8] = kind.as_ref();
                 bytes.eq_ignore_ascii_case(b"attachment")
             });
-            let filename = disposition.into_iter()
+            let filename = disposition
+                .into_iter()
                 .flat_map(|(_, pairs)| pairs.iter())
                 .chain(body.basic.parameter_list.iter())
                 .find(|(key, _)| {
@@ -1121,19 +1293,23 @@ fn collect_bodystructure_attachments(structure: &BodyStructure<'_>, names: &mut 
                 bytes.eq_ignore_ascii_case(b"inline")
             });
             let inline_image = matches!(&body.specific,
-                SpecificFields::Basic { r#type, .. } if {
-                    let bytes: &[u8] = r#type.as_ref();
-                    bytes.eq_ignore_ascii_case(b"image")
-                });
+            SpecificFields::Basic { r#type, .. } if {
+                let bytes: &[u8] = r#type.as_ref();
+                bytes.eq_ignore_ascii_case(b"image")
+            });
             if is_file || (filename.is_some() && !(inline && inline_image)) {
                 let unnamed = filename.is_none();
                 let name = filename.unwrap_or_else(|| format!("attachment-{}", names.len() + 1));
                 // Never treat MIME filenames as filesystem paths.
-                let safe = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(&name);
+                let safe = name
+                    .rsplit(|c| c == '/' || c == '\\')
+                    .next()
+                    .unwrap_or(&name);
                 // An unnamed text/calendar part often duplicates a named
                 // .ics part (Google Calendar). Keep the type information to
                 // avoid inventing a second filename in the initial summary.
-                let unnamed_calendar = unnamed && matches!(&body.specific,
+                let unnamed_calendar = unnamed
+                    && matches!(&body.specific,
                     SpecificFields::Text { subtype, .. } if {
                         let sub: &[u8] = subtype.as_ref();
                         sub.eq_ignore_ascii_case(b"calendar")
@@ -1216,11 +1392,10 @@ mod tests {
     use super::{ImapAuth, ImapSource, role_for_name};
 
     #[test]
-    fn parses_aerc_style_password_source() {
-        let source = ImapSource::parse(
-            "imaps://person%40example.com:abcd%20efgh@imap.example.com:993",
-        )
-        .unwrap();
+    fn parses_password_source() {
+        let source =
+            ImapSource::parse("imaps://person%40example.com:abcd%20efgh@imap.example.com:993")
+                .unwrap();
         assert_eq!(source.username, "person@example.com");
         assert_eq!(source.host, "imap.example.com");
         assert_eq!(source.port, 993);
@@ -1229,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_aerc_style_oauth_refresh_source() {
+    fn parses_oauth_refresh_source() {
         let source = ImapSource::parse(
             "imaps+oauthbearer://person%40example.edu:refresh-token@imap.example.com:993?client_id=client&client_secret=secret&token_endpoint=https%3A%2F%2Foauth.example.com%2Ftoken",
         )
@@ -1244,12 +1419,13 @@ mod tests {
 
     #[test]
     fn uri_credential_takes_precedence_over_external_command() {
-        let source = ImapSource::parse(
-            "imaps://person%40example.com:uri-secret@imap.example.com:993",
-        )
-        .unwrap();
+        let source =
+            ImapSource::parse("imaps://person%40example.com:uri-secret@imap.example.com:993")
+                .unwrap();
         assert_eq!(
-            source.credential(Some("this command must never run")).unwrap(),
+            source
+                .credential(Some("this command must never run"))
+                .unwrap(),
             "uri-secret"
         );
     }
@@ -1312,12 +1488,14 @@ mod tests {
         let cached = vec![cached_summary(41, 7), cached_summary(41, 8)];
         let mut seen = MessageFlags::empty();
         seen.set(MessageFlags::SEEN, true);
-        let page = merge_uid_page(41, &cached, &[(7, seen), (8, seen)],
-            HashMap::new()).unwrap();
+        let page = merge_uid_page(41, &cached, &[(7, seen), (8, seen)], HashMap::new()).unwrap();
         assert_eq!(page.len(), 2);
         assert_eq!(page[0].subject, "subject-8");
         assert!(page[0].flags.contains(MessageFlags::SEEN));
-        assert_eq!(page[0].attachment_names_hint, vec!["cached.pdf".to_string()]);
+        assert_eq!(
+            page[0].attachment_names_hint,
+            vec!["cached.pdf".to_string()]
+        );
     }
 
     #[test]
@@ -1327,11 +1505,17 @@ mod tests {
         use std::collections::HashMap;
         let cached = vec![cached_summary(41, 7), cached_summary(41, 8)];
         let fresh = HashMap::from([(9, cached_summary(41, 9))]);
-        let page = merge_uid_page(41, &cached,
-            &[(8, MessageFlags::empty()), (9, MessageFlags::empty())], fresh)
-            .unwrap();
-        assert_eq!(page.iter().map(|m| m.id.0.as_str()).collect::<Vec<_>>(),
-            vec!["imap-uid:41:9", "imap-uid:41:8"]);
+        let page = merge_uid_page(
+            41,
+            &cached,
+            &[(8, MessageFlags::empty()), (9, MessageFlags::empty())],
+            fresh,
+        )
+        .unwrap();
+        assert_eq!(
+            page.iter().map(|m| m.id.0.as_str()).collect::<Vec<_>>(),
+            vec!["imap-uid:41:9", "imap-uid:41:8"]
+        );
     }
 
     #[test]
@@ -1343,18 +1527,40 @@ mod tests {
         let requested = &[(7, MessageFlags::empty())];
         assert!(merge_uid_page(41, &cached, requested, HashMap::new()).is_none());
         assert!(merge_uid_page(41, &[], requested, HashMap::new()).is_none());
-        assert!(merge_uid_page(41, &[], requested,
-            HashMap::from([(7, cached_summary(40, 7))])).is_none());
-        assert!(merge_uid_page(41, &[],
-            &[(7, MessageFlags::empty()), (7, MessageFlags::empty())],
-            HashMap::from([(7, cached_summary(41, 7))])).is_none());
+        assert!(
+            merge_uid_page(
+                41,
+                &[],
+                requested,
+                HashMap::from([(7, cached_summary(40, 7))])
+            )
+            .is_none()
+        );
+        assert!(
+            merge_uid_page(
+                41,
+                &[],
+                &[(7, MessageFlags::empty()), (7, MessageFlags::empty())],
+                HashMap::from([(7, cached_summary(41, 7))])
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn common_mailbox_names_map_to_roles() {
         assert_eq!(role_for_name("INBOX"), crate::model::MailboxRole::Inbox);
-        assert_eq!(role_for_name("[Gmail]/Sent Mail"), crate::model::MailboxRole::Sent);
-        assert_eq!(role_for_name("[Gmail]/All Mail"), crate::model::MailboxRole::Archive);
-        assert_eq!(role_for_name("[Gmail]/Trash"), crate::model::MailboxRole::Trash);
+        assert_eq!(
+            role_for_name("[Gmail]/Sent Mail"),
+            crate::model::MailboxRole::Sent
+        );
+        assert_eq!(
+            role_for_name("[Gmail]/All Mail"),
+            crate::model::MailboxRole::Archive
+        );
+        assert_eq!(
+            role_for_name("[Gmail]/Trash"),
+            crate::model::MailboxRole::Trash
+        );
     }
 }

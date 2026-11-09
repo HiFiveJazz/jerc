@@ -6,7 +6,7 @@ fn main() {
     let root = env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/aerc-rs-maildir"));
+        .unwrap_or_else(|| PathBuf::from("/tmp/jerc-maildir"));
     let count = env::args()
         .nth(2)
         .and_then(|v| v.parse::<usize>().ok())

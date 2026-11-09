@@ -7,9 +7,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::backend::{MailBackend, MailboxSyncHint};
-use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingMessage, OutgoingAttachment};
-use crate::outgoing::MailSender;
 use crate::mail_image::MailImageEvent;
+use crate::model::{
+    Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingAttachment, OutgoingMessage,
+};
+use crate::outgoing::MailSender;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -19,21 +21,71 @@ pub enum ActionKind {
     ListMailboxes,
     MailboxStatus(String),
     /// A single newest message preview after a known Inbox count increase.
-    NewMailPreview { mailbox: String, count: usize },
-    OpenMailbox { name: String, offset: usize, limit: usize, hint: Option<MailboxSyncHint> },
-    FetchBody { mailbox: String, id: MessageId },
+    NewMailPreview {
+        mailbox: String,
+        count: usize,
+    },
+    OpenMailbox {
+        name: String,
+        offset: usize,
+        limit: usize,
+        hint: Option<MailboxSyncHint>,
+    },
+    FetchBody {
+        mailbox: String,
+        id: MessageId,
+    },
     /// Read-only, opportunistic preview fetches on the background session.
-    PrefetchBodies { mailbox: String, ids: Vec<MessageId> },
-    FetchRawForCompose { mailbox: String, id: MessageId },
-    FetchAttachments { mailbox: String, id: MessageId },
-    ExportRaw { mailbox: String, id: MessageId, path: PathBuf },
-    SetSeen { mailbox: String, id: MessageId, seen: bool },
-    Delete { mailbox: String, id: MessageId },
-    DeleteMany { mailbox: String, ids: Vec<MessageId> },
-    Move { source: String, destination: String, id: MessageId },
-    MoveMany { source: String, destination: String, ids: Vec<MessageId> },
-    ArchiveMany { source: String, destination: String, ids: Vec<MessageId> },
-    UnarchiveMany { source: String, destination: String, ids: Vec<MessageId> },
+    PrefetchBodies {
+        mailbox: String,
+        ids: Vec<MessageId>,
+    },
+    FetchRawForCompose {
+        mailbox: String,
+        id: MessageId,
+    },
+    FetchAttachments {
+        mailbox: String,
+        id: MessageId,
+    },
+    ExportRaw {
+        mailbox: String,
+        id: MessageId,
+        path: PathBuf,
+    },
+    SetSeen {
+        mailbox: String,
+        id: MessageId,
+        seen: bool,
+    },
+    Delete {
+        mailbox: String,
+        id: MessageId,
+    },
+    DeleteMany {
+        mailbox: String,
+        ids: Vec<MessageId>,
+    },
+    Move {
+        source: String,
+        destination: String,
+        id: MessageId,
+    },
+    MoveMany {
+        source: String,
+        destination: String,
+        ids: Vec<MessageId>,
+    },
+    ArchiveMany {
+        source: String,
+        destination: String,
+        ids: Vec<MessageId>,
+    },
+    UnarchiveMany {
+        source: String,
+        destination: String,
+        ids: Vec<MessageId>,
+    },
     Send {
         message: OutgoingMessage,
         sent_mailbox: Option<String>,
@@ -41,7 +93,10 @@ pub enum ActionKind {
         /// every explicit folder, even when the SMTP provider files Sent.
         copy_to: Option<Vec<String>>,
     },
-    SaveDraft { message: OutgoingMessage, mailbox: String },
+    SaveDraft {
+        message: OutgoingMessage,
+        mailbox: String,
+    },
     Shutdown,
 }
 
@@ -65,7 +120,9 @@ impl Action {
 
 #[derive(Debug, Clone)]
 pub enum WorkerEventKind {
-    Connected { capabilities: Capabilities },
+    Connected {
+        capabilities: Capabilities,
+    },
     Mailboxes(Vec<Mailbox>),
     MailboxStatus {
         name: String,
@@ -85,17 +142,42 @@ pub enum WorkerEventKind {
         uid_next: Option<u32>,
         elapsed_micros: u128,
     },
-    MailboxOpenFailed { name: String, error: String },
+    MailboxOpenFailed {
+        name: String,
+        error: String,
+    },
     BodyLoaded(MessageBody),
-    BodyPrefetched { mailbox: String, body: MessageBody },
-    BodyLoadFailed { error: String },
-    RawLoaded { id: MessageId, raw: Vec<u8> },
-    AttachmentsLoaded { mailbox: String, id: MessageId, attachments: Vec<OutgoingAttachment> },
-    MessageExported { path: PathBuf },
-    SeenChanged { id: MessageId, seen: bool },
+    BodyPrefetched {
+        mailbox: String,
+        body: MessageBody,
+    },
+    BodyLoadFailed {
+        error: String,
+    },
+    RawLoaded {
+        id: MessageId,
+        raw: Vec<u8>,
+    },
+    AttachmentsLoaded {
+        mailbox: String,
+        id: MessageId,
+        attachments: Vec<OutgoingAttachment>,
+    },
+    MessageExported {
+        path: PathBuf,
+    },
+    SeenChanged {
+        id: MessageId,
+        seen: bool,
+    },
     MutationComplete,
-    DraftSaved { mailbox: String },
-    DraftSaveFailed { mailbox: String, error: String },
+    DraftSaved {
+        mailbox: String,
+    },
+    DraftSaveFailed {
+        mailbox: String,
+        error: String,
+    },
     MessageSent {
         smtp_status: String,
         sent_mailbox: Option<String>,
@@ -119,7 +201,10 @@ pub enum RuntimeEvent {
     Input(crossterm::event::Event),
     Worker(WorkerEvent),
     MailImage(MailImageEvent),
-    SetupDiscovered { email: String, result: Result<crate::discovery::MailConfiguration, String> },
+    SetupDiscovered {
+        email: String,
+        result: Result<crate::discovery::MailConfiguration, String>,
+    },
     SetupLoginFinished(Result<Option<String>, String>),
     InputStopped,
 }
@@ -146,13 +231,7 @@ impl WorkerHandle {
         let join = thread::Builder::new()
             .name(format!("mail-worker-{account}"))
             .spawn(move || {
-                run_worker(
-                    account,
-                    &mut *backend,
-                    &mut outgoing,
-                    receiver,
-                    runtime_tx,
-                );
+                run_worker(account, &mut *backend, &mut outgoing, receiver, runtime_tx);
             })
             .expect("failed to spawn mail worker");
         let (status_sender, status_join) = if let Some(status_backend) = status_backend {
@@ -196,8 +275,14 @@ impl WorkerHandle {
                 Some(sender) => sender.try_send(action)?,
                 None => return Err(TrySendError::Disconnected(action)),
             }
-        } else if matches!(&action.kind, ActionKind::MailboxStatus(_) | ActionKind::NewMailPreview { .. }) {
-            self.status_sender.as_ref().unwrap_or(&self.sender).try_send(action)?;
+        } else if matches!(
+            &action.kind,
+            ActionKind::MailboxStatus(_) | ActionKind::NewMailPreview { .. }
+        ) {
+            self.status_sender
+                .as_ref()
+                .unwrap_or(&self.sender)
+                .try_send(action)?;
         } else {
             self.sender.try_send(action)?;
         }
@@ -252,7 +337,9 @@ fn run_worker(
             pending.push_back(action);
         }
         compact_navigation_queue(&mut pending);
-        let Some(action) = pending.pop_front() else { continue; };
+        let Some(action) = pending.pop_front() else {
+            continue;
+        };
         if matches!(&action.kind, ActionKind::Shutdown) {
             break;
         }
@@ -282,7 +369,13 @@ fn run_worker(
         let started = Instant::now();
         let request_id = action.id;
         if operation == "worker_open_mailbox" || operation == "worker_fetch_body" {
-            crate::perf::record_request("worker_start", request_id, Some(queue_wait), started.elapsed(), true);
+            crate::perf::record_request(
+                "worker_start",
+                request_id,
+                Some(queue_wait),
+                started.elapsed(),
+                true,
+            );
         }
         let event = match action.kind {
             ActionKind::Connect => backend
@@ -410,15 +503,27 @@ fn run_worker(
             operation,
             Some(queue_wait),
             started.elapsed(),
-            !matches!(&event, WorkerEventKind::Error(_) | WorkerEventKind::DraftSaveFailed { .. }
-                | WorkerEventKind::MailboxOpenFailed { .. } | WorkerEventKind::BodyLoadFailed { .. }),
+            !matches!(
+                &event,
+                WorkerEventKind::Error(_)
+                    | WorkerEventKind::DraftSaveFailed { .. }
+                    | WorkerEventKind::MailboxOpenFailed { .. }
+                    | WorkerEventKind::BodyLoadFailed { .. }
+            ),
         );
 
         if operation == "worker_open_mailbox" || operation == "worker_fetch_body" {
             crate::perf::record_request(
-                "worker_complete", request_id, Some(queue_wait), started.elapsed(),
-                !matches!(&event, WorkerEventKind::Error(_) | WorkerEventKind::MailboxOpenFailed { .. }
-                    | WorkerEventKind::BodyLoadFailed { .. }),
+                "worker_complete",
+                request_id,
+                Some(queue_wait),
+                started.elapsed(),
+                !matches!(
+                    &event,
+                    WorkerEventKind::Error(_)
+                        | WorkerEventKind::MailboxOpenFailed { .. }
+                        | WorkerEventKind::BodyLoadFailed { .. }
+                ),
             );
         }
         if runtime_tx
@@ -438,10 +543,14 @@ fn run_worker(
 /// other side effects. The newest mailbox open wins; a newer open invalidates
 /// earlier body fetches as well. An in-flight IMAP request can't be canceled.
 fn compact_navigation_queue(pending: &mut VecDeque<Action>) {
-    let latest_mailbox = pending.iter().rev().find_map(|action| match &action.kind {
-        ActionKind::OpenMailbox { name, .. } => Some(name.as_str()),
-        _ => None,
-    }).map(str::to_owned);
+    let latest_mailbox = pending
+        .iter()
+        .rev()
+        .find_map(|action| match &action.kind {
+            ActionKind::OpenMailbox { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .map(str::to_owned);
     let mut seen_open = false;
     let mut seen_body = false;
     let mut kept = VecDeque::with_capacity(pending.len());
@@ -453,7 +562,13 @@ fn compact_navigation_queue(pending: &mut VecDeque<Action>) {
                 seen_body = true;
             }
             ActionKind::FetchBody { mailbox, .. }
-                if seen_body || latest_mailbox.as_deref().is_some_and(|name| name != mailbox) => continue,
+                if seen_body
+                    || latest_mailbox
+                        .as_deref()
+                        .is_some_and(|name| name != mailbox) =>
+            {
+                continue;
+            }
             ActionKind::FetchBody { .. } => seen_body = true,
             _ => {}
         }
@@ -464,24 +579,33 @@ fn compact_navigation_queue(pending: &mut VecDeque<Action>) {
 
 /// Choose the newest prefetch window, but after a small body burst give an
 /// awaiting unread-count update priority. Returns None only for an empty queue.
-fn pop_background_action(pending: &mut VecDeque<Action>, bodies_since_status: usize) -> Option<Action> {
+fn pop_background_action(
+    pending: &mut VecDeque<Action>,
+    bodies_since_status: usize,
+) -> Option<Action> {
     // Interactive reads have priority even over unread-count polling; only
     // one in-flight IMAP operation may precede the newest selected message.
-    if let Some(index) = pending.iter().rposition(|action| matches!(&action.kind,
-        ActionKind::FetchBody { .. })) {
+    if let Some(index) = pending
+        .iter()
+        .rposition(|action| matches!(&action.kind, ActionKind::FetchBody { .. }))
+    {
         let newest = pending.remove(index);
         pending.retain(|action| !matches!(&action.kind, ActionKind::FetchBody { .. }));
         return newest;
     }
-    let status_index = (bodies_since_status >= 4).then(|| pending.iter().position(|action| {
-        matches!(&action.kind, ActionKind::MailboxStatus(_))
-    })).flatten();
+    let status_index = (bodies_since_status >= 4)
+        .then(|| {
+            pending
+                .iter()
+                .position(|action| matches!(&action.kind, ActionKind::MailboxStatus(_)))
+        })
+        .flatten();
     if let Some(index) = status_index {
         return pending.remove(index);
     }
-    let prefetch_index = pending.iter().rposition(|action| {
-        matches!(&action.kind, ActionKind::PrefetchBodies { .. })
-    });
+    let prefetch_index = pending
+        .iter()
+        .rposition(|action| matches!(&action.kind, ActionKind::PrefetchBodies { .. }));
     if let Some(index) = prefetch_index {
         let newest = pending.remove(index);
         pending.retain(|action| !matches!(&action.kind, ActionKind::PrefetchBodies { .. }));
@@ -518,10 +642,15 @@ fn run_status_worker(
         while let Ok(action) = receiver.try_recv() {
             pending.push_back(action);
         }
-        if pending.iter().any(|action| matches!(&action.kind, ActionKind::Shutdown)) {
+        if pending
+            .iter()
+            .any(|action| matches!(&action.kind, ActionKind::Shutdown))
+        {
             break;
         }
-        let Some(action) = pop_background_action(&mut pending, bodies_since_status) else { continue; };
+        let Some(action) = pop_background_action(&mut pending, bodies_since_status) else {
+            continue;
+        };
         let queue_wait = action.queued_at.elapsed();
         let started = Instant::now();
         match action.kind {
@@ -535,18 +664,34 @@ fn run_status_worker(
                     }
                     backend.fetch_body(&mailbox, &id)
                 })();
-                if result.is_err() { connected = false; }
-                crate::perf::record("worker_priority_fetch_body", Some(queue_wait), started.elapsed(), result.is_ok());
+                if result.is_err() {
+                    connected = false;
+                }
+                crate::perf::record(
+                    "worker_priority_fetch_body",
+                    Some(queue_wait),
+                    started.elapsed(),
+                    result.is_ok(),
+                );
                 let kind = match result {
                     Ok(body) => {
                         recent.insert((mailbox, id), Instant::now());
                         WorkerEventKind::BodyLoaded(body)
                     }
-                    Err(error) => WorkerEventKind::BodyLoadFailed { error: format!("{error:#}") },
+                    Err(error) => WorkerEventKind::BodyLoadFailed {
+                        error: format!("{error:#}"),
+                    },
                 };
-                if runtime_tx.send(RuntimeEvent::Worker(WorkerEvent {
-                    account, request_id: action.id, kind,
-                })).is_err() { break; }
+                if runtime_tx
+                    .send(RuntimeEvent::Worker(WorkerEvent {
+                        account,
+                        request_id: action.id,
+                        kind,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
             }
             ActionKind::NewMailPreview { mailbox, count } => {
                 let result = (|| {
@@ -557,11 +702,21 @@ fn run_status_worker(
                     Ok::<_, anyhow::Error>(new_mail_preview(&mut *backend, &mailbox, count))
                 })();
                 let kind = result.unwrap_or(WorkerEventKind::NewMailPreview {
-                    count, sender: String::new(), subject: String::new(), excerpt: String::new(),
+                    count,
+                    sender: String::new(),
+                    subject: String::new(),
+                    excerpt: String::new(),
                 });
-                if runtime_tx.send(RuntimeEvent::Worker(WorkerEvent {
-                    account, request_id: action.id, kind,
-                })).is_err() { break; }
+                if runtime_tx
+                    .send(RuntimeEvent::Worker(WorkerEvent {
+                        account,
+                        request_id: action.id,
+                        kind,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
             }
             ActionKind::MailboxStatus(name) => {
                 bodies_since_status = 0;
@@ -572,16 +727,31 @@ fn run_status_worker(
                     }
                     backend.mailbox_status(&name)
                 })();
-                if result.is_err() { connected = false; }
+                if result.is_err() {
+                    connected = false;
+                }
                 let ok = result.is_ok();
                 crate::perf::record("background_status", Some(queue_wait), started.elapsed(), ok);
                 let kind = match result {
-                    Ok((total, unread)) => WorkerEventKind::MailboxStatus { name, total, unread },
-                    Err(error) => WorkerEventKind::Error(format!("background mailbox count: {error:#}")),
+                    Ok((total, unread)) => WorkerEventKind::MailboxStatus {
+                        name,
+                        total,
+                        unread,
+                    },
+                    Err(error) => {
+                        WorkerEventKind::Error(format!("background mailbox count: {error:#}"))
+                    }
                 };
-                if runtime_tx.send(RuntimeEvent::Worker(WorkerEvent {
-                    account, request_id: action.id, kind,
-                })).is_err() { break; }
+                if runtime_tx
+                    .send(RuntimeEvent::Worker(WorkerEvent {
+                        account,
+                        request_id: action.id,
+                        kind,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
             }
             ActionKind::PrefetchBodies { mailbox, ids } => {
                 if recent.len() > 256 {
@@ -589,42 +759,72 @@ fn run_status_worker(
                 }
                 if !connected {
                     let result = backend.connect();
-                    crate::perf::record("prefetch_connect", Some(queue_wait), started.elapsed(), result.is_ok());
-                    if result.is_err() { continue; } // Optional; never interrupt the UI.
+                    crate::perf::record(
+                        "prefetch_connect",
+                        Some(queue_wait),
+                        started.elapsed(),
+                        result.is_ok(),
+                    );
+                    if result.is_err() {
+                        continue;
+                    } // Optional; never interrupt the UI.
                     connected = true;
                 }
                 let mut remaining = ids.into_iter();
                 while let Some(id) = remaining.next() {
                     let key = (mailbox.clone(), id.clone());
-                    if recent.get(&key).is_some_and(|at| at.elapsed() < Duration::from_secs(4)) {
+                    if recent
+                        .get(&key)
+                        .is_some_and(|at| at.elapsed() < Duration::from_secs(4))
+                    {
                         continue;
                     }
                     // An IMAP body fetch uses PEEK and must not mark mail seen.
                     let fetched_at = Instant::now();
                     let result = backend.fetch_body(&mailbox, &id);
                     bodies_since_status = bodies_since_status.saturating_add(1);
-                    crate::perf::record("prefetch_body", None, fetched_at.elapsed(), result.is_ok());
+                    crate::perf::record(
+                        "prefetch_body",
+                        None,
+                        fetched_at.elapsed(),
+                        result.is_ok(),
+                    );
                     if let Ok(body) = result {
                         recent.insert(key, Instant::now());
-                        if runtime_tx.send(RuntimeEvent::Worker(WorkerEvent {
-                            account,
-                            request_id: action.id,
-                            kind: WorkerEventKind::BodyPrefetched { mailbox: mailbox.clone(), body },
-                        })).is_err() { return; }
+                        if runtime_tx
+                            .send(RuntimeEvent::Worker(WorkerEvent {
+                                account,
+                                request_id: action.id,
+                                kind: WorkerEventKind::BodyPrefetched {
+                                    mailbox: mailbox.clone(),
+                                    body,
+                                },
+                            }))
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                     // The user may have reversed direction while this download
                     // was in flight. Obey the latest window before fetching more.
                     while let Ok(new_action) = receiver.try_recv() {
                         pending.push_back(new_action);
                     }
-                    if pending.iter().any(|next| matches!(&next.kind,
-                        ActionKind::Shutdown | ActionKind::PrefetchBodies { .. })) {
+                    if pending.iter().any(|next| {
+                        matches!(
+                            &next.kind,
+                            ActionKind::Shutdown | ActionKind::PrefetchBodies { .. }
+                        )
+                    }) {
                         break; // Superseded window or shutdown: abandon the rest.
                     }
-                    let interactive_waiting = pending.iter().any(|next| matches!(&next.kind,
-                        ActionKind::FetchBody { .. }));
-                    let status_waiting = bodies_since_status >= 4 && pending.iter().any(|next| matches!(&next.kind,
-                        ActionKind::MailboxStatus(_)));
+                    let interactive_waiting = pending
+                        .iter()
+                        .any(|next| matches!(&next.kind, ActionKind::FetchBody { .. }));
+                    let status_waiting = bodies_since_status >= 4
+                        && pending
+                            .iter()
+                            .any(|next| matches!(&next.kind, ActionKind::MailboxStatus(_)));
                     if interactive_waiting || status_waiting {
                         // Yield to an explicit reader fetch first, or to STATUS
                         // after a short burst. Resume only if no newer window
@@ -632,7 +832,8 @@ fn run_status_worker(
                         let rest = remaining.collect::<Vec<_>>();
                         if !rest.is_empty() {
                             pending.push_back(Action::new(ActionKind::PrefetchBodies {
-                                mailbox: mailbox.clone(), ids: rest,
+                                mailbox: mailbox.clone(),
+                                ids: rest,
                             }));
                         }
                         break;
@@ -653,15 +854,23 @@ fn new_mail_preview(backend: &mut dyn MailBackend, mailbox: &str, count: usize) 
     let mut excerpt = String::new();
     if let Ok(page) = backend.open_mailbox(mailbox, 0, 1) {
         if let Some(message) = page.messages.first() {
-            sender = if message.from_name.is_empty() { message.from_address.clone() }
-                else { message.from_name.clone() };
+            sender = if message.from_name.is_empty() {
+                message.from_address.clone()
+            } else {
+                message.from_name.clone()
+            };
             subject = message.subject.clone();
             if let Ok(body) = backend.fetch_body(mailbox, &message.id) {
                 excerpt = body.display_text(false).chars().take(400).collect();
             }
         }
     }
-    WorkerEventKind::NewMailPreview { count, sender, subject, excerpt }
+    WorkerEventKind::NewMailPreview {
+        count,
+        sender,
+        subject,
+        excerpt,
+    }
 }
 
 fn write_export(path: &std::path::Path, raw: &[u8]) -> anyhow::Result<()> {
@@ -679,7 +888,10 @@ fn write_export(path: &std::path::Path, raw: &[u8]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_navigation_queue, pop_background_action, write_export, Action, ActionKind, WorkerHandle, RuntimeEvent, WorkerEventKind};
+    use super::{
+        Action, ActionKind, RuntimeEvent, WorkerEventKind, WorkerHandle, compact_navigation_queue,
+        pop_background_action, write_export,
+    };
     use crate::backend::MailBackend;
     use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage};
     use std::collections::VecDeque;
@@ -687,25 +899,43 @@ mod tests {
     use std::time::Duration;
 
     fn open(name: &str) -> Action {
-        Action::new(ActionKind::OpenMailbox { name: name.into(), offset: 0, limit: 50, hint: None })
+        Action::new(ActionKind::OpenMailbox {
+            name: name.into(),
+            offset: 0,
+            limit: 50,
+            hint: None,
+        })
     }
 
     fn body(mailbox: &str) -> Action {
-        Action::new(ActionKind::FetchBody { mailbox: mailbox.into(), id: MessageId("imap-uid:1".into()) })
+        Action::new(ActionKind::FetchBody {
+            mailbox: mailbox.into(),
+            id: MessageId("imap-uid:1".into()),
+        })
     }
 
     #[test]
     fn coalescing_preserves_only_latest_navigation_and_keeps_mutations() {
         let mut pending = VecDeque::from([
-            open("A"), body("A"),
-            Action::new(ActionKind::SetSeen { mailbox: "A".into(), id: MessageId("imap-uid:1".into()), seen: true }),
-            open("B"), body("B"), open("C"), body("C"),
+            open("A"),
+            body("A"),
+            Action::new(ActionKind::SetSeen {
+                mailbox: "A".into(),
+                id: MessageId("imap-uid:1".into()),
+                seen: true,
+            }),
+            open("B"),
+            body("B"),
+            open("C"),
+            body("C"),
         ]);
         compact_navigation_queue(&mut pending);
         assert_eq!(pending.len(), 3);
         assert!(matches!(&pending[0].kind, ActionKind::SetSeen { .. }));
         assert!(matches!(&pending[1].kind, ActionKind::OpenMailbox { name, .. } if name == "C"));
-        assert!(matches!(&pending[2].kind, ActionKind::FetchBody { mailbox, .. } if mailbox == "C"));
+        assert!(
+            matches!(&pending[2].kind, ActionKind::FetchBody { mailbox, .. } if mailbox == "C")
+        );
     }
 
     #[test]
@@ -720,8 +950,14 @@ mod tests {
     fn background_scheduler_yields_to_status_after_four_bodies() {
         let mut pending = VecDeque::from([
             Action::new(ActionKind::MailboxStatus("INBOX".into())),
-            Action::new(ActionKind::PrefetchBodies { mailbox: "A".into(), ids: vec![] }),
-            Action::new(ActionKind::PrefetchBodies { mailbox: "B".into(), ids: vec![] }),
+            Action::new(ActionKind::PrefetchBodies {
+                mailbox: "A".into(),
+                ids: vec![],
+            }),
+            Action::new(ActionKind::PrefetchBodies {
+                mailbox: "B".into(),
+                ids: vec![],
+            }),
         ]);
         let next = pop_background_action(&mut pending, 0).unwrap();
         assert!(matches!(next.kind, ActionKind::PrefetchBodies { mailbox, .. } if mailbox == "B"));
@@ -729,7 +965,8 @@ mod tests {
         assert!(matches!(&pending[0].kind, ActionKind::MailboxStatus(_)));
 
         pending.push_back(Action::new(ActionKind::PrefetchBodies {
-            mailbox: "C".into(), ids: vec![],
+            mailbox: "C".into(),
+            ids: vec![],
         }));
         let next = pop_background_action(&mut pending, 4).unwrap();
         assert!(matches!(next.kind, ActionKind::MailboxStatus(_)));
@@ -741,7 +978,10 @@ mod tests {
     fn selected_message_beats_status_and_obsolete_body_requests() {
         let mut pending = VecDeque::from([
             Action::new(ActionKind::MailboxStatus("INBOX".into())),
-            Action::new(ActionKind::PrefetchBodies { mailbox: "INBOX".into(), ids: vec![] }),
+            Action::new(ActionKind::PrefetchBodies {
+                mailbox: "INBOX".into(),
+                ids: vec![],
+            }),
             body("INBOX"),
             body("INBOX"),
         ]);
@@ -749,8 +989,15 @@ mod tests {
         let next = pop_background_action(&mut pending, 4).unwrap();
         assert_eq!(next.id, expected);
         assert_eq!(pending.len(), 2);
-        assert!(pending.iter().all(|a| !matches!(&a.kind, ActionKind::FetchBody { .. })));
-        assert!(matches!(pop_background_action(&mut pending, 4).unwrap().kind, ActionKind::MailboxStatus(_)));
+        assert!(
+            pending
+                .iter()
+                .all(|a| !matches!(&a.kind, ActionKind::FetchBody { .. }))
+        );
+        assert!(matches!(
+            pop_background_action(&mut pending, 4).unwrap().kind,
+            ActionKind::MailboxStatus(_)
+        ));
     }
 
     struct TestBackend {
@@ -759,48 +1006,113 @@ mod tests {
     }
 
     impl MailBackend for TestBackend {
-        fn capabilities(&self) -> Capabilities { Capabilities::IMAP_BASIC }
-        fn connect(&mut self) -> anyhow::Result<()> { Ok(()) }
-        fn list_mailboxes(&mut self) -> anyhow::Result<Vec<Mailbox>> { Ok(vec![]) }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::IMAP_BASIC
+        }
+        fn connect(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_mailboxes(&mut self) -> anyhow::Result<Vec<Mailbox>> {
+            Ok(vec![])
+        }
         fn mailbox_status(&mut self, _name: &str) -> anyhow::Result<(usize, usize)> {
-            if let Some(started) = &self.status_started { let _ = started.send(()); }
-            if let Some(release) = &self.status_release { let _ = release.recv_timeout(Duration::from_secs(2)); }
+            if let Some(started) = &self.status_started {
+                let _ = started.send(());
+            }
+            if let Some(release) = &self.status_release {
+                let _ = release.recv_timeout(Duration::from_secs(2));
+            }
             Ok((5, 2))
         }
-        fn open_mailbox(&mut self, _name: &str, offset: usize, _limit: usize) -> anyhow::Result<MessagePage> {
-            if let Some(started) = &self.status_started { let _ = started.send(()); }
-            if let Some(release) = &self.status_release { let _ = release.recv_timeout(Duration::from_secs(2)); }
-            Ok(MessagePage { messages: vec![], offset, next_offset: offset, has_more: false })
+        fn open_mailbox(
+            &mut self,
+            _name: &str,
+            offset: usize,
+            _limit: usize,
+        ) -> anyhow::Result<MessagePage> {
+            if let Some(started) = &self.status_started {
+                let _ = started.send(());
+            }
+            if let Some(release) = &self.status_release {
+                let _ = release.recv_timeout(Duration::from_secs(2));
+            }
+            Ok(MessagePage {
+                messages: vec![],
+                offset,
+                next_offset: offset,
+                has_more: false,
+            })
         }
         fn fetch_body(&mut self, _mailbox: &str, id: &MessageId) -> anyhow::Result<MessageBody> {
-            if let Some(started) = &self.status_started { let _ = started.send(()); }
-            if let Some(release) = &self.status_release { let _ = release.recv_timeout(Duration::from_secs(2)); }
+            if let Some(started) = &self.status_started {
+                let _ = started.send(());
+            }
+            if let Some(release) = &self.status_release {
+                let _ = release.recv_timeout(Duration::from_secs(2));
+            }
             Ok(MessageBody {
-                id: id.clone(), plain_text: Some("prefetched".into()), plain_fallback: None,
-                html_source: None, html_text: None, html_lines: None, html_renderer: None,
-                html_render_width: 0, attachment_count: 0, attachment_names: Vec::new(),
+                id: id.clone(),
+                plain_text: Some("prefetched".into()),
+                plain_fallback: None,
+                html_source: None,
+                html_text: None,
+                html_lines: None,
+                html_renderer: None,
+                html_render_width: 0,
+                attachment_count: 0,
+                attachment_names: Vec::new(),
             })
         }
         fn fetch_raw(&mut self, _mailbox: &str, _id: &MessageId) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("not needed for this test")
         }
-        fn set_seen(&mut self, _mailbox: &str, _id: &MessageId, _seen: bool) -> anyhow::Result<()> { Ok(()) }
-        fn delete(&mut self, _mailbox: &str, _id: &MessageId) -> anyhow::Result<()> { Ok(()) }
-        fn move_to(&mut self, _source: &str, _destination: &str, _id: &MessageId) -> anyhow::Result<()> { Ok(()) }
+        fn set_seen(&mut self, _mailbox: &str, _id: &MessageId, _seen: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn delete(&mut self, _mailbox: &str, _id: &MessageId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn move_to(
+            &mut self,
+            _source: &str,
+            _destination: &str,
+            _id: &MessageId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
     fn stalled_status_lookup_does_not_block_interactive_open() {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let foreground = Box::new(TestBackend { status_started: None, status_release: None });
-        let background = Box::new(TestBackend { status_started: Some(started_tx), status_release: Some(release_rx) });
+        let foreground = Box::new(TestBackend {
+            status_started: None,
+            status_release: None,
+        });
+        let background = Box::new(TestBackend {
+            status_started: Some(started_tx),
+            status_release: Some(release_rx),
+        });
         let (events_tx, events_rx) = mpsc::sync_channel(16);
         let mut worker = WorkerHandle::spawn(0, foreground, Some(background), None, events_tx);
-        let _ = worker.post(ActionKind::MailboxStatus("INBOX".into())).unwrap();
-        started_rx.recv_timeout(Duration::from_secs(1)).expect("background status should start");
-        let requested = worker.post(ActionKind::OpenMailbox { name: "All Mail".into(), offset: 0, limit: 50, hint: None }).unwrap();
-        let event = events_rx.recv_timeout(Duration::from_millis(500)).expect("interactive open must not wait for STATUS");
+        let _ = worker
+            .post(ActionKind::MailboxStatus("INBOX".into()))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("background status should start");
+        let requested = worker
+            .post(ActionKind::OpenMailbox {
+                name: "All Mail".into(),
+                offset: 0,
+                limit: 50,
+                hint: None,
+            })
+            .unwrap();
+        let event = events_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("interactive open must not wait for STATUS");
         match event {
             RuntimeEvent::Worker(ev) => {
                 assert_eq!(ev.request_id, requested);
@@ -817,19 +1129,37 @@ mod tests {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let foreground = Box::new(TestBackend {
-            status_started: Some(started_tx), status_release: Some(release_rx),
+            status_started: Some(started_tx),
+            status_release: Some(release_rx),
         });
-        let background = Box::new(TestBackend { status_started: None, status_release: None });
+        let background = Box::new(TestBackend {
+            status_started: None,
+            status_release: None,
+        });
         let (events_tx, events_rx) = mpsc::sync_channel(8);
         let mut worker = WorkerHandle::spawn(0, foreground, Some(background), None, events_tx);
-        worker.post(ActionKind::OpenMailbox {
-            name: "INBOX".into(), offset: 0, limit: 100, hint: None,
-        }).unwrap();
-        started_rx.recv_timeout(Duration::from_secs(1)).expect("header fetch should be in flight");
+        worker
+            .post(ActionKind::OpenMailbox {
+                name: "INBOX".into(),
+                offset: 0,
+                limit: 100,
+                hint: None,
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("header fetch should be in flight");
         let id = MessageId("imap-uid:9:123".into());
-        let requested = worker.post(ActionKind::FetchBody { mailbox: "INBOX".into(), id: id.clone() }).unwrap();
-        let RuntimeEvent::Worker(event) = events_rx.recv_timeout(Duration::from_millis(500))
-            .expect("selected body must not wait for foreground headers") else {
+        let requested = worker
+            .post(ActionKind::FetchBody {
+                mailbox: "INBOX".into(),
+                id: id.clone(),
+            })
+            .unwrap();
+        let RuntimeEvent::Worker(event) = events_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("selected body must not wait for foreground headers")
+        else {
             panic!("expected selected-message body event");
         };
         assert_eq!(event.request_id, requested);
@@ -841,13 +1171,22 @@ mod tests {
     #[test]
     fn background_prefetch_delivers_body_without_changing_read_state() {
         let (tx, rx) = mpsc::sync_channel(16);
-        let foreground = Box::new(TestBackend { status_started: None, status_release: None });
-        let background = Box::new(TestBackend { status_started: None, status_release: None });
+        let foreground = Box::new(TestBackend {
+            status_started: None,
+            status_release: None,
+        });
+        let background = Box::new(TestBackend {
+            status_started: None,
+            status_release: None,
+        });
         let mut worker = WorkerHandle::spawn(0, foreground, Some(background), None, tx);
         let id = MessageId("imap-uid:9:123".into());
-        let requested = worker.post(ActionKind::PrefetchBodies {
-            mailbox: "INBOX".into(), ids: vec![id.clone()],
-        }).unwrap();
+        let requested = worker
+            .post(ActionKind::PrefetchBodies {
+                mailbox: "INBOX".into(),
+                ids: vec![id.clone()],
+            })
+            .unwrap();
         let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
             panic!("expected background prefetch event");
         };
@@ -866,19 +1205,37 @@ mod tests {
     fn slow_background_prefetch_never_blocks_interactive_open() {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let foreground = Box::new(TestBackend { status_started: None, status_release: None });
-        let background = Box::new(TestBackend { status_started: Some(started_tx), status_release: Some(release_rx) });
+        let foreground = Box::new(TestBackend {
+            status_started: None,
+            status_release: None,
+        });
+        let background = Box::new(TestBackend {
+            status_started: Some(started_tx),
+            status_release: Some(release_rx),
+        });
         let (tx, rx) = mpsc::sync_channel(16);
         let mut worker = WorkerHandle::spawn(0, foreground, Some(background), None, tx);
-        worker.post(ActionKind::PrefetchBodies {
-            mailbox: "INBOX".into(), ids: vec![MessageId("imap-uid:1:1".into())],
-        }).unwrap();
-        started_rx.recv_timeout(Duration::from_secs(1)).expect("prefetch should start");
-        let requested = worker.post(ActionKind::OpenMailbox {
-            name: "INBOX".into(), offset: 0, limit: 10, hint: None,
-        }).unwrap();
-        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_millis(500))
-            .expect("interactive mailbox open must not await prefetch") else {
+        worker
+            .post(ActionKind::PrefetchBodies {
+                mailbox: "INBOX".into(),
+                ids: vec![MessageId("imap-uid:1:1".into())],
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("prefetch should start");
+        let requested = worker
+            .post(ActionKind::OpenMailbox {
+                name: "INBOX".into(),
+                offset: 0,
+                limit: 10,
+                hint: None,
+            })
+            .unwrap();
+        let RuntimeEvent::Worker(event) = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("interactive mailbox open must not await prefetch")
+        else {
             panic!("expected foreground event");
         };
         assert_eq!(event.request_id, requested);
@@ -897,7 +1254,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 }

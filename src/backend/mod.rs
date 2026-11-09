@@ -39,8 +39,13 @@ pub fn from_source(source: &str) -> Result<Box<dyn MailBackend>> {
     let account = AccountConfig {
         name: "direct".to_owned(),
         source: source.to_owned(),
-        email: None, imap_username: None, smtp_username: None, imap_host: None, smtp_host: None,
-        imap_port: None, smtp_port: None,
+        email: None,
+        imap_username: None,
+        smtp_username: None,
+        imap_host: None,
+        smtp_host: None,
+        imap_port: None,
+        smtp_port: None,
         default_mailbox: "INBOX".to_owned(),
         exclude_mailboxes: Vec::new(),
         source_cred_cmd: None,
@@ -81,9 +86,10 @@ pub fn redact_source(source: &str) -> String {
 
     match ImapSource::parse(source) {
         Ok(parsed) => parsed.redacted(),
-        Err(_) => source
-            .split_once("://")
-            .map_or_else(|| "<invalid source>".to_owned(), |(scheme, _)| format!("{scheme}://<redacted>")),
+        Err(_) => source.split_once("://").map_or_else(
+            || "<invalid source>".to_owned(),
+            |(scheme, _)| format!("{scheme}://<redacted>"),
+        ),
     }
 }
 
@@ -113,13 +119,22 @@ pub trait MailBackend: Send {
     fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>>;
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)>;
     /// UIDVALIDITY from the currently selected mailbox, if provided by IMAP.
-    fn mailbox_uid_validity(&self, _name: &str) -> Option<u32> { None }
-    fn mailbox_uid_next(&self, _name: &str) -> Option<u32> { None }
+    fn mailbox_uid_validity(&self, _name: &str) -> Option<u32> {
+        None
+    }
+    fn mailbox_uid_next(&self, _name: &str) -> Option<u32> {
+        None
+    }
     fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage>;
     /// Optional metadata-only optimization; Maildir and older backends use
     /// the regular open path without any protocol-specific coupling.
-    fn open_mailbox_with_hint(&mut self, name: &str, offset: usize, limit: usize,
-        _hint: Option<MailboxSyncHint>) -> Result<MessagePage> {
+    fn open_mailbox_with_hint(
+        &mut self,
+        name: &str,
+        offset: usize,
+        limit: usize,
+        _hint: Option<MailboxSyncHint>,
+    ) -> Result<MessagePage> {
         self.open_mailbox(name, offset, limit)
     }
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody>;

@@ -4,7 +4,10 @@ use std::io::{BufRead, BufReader, Read};
 use anyhow::{Context, Result, anyhow};
 use mail_parser::{MessageParser, PartKind};
 
-use crate::model::{HtmlLine, HtmlSpan, HtmlSpanStyle, MessageBody, MessageFlags, MessageId, MessageSummary, OutgoingAttachment};
+use crate::model::{
+    HtmlLine, HtmlSpan, HtmlSpanStyle, MessageBody, MessageFlags, MessageId, MessageSummary,
+    OutgoingAttachment,
+};
 
 const MAX_HEADER_BYTES: usize = 512 * 1024;
 
@@ -27,7 +30,9 @@ pub fn read_header_block(reader: impl Read) -> Result<Vec<u8>> {
             break;
         }
         if out.len() + line.len() > MAX_HEADER_BYTES {
-            return Err(anyhow!("message header block exceeds {MAX_HEADER_BYTES} bytes"));
+            return Err(anyhow!(
+                "message header block exceeds {MAX_HEADER_BYTES} bytes"
+            ));
         }
         let blank = line == b"\n" || line == b"\r\n";
         out.extend_from_slice(&line);
@@ -128,20 +133,37 @@ pub fn parse_summary(
     // a recipient cannot recover who else was blind-copied via Bcc.
     macro_rules! render_addresses {
         ($value:expr) => {
-            $value.map(|value| value.mailboxes().filter_map(|mailbox| {
-                let address = mailbox.address()?.trim();
-                if address.is_empty() { return None; }
-                let name = mailbox.name().unwrap_or_default().trim();
-                Some(if name.is_empty() { address.to_owned() }
-                    else { format!("{name} <{address}>") })
-            }).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+            $value
+                .map(|value| {
+                    value
+                        .mailboxes()
+                        .filter_map(|mailbox| {
+                            let address = mailbox.address()?.trim();
+                            if address.is_empty() {
+                                return None;
+                            }
+                            let name = mailbox.name().unwrap_or_default().trim();
+                            Some(if name.is_empty() {
+                                address.to_owned()
+                            } else {
+                                format!("{name} <{address}>")
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
         };
     }
     let to = render_addresses!(message.to());
     let cc = render_addresses!(message.cc());
     let bcc = render_addresses!(message.bcc());
 
-    let subject = message.subject().unwrap_or("(no subject)").trim().to_owned();
+    let subject = message
+        .subject()
+        .unwrap_or("(no subject)")
+        .trim()
+        .to_owned();
     let (timestamp, date_label) = message.date().map_or((0, String::new()), |date| {
         let rendered = date.to_rfc3339();
         let label = rendered.get(5..10).unwrap_or(&rendered).to_owned();
@@ -200,8 +222,12 @@ pub fn attachment_hint(headers: &[u8]) -> bool {
 /// explicitly marked attachment or supplied with a filename.
 fn visible_mime_attachment(part: &mail_parser::MessagePart<'_>) -> bool {
     if part.is_content_type("text", "vnd.google.email-reaction+json") {
-        return part.attachment_name().is_some_and(|name| !name.trim().is_empty())
-            || part.content_disposition().is_some_and(|disposition| disposition.is_attachment());
+        return part
+            .attachment_name()
+            .is_some_and(|name| !name.trim().is_empty())
+            || part
+                .content_disposition()
+                .is_some_and(|disposition| disposition.is_attachment());
     }
     true
 }
@@ -209,30 +235,53 @@ fn visible_mime_attachment(part: &mail_parser::MessagePart<'_>) -> bool {
 /// Some calendar providers include identical invitation bytes twice: an unnamed
 /// `text/calendar` alternative and a named `invite.ics` attachment. Show the
 /// named file only, but preserve unique or explicitly attached calendar parts.
-fn attachment_parts<'msg>(message: &'msg mail_parser::Message<'_>) -> Vec<mail_parser::MessagePart<'msg>> {
-    let parts: Vec<_> = message.attachments()
-        .filter(|part| visible_mime_attachment(part)).collect();
-    parts.iter().filter(|part| {
-        if !part.is_content_type("text", "calendar")
-            || part.attachment_name().is_some_and(|name| !name.trim().is_empty())
-            || part.content_disposition().is_some_and(|disposition| disposition.is_attachment())
-        {
-            return true;
-        }
-        !parts.iter().any(|named| {
-            named.attachment_name().is_some_and(|name| name.to_ascii_lowercase().ends_with(".ics"))
-                && named.decoded().as_ref() == part.decoded().as_ref()
+fn attachment_parts<'msg>(
+    message: &'msg mail_parser::Message<'_>,
+) -> Vec<mail_parser::MessagePart<'msg>> {
+    let parts: Vec<_> = message
+        .attachments()
+        .filter(|part| visible_mime_attachment(part))
+        .collect();
+    parts
+        .iter()
+        .filter(|part| {
+            if !part.is_content_type("text", "calendar")
+                || part
+                    .attachment_name()
+                    .is_some_and(|name| !name.trim().is_empty())
+                || part
+                    .content_disposition()
+                    .is_some_and(|disposition| disposition.is_attachment())
+            {
+                return true;
+            }
+            !parts.iter().any(|named| {
+                named
+                    .attachment_name()
+                    .is_some_and(|name| name.to_ascii_lowercase().ends_with(".ics"))
+                    && named.decoded().as_ref() == part.decoded().as_ref()
+            })
         })
-    }).copied().collect()
+        .copied()
+        .collect()
 }
 
 fn attachment_display_name(part: &mail_parser::MessagePart<'_>, index: usize) -> String {
     let raw_name = part.attachment_name().unwrap_or("");
-    let name = raw_name.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or("").trim();
+    let name = raw_name
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or("")
+        .trim();
     if name.is_empty() || name == "." || name == ".." {
-        if part.is_content_type("text", "calendar") { "invite.ics".into() }
-        else { format!("attachment-{}", index + 1) }
-    } else { name.to_owned() }
+        if part.is_content_type("text", "calendar") {
+            "invite.ics".into()
+        } else {
+            format!("attachment-{}", index + 1)
+        }
+    } else {
+        name.to_owned()
+    }
 }
 
 /// Cached IMAP summary hints predate the calendar MIME deduplication fix.
@@ -240,21 +289,36 @@ fn attachment_display_name(part: &mail_parser::MessagePart<'_>, index: usize) ->
 /// a named calendar invite is also advertised. The decoded MIME parts remain
 /// authoritative: distinct invitations are still available after opening.
 pub fn visible_attachment_hints(hints: &[String]) -> Vec<String> {
-    let has_ics = hints.iter().any(|name| name.to_ascii_lowercase().ends_with(".ics"));
-    let generic_count = hints.iter().filter(|name| {
-        name.strip_prefix("attachment-").is_some_and(|suffix|
-            !suffix.is_empty() && suffix.bytes().all(|ch| ch.is_ascii_digit()))
-    }).count();
+    let has_ics = hints
+        .iter()
+        .any(|name| name.to_ascii_lowercase().ends_with(".ics"));
+    let generic_count = hints
+        .iter()
+        .filter(|name| {
+            name.strip_prefix("attachment-").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|ch| ch.is_ascii_digit())
+            })
+        })
+        .count();
     // Only the exact legacy two-chip case is unambiguous enough to
     // collapse without decoded MIME bytes. Keep larger/mixed lists intact.
-    if !has_ics || generic_count != 1 || hints.len() != 2 { return hints.to_vec(); }
-    hints.iter().filter(|name| !name.strip_prefix("attachment-").is_some_and(|suffix|
-        !suffix.is_empty() && suffix.bytes().all(|ch| ch.is_ascii_digit())))
-        .cloned().collect()
+    if !has_ics || generic_count != 1 || hints.len() != 2 {
+        return hints.to_vec();
+    }
+    hints
+        .iter()
+        .filter(|name| {
+            !name.strip_prefix("attachment-").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|ch| ch.is_ascii_digit())
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 pub fn extract_attachments(raw: &[u8]) -> Result<Vec<OutgoingAttachment>> {
-    let parsed = MessageParser::new().parse(raw)
+    let parsed = MessageParser::new()
+        .parse(raw)
         .ok_or_else(|| anyhow!("unable to parse MIME attachments"))?;
     let mut results = Vec::new();
     for (index, part) in attachment_parts(&parsed).into_iter().enumerate() {
@@ -270,12 +334,26 @@ pub fn extract_attachments(raw: &[u8]) -> Result<Vec<OutgoingAttachment>> {
 }
 
 fn guessed_attachment_type(name: &str, bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(b"%PDF-") { return "application/pdf"; }
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return "image/png"; }
-    if bytes.starts_with(b"\xff\xd8\xff") { return "image/jpeg"; }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") { return "image/gif"; }
-    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) { return "image/webp"; }
-    match name.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase()).as_deref() {
+    if bytes.starts_with(b"%PDF-") {
+        return "application/pdf";
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png";
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "image/gif";
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) {
+        return "image/webp";
+    }
+    match name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("pdf") => "application/pdf",
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
@@ -329,8 +407,11 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         .map(|(text, lines, renderer)| (Some(text), Some(lines), Some(renderer)))
         .unwrap_or((None, None, None));
 
-    let attachment_names: Vec<String> = attachment_parts(&message).into_iter()
-        .enumerate().map(|(index, part)| attachment_display_name(&part, index)).collect();
+    let attachment_names: Vec<String> = attachment_parts(&message)
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| attachment_display_name(&part, index))
+        .collect();
     Ok(MessageBody {
         id,
         plain_text,
@@ -349,7 +430,7 @@ pub fn render_html_for_terminal(html: &str, width: usize) -> (String, Vec<HtmlLi
     // html2text's rich renderer is intentionally closer to a text browser than
     // its String-only API: tables keep their box drawing and semantic markup
     // such as links/strong/emphasis remains tagged. Ratatui maps those tags to
-    // the active aerc-rs theme, which gives HTML mail the same useful visual
+    // the active jerc theme, which gives HTML mail the same useful visual
     // landmarks as a terminal browser without spawning an external process for
     // every message. The worker produces a fallback layout; reader mode can
     // reflow the preserved HTML when its actual viewport width changes.
@@ -407,7 +488,9 @@ fn flatten_presentation_tables_html(html: &str) -> Cow<'_, str> {
     // to html2text avoids allocating/copying the entire MIME part on every
     // render and reflow. The ASCII-insensitive precheck cannot miss a valid
     // presentation attribute, including one with mixed-case spelling.
-    if !html.as_bytes().windows(b"presentation".len())
+    if !html
+        .as_bytes()
+        .windows(b"presentation".len())
         .any(|part| part.eq_ignore_ascii_case(b"presentation"))
     {
         return Cow::Borrowed(html);
@@ -434,10 +517,14 @@ fn flatten_presentation_tables_html(html: &str) -> Cow<'_, str> {
         let (closing, name) = html_tag_name(tag);
         let is_table = name.is_some_and(|name| name.eq_ignore_ascii_case("table"));
         let is_table_section = name.is_some_and(|name| {
-            ["tbody", "thead", "tfoot"].iter().any(|part| name.eq_ignore_ascii_case(part))
+            ["tbody", "thead", "tfoot"]
+                .iter()
+                .any(|part| name.eq_ignore_ascii_case(part))
         });
         let is_cell_or_row = name.is_some_and(|name| {
-            ["tr", "td", "th"].iter().any(|part| name.eq_ignore_ascii_case(part))
+            ["tr", "td", "th"]
+                .iter()
+                .any(|part| name.eq_ignore_ascii_case(part))
         });
 
         if is_table && !closing {
@@ -474,7 +561,11 @@ fn flatten_presentation_tables_html(html: &str) -> Cow<'_, str> {
     if cursor < html.len() {
         out.push_str(&html[cursor..]);
     }
-    if modified { Cow::Owned(out) } else { Cow::Borrowed(html) }
+    if modified {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(html)
+    }
 }
 
 fn find_html_tag_end(html: &str, start: usize) -> Option<usize> {
@@ -492,7 +583,10 @@ fn find_html_tag_end(html: &str, start: usize) -> Option<usize> {
 }
 
 fn html_tag_name(tag: &str) -> (bool, Option<&str>) {
-    let inner = tag.trim_start_matches('<').trim_end_matches('>').trim_start();
+    let inner = tag
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim_start();
     if inner.starts_with('!') || inner.starts_with('?') {
         return (false, None);
     }
@@ -508,7 +602,8 @@ fn tag_has_presentation_role(tag: &str) -> bool {
     // case-insensitive and supporting unquoted or quoted values.
     let bytes = tag.as_bytes();
     let mut offset = 0usize;
-    while let Some(relative) = bytes[offset..].windows(4)
+    while let Some(relative) = bytes[offset..]
+        .windows(4)
         .position(|candidate| candidate.eq_ignore_ascii_case(b"role"))
     {
         let start = offset + relative;
@@ -531,7 +626,10 @@ fn tag_has_presentation_role(tag: &str) -> bool {
         while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
-        let quote = bytes.get(cursor).copied().filter(|byte| matches!(*byte, b'\'' | b'"'));
+        let quote = bytes
+            .get(cursor)
+            .copied()
+            .filter(|byte| matches!(*byte, b'\'' | b'"'));
         if quote.is_some() {
             cursor += 1;
         }
@@ -559,8 +657,10 @@ fn compact_prose_whitespace(mut lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
     // Do not touch box-drawn table rows or preformatted/code content: their
     // spacing is structural rather than decorative.
     for line in &mut lines {
-        if line.spans.iter().any(|span| span.style.code
-            || span.text.chars().any(is_table_chrome_char))
+        if line
+            .spans
+            .iter()
+            .any(|span| span.style.code || span.text.chars().any(is_table_chrome_char))
         {
             continue;
         }
@@ -664,8 +764,12 @@ fn clean_heading_markers(mut lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
     for line in &mut lines {
         // Most rows are not headings; don't allocate a concatenated copy just
         // to discover that their first visible character is not '#'.
-        if !line.spans.iter().flat_map(|span| span.text.chars())
-            .find(|ch| !ch.is_whitespace()).is_some_and(|ch| ch == '#')
+        if !line
+            .spans
+            .iter()
+            .flat_map(|span| span.text.chars())
+            .find(|ch| !ch.is_whitespace())
+            .is_some_and(|ch| ch == '#')
         {
             continue;
         }
@@ -673,15 +777,15 @@ fn clean_heading_markers(mut lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
         let trimmed = text.trim_start();
         let marker_len = trimmed.chars().take_while(|ch| *ch == '#').count();
         if !(1..=6).contains(&marker_len)
-            || !trimmed.chars().nth(marker_len).is_some_and(char::is_whitespace)
+            || !trimmed
+                .chars()
+                .nth(marker_len)
+                .is_some_and(char::is_whitespace)
         {
             continue;
         }
 
-        let leading = text
-            .chars()
-            .count()
-            .saturating_sub(trimmed.chars().count());
+        let leading = text.chars().count().saturating_sub(trimmed.chars().count());
         remove_visible_prefix(line, leading + marker_len + 1);
         for span in &mut line.spans {
             if !span.text.trim().is_empty() {
@@ -720,40 +824,52 @@ fn simplify_layout_table_blocks(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
     let mut output = Vec::with_capacity(lines.len());
     let mut remaining = lines.into_iter().peekable();
     while let Some(line) = remaining.next() {
-        if html_line_is_blank(&line) || remaining.peek().is_none_or(|next| html_line_is_blank(next)) {
+        if html_line_is_blank(&line) || remaining.peek().is_none_or(|next| html_line_is_blank(next))
+        {
             // Single-line prose can never be a layout-table block.
             output.push(line);
             continue;
         }
         let mut block = vec![line];
-        while remaining.peek().is_some_and(|next| !html_line_is_blank(next)) {
+        while remaining
+            .peek()
+            .is_some_and(|next| !html_line_is_blank(next))
+        {
             if let Some(next) = remaining.next() {
                 block.push(next);
             }
         }
-        let separator_rows = block.iter()
+        let separator_rows = block
+            .iter()
             .filter(|line| line_is_separator_or_blank(line) && !html_line_is_blank(line))
             .count();
-        let empty_cell_rows = block.iter()
+        let empty_cell_rows = block
+            .iter()
             .filter(|line| {
                 let text = html_line_text(line);
                 line_has_table_chrome(&text)
                     && !text.trim().is_empty()
-                    && text.chars().filter(|ch| !ch.is_whitespace() && !is_table_chrome_char(*ch)).count() == 0
+                    && text
+                        .chars()
+                        .filter(|ch| !ch.is_whitespace() && !is_table_chrome_char(*ch))
+                        .count()
+                        == 0
                     && text.chars().any(|ch| matches!(ch, '│' | '║'))
             })
             .count();
-        let nested_rows = block.iter()
-            .filter(|line| line.spans.iter()
-                .flat_map(|span| span.text.chars())
-                .filter(|ch| matches!(ch, '┬' | '┴' | '┼' | '│'))
-                .count() >= 5)
+        let nested_rows = block
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .flat_map(|span| span.text.chars())
+                    .filter(|ch| matches!(ch, '┬' | '┴' | '┼' | '│'))
+                    .count()
+                    >= 5
+            })
             .count();
 
-        if block.len() >= 5
-            && separator_rows >= 3
-            && (empty_cell_rows >= 2 || nested_rows >= 2)
-        {
+        if block.len() >= 5 && separator_rows >= 3 && (empty_cell_rows >= 2 || nested_rows >= 2) {
             for line in &block {
                 let flattened = flatten_layout_line(line);
                 if !html_line_is_blank(&flattened) {
@@ -858,7 +974,11 @@ fn clean_rich_lines(mut lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
             }
         }
         line.spans.retain(|span| !span.text.is_empty());
-        while line.spans.last().is_some_and(|span| span.text.trim().is_empty()) {
+        while line
+            .spans
+            .last()
+            .is_some_and(|span| span.text.trim().is_empty())
+        {
             line.spans.pop();
         }
         let blank = html_line_is_blank(line);
@@ -887,7 +1007,9 @@ fn compact_social_link_chrome(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
             }
             let label = html_line_text(line);
             let label = label.trim();
-            if !is_social_link_label(label) { return None; }
+            if !is_social_link_label(label) {
+                return None;
+            }
             let style = line
                 .spans
                 .iter()
@@ -1028,9 +1150,29 @@ fn line_is_separator_or_blank(line: &HtmlLine) -> bool {
         || trimmed.chars().all(|ch| {
             matches!(
                 ch,
-                '-' | '─' | '━' | '│' | '┌' | '┐' | '└' | '┘' | '├' | '┤'
-                    | '┬' | '┴' | '┼' | '═' | '║' | '╔' | '╗' | '╚' | '╝'
-                    | '╠' | '╣' | '╦' | '╩' | '╬'
+                '-' | '─'
+                    | '━'
+                    | '│'
+                    | '┌'
+                    | '┐'
+                    | '└'
+                    | '┘'
+                    | '├'
+                    | '┤'
+                    | '┬'
+                    | '┴'
+                    | '┼'
+                    | '═'
+                    | '║'
+                    | '╔'
+                    | '╗'
+                    | '╚'
+                    | '╝'
+                    | '╠'
+                    | '╣'
+                    | '╦'
+                    | '╩'
+                    | '╬'
             )
         })
 }
@@ -1042,9 +1184,30 @@ fn line_has_table_chrome(text: &str) -> bool {
 fn is_table_chrome_char(ch: char) -> bool {
     matches!(
         ch,
-        '─' | '━' | '│' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴'
-            | '┼' | '═' | '║' | '╔' | '╗' | '╚' | '╝' | '╠' | '╣' | '╦'
-            | '╩' | '╬' | '╌' | '╍'
+        '─' | '━'
+            | '│'
+            | '┌'
+            | '┐'
+            | '└'
+            | '┘'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+            | '═'
+            | '║'
+            | '╔'
+            | '╗'
+            | '╚'
+            | '╝'
+            | '╠'
+            | '╣'
+            | '╦'
+            | '╩'
+            | '╬'
+            | '╌'
+            | '╍'
     )
 }
 
@@ -1127,7 +1290,10 @@ fn rich_lines_to_text(lines: &[HtmlLine]) -> String {
 }
 
 fn needs_html_text_cleanup(ch: char) -> bool {
-    matches!(ch, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}' | '\u{00a0}')
+    matches!(
+        ch,
+        '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}' | '\u{00a0}'
+    )
 }
 
 fn clean_html_text(text: &str) -> String {
@@ -1198,11 +1364,20 @@ Hello from the body.\r\n";
         let hints = vec!["attachment-1".into(), "invite.ics".into()];
         assert_eq!(super::visible_attachment_hints(&hints), vec!["invite.ics"]);
         assert_eq!(hints.len(), 2, "do not mutate cached source data");
-        assert_eq!(super::visible_attachment_hints(&["attachment-1".into()]),
-            vec!["attachment-1"]);
-        assert_eq!(super::visible_attachment_hints(&[
-            "attachment-1".into(), "invite.ics".into(), "report.pdf".into(),
-        ]).len(), 3, "never guess about larger multipart messages");
+        assert_eq!(
+            super::visible_attachment_hints(&["attachment-1".into()]),
+            vec!["attachment-1"]
+        );
+        assert_eq!(
+            super::visible_attachment_hints(&[
+                "attachment-1".into(),
+                "invite.ics".into(),
+                "report.pdf".into(),
+            ])
+            .len(),
+            3,
+            "never guess about larger multipart messages"
+        );
     }
 
     #[test]
@@ -1268,8 +1443,16 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
         let raw = b"From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><h1>Hello</h1><p>World</p></body></html>";
         let body = parse_body(MessageId("html".into()), raw).unwrap();
         assert!(body.plain_text.is_none());
-        assert!(body.html_text.as_deref().is_some_and(|text| text.contains("Hello")));
-        assert!(body.html_lines.as_ref().is_some_and(|lines| !lines.is_empty()));
+        assert!(
+            body.html_text
+                .as_deref()
+                .is_some_and(|text| text.contains("Hello"))
+        );
+        assert!(
+            body.html_lines
+                .as_ref()
+                .is_some_and(|lines| !lines.is_empty())
+        );
     }
 
     #[test]
@@ -1279,14 +1462,17 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
         let rendered = body.html_text.as_deref().unwrap();
         assert!(rendered.contains("View in Figma"));
         assert!(rendered.contains("Comment text"));
-        assert!(rendered.chars().any(|ch| matches!(ch, '│' | '─' | '┌' | '┐')));
+        assert!(
+            rendered
+                .chars()
+                .any(|ch| matches!(ch, '│' | '─' | '┌' | '┐'))
+        );
         assert_eq!(
             body.html_links(),
             vec!["https://tracking.example/very/long/url".to_owned()]
         );
         assert_eq!(body.html_renderer.as_deref(), Some("html2text-rich"));
     }
-
 
     #[test]
     fn html_reader_preserves_supported_css_colours() {
@@ -1300,9 +1486,21 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
             .flat_map(|line| line.spans.iter())
             .map(|span| &span.style)
             .collect::<Vec<_>>();
-        assert!(styles.iter().any(|style| style.foreground == Some((255, 0, 0))));
-        assert!(styles.iter().any(|style| style.background == Some((0, 0, 255))));
-        assert!(styles.iter().any(|style| style.link.as_deref() == Some("https://example.com")));
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.foreground == Some((255, 0, 0)))
+        );
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.background == Some((0, 0, 255)))
+        );
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.link.as_deref() == Some("https://example.com"))
+        );
     }
 
     #[test]
@@ -1493,7 +1691,10 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
             line("Please don't miss the   first cut!"),
             line(table),
         ]);
-        assert_eq!(super::html_line_text(&compacted[0]), "Please don't miss the first cut!");
+        assert_eq!(
+            super::html_line_text(&compacted[0]),
+            "Please don't miss the first cut!"
+        );
         assert_eq!(super::html_line_text(&compacted[1]), table);
     }
 
@@ -1505,11 +1706,13 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
         );
         assert!(text.contains("Your Services Agreement made clearer"));
         assert!(!text.contains("# Your Services Agreement"));
-        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
-            span.text.contains("Your Services Agreement") && span.style.bold
-        }));
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| { span.text.contains("Your Services Agreement") && span.style.bold })
+        );
     }
-
 
     #[test]
     fn explicit_presentation_tables_are_linearized_before_rich_rendering() {
@@ -1546,17 +1749,27 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
             line(" │Take Survey     │ "),
             line("─┴────────────────┴─"),
         ]);
-        let text = flattened.iter().map(super::html_line_text).collect::<Vec<_>>();
+        let text = flattened
+            .iter()
+            .map(super::html_line_text)
+            .collect::<Vec<_>>();
         assert!(text.iter().any(|line| line.contains("Share Your Thoughts")));
         assert!(text.iter().any(|line| line.contains("Take Survey")));
-        assert!(!text.iter().any(|line| line.contains('┬') || line.contains('┴')));
+        assert!(
+            !text
+                .iter()
+                .any(|line| line.contains('┬') || line.contains('┴'))
+        );
 
         let data = simplify_layout_table_blocks(vec![
             line("──────┬────────"),
             line("Ticket│$85.00"),
             line("──────┴────────"),
         ]);
-        assert!(data.iter().any(|line| super::html_line_text(line).contains('┬')));
+        assert!(
+            data.iter()
+                .any(|line| super::html_line_text(line).contains('┬'))
+        );
     }
 
     #[test]
@@ -1589,10 +1802,18 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
             bold: true,
             ..HtmlSpanStyle::default()
         };
-        let lines = vec![HtmlLine { spans: vec![
-            HtmlSpan { text: "Read  ".into(), style: linked.clone() },
-            HtmlSpan { text: "\tmore\u{200b}".into(), style: linked.clone() },
-        ] }];
+        let lines = vec![HtmlLine {
+            spans: vec![
+                HtmlSpan {
+                    text: "Read  ".into(),
+                    style: linked.clone(),
+                },
+                HtmlSpan {
+                    text: "\tmore\u{200b}".into(),
+                    style: linked.clone(),
+                },
+            ],
+        }];
         let clean = compact_prose_whitespace(super::clean_rich_lines(lines));
         assert_eq!(super::html_line_text(&clean[0]), "Read more");
         assert!(clean[0].spans.iter().all(|span| span.style == linked));
@@ -1602,19 +1823,32 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
 
     #[test]
     fn ordinary_layout_blocks_keep_their_styled_spans() {
-        let first = HtmlLine { spans: vec![HtmlSpan {
-            text: "Hello ".into(),
-            style: HtmlSpanStyle { italic: true, ..HtmlSpanStyle::default() },
-        }, HtmlSpan {
-            text: "world".into(),
-            style: HtmlSpanStyle { link: Some("https://example.org".into()), ..HtmlSpanStyle::default() },
-        }] };
-        let second = HtmlLine { spans: vec![HtmlSpan {
-            text: "Next paragraph".into(), style: HtmlSpanStyle::default(),
-        }] };
-        let actual = simplify_layout_table_blocks(vec![
-            first.clone(), HtmlLine::default(), second.clone(),
-        ]);
+        let first = HtmlLine {
+            spans: vec![
+                HtmlSpan {
+                    text: "Hello ".into(),
+                    style: HtmlSpanStyle {
+                        italic: true,
+                        ..HtmlSpanStyle::default()
+                    },
+                },
+                HtmlSpan {
+                    text: "world".into(),
+                    style: HtmlSpanStyle {
+                        link: Some("https://example.org".into()),
+                        ..HtmlSpanStyle::default()
+                    },
+                },
+            ],
+        };
+        let second = HtmlLine {
+            spans: vec![HtmlSpan {
+                text: "Next paragraph".into(),
+                style: HtmlSpanStyle::default(),
+            }],
+        };
+        let actual =
+            simplify_layout_table_blocks(vec![first.clone(), HtmlLine::default(), second.clone()]);
         assert_eq!(actual, vec![first, HtmlLine::default(), second]);
     }
 
@@ -1654,8 +1888,11 @@ Content-Type: text/html; charset=utf-8\r\n\
 \r\n\
 <table><tr><td>Hello</td><td>World</td></tr></table>";
         let body = parse_body(MessageId("html".into()), raw).unwrap();
-        assert!(body.html_text.as_deref().is_some_and(|text| text.contains("Hello")));
+        assert!(
+            body.html_text
+                .as_deref()
+                .is_some_and(|text| text.contains("Hello"))
+        );
         assert!(body.display_text(false).contains("Hello"));
     }
-
 }

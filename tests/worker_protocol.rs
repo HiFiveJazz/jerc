@@ -3,12 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use aerc_rs::backend::MailBackend;
-use aerc_rs::model::{
-    Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingMessage,
-};
-use aerc_rs::outgoing::{MailSender, SendReceipt};
-use aerc_rs::worker::{ActionKind, RuntimeEvent, WorkerEventKind, WorkerHandle};
+use jerc::backend::MailBackend;
+use jerc::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingMessage};
+use jerc::outgoing::{MailSender, SendReceipt};
+use jerc::worker::{ActionKind, RuntimeEvent, WorkerEventKind, WorkerHandle};
 
 struct FakeBackend;
 
@@ -144,7 +142,9 @@ impl MailBackend for AppendingBackend {
         Ok(vec![])
     }
     fn append_message(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
-        if self.fail_append { anyhow::bail!("simulated Sent append failure"); }
+        if self.fail_append {
+            anyhow::bail!("simulated Sent append failure");
+        }
         self.appended
             .lock()
             .unwrap()
@@ -183,7 +183,8 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
         fail_append: false,
     };
     let (tx, rx) = sync_channel(8);
-    let mut worker = WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
+    let mut worker =
+        WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
     worker
         .post(ActionKind::Send {
             message: OutgoingMessage {
@@ -232,27 +233,45 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
     worker.shutdown();
 }
 
-
 #[test]
 fn sent_append_failure_is_reported_and_not_retried_as_smtp_send() {
     let appended = Arc::new(Mutex::new(Vec::new()));
-    let backend = AppendingBackend { appended: Arc::clone(&appended), fail_append: true };
+    let backend = AppendingBackend {
+        appended: Arc::clone(&appended),
+        fail_append: true,
+    };
     let (tx, rx) = sync_channel(8);
-    let mut worker = WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
-    worker.post(ActionKind::Send {
-        message: OutgoingMessage {
-            from: "sender@example.com".into(), to: "receiver@example.com".into(),
-            cc: String::new(), bcc: String::new(), subject: "failure test".into(),
-            body: "test".into(), html_body: None, attachments: vec![], custom_headers: vec![],
-            in_reply_to: None, references: vec![], forwarded_raw: None,
-        },
-        sent_mailbox: Some("Sent".into()),
-        copy_to: None,
-    }).unwrap();
+    let mut worker =
+        WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
+    worker
+        .post(ActionKind::Send {
+            message: OutgoingMessage {
+                from: "sender@example.com".into(),
+                to: "receiver@example.com".into(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: "failure test".into(),
+                body: "test".into(),
+                html_body: None,
+                attachments: vec![],
+                custom_headers: vec![],
+                in_reply_to: None,
+                references: vec![],
+                forwarded_raw: None,
+            },
+            sent_mailbox: Some("Sent".into()),
+            copy_to: None,
+        })
+        .unwrap();
     let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
         panic!("worker event expected");
     };
-    let WorkerEventKind::MessageSent { sent_copy_saved, sent_copy_warning, .. } = event.kind else {
+    let WorkerEventKind::MessageSent {
+        sent_copy_saved,
+        sent_copy_warning,
+        ..
+    } = event.kind
+    else {
         panic!("SMTP accepted message but worker returned error");
     };
     assert!(!sent_copy_saved);
@@ -264,23 +283,42 @@ fn sent_append_failure_is_reported_and_not_retried_as_smtp_send() {
 #[test]
 fn sent_copy_can_be_disabled_without_appending_to_server() {
     let appended = Arc::new(Mutex::new(Vec::new()));
-    let backend = AppendingBackend { appended: Arc::clone(&appended), fail_append: false };
+    let backend = AppendingBackend {
+        appended: Arc::clone(&appended),
+        fail_append: false,
+    };
     let (tx, rx) = sync_channel(8);
-    let mut worker = WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
-    worker.post(ActionKind::Send {
-        message: OutgoingMessage {
-            from: "sender@example.com".into(), to: "receiver@example.com".into(),
-            cc: String::new(), bcc: String::new(), subject: "no copy".into(),
-            body: "test".into(), html_body: None, attachments: vec![], custom_headers: vec![],
-            in_reply_to: None, references: vec![], forwarded_raw: None,
-        },
-        sent_mailbox: Some("Sent".into()),
-        copy_to: Some(Vec::new()),
-    }).unwrap();
+    let mut worker =
+        WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
+    worker
+        .post(ActionKind::Send {
+            message: OutgoingMessage {
+                from: "sender@example.com".into(),
+                to: "receiver@example.com".into(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: "no copy".into(),
+                body: "test".into(),
+                html_body: None,
+                attachments: vec![],
+                custom_headers: vec![],
+                in_reply_to: None,
+                references: vec![],
+                forwarded_raw: None,
+            },
+            sent_mailbox: Some("Sent".into()),
+            copy_to: Some(Vec::new()),
+        })
+        .unwrap();
     let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
         panic!("worker event expected");
     };
-    let WorkerEventKind::MessageSent { sent_copy_saved, sent_copy_disabled, .. } = event.kind else {
+    let WorkerEventKind::MessageSent {
+        sent_copy_saved,
+        sent_copy_disabled,
+        ..
+    } = event.kind
+    else {
         panic!("SMTP accepted message but worker returned error");
     };
     assert!(!sent_copy_saved);
@@ -292,30 +330,54 @@ fn sent_copy_can_be_disabled_without_appending_to_server() {
 #[test]
 fn sent_copy_explicit_multiple_folders_appends_both() {
     let appended = Arc::new(Mutex::new(Vec::new()));
-    let backend = AppendingBackend { appended: Arc::clone(&appended), fail_append: false };
+    let backend = AppendingBackend {
+        appended: Arc::clone(&appended),
+        fail_append: false,
+    };
     let (tx, rx) = sync_channel(8);
-    let mut worker = WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
-    worker.post(ActionKind::Send {
-        message: OutgoingMessage {
-            from: "sender@example.com".into(), to: "receiver@example.com".into(),
-            cc: String::new(), bcc: String::new(), subject: "multiple".into(),
-            body: "test".into(), html_body: None, attachments: vec![], custom_headers: vec![],
-            in_reply_to: None, references: vec![], forwarded_raw: None,
-        },
-        sent_mailbox: Some("Sent".into()),
-        copy_to: Some(vec!["Sent".into(), "Project Archive".into()]),
-    }).unwrap();
+    let mut worker =
+        WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(FakeSender)), tx);
+    worker
+        .post(ActionKind::Send {
+            message: OutgoingMessage {
+                from: "sender@example.com".into(),
+                to: "receiver@example.com".into(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: "multiple".into(),
+                body: "test".into(),
+                html_body: None,
+                attachments: vec![],
+                custom_headers: vec![],
+                in_reply_to: None,
+                references: vec![],
+                forwarded_raw: None,
+            },
+            sent_mailbox: Some("Sent".into()),
+            copy_to: Some(vec!["Sent".into(), "Project Archive".into()]),
+        })
+        .unwrap();
     let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
         panic!("worker event expected");
     };
-    let WorkerEventKind::MessageSent { sent_copy_saved, sent_copy_warning, .. } = event.kind else {
+    let WorkerEventKind::MessageSent {
+        sent_copy_saved,
+        sent_copy_warning,
+        ..
+    } = event.kind
+    else {
         panic!("SMTP accepted message but worker returned error");
     };
     assert!(sent_copy_saved);
     assert!(sent_copy_warning.is_none());
     let appended = appended.lock().unwrap();
-    assert_eq!(appended.iter().map(|(name, _, _)| name.as_str()).collect::<Vec<_>>(),
-        vec!["Sent", "Project Archive"]);
+    assert_eq!(
+        appended
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Sent", "Project Archive"]
+    );
     drop(appended);
     worker.shutdown();
 }

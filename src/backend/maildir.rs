@@ -8,7 +8,10 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::backend::MailBackend;
 use crate::mail::{parse_body, parse_summary, read_all, read_header_block};
-use crate::model::{Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage, MessageSummary};
+use crate::model::{
+    Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage,
+    MessageSummary,
+};
 
 #[derive(Debug)]
 pub struct MaildirBackend {
@@ -121,18 +124,16 @@ impl MaildirBackend {
             }
         }
 
-        summaries.sort_by(|a, b| {
-            b.timestamp
-                .cmp(&a.timestamp)
-                .then_with(|| b.id.cmp(&a.id))
-        });
+        summaries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
         self.selected_mailbox = Some(name.to_owned());
         self.selected_index = index;
         Ok(summaries)
     }
 
     fn locate(&mut self, mailbox: &str, id: &MessageId) -> Result<PathBuf> {
-        if self.selected_mailbox.as_deref() != Some(mailbox) || !self.selected_index.contains_key(id) {
+        if self.selected_mailbox.as_deref() != Some(mailbox)
+            || !self.selected_index.contains_key(id)
+        {
             let _ = self.scan_mailbox(mailbox)?;
         }
         self.selected_index
@@ -234,7 +235,8 @@ impl MailBackend for MaildirBackend {
 
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
         let path = self.locate(mailbox, id)?;
-        read_all(File::open(&path)?).with_context(|| format!("reading message from {}", path.display()))
+        read_all(File::open(&path)?)
+            .with_context(|| format!("reading message from {}", path.display()))
     }
 
     fn append_message(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
@@ -243,7 +245,7 @@ impl MailBackend for MaildirBackend {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let unique = format!(
-            "{}.M{}P{}.aerc-rs",
+            "{}.M{}P{}.jerc",
             now.as_secs(),
             now.subsec_nanos(),
             std::process::id()
@@ -267,11 +269,20 @@ impl MailBackend for MaildirBackend {
 
     fn append_draft(&mut self, mailbox: &str, raw: &[u8]) -> Result<()> {
         let maildir = self.mailbox_path(mailbox)?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-        let unique = format!("{}.M{}P{}.aerc-rs-draft", now.as_secs(), now.subsec_nanos(), std::process::id());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let unique = format!(
+            "{}.M{}P{}.jerc-draft",
+            now.as_secs(),
+            now.subsec_nanos(),
+            std::process::id()
+        );
         let tmp = maildir.join("tmp").join(&unique);
         fs::write(&tmp, raw).with_context(|| format!("writing draft {}", tmp.display()))?;
-        let target = maildir.join("cur").join(format!("{unique}{}2,DS", maildir_info_separator()));
+        let target = maildir
+            .join("cur")
+            .join(format!("{unique}{}2,DS", maildir_info_separator()));
         if let Err(error) = fs::rename(&tmp, &target) {
             let _ = fs::remove_file(&tmp);
             return Err(error).with_context(|| format!("saving draft to {}", target.display()));
@@ -298,7 +309,11 @@ impl MailBackend for MaildirBackend {
         let new_name = if target_dir == "new" {
             base.to_owned()
         } else {
-            format!("{base}{}2,{}", maildir_info_separator(), flags.to_maildir_suffix())
+            format!(
+                "{base}{}2,{}",
+                maildir_info_separator(),
+                flags.to_maildir_suffix()
+            )
         };
         let new_path = maildir.join(target_dir).join(new_name);
         move_file(&old, &new_path)?;
@@ -357,10 +372,9 @@ fn split_maildir_info(filename: &str) -> (&str, Option<&str>) {
 }
 
 fn flags_from_filename(filename: &str) -> MessageFlags {
-    split_maildir_info(filename).1.map_or_else(
-        MessageFlags::empty,
-        MessageFlags::from_maildir_suffix,
-    )
+    split_maildir_info(filename)
+        .1
+        .map_or_else(MessageFlags::empty, MessageFlags::from_maildir_suffix)
 }
 
 fn role_for_name(name: &str) -> MailboxRole {

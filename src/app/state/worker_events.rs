@@ -4,7 +4,9 @@ use super::*;
 
 impl App {
     pub fn handle_worker_event(&mut self, event: WorkerEvent) {
-        let own_addresses = self.accounts.iter()
+        let own_addresses = self
+            .accounts
+            .iter()
             .filter_map(|a| a.from.parse::<lettre::message::Mailbox>().ok())
             .map(|a| a.email.to_string())
             .collect::<Vec<_>>();
@@ -26,9 +28,15 @@ impl App {
                     .current_mailbox
                     .clone()
                     .unwrap_or_else(|| account.default_mailbox.clone());
-                account.mailboxes = mailboxes.into_iter()
-                    .filter(|mailbox| !crate::config::mailbox_is_excluded(
-                        &mailbox.name, &account.exclude_mailboxes)).collect();
+                account.mailboxes = mailboxes
+                    .into_iter()
+                    .filter(|mailbox| {
+                        !crate::config::mailbox_is_excluded(
+                            &mailbox.name,
+                            &account.exclude_mailboxes,
+                        )
+                    })
+                    .collect();
                 account.persist_mailboxes();
                 account.mailbox_index = account
                     .mailboxes
@@ -80,7 +88,9 @@ impl App {
                     account.mailbox_status_inflight = None;
                 }
                 let from_poll = account.inbox_poll_inflight == Some(event.request_id);
-                if from_poll { account.inbox_poll_inflight = None; }
+                if from_poll {
+                    account.inbox_poll_inflight = None;
+                }
                 let mut new_count = 0usize;
                 if let Some(mailbox) = account.mailboxes.iter_mut().find(|m| m.name == name) {
                     new_count = inbox_new_mail_count(
@@ -95,28 +105,38 @@ impl App {
                 }
                 if new_count > 0 {
                     if self.new_mail_notifications_enabled {
-                        self.new_mail_since_launch = self.new_mail_since_launch.saturating_add(new_count);
+                        self.new_mail_since_launch =
+                            self.new_mail_since_launch.saturating_add(new_count);
                     }
                     // Keep the UID-keyed header cache on new arrivals. The
                     // next SELECT validates UIDVALIDITY and obtains a current
                     // UID+FLAGS page before we reuse any old summary. Dropping
                     // the cache here would force full header downloads on
                     // precisely the refreshes that benefit from delta fetches.
-                    self.status = StatusLine::temporary(format!(
-                        "{} new message(s) in {}", new_count, account.name,
-                    ), Duration::from_secs(6));
+                    self.status = StatusLine::temporary(
+                        format!("{} new message(s) in {}", new_count, account.name,),
+                        Duration::from_secs(6),
+                    );
                     if self.new_mail_bell_enabled && self.new_mail_notifications_enabled {
                         self.new_mail_bell_pending = true;
                     }
                     if self.new_mail_notifications_enabled {
                         // Use the existing background IMAP session; do not block
                         // rendering, fetch on the foreground session, or change \Seen.
-                        if account.worker.post(ActionKind::NewMailPreview {
-                            mailbox: name.clone(), count: new_count,
-                        }).is_err() {
+                        if account
+                            .worker
+                            .post(ActionKind::NewMailPreview {
+                                mailbox: name.clone(),
+                                count: new_count,
+                            })
+                            .is_err()
+                        {
                             self.new_mail_notices.push_back(NewMailNotice {
-                                account: account.name.clone(), count: new_count,
-                                sender: String::new(), subject: String::new(), excerpt: String::new(),
+                                account: account.name.clone(),
+                                count: new_count,
+                                sender: String::new(),
+                                subject: String::new(),
+                                excerpt: String::new(),
                             });
                         }
                     }
@@ -137,10 +157,19 @@ impl App {
                 account.persist_mailboxes();
                 Self::pump_mailbox_status(account);
             }
-            WorkerEventKind::NewMailPreview { count, sender, subject, excerpt } => {
+            WorkerEventKind::NewMailPreview {
+                count,
+                sender,
+                subject,
+                excerpt,
+            } => {
                 if self.new_mail_notifications_enabled {
                     self.new_mail_notices.push_back(NewMailNotice {
-                        account: account.name.clone(), count, sender, subject, excerpt,
+                        account: account.name.clone(),
+                        count,
+                        sender,
+                        subject,
+                        excerpt,
                     });
                 }
             }
@@ -154,14 +183,20 @@ impl App {
                 // A newer folder/page request supersedes this result even if
                 // both requests happen to name the same mailbox.
                 if account.page_request_id != Some(event.request_id) {
-                    crate::perf::record_request("ui_mailbox_stale", event.request_id, None, Duration::ZERO, true);
+                    crate::perf::record_request(
+                        "ui_mailbox_stale",
+                        event.request_id,
+                        None,
+                        Duration::ZERO,
+                        true,
+                    );
                     return;
                 }
                 account.page_request_id = None;
                 let first_page = page.offset == 0;
                 let previous_validity = account.uid_validities.get(&name).copied();
-                let generation_changed = first_page && previous_validity.is_some()
-                    && previous_validity != uid_validity;
+                let generation_changed =
+                    first_page && previous_validity.is_some() && previous_validity != uid_validity;
                 if generation_changed {
                     // Cached UIDs may point to entirely different emails after
                     // a server UIDVALIDITY reset: drop all old derived data.
@@ -180,7 +215,9 @@ impl App {
                     account.uid_nexts.remove(&name);
                 }
                 account.unverified_mailboxes.remove(&name);
-                let selected_name = account.selected_mailbox().map(|mailbox| mailbox.name.clone());
+                let selected_name = account
+                    .selected_mailbox()
+                    .map(|mailbox| mailbox.name.clone());
                 if selected_name.as_deref() != Some(name.as_str()) {
                     account.page_inflight = None;
                     account.messages_loading = false;
@@ -212,7 +249,13 @@ impl App {
                     account.page_inflight = None;
                 }
                 account.messages_loading = false;
-                crate::perf::record_request("ui_mailbox_applied", event.request_id, None, Duration::ZERO, true);
+                crate::perf::record_request(
+                    "ui_mailbox_applied",
+                    event.request_id,
+                    None,
+                    Duration::ZERO,
+                    true,
+                );
                 account.current_mailbox = Some(name.clone());
                 if page.offset == 0 {
                     let selected_id = (!generation_changed)
@@ -243,9 +286,7 @@ impl App {
                             .filter(|message| !existing.contains(&message.id)),
                     );
                     account.messages.sort_by(|a, b| {
-                        b.timestamp
-                            .cmp(&a.timestamp)
-                            .then_with(|| b.id.cmp(&a.id))
+                        b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id))
                     });
                 }
                 account.next_page_offset = page.next_offset;
@@ -262,8 +303,9 @@ impl App {
                     let still_selected = !generation_changed
                         && account.body_request_id.is_some()
                         && account.pending_bodies.len() == 1
-                        && account.selected_message().is_some_and(|message|
-                            account.pending_bodies.contains(&message.id));
+                        && account
+                            .selected_message()
+                            .is_some_and(|message| account.pending_bodies.contains(&message.id));
                     if !still_selected {
                         account.pending_bodies.clear();
                         account.body_request_id = None;
@@ -273,24 +315,42 @@ impl App {
                 account.last_scan_micros = Some(elapsed_micros);
                 // Learn only lightweight envelope addresses already fetched
                 // for normal browsing. Never scan bodies or junk folders.
-                let mailbox_role = account.mailboxes.iter()
-                    .find(|m| m.name == name).map(|m| &m.role);
+                let mailbox_role = account
+                    .mailboxes
+                    .iter()
+                    .find(|m| m.name == name)
+                    .map(|m| &m.role);
                 let is_sent = matches!(mailbox_role, Some(&MailboxRole::Sent));
                 let is_inbox = matches!(mailbox_role, Some(&MailboxRole::Inbox));
-                if ((is_inbox && self.contacts_learn_inbox) || (is_sent && self.contacts_learn_sent))
-                    && self.contacts_writable {
+                if ((is_inbox && self.contacts_learn_inbox)
+                    || (is_sent && self.contacts_learn_sent))
+                    && self.contacts_writable
+                {
                     let mut changed = false;
                     for message in account.messages.iter().take(200) {
-                        if is_inbox && !own_addresses.iter().any(|own|
-                            own.eq_ignore_ascii_case(&message.from_address)) {
-                            changed |= self.contacts.upsert(&message.from_name, &message.from_address, false)
+                        if is_inbox
+                            && !own_addresses
+                                .iter()
+                                .any(|own| own.eq_ignore_ascii_case(&message.from_address))
+                        {
+                            changed |= self
+                                .contacts
+                                .upsert(&message.from_name, &message.from_address, false)
                                 .unwrap_or(false);
                         }
                         if is_sent {
-                            for (person, address) in recipients(&message.to).into_iter()
-                                .chain(recipients(&message.cc)) {
-                                if !own_addresses.iter().any(|own| own.eq_ignore_ascii_case(&address)) {
-                                    changed |= self.contacts.upsert(&person, &address, false).unwrap_or(false);
+                            for (person, address) in recipients(&message.to)
+                                .into_iter()
+                                .chain(recipients(&message.cc))
+                            {
+                                if !own_addresses
+                                    .iter()
+                                    .any(|own| own.eq_ignore_ascii_case(&address))
+                                {
+                                    changed |= self
+                                        .contacts
+                                        .upsert(&person, &address, false)
+                                        .unwrap_or(false);
                                 }
                             }
                         }
@@ -348,12 +408,15 @@ impl App {
                     Duration::from_secs(4),
                 );
                 account.last_prefetch_window = None;
-                if event.account == self.account_index { account.prefetch_near_cursor(1); }
+                if event.account == self.account_index {
+                    account.prefetch_near_cursor(1);
+                }
                 if self.preview_split && event.account == self.account_index {
                     account.request_selected_body();
                     Self::mark_cached_selected_seen(account);
                 }
-                if account.pending_inbox_refresh && account.page_inflight.is_none()
+                if account.pending_inbox_refresh
+                    && account.page_inflight.is_none()
                     && !(self.message_open && event.account == self.account_index)
                 {
                     account.pending_inbox_refresh = false;
@@ -367,19 +430,29 @@ impl App {
             }
             WorkerEventKind::MailboxOpenFailed { name, error } => {
                 if account.page_request_id != Some(event.request_id) {
-                    crate::perf::record_request("ui_mailbox_stale", event.request_id, None, Duration::ZERO, false);
+                    crate::perf::record_request(
+                        "ui_mailbox_stale",
+                        event.request_id,
+                        None,
+                        Duration::ZERO,
+                        false,
+                    );
                     return;
                 }
                 account.page_request_id = None;
                 account.page_inflight = None;
                 account.messages_loading = false;
-                self.status = StatusLine::error(format!("{}: could not open {name}: {error}", account.name));
+                self.status =
+                    StatusLine::error(format!("{}: could not open {name}: {error}", account.name));
             }
             WorkerEventKind::BodyLoadFailed { error } => {
-                if account.body_request_id != Some(event.request_id) { return; }
+                if account.body_request_id != Some(event.request_id) {
+                    return;
+                }
                 account.body_request_id = None;
                 account.pending_bodies.clear();
-                self.status = StatusLine::error(format!("{}: could not load email: {error}", account.name));
+                self.status =
+                    StatusLine::error(format!("{}: could not load email: {error}", account.name));
             }
             WorkerEventKind::BodyLoaded(body) => {
                 if account.body_request_id != Some(event.request_id) {
@@ -403,7 +476,6 @@ impl App {
                     account.request_seen(id, true);
                 }
                 Self::pump_mailbox_status(account);
-
             }
             WorkerEventKind::BodyPrefetched { mailbox, body } => {
                 // The background connection can finish after a folder change,
@@ -424,28 +496,59 @@ impl App {
                 crate::perf::record("ui_prefetch_applied", None, Duration::ZERO, true);
                 account.bodies.insert(id.clone(), body);
                 account.trim_preview_bodies();
-                if event.account == self.account_index && (self.message_open || self.preview_split)
-                    && account.selected_message().is_some_and(|message| message.id == id && message.unread())
+                if event.account == self.account_index
+                    && (self.message_open || self.preview_split)
+                    && account
+                        .selected_message()
+                        .is_some_and(|message| message.id == id && message.unread())
                 {
                     account.request_seen(id, true);
                 }
                 // Do not serialize the entire mailbox for every opportunistic
                 // body. The regular cache checkpoint saves it when needed.
             }
-            WorkerEventKind::AttachmentsLoaded { mailbox, id, attachments } => {
-                let expected = self.attachment_source.as_ref().is_some_and(|(account, folder, _, wanted)|
-                    *account == event.account && folder == &mailbox && wanted == &id);
-                if expected && self.attachment_pending.as_ref() == Some(&id) && self.attachment_picker_visible {
+            WorkerEventKind::AttachmentsLoaded {
+                mailbox,
+                id,
+                attachments,
+            } => {
+                let expected =
+                    self.attachment_source
+                        .as_ref()
+                        .is_some_and(|(account, folder, _, wanted)| {
+                            *account == event.account && folder == &mailbox && wanted == &id
+                        });
+                if expected
+                    && self.attachment_pending.as_ref() == Some(&id)
+                    && self.attachment_picker_visible
+                {
                     self.attachment_files = Arc::new(attachments);
-                    if let Some(source) = self.attachment_source.as_ref()
-                        .filter(|(account, _, _, message)| *account == event.account && message == &id).cloned() {
-                        let total_bytes = self.attachment_files.iter().map(|file| file.data.len()).sum::<usize>();
+                    if let Some(source) = self
+                        .attachment_source
+                        .as_ref()
+                        .filter(|(account, _, _, message)| {
+                            *account == event.account && message == &id
+                        })
+                        .cloned()
+                    {
+                        let total_bytes = self
+                            .attachment_files
+                            .iter()
+                            .map(|file| file.data.len())
+                            .sum::<usize>();
                         if total_bytes <= 12 * 1024 * 1024 {
                             self.attachment_cache.retain(|(key, _)| key != &source);
-                            self.attachment_cache.push_back((source, Arc::clone(&self.attachment_files)));
-                            while self.attachment_cache.len() > 6 || self.attachment_cache.iter()
-                                .flat_map(|(_, files)| files.iter()).map(|file| file.data.len()).sum::<usize>()
-                                > 24 * 1024 * 1024 {
+                            self.attachment_cache
+                                .push_back((source, Arc::clone(&self.attachment_files)));
+                            while self.attachment_cache.len() > 6
+                                || self
+                                    .attachment_cache
+                                    .iter()
+                                    .flat_map(|(_, files)| files.iter())
+                                    .map(|file| file.data.len())
+                                    .sum::<usize>()
+                                    > 24 * 1024 * 1024
+                            {
                                 self.attachment_cache.pop_front();
                             }
                         }
@@ -457,15 +560,21 @@ impl App {
                     self.attachment_preview_identity = None;
                     self.attachment_pending = None;
                     self.queue_attachment_preview();
-                    self.status = StatusLine::info(format!("{} attachment(s) loaded", self.attachment_files.len()));
+                    self.status = StatusLine::info(format!(
+                        "{} attachment(s) loaded",
+                        self.attachment_files.len()
+                    ));
                 }
             }
             WorkerEventKind::RawLoaded { id, raw } => {
-                let pending = self.pending_compose.as_ref().filter(|pending| {
-                    pending.account == event.account && pending.message_id == id
-                });
+                let pending = self
+                    .pending_compose
+                    .as_ref()
+                    .filter(|pending| pending.account == event.account && pending.message_id == id);
                 let result = pending.and_then(|pending| {
-                    let message = account.messages.iter()
+                    let message = account
+                        .messages
+                        .iter()
                         .find(|message| message.id == pending.message_id)?;
                     Some(match pending.intent {
                         ComposeIntent::Forward => Composer::forward(message, raw),
@@ -504,7 +613,8 @@ impl App {
             WorkerEventKind::SeenChanged { id, seen } => {
                 account.pending_seen.remove(&id);
                 let mut unread_delta = 0isize;
-                if let Some(message) = account.messages.iter_mut().find(|message| message.id == id) {
+                if let Some(message) = account.messages.iter_mut().find(|message| message.id == id)
+                {
                     let was_unread = message.unread();
                     message.flags.set(MessageFlags::SEEN, seen);
                     let is_unread = message.unread();
@@ -530,28 +640,35 @@ impl App {
             }
             WorkerEventKind::MutationComplete => {
                 account.pending_mutations = account.pending_mutations.saturating_sub(1);
-                let message = account.pending_mutation_labels.remove(&event.request_id)
+                let message = account
+                    .pending_mutation_labels
+                    .remove(&event.request_id)
                     .unwrap_or("mail updated");
                 self.status = StatusLine::temporary(message, Duration::from_secs(2));
             }
             WorkerEventKind::DraftSaveFailed { mailbox, error } => {
                 self.status = StatusLine::error(format!(
-                    "saved locally only: uploading to {mailbox} failed ({error}); Ctrl+n resumes"));
+                    "saved locally only: uploading to {mailbox} failed ({error}); Ctrl+n resumes"
+                ));
             }
             WorkerEventKind::DraftSaved { mailbox } => {
                 // Refresh cached Drafts on the next visit, or immediately if
                 // the user is already browsing that folder.
                 account.mailbox_cache.remove(&mailbox);
                 account.remove_persistent_folder(&mailbox);
-                if let Some(folder) = account.mailboxes.iter_mut()
-                    .find(|folder| folder.name == mailbox) {
+                if let Some(folder) = account
+                    .mailboxes
+                    .iter_mut()
+                    .find(|folder| folder.name == mailbox)
+                {
                     folder.counts_known = false;
                 }
                 if account.current_mailbox.as_deref() == Some(mailbox.as_str()) {
                     let _ = account.request_mailbox_page(mailbox.clone(), 0);
                 }
                 self.status = StatusLine::info(format!(
-                    "draft saved in {mailbox}; Ctrl+n resumes editing local recovery copy"));
+                    "draft saved in {mailbox}; Ctrl+n resumes editing local recovery copy"
+                ));
             }
             WorkerEventKind::MessageSent {
                 smtp_status,
@@ -564,8 +681,14 @@ impl App {
                     let mut changed = false;
                     for field in [&composer.to, &composer.cc, &composer.bcc] {
                         for (name, address) in recipients(field) {
-                            if !own_addresses.iter().any(|own| own.eq_ignore_ascii_case(&address)) {
-                                changed |= self.contacts.upsert(&name, &address, false).unwrap_or(false);
+                            if !own_addresses
+                                .iter()
+                                .any(|own| own.eq_ignore_ascii_case(&address))
+                            {
+                                changed |= self
+                                    .contacts
+                                    .upsert(&name, &address, false)
+                                    .unwrap_or(false);
                             }
                         }
                     }
@@ -631,7 +754,10 @@ impl App {
                         Duration::from_secs(8),
                     )
                 } else if sent_copy_disabled {
-                    StatusLine::temporary(format!("Message accepted ({smtp_status}); Sent copy disabled"), Duration::from_secs(5))
+                    StatusLine::temporary(
+                        format!("Message accepted ({smtp_status}); Sent copy disabled"),
+                        Duration::from_secs(5),
+                    )
                 } else if sent_copy_saved {
                     StatusLine::temporary(
                         format!("SMTP accepted ({smtp_status}); saved to Sent"),
@@ -710,5 +836,4 @@ impl App {
             WorkerEventKind::Stopped => {}
         }
     }
-
 }

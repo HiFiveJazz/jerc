@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-maildir="${1:-/tmp/aerc-rs-maildir}"
+maildir="${1:-/tmp/jerc-maildir}"
 count="${2:-10000}"
 runs="${3:-5}"
 

@@ -97,7 +97,9 @@ impl SmtpSource {
 
         let auth = if auth == SmtpAuth::Auto && token_endpoint.is_some() {
             SmtpAuth::OAuthBearer // negotiate OAuth only; never downgrade to password
-        } else { auth };
+        } else {
+            auth
+        };
         if matches!(auth, SmtpAuth::XOAuth2 | SmtpAuth::OAuthBearer) {
             if let Some(endpoint) = &token_endpoint {
                 let parsed = Url::parse(endpoint).context("parsing SMTP OAuth token endpoint")?;
@@ -130,13 +132,20 @@ impl SmtpSource {
 
     pub fn with_account_oauth(mut self, account: &crate::config::AccountConfig) -> Result<Self> {
         if let Some(settings) = crate::oauth::OAuthSettings::for_account(account)? {
-            if matches!(self.auth, SmtpAuth::Plain | SmtpAuth::Login | SmtpAuth::None) {
-                bail!("OAuth account cannot use SMTP password or no-auth scheme; use smtps:// or +xoauth2");
+            if matches!(
+                self.auth,
+                SmtpAuth::Plain | SmtpAuth::Login | SmtpAuth::None
+            ) {
+                bail!(
+                    "OAuth account cannot use SMTP password or no-auth scheme; use smtps:// or +xoauth2"
+                );
             }
             self.account_oauth = Some(settings);
             // An unsuffixed SMTP URI must not try PLAIN/LOGIN with an OAuth
             // token; force token-only capability negotiation for this account.
-            if self.auth == SmtpAuth::Auto { self.auth = SmtpAuth::OAuthBearer; }
+            if self.auth == SmtpAuth::Auto {
+                self.auth = SmtpAuth::OAuthBearer;
+            }
         }
         Ok(self)
     }
@@ -249,8 +258,9 @@ impl SmtpSender {
     /// Opt-in diagnostic: send `AUTH XOAUTH2`, wait for 334, then send the
     /// base64 SASL response. Does not send an email or change the send path.
     pub fn probe_oauth_with_challenge(&self, challenge: bool) -> Result<()> {
-        if !matches!(self.source.auth, SmtpAuth::XOAuth2 | SmtpAuth::OAuthBearer) ||
-            self.source.account_oauth.is_none() {
+        if !matches!(self.source.auth, SmtpAuth::XOAuth2 | SmtpAuth::OAuthBearer)
+            || self.source.account_oauth.is_none()
+        {
             bail!("SMTP OAuth probe requires an account with [accounts.oauth]");
         }
         let mut connection = self.authenticated_oauth_connection(challenge, true)?;
@@ -260,7 +270,11 @@ impl SmtpSender {
 
     /// Lettre's high-level transport does not expose RFC 7628 OAUTHBEARER.
     /// The low-level path is shared by actual sends and credential-only probes.
-    fn authenticated_oauth_connection(&self, challenge_xoauth2: bool, probe: bool) -> Result<SmtpConnection> {
+    fn authenticated_oauth_connection(
+        &self,
+        challenge_xoauth2: bool,
+        probe: bool,
+    ) -> Result<SmtpConnection> {
         let credential = self.source.credential(self.credential_command.as_deref())?;
         let token = self.source.access_token(&credential)?;
         if probe {
@@ -268,9 +282,14 @@ impl SmtpSender {
                 if oauth.provider == "microsoft" {
                     // Claims can be unavailable/opaque. Never print the token,
                     // decoded JSON, username, or arbitrary identity fields.
-                    println!("  {}", crate::oauth::safe_smtp_token_diagnostics(
-                        &token, &oauth.client_id, &self.source.username,
-                    ));
+                    println!(
+                        "  {}",
+                        crate::oauth::safe_smtp_token_diagnostics(
+                            &token,
+                            &oauth.client_id,
+                            &self.source.username,
+                        )
+                    );
                 }
             }
         }
@@ -297,7 +316,9 @@ impl SmtpSender {
 
         if self.source.tls == SmtpTls::StartTls {
             // Required STARTTLS, never opportunistic: no token on plaintext.
-            connection.starttls(&tls, &hello).context("upgrading SMTP connection to TLS")?;
+            connection
+                .starttls(&tls, &hello)
+                .context("upgrading SMTP connection to TLS")?;
         }
         if !connection.is_encrypted() {
             bail!("SMTP OAUTHBEARER requires an encrypted TLS connection");
@@ -312,41 +333,63 @@ impl SmtpSender {
             // This diagnostic deliberately tests the two-step form described
             // in Microsoft's SMTP OAuth documentation. Do not automatically
             // retry failed credentials or downgrade to PLAIN/LOGIN.
-            if !connection.server_info().supports_auth_mechanism(Mechanism::Xoauth2) {
+            if !connection
+                .server_info()
+                .supports_auth_mechanism(Mechanism::Xoauth2)
+            {
                 bail!("SMTP server did not advertise XOAUTH2 after STARTTLS");
             }
-            let auth = connection.command("AUTH XOAUTH2\r\n")
+            let auth = connection
+                .command("AUTH XOAUTH2\r\n")
                 .context("starting two-step SMTP XOAUTH2 exchange")?;
             if !auth.has_code(334) {
-                bail!("SMTP did not issue XOAUTH2 challenge (code {})", auth.code());
+                bail!(
+                    "SMTP did not issue XOAUTH2 challenge (code {})",
+                    auth.code()
+                );
             }
             let initial = xoauth2_initial_response(&self.source.username, &token)?;
             // Never log the base64 payload: it contains the access token.
-            let result = connection.command(format!("{}\r\n", BASE64.encode(initial)))
+            let result = connection
+                .command(format!("{}\r\n", BASE64.encode(initial)))
                 .map_err(|error| smtp_xoauth2_error(&self.source.host, error))?;
             if !result.has_code(235) {
-                bail!("SMTP rejected two-step XOAUTH2 authentication (code {})", result.code());
+                bail!(
+                    "SMTP rejected two-step XOAUTH2 authentication (code {})",
+                    result.code()
+                );
             }
         } else if is_microsoft_smtp_host(&self.source.host) {
             // Thunderbird chooses XOAUTH2 for Microsoft SMTP. The old path
             // preferred OAUTHBEARER when advertised, unlike Thunderbird.
             // Fail explicitly rather than silently attempting another method.
-            if !connection.server_info().supports_auth_mechanism(Mechanism::Xoauth2) {
+            if !connection
+                .server_info()
+                .supports_auth_mechanism(Mechanism::Xoauth2)
+            {
                 bail!("Microsoft SMTP server did not advertise XOAUTH2 after STARTTLS");
             }
             if probe {
                 println!("  SMTP OAuth mechanism: XOAUTH2 (Microsoft / Thunderbird-compatible)");
             }
-            let auth = connection.auth(
-                &[Mechanism::Xoauth2],
-                &Credentials::new(self.source.username.clone(), token),
-            ).map_err(|error| smtp_xoauth2_error(&self.source.host, error))?;
+            let auth = connection
+                .auth(
+                    &[Mechanism::Xoauth2],
+                    &Credentials::new(self.source.username.clone(), token),
+                )
+                .map_err(|error| smtp_xoauth2_error(&self.source.host, error))?;
             if !auth.has_code(235) {
-                bail!("Microsoft SMTP rejected XOAUTH2 authentication (code {})", auth.code());
+                bail!(
+                    "Microsoft SMTP rejected XOAUTH2 authentication (code {})",
+                    auth.code()
+                );
             }
         } else if smtp_advertises_oauthbearer(&extensions) {
             let sasl = oauthbearer_initial_response(
-                &self.source.username, &self.source.host, self.source.port, &token,
+                &self.source.username,
+                &self.source.host,
+                self.source.port,
+                &token,
             )?;
             // The command contains a bearer token; never log it or include it in an error.
             let auth = connection
@@ -360,18 +403,29 @@ impl SmtpSender {
                 bail!("SMTP rejected OAUTHBEARER credentials (334 challenge)");
             }
             if !auth.has_code(235) {
-                bail!("SMTP rejected OAUTHBEARER authentication (code {})", auth.code());
+                bail!(
+                    "SMTP rejected OAUTHBEARER authentication (code {})",
+                    auth.code()
+                );
             }
-        } else if connection.server_info().supports_auth_mechanism(Mechanism::Xoauth2) {
+        } else if connection
+            .server_info()
+            .supports_auth_mechanism(Mechanism::Xoauth2)
+        {
             // Gmail and some other providers advertise XOAUTH2, not RFC 7628.
             // Both use the same OAuth 2.0 access token. Never fall back to a
             // password mechanism, and never retry after rejected credentials.
-            let auth = connection.auth(
-                &[Mechanism::Xoauth2],
-                &Credentials::new(self.source.username.clone(), token),
-            ).map_err(|error| smtp_xoauth2_error(&self.source.host, error))?;
+            let auth = connection
+                .auth(
+                    &[Mechanism::Xoauth2],
+                    &Credentials::new(self.source.username.clone(), token),
+                )
+                .map_err(|error| smtp_xoauth2_error(&self.source.host, error))?;
             if !auth.has_code(235) {
-                bail!("SMTP rejected XOAUTH2 fallback authentication (code {})", auth.code());
+                bail!(
+                    "SMTP rejected XOAUTH2 fallback authentication (code {})",
+                    auth.code()
+                );
             }
         } else {
             bail!("SMTP server supports neither AUTH OAUTHBEARER nor XOAUTH2 after TLS");
@@ -391,9 +445,7 @@ impl SmtpSender {
     }
 
     fn transport(&self) -> Result<SmtpTransport> {
-        let credential = self
-            .source
-            .credential(self.credential_command.as_deref())?;
+        let credential = self.source.credential(self.credential_command.as_deref())?;
         let secret = if self.source.auth == SmtpAuth::XOAuth2 {
             self.source.access_token(&credential)?
         } else {
@@ -409,10 +461,7 @@ impl SmtpSender {
         .timeout(Some(SMTP_TIMEOUT));
 
         if self.source.auth != SmtpAuth::None {
-            builder = builder.credentials(Credentials::new(
-                self.source.username.clone(),
-                secret,
-            ));
+            builder = builder.credentials(Credentials::new(self.source.username.clone(), secret));
             // Lettre checks the post-TLS EHLO mechanism list and chooses the
             // first mutually supported option. Never retry a rejected password
             // using a different mechanism or downgrade to cleartext SMTP.
@@ -457,8 +506,11 @@ impl MailSender for SmtpSender {
 /// `user=<username>\x01auth=Bearer <token>\x01\x01` protocol example.
 /// Never log this string or its base64 encoding: both contain the token.
 fn xoauth2_initial_response(user: &str, token: &str) -> Result<String> {
-    if user.is_empty() || token.is_empty() || user.chars().any(char::is_control)
-        || token.chars().any(char::is_control) {
+    if user.is_empty()
+        || token.is_empty()
+        || user.chars().any(char::is_control)
+        || token.chars().any(char::is_control)
+    {
         bail!("invalid SMTP XOAUTH2 identity or token");
     }
     Ok(format!("user={user}\x01auth=Bearer {token}\x01\x01"))
@@ -467,7 +519,9 @@ fn xoauth2_initial_response(user: &str, token: &str) -> Result<String> {
 /// RFC 7628's GS2 header and bearer key/value fields. Do not put tokens in
 /// log messages, Debug implementations, or anyhow error context.
 fn oauthbearer_initial_response(user: &str, host: &str, port: u16, token: &str) -> Result<String> {
-    if user.is_empty() || token.is_empty() || user.chars().any(char::is_control)
+    if user.is_empty()
+        || token.is_empty()
+        || user.chars().any(char::is_control)
         || token.chars().any(char::is_control)
         || host.chars().any(char::is_control)
     {
@@ -483,16 +537,17 @@ fn oauthbearer_initial_response(user: &str, host: &str, port: u16, token: &str) 
 /// Inspect the post-TLS EHLO reply, rather than Lettre's Mechanism enum (which
 /// does not recognize OAUTHBEARER and consequently omits it from ServerInfo).
 fn smtp_advertises_oauthbearer(response: &Response) -> bool {
-    response.has_code(250) && response.message().any(|line| {
-        let mut fields = line.split_ascii_whitespace();
-        matches!(fields.next(), Some(prefix) if prefix.eq_ignore_ascii_case("AUTH"))
-            && fields.any(|mechanism| mechanism.eq_ignore_ascii_case("OAUTHBEARER"))
-    })
+    response.has_code(250)
+        && response.message().any(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            matches!(fields.next(), Some(prefix) if prefix.eq_ignore_ascii_case("AUTH"))
+                && fields.any(|mechanism| mechanism.eq_ignore_ascii_case("OAUTHBEARER"))
+        })
 }
 
 fn is_microsoft_smtp_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("smtp.office365.com") ||
-        host.eq_ignore_ascii_case("smtp-mail.outlook.com")
+    host.eq_ignore_ascii_case("smtp.office365.com")
+        || host.eq_ignore_ascii_case("smtp-mail.outlook.com")
 }
 
 /// SMTP AUTH is a separate Exchange Online policy, even when IMAP OAuth works.
@@ -501,13 +556,16 @@ fn smtp_xoauth2_error(host: &str, error: impl std::fmt::Display) -> anyhow::Erro
     let detail = error.to_string();
     if (host.eq_ignore_ascii_case("smtp.office365.com")
         || host.eq_ignore_ascii_case("smtp-mail.outlook.com"))
-        && detail.contains("535") {
-        anyhow!("Microsoft SMTP XOAUTH2 rejected authentication (535). \
+        && detail.contains("535")
+    {
+        anyhow!(
+            "Microsoft SMTP XOAUTH2 rejected authentication (535). \
             IMAP OAuth may still work. Check the mailbox's SMTP AUTH policy, \
             whether delegated SMTP.Send was consented, the outgoing username, \
             and that smtp.office365.com:587 uses STARTTLS. \
             Only your Exchange administrator can change tenant/mailbox SMTP AUTH restrictions. \
-            Server response: {detail}")
+            Server response: {detail}"
+        )
     } else {
         anyhow!("SMTP XOAUTH2 authentication exchange: {detail}")
     }
@@ -547,15 +605,17 @@ fn run_credential_command(command: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SmtpAuth, SmtpSource, oauthbearer_initial_response, smtp_advertises_oauthbearer, xoauth2_initial_response, is_microsoft_smtp_host};
+    use super::{
+        SmtpAuth, SmtpSource, is_microsoft_smtp_host, oauthbearer_initial_response,
+        smtp_advertises_oauthbearer, xoauth2_initial_response,
+    };
     use lettre::transport::smtp::response::Response;
 
     #[test]
     fn parses_secure_password_smtp() {
-        let source = SmtpSource::parse(
-            "smtps://user%40example.com:app%20password@smtp.example.com:465",
-        )
-        .unwrap();
+        let source =
+            SmtpSource::parse("smtps://user%40example.com:app%20password@smtp.example.com:465")
+                .unwrap();
         assert_eq!(source.username, "user@example.com");
         assert_eq!(source.auth, SmtpAuth::Auto);
         assert_eq!(source.port, 465);
@@ -580,9 +640,8 @@ mod tests {
             "smtps://a%40example.org:refresh@smtp.example.org:465?token_endpoint=https%3A%2F%2Foauth.example.org%2Ftoken"
         ).unwrap();
         assert_eq!(source.auth, SmtpAuth::OAuthBearer);
-        let explicit = SmtpSource::parse(
-            "smtp+plain://a%40example.org:pw@smtp.example.org:587"
-        ).unwrap();
+        let explicit =
+            SmtpSource::parse("smtp+plain://a%40example.org:pw@smtp.example.org:587").unwrap();
         assert_eq!(explicit.auth, SmtpAuth::Plain);
     }
 
@@ -593,9 +652,9 @@ mod tests {
         ).unwrap();
         assert_eq!(implicit.auth, SmtpAuth::OAuthBearer);
         assert_eq!(implicit.port, 465);
-        let explicit = SmtpSource::parse(
-            "smtp+oauthbearer://alice%40example.org:secret@smtp.example.org:587",
-        ).unwrap();
+        let explicit =
+            SmtpSource::parse("smtp+oauthbearer://alice%40example.org:secret@smtp.example.org:587")
+                .unwrap();
         assert_eq!(explicit.auth, SmtpAuth::OAuthBearer);
         assert_eq!(explicit.port, 587);
         assert!(!format!("{implicit:?}").contains("refresh-secret"));
@@ -613,11 +672,24 @@ mod tests {
     #[test]
     fn oauthbearer_initial_response_uses_rfc_7628_layout_and_gs2_escape() {
         let frame = oauthbearer_initial_response(
-            "alice,test=one@example.org", "smtp.example.org", 587, "opaque.token",
-        ).unwrap();
-        assert_eq!(frame, "n,a=alice=2Ctest=3Done@example.org,\x01host=smtp.example.org\x01port=587\x01auth=Bearer opaque.token\x01\x01");
-        assert!(oauthbearer_initial_response("alice\r\nINJECT", "smtp.example.org", 587, "token").is_err());
-        assert!(oauthbearer_initial_response("alice", "smtp.example.org", 587, "token\x01INJECT").is_err());
+            "alice,test=one@example.org",
+            "smtp.example.org",
+            587,
+            "opaque.token",
+        )
+        .unwrap();
+        assert_eq!(
+            frame,
+            "n,a=alice=2Ctest=3Done@example.org,\x01host=smtp.example.org\x01port=587\x01auth=Bearer opaque.token\x01\x01"
+        );
+        assert!(
+            oauthbearer_initial_response("alice\r\nINJECT", "smtp.example.org", 587, "token")
+                .is_err()
+        );
+        assert!(
+            oauthbearer_initial_response("alice", "smtp.example.org", 587, "token\x01INJECT")
+                .is_err()
+        );
     }
 
     #[test]
@@ -639,8 +711,14 @@ mod tests {
 
     #[test]
     fn smtp_auth_capabilities_are_checked_after_tls() {
-        let supported: Response = "250-smtp.example.org Hello\r\n250-AUTH LOGIN PLAIN OAUTHBEARER\r\n250 SIZE 12000\r\n".parse().unwrap();
-        let unsupported: Response = "250-smtp.gmail.com Hello\r\n250-AUTH PLAIN LOGIN XOAUTH2\r\n250 SIZE 12000\r\n".parse().unwrap();
+        let supported: Response =
+            "250-smtp.example.org Hello\r\n250-AUTH LOGIN PLAIN OAUTHBEARER\r\n250 SIZE 12000\r\n"
+                .parse()
+                .unwrap();
+        let unsupported: Response =
+            "250-smtp.gmail.com Hello\r\n250-AUTH PLAIN LOGIN XOAUTH2\r\n250 SIZE 12000\r\n"
+                .parse()
+                .unwrap();
         assert!(smtp_advertises_oauthbearer(&supported));
         assert!(!smtp_advertises_oauthbearer(&unsupported));
     }
