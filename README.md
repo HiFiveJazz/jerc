@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/images/logo.svg" alt="Jerc logo" width="180" />
+  <img src="assets/images/logo.svg" alt="Jerc logo" width="500" />
   <h1>Jerc</h1>
   <p><strong>A keyboard-driven email client for the terminal, written in Rust.</strong></p>
   <p>
