@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/images/logo.svg" alt="Jerc logo" width="500" />
+  <img src="assets/images/logo.svg" alt="Jerc Logo" width="500" />
   <h1>Jerc</h1>
   <p><strong>A keyboard-driven email client for the terminal, written in Rust.</strong></p>
   <p>
@@ -13,7 +13,7 @@
 
 ---
 
-Jerc is a batteries-included terminal mail app! Features include contacts, and composition together in a responsive terminal interface. Navigate with Vim-style keys, manage multiple accounts, and read rich messages without leaving your terminal.
+Jerc is a batteries-included terminal mail app, acting as a successor to **[aerc](https://aerc-mail.org/)**! Features include contacts, and composition together in a responsive terminal interface. Navigate with Vim-style keys, manage multiple accounts, and read rich messages without leaving your terminal.
 
 ## Features
 
