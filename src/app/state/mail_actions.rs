@@ -664,7 +664,6 @@ impl App {
             .account_mut()
             .is_some_and(|account| match account.worker.post(action) {
                 Ok(request) => {
-                    account.pending_mutations = account.pending_mutations.saturating_add(1);
                     account
                         .pending_mutation_labels
                         .insert(request, complete_label);

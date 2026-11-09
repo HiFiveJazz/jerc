@@ -29,6 +29,10 @@ The shared behavior layer is:
 - `src/app/help_palette.rs`: one searchable-help key controller for app, contacts, composer, file picker, and attachment destination. It operates on their existing query/cursor fields rather than introducing another state store.
 - `src/ui/render/common.rs`: shared popup shells, centered list windows, borrowed filtered slices, display-width truncation, and rendering helpers. Feature renderers keep ownership of their content while using a common themed overlay frame. All searchable keybinding popups use `draw_help_palette` in `help.rs`.
 
+Mailbox synchronization uses `src/app/state/account_sync.rs`: initial mailbox counts, periodic Inbox polls and IMAP IDLE notifications share one deduplicated, request-ID-correlated STATUS queue. The queue retains at most one waiting request per known mailbox, even during an IDLE notification burst, and never applies an older completion over a newer pending request. Foreground SELECT/FETCH requests still use their existing correlation IDs. A failed mutation/Seen request removes only its own pending record, not those of unrelated operations.
+
+Worker-event routing is centralized in `src/app/state/worker_events.rs`, whose focused handlers live in `worker_events/{mailbox,content,outgoing,errors}.rs`. The UI thread remains the single owner of `App`; handlers are organized by event ownership rather than creating extra state stores. Account identities are parsed only for event categories that need contact/recipient learning.
+
 The protocol backends and the UI worker remain separate; renderers must never start filesystem or network I/O. Prefer adding behavior to the existing shared primitives over introducing new duplicate implementations.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for a file map and local validation commands.

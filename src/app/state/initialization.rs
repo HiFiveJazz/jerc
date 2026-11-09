@@ -98,10 +98,8 @@ impl App {
                     search_mode: app_search_mode,
                     bodies: HashMap::new(),
                     pending_bodies: HashSet::new(),
-                    pending_seen: HashSet::new(),
-                    mailbox_status_queue: VecDeque::new(),
-                    mailbox_status_inflight: None,
-                    inbox_poll_inflight: None,
+                    pending_seen: HashMap::new(),
+                    status_requests: MailboxStatusQueue::default(),
                     pending_inbox_refresh: false,
                     pending_mutation_labels: HashMap::new(),
                     connecting: false,
@@ -109,7 +107,6 @@ impl App {
                     messages_loading: false,
                     last_scan_micros: None,
                     restore_message_index: None,
-                    pending_mutations: 0,
                     worker,
                 };
                 if let Some(index) = account

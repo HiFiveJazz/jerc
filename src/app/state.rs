@@ -48,6 +48,8 @@ use crate::worker::{ActionKind, RuntimeEvent, WorkerEvent, WorkerEventKind, Work
 // Large feature handlers live alongside the state model. Keeping the types
 // here preserves the public API and serialized draft representation.
 mod account_cache;
+mod account_sync;
+use self::account_sync::{MailboxStatusQueue, StatusReason};
 mod attachment_actions;
 mod compose_actions;
 mod composer;
@@ -736,10 +738,8 @@ pub struct AccountState {
     pub search_mode: crate::config::MailSearchMode,
     pub bodies: HashMap<MessageId, MessageBody>,
     pub pending_bodies: HashSet<MessageId>,
-    pub pending_seen: HashSet<MessageId>,
-    pub mailbox_status_queue: VecDeque<String>,
-    pub mailbox_status_inflight: Option<u64>,
-    inbox_poll_inflight: Option<u64>,
+    pub pending_seen: HashMap<MessageId, u64>,
+    status_requests: MailboxStatusQueue,
     pending_inbox_refresh: bool,
     pending_mutation_labels: HashMap<u64, &'static str>,
     pub connecting: bool,
@@ -747,7 +747,6 @@ pub struct AccountState {
     pub messages_loading: bool,
     pub last_scan_micros: Option<u128>,
     pub restore_message_index: Option<usize>,
-    pub pending_mutations: usize,
     pub worker: WorkerHandle,
 }
 
@@ -880,35 +879,6 @@ impl AccountState {
             visible.len(),
             self.message_view_height,
         );
-    }
-
-    fn queue_unknown_mailbox_statuses(&mut self, priority: Option<&str>) {
-        let unknown = self
-            .mailboxes
-            .iter()
-            .filter(|mailbox| !mailbox.counts_known)
-            .map(|mailbox| mailbox.name.clone())
-            .collect::<Vec<_>>();
-
-        self.mailbox_status_queue
-            .retain(|name| unknown.iter().any(|candidate| candidate == name));
-
-        if let Some(priority) = priority
-            && unknown.iter().any(|name| name == priority)
-        {
-            self.mailbox_status_queue.retain(|name| name != priority);
-            self.mailbox_status_queue.push_front(priority.to_owned());
-        }
-
-        for name in unknown {
-            if !self
-                .mailbox_status_queue
-                .iter()
-                .any(|queued| queued == &name)
-            {
-                self.mailbox_status_queue.push_back(name);
-            }
-        }
     }
 
     fn request_mailbox_page(&mut self, name: String, offset: usize) -> bool {
@@ -1153,19 +1123,15 @@ impl AccountState {
         let Some(mailbox) = self.current_mailbox.clone() else {
             return false;
         };
-        if self.pending_seen.contains(&id) {
+        if self.pending_seen.contains_key(&id) {
             return false;
         }
-        if self
-            .worker
-            .post(ActionKind::SetSeen {
-                mailbox,
-                id: id.clone(),
-                seen,
-            })
-            .is_ok()
-        {
-            self.pending_seen.insert(id);
+        if let Ok(request_id) = self.worker.post(ActionKind::SetSeen {
+            mailbox,
+            id: id.clone(),
+            seen,
+        }) {
+            self.pending_seen.insert(id, request_id);
             true
         } else {
             false
@@ -1467,32 +1433,6 @@ impl App {
     #[must_use]
     pub fn inbox_poll_interval(&self) -> Duration {
         self.inbox_poll_interval
-    }
-
-    /// Poll only Inbox counts, not every message body or folder. IMAP servers
-    /// without IDLE can still report new mail with one inexpensive STATUS.
-    pub fn poll_inboxes(&mut self) {
-        for account in &mut self.accounts {
-            if account.capabilities.is_none()
-                || account.mailboxes_loading
-                || account.inbox_poll_inflight.is_some()
-                || account.mailbox_status_inflight.is_some()
-                || account.pending_mutations > 0
-            {
-                continue;
-            }
-            let Some(inbox) = account
-                .mailboxes
-                .iter()
-                .find(|mailbox| mailbox.role == MailboxRole::Inbox)
-                .map(|mailbox| mailbox.name.clone())
-            else {
-                continue;
-            };
-            if let Ok(request) = account.worker.post(ActionKind::MailboxStatus(inbox)) {
-                account.inbox_poll_inflight = Some(request);
-            }
-        }
     }
 
     /// Terminal BEL is emitted in the main runtime, never from a worker.
@@ -2009,29 +1949,6 @@ impl App {
 
         if mailbox_finished {
             Self::activate_selected_mailbox(account, preview_split);
-        }
-    }
-
-    fn pump_mailbox_status(account: &mut AccountState) {
-        if account.mailbox_status_inflight.is_some()
-            || account.messages_loading
-            || !account.pending_bodies.is_empty()
-        {
-            return;
-        }
-        while let Some(name) = account.mailbox_status_queue.pop_front() {
-            if account
-                .mailboxes
-                .iter()
-                .find(|mailbox| mailbox.name == name)
-                .is_some_and(|mailbox| mailbox.counts_known)
-            {
-                continue;
-            }
-            if let Ok(request_id) = account.worker.post(ActionKind::MailboxStatus(name.clone())) {
-                account.mailbox_status_inflight = Some(request_id);
-            }
-            break;
         }
     }
 

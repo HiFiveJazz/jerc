@@ -2149,3 +2149,84 @@ fn account_navigation_wraps() {
     assert_eq!(offset_index(0, 3, -1), 2);
     assert_eq!(offset_index(2, 3, 1), 0);
 }
+
+#[test]
+fn unrelated_worker_error_preserves_other_mutations_and_seen_requests() {
+    use crate::worker::{WorkerEvent, WorkerEventKind, WorkerHandle};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let seen_id = MessageId("test-seen".into());
+    let account = app.account_mut().unwrap();
+    account.pending_mutation_labels.insert(101, "archived");
+    account.pending_mutation_labels.insert(102, "deleted");
+    account.pending_seen.insert(seen_id.clone(), 103);
+
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 101,
+        kind: WorkerEventKind::Error("archive failed".into()),
+    });
+    let account = app.account().unwrap();
+    assert!(!account.pending_mutation_labels.contains_key(&101));
+    assert_eq!(account.pending_mutation_labels.get(&102), Some(&"deleted"));
+    assert_eq!(account.pending_seen.get(&seen_id), Some(&103));
+
+    // A late success for the failed request must not release another pending
+    // request or incorrectly overwrite the failure status.
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 101,
+        kind: WorkerEventKind::MutationComplete,
+    });
+    assert_eq!(app.account().unwrap().pending_mutation_labels.len(), 1);
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 102,
+        kind: WorkerEventKind::MutationComplete,
+    });
+    assert!(app.account().unwrap().pending_mutation_labels.is_empty());
+}
+
+#[test]
+fn seen_response_must_match_the_pending_request_id() {
+    use crate::worker::{WorkerEvent, WorkerEventKind, WorkerHandle};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let id = MessageId("test-seen".into());
+    app.account_mut().unwrap().pending_seen.insert(id.clone(), 203);
+
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 202,
+        kind: WorkerEventKind::SeenChanged { id: id.clone(), seen: true },
+    });
+    assert_eq!(app.account().unwrap().pending_seen.get(&id), Some(&203));
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 203,
+        kind: WorkerEventKind::SeenChanged { id: id.clone(), seen: true },
+    });
+    assert!(!app.account().unwrap().pending_seen.contains_key(&id));
+}
