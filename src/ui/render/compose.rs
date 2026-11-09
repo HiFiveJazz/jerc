@@ -109,12 +109,9 @@ pub(super) fn compose_picker_rows(
     }
     let selected_index = selected.unwrap_or(0).min(entries.len().saturating_sub(1));
     // The selection stays near the middle, in the three-pane file picker.
-    let start = selected_index
-        .saturating_sub(usize::from(rect.height) / 2)
-        .min(entries.len().saturating_sub(usize::from(rect.height)));
-    let end = start
-        .saturating_add(usize::from(rect.height))
-        .min(entries.len());
+    let window = centered_list_window(selected_index, entries.len(), usize::from(rect.height));
+    let start = window.start;
+    let end = window.end;
     let digits = entries.len().to_string().len();
     let mut items = Vec::new();
     for (index, entry) in entries.iter().enumerate().take(end).skip(start) {
@@ -197,17 +194,8 @@ pub(super) fn draw_compose_file_picker(frame: &mut Frame<'_>, app: &mut App) {
         return;
     };
     let theme = app.theme();
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(format!(
-            " Attach files · {} selected ",
-            composer.attachment_count()
-        ))
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.accent());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let title = format!(" Attach files · {} selected ", composer.attachment_count());
+    let inner = popup_inner(frame, theme, area, &title, theme.accent());
     if inner.height < 5 || inner.width < 12 {
         return;
     }
@@ -453,60 +441,11 @@ pub(super) fn draw_compose_file_picker_help(
     app: &App,
     picker: &crate::app::ComposeFilePicker,
 ) {
-    let theme = app.theme();
-    let area = centered_rect(frame.area(), 83, 72);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" File picker keybindings ")
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.accent());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
-    draw_search_header(frame, chunks[0], &picker.help_query, app);
     let matches = picker.help_matches();
-    let start = picker
-        .help_scroll
-        .min(matches.len().saturating_sub(usize::from(chunks[1].height)));
-    let shown: Vec<_> = matches
-        .into_iter()
-        .skip(start)
-        .take(usize::from(chunks[1].height))
-        .collect();
-    let (category_width, key_width, description_width) = help_columns(chunks[1].width);
-    let rows = shown.iter().map(|&index| {
-        let entry = PICKER_HELP_ENTRIES[index];
-        Row::new(vec![
-            Cell::from(truncate_display_width(
-                entry.category,
-                usize::from(category_width),
-            )),
-            Cell::from(truncate_display_width(entry.key, usize::from(key_width))),
-            Cell::from(truncate_display_width(
-                entry.description,
-                usize::from(description_width),
-            )),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(category_width),
-            Constraint::Length(key_width),
-            Constraint::Length(description_width),
-        ],
-    )
-    .style(theme.text())
-    .column_spacing(1)
-    .row_highlight_style(theme.selected());
-    let mut state = TableState::default().with_selected(
-        shown
-            .iter()
-            .position(|&index| index == picker.help_selected),
+    draw_help_palette(
+        frame, app.theme(), " File picker keybindings ", PICKER_HELP_ENTRIES,
+        &picker.help_query, &matches, (picker.help_selected, picker.help_scroll),
     );
-    frame.render_stateful_widget(table, chunks[1], &mut state);
-    // All picker bindings live in this searchable popup, not a footer.
 }
 
 pub(super) fn draw_compose_attachment_manager(frame: &mut Frame<'_>, app: &App) {
@@ -515,17 +454,8 @@ pub(super) fn draw_compose_attachment_manager(frame: &mut Frame<'_>, app: &App) 
     };
     let theme = app.theme();
     let area = centered_rect(frame.area(), 84, 66);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(format!(
-            " Attached files · {} ",
-            composer.attachment_count()
-        ))
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.accent());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let title = format!(" Attached files · {} ", composer.attachment_count());
+    let inner = popup_inner(frame, theme, area, &title, theme.accent());
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -551,14 +481,12 @@ pub(super) fn draw_compose_attachment_manager(frame: &mut Frame<'_>, app: &App) 
         return;
     }
     let selected = composer.attachment_manager_selected.min(files.len() - 1);
-    let start = selected
-        .saturating_sub(usize::from(inner.height) / 2)
-        .min(files.len().saturating_sub(usize::from(inner.height)));
+    let window = centered_list_window(selected, files.len(), usize::from(inner.height));
     let rows: Vec<ListItem<'_>> = files
         .iter()
         .enumerate()
-        .skip(start)
-        .take(usize::from(inner.height))
+        .skip(window.start)
+        .take(window.end - window.start)
         .map(|(index, file)| {
             let name = file
                 .file_name()
@@ -608,14 +536,7 @@ pub(super) fn draw_compose_advanced_options(frame: &mut Frame<'_>, app: &App) {
     };
     let theme = app.theme();
     let area = centered_rect(frame.area(), 82, 32);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Advanced compose options ")
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.accent());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = popup_inner(frame, theme, area, " Advanced compose options ", theme.accent());
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(1),
@@ -650,70 +571,16 @@ pub(super) fn compose_mode_colors(mode: ComposeMode, theme: &Theme) -> (Color, C
 }
 
 pub(super) fn draw_compose_help(frame: &mut Frame<'_>, app: &App) {
-    let theme = app.theme().clone();
     let Some(composer) = app.composer.as_ref() else {
         return;
     };
-    let area = centered_rect(frame.area(), 85, 73);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Compose keybindings ")
-        .borders(Borders::ALL)
-        .border_type(theme.border_type)
-        .border_style(theme.accent());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let chunks = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
-    draw_search_header(frame, chunks[0], &composer.help_query, app);
     let matches = composer.compose_help_matches();
-    let max_start = matches.len().saturating_sub(usize::from(chunks[1].height));
-    let start = composer.help_scroll.min(max_start);
-    let shown: Vec<usize> = matches
-        .into_iter()
-        .skip(start)
-        .take(usize::from(chunks[1].height))
-        .collect();
-    let (category_width, key_width, description_width) = help_columns(chunks[1].width);
-    let rows = shown.iter().map(|&index| {
-        let entry = COMPOSE_HELP_ENTRIES[index];
-        Row::new(vec![
-            Cell::from(truncate_display_width(
-                entry.category,
-                usize::from(category_width),
-            )),
-            Cell::from(truncate_display_width(entry.key, usize::from(key_width))),
-            Cell::from(truncate_display_width(
-                entry.description,
-                usize::from(description_width),
-            )),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(category_width),
-            Constraint::Length(key_width),
-            Constraint::Length(description_width),
-        ],
-    )
-    .style(theme.text())
-    .column_spacing(1)
-    .row_highlight_style(theme.selected());
-    let selected = shown
-        .iter()
-        .position(|&index| index == composer.help_selected);
-    let mut state = TableState::default().with_selected(selected);
-    frame.render_stateful_widget(table, chunks[1], &mut state);
-    frame.render_widget(
-        Paragraph::new(" Type to filter   Backspace to edit   Esc to close ").style(theme.muted()),
-        chunks[2],
+    draw_help_palette(
+        frame, app.theme(), " Compose keybindings ", COMPOSE_HELP_ENTRIES,
+        &composer.help_query, &matches, (composer.help_selected, composer.help_scroll),
     );
 }
+
 /// Layout of a single composer header. We wrap on grapheme boundaries
 /// rather than relying on Paragraph word-wrap, so the visual caret position
 /// cannot drift when a recipient contains spaces, wide characters or emoji.

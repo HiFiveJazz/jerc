@@ -124,45 +124,22 @@ impl App {
     }
 
     pub(super) fn handle_help_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('?') if key.modifiers.is_empty() => {
-                self.help_visible = false;
-                // Kitty graphics can be erased by a modal's Clear even when the
-                // attachment selection and geometry have not changed.
-                self.invalidate_attachment_preview_layout();
-            }
-            KeyCode::Down if key.modifiers.is_empty() => {
-                self.move_help_selection(1);
-            }
-            KeyCode::Up if key.modifiers.is_empty() => {
-                self.move_help_selection(-1);
-            }
-            KeyCode::Home if key.modifiers.is_empty() => {
-                if let Some(first) = self.help_matches().first().copied() {
-                    self.help_selected = first;
-                    self.help_scroll = 0;
-                }
-            }
-            KeyCode::End if key.modifiers.is_empty() => {
-                let matches = self.help_matches();
-                if let Some(last) = matches.last().copied() {
-                    self.help_selected = last;
-                    self.help_scroll = matches.len().saturating_sub(7);
-                }
-            }
-            KeyCode::Backspace if key.modifiers.is_empty() => {
-                self.help_query.pop();
-                self.reset_help_selection();
-            }
-            KeyCode::Char(ch)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.help_query.push(ch);
-                self.reset_help_selection();
-            }
-            _ => {}
+        let entries = if self.attachment_picker_visible {
+            ATTACHMENT_HELP_ENTRIES
+        } else {
+            HELP_ENTRIES
+        };
+        if crate::app::help_palette::handle_help_key(
+            key,
+            entries,
+            &mut self.help_query,
+            &mut self.help_selected,
+            &mut self.help_scroll,
+            crate::app::help_palette::HelpKeys::GLOBAL,
+        ) {
+            self.help_visible = false;
+            // The modal Clear can erase otherwise unchanged Kitty graphics.
+            self.invalidate_attachment_preview_layout();
         }
     }
 
@@ -207,26 +184,6 @@ impl App {
         }
     }
 
-    pub(super) fn reset_help_selection(&mut self) {
-        let matches = self.help_matches();
-        self.help_selected = matches.first().copied().unwrap_or(0);
-        self.help_scroll = 0;
-    }
-
-    pub(super) fn move_help_selection(&mut self, delta: isize) {
-        let matches = self.help_matches();
-        if matches.is_empty() {
-            return;
-        }
-        let position = matches
-            .iter()
-            .position(|index| *index == self.help_selected)
-            .unwrap_or(0);
-        let next = offset_index(position, matches.len(), delta);
-        self.help_selected = matches[next];
-        self.help_scroll = next.saturating_sub(6);
-    }
-
     pub(super) fn reset_theme_selection(&mut self) {
         let matches = self.theme_matches();
         if let Some(index) = matches.first().copied() {
@@ -238,17 +195,13 @@ impl App {
 
     pub(super) fn move_theme_selection(&mut self, delta: isize) {
         let matches = self.theme_matches();
-        if matches.is_empty() {
-            return;
+        if let Some((index, position)) = crate::app::navigation::filtered_move(
+            &matches, self.theme_selected, delta, true,
+        ) {
+            self.theme_selected = index;
+            self.theme_index = index;
+            self.theme_scroll = position.saturating_sub(4);
         }
-        let position = matches
-            .iter()
-            .position(|index| *index == self.theme_selected)
-            .unwrap_or(0);
-        let next = offset_index(position, matches.len(), delta);
-        self.theme_selected = matches[next];
-        self.theme_index = self.theme_selected;
-        self.theme_scroll = next.saturating_sub(4);
     }
 
     pub(super) fn commit_theme_picker(&mut self) {

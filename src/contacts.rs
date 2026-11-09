@@ -509,11 +509,12 @@ impl ContactsModal {
         self.smooth_target = (target != self.selected).then_some(target);
     }
     pub fn advance(&mut self, length: usize) {
-        if let Some(target) = self.smooth_target {
-            self.navigate(length, if target > self.selected { 1 } else { -1 });
-            if self.selected != target {
-                self.smooth_target = Some(target);
-            }
+        let (next, moved) = crate::app::navigation::smooth_step(
+            self.selected, &mut self.smooth_target, length,
+        );
+        if moved {
+            self.selected = next;
+            self.ensure_visible(length);
         }
     }
 }

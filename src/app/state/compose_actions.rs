@@ -276,43 +276,15 @@ impl App {
         }
         if composer.help_visible {
             let composer = self.composer.as_mut().expect("composer exists");
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('?') if composer.help_query.is_empty() => {
-                    composer.help_visible = false;
-                }
-                KeyCode::Esc => composer.help_visible = false,
-                KeyCode::Backspace => {
-                    composer.help_query.pop();
-                    composer.help_selected = *composer.compose_help_matches().first().unwrap_or(&0);
-                    composer.help_scroll = 0;
-                }
-                KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k')
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && composer.help_query.is_empty() =>
-                {
-                    let matches = composer.compose_help_matches();
-                    if let Some(position) =
-                        matches.iter().position(|&i| i == composer.help_selected)
-                    {
-                        let next = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
-                            position.saturating_sub(1)
-                        } else {
-                            (position + 1).min(matches.len().saturating_sub(1))
-                        };
-                        composer.help_selected = matches[next];
-                        composer.help_scroll = next.saturating_sub(5);
-                    }
-                }
-                KeyCode::Char(ch)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    composer.help_query.push(ch);
-                    composer.help_selected = *composer.compose_help_matches().first().unwrap_or(&0);
-                    composer.help_scroll = 0;
-                }
-                _ => {}
+            if crate::app::help_palette::handle_help_key(
+                key,
+                crate::app::COMPOSE_HELP_ENTRIES,
+                &mut composer.help_query,
+                &mut composer.help_selected,
+                &mut composer.help_scroll,
+                crate::app::help_palette::HelpKeys::TEXT_MODAL,
+            ) {
+                composer.help_visible = false;
             }
             return;
         }

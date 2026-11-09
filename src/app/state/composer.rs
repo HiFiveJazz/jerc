@@ -406,36 +406,15 @@ impl Composer {
             return Ok(None);
         };
         if picker.help_visible {
-            match key {
-                KeyCode::Esc | KeyCode::Char('?') if picker.help_query.is_empty() => {
-                    picker.help_visible = false
-                }
-                KeyCode::Esc => picker.help_visible = false,
-                KeyCode::Backspace => {
-                    picker.help_query.pop();
-                    picker.help_selected = *picker.help_matches().first().unwrap_or(&0);
-                    picker.help_scroll = 0;
-                }
-                KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k')
-                    if picker.help_query.is_empty() =>
-                {
-                    let matches = picker.help_matches();
-                    if let Some(index) = matches.iter().position(|&i| i == picker.help_selected) {
-                        let index = if matches!(key, KeyCode::Up | KeyCode::Char('k')) {
-                            index.saturating_sub(1)
-                        } else {
-                            (index + 1).min(matches.len().saturating_sub(1))
-                        };
-                        picker.help_selected = matches[index];
-                        picker.help_scroll = index.saturating_sub(5);
-                    }
-                }
-                KeyCode::Char(ch) => {
-                    picker.help_query.push(ch);
-                    picker.help_selected = *picker.help_matches().first().unwrap_or(&0);
-                    picker.help_scroll = 0;
-                }
-                _ => {}
+            if crate::app::help_palette::handle_help_key(
+                KeyEvent::new(key, KeyModifiers::NONE),
+                crate::app::PICKER_HELP_ENTRIES,
+                &mut picker.help_query,
+                &mut picker.help_selected,
+                &mut picker.help_scroll,
+                crate::app::help_palette::HelpKeys::TEXT_MODAL,
+            ) {
+                picker.help_visible = false;
             }
             return Ok(None);
         }
@@ -1150,18 +1129,7 @@ impl Composer {
     }
 
     pub fn compose_help_matches(&self) -> Vec<usize> {
-        let query = self.help_query.trim().to_lowercase();
-        crate::app::COMPOSE_HELP_ENTRIES
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                (query.is_empty()
-                    || format!("{} {} {}", entry.category, entry.key, entry.description)
-                        .to_lowercase()
-                        .contains(&query))
-                .then_some(index)
-            })
-            .collect()
+        crate::app::ranked_help_matches(crate::app::COMPOSE_HELP_ENTRIES, &self.help_query)
     }
 
     pub fn visual_range(&self) -> Option<(usize, usize)> {

@@ -148,60 +148,16 @@ impl App {
         key: KeyEvent,
     ) -> bool {
         if modal.help {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('?') => {
-                    modal.help = false;
-                    modal.help_query.clear();
-                }
-                KeyCode::Backspace => {
-                    modal.help_query.pop();
-                    modal.help_selected =
-                        ranked_help_matches(CONTACT_HELP_ENTRIES, &modal.help_query)
-                            .first()
-                            .copied()
-                            .unwrap_or(0);
-                    modal.help_scroll = 0;
-                }
-                KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
-                    if key.modifiers.is_empty() =>
-                {
-                    let matches = ranked_help_matches(CONTACT_HELP_ENTRIES, &modal.help_query);
-                    if !matches.is_empty() {
-                        let current = matches
-                            .iter()
-                            .position(|&i| i == modal.help_selected)
-                            .unwrap_or(0);
-                        let next = match key.code {
-                            KeyCode::Up => current.saturating_sub(1),
-                            KeyCode::Down => (current + 1).min(matches.len() - 1),
-                            KeyCode::Home => 0,
-                            KeyCode::End => matches.len() - 1,
-                            _ => current,
-                        };
-                        modal.help_selected = matches[next];
-                        // Keep the selected shortcut in the visible palette.
-                        if next < modal.help_scroll {
-                            modal.help_scroll = next;
-                        }
-                        if next >= modal.help_scroll.saturating_add(12) {
-                            modal.help_scroll = next.saturating_sub(11);
-                        }
-                    }
-                }
-                KeyCode::Char(ch)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-                {
-                    modal.help_query.push(ch);
-                    modal.help_selected =
-                        ranked_help_matches(CONTACT_HELP_ENTRIES, &modal.help_query)
-                            .first()
-                            .copied()
-                            .unwrap_or(0);
-                    modal.help_scroll = 0;
-                }
-                _ => {}
+            if crate::app::help_palette::handle_help_key(
+                key,
+                CONTACT_HELP_ENTRIES,
+                &mut modal.help_query,
+                &mut modal.help_selected,
+                &mut modal.help_scroll,
+                crate::app::help_palette::HelpKeys::MODAL,
+            ) {
+                modal.help = false;
+                modal.help_query.clear();
             }
             return true;
         }

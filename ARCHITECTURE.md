@@ -25,8 +25,9 @@ The renderer is divided by surface (`src/ui/render/{mail_list,reader,compose,con
 The shared behavior layer is:
 
 - `src/app/vim.rs`: UTF-8 character offsets, word motions, text objects, visual ranges, persistent marked selection, the unnamed yank register, a single pending-command/count state machine (`VimSequence`), and bounded undo/redo history (`VimHistory`). Compose and Contacts share these primitives while retaining their distinct field validation, editing actions, and mode-specific UI; the reader shares motions and the register. Editor history and pending keys are ephemeral, not serialized in drafts.
-- `src/app/navigation.rs`: bounded/wrapping row navigation and scrolloff in display rows. Mailbox lists, file pickers, contacts, and the reader reuse it.
-- `src/ui/render/common.rs`: shared popup shells, display-width truncation, and rendering helpers. Feature renderers keep ownership of their content while using a common themed overlay frame.
+- `src/app/navigation.rs`: bounded/wrapping row navigation, filtered selection, smooth-scroll steps, and scrolloff in display rows. Mailbox lists, file pickers, contacts, and the reader reuse it.
+- `src/app/help_palette.rs`: one searchable-help key controller for app, contacts, composer, file picker, and attachment destination. It operates on their existing query/cursor fields rather than introducing another state store.
+- `src/ui/render/common.rs`: shared popup shells, centered list windows, borrowed filtered slices, display-width truncation, and rendering helpers. Feature renderers keep ownership of their content while using a common themed overlay frame. All searchable keybinding popups use `draw_help_palette` in `help.rs`.
 
 The protocol backends and the UI worker remain separate; renderers must never start filesystem or network I/O. Prefer adding behavior to the existing shared primitives over introducing new duplicate implementations.
 

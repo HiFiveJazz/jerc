@@ -223,59 +223,16 @@ impl App {
         if let Some(picker) = self.attachment_destination_picker.as_mut()
             && picker.help_visible
         {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('?') => {
-                    picker.help_visible = false;
-                    picker.help_query.clear();
-                }
-                KeyCode::Backspace => {
-                    picker.help_query.pop();
-                    picker.help_selected = ranked_help_matches(
-                        DESTINATION_HELP_ENTRIES,
-                        &picker.help_query,
-                    )
-                    .first()
-                    .copied()
-                    .unwrap_or(0);
-                    picker.help_scroll = 0;
-                }
-                KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
-                    if key.modifiers.is_empty() =>
-                {
-                    let matches = ranked_help_matches(
-                        DESTINATION_HELP_ENTRIES,
-                        &picker.help_query,
-                    );
-                    if let Some(position) = matches.iter().position(|&i| i == picker.help_selected)
-                    {
-                        let next = match key.code {
-                            KeyCode::Up => position.saturating_sub(1),
-                            KeyCode::Down => (position + 1).min(matches.len() - 1),
-                            KeyCode::Home => 0,
-                            KeyCode::End => matches.len() - 1,
-                            _ => position,
-                        };
-                        picker.help_selected = matches[next];
-                        picker.help_scroll = next.saturating_sub(5);
-                    } else if let Some(&first) = matches.first() {
-                        picker.help_selected = first;
-                        picker.help_scroll = 0;
-                    }
-                }
-                KeyCode::Char(ch)
-                    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-                {
-                    picker.help_query.push(ch);
-                    picker.help_selected = ranked_help_matches(
-                        DESTINATION_HELP_ENTRIES,
-                        &picker.help_query,
-                    )
-                    .first()
-                    .copied()
-                    .unwrap_or(0);
-                    picker.help_scroll = 0;
-                }
-                _ => {}
+            if crate::app::help_palette::handle_help_key(
+                key,
+                DESTINATION_HELP_ENTRIES,
+                &mut picker.help_query,
+                &mut picker.help_selected,
+                &mut picker.help_scroll,
+                crate::app::help_palette::HelpKeys::MODAL,
+            ) {
+                picker.help_visible = false;
+                picker.help_query.clear();
             }
             return;
         }

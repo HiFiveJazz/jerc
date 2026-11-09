@@ -78,14 +78,7 @@ pub(super) fn draw_help_palette(
         chunks[0],
     );
 
-    let visible = usize::from(chunks[1].height.max(1));
-    let max_start = matches.len().saturating_sub(visible);
-    let selected_position = matches.iter().position(|&i| i == selected).unwrap_or(0);
-    let start = scroll
-        .max(selected_position.saturating_sub(visible.saturating_sub(1)))
-        .min(selected_position)
-        .min(max_start);
-    let shown: Vec<usize> = matches.iter().copied().skip(start).take(visible).collect();
+    let shown = visible_filtered(matches, selected, scroll, usize::from(chunks[1].height));
     if shown.is_empty() {
         frame.render_widget(
             Paragraph::new(" No matching keybindings").style(theme.muted()),
@@ -153,10 +146,9 @@ pub(super) fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
     draw_search_header(frame, chunks[0], &app.theme_query, app);
 
     let matches = app.theme_matches();
-    let visible = usize::from(chunks[1].height.max(1));
-    let max_start = matches.len().saturating_sub(visible);
-    let start = app.theme_scroll.min(max_start);
-    let shown: Vec<usize> = matches.iter().copied().skip(start).take(visible).collect();
+    let shown = visible_filtered(
+        &matches, app.theme_selected, app.theme_scroll, usize::from(chunks[1].height),
+    );
     if shown.is_empty() {
         frame.render_widget(
             Paragraph::new(" No matching themes").style(theme.muted()),

@@ -255,38 +255,19 @@ impl ComposeFilePicker {
     }
 
     pub(super) fn advance_smooth_scroll(&mut self) {
-        let Some(target) = self.smooth_target else {
-            return;
-        };
-        if target == self.selected {
-            self.smooth_target = None;
-            return;
-        }
-        self.selected = self
-            .selected
-            .saturating_add_signed(if target > self.selected { 1 } else { -1 });
-        // Rebuilding a preview for every *intermediate* animation row makes
-        // Ctrl-j/k do filesystem I/O and image rasterization for files the user
-        // never stopped on. Keep the old preview while moving and refresh once.
-        if target == self.selected {
-            self.smooth_target = None;
+        let was_animating = self.smooth_target.is_some();
+        let (next, moved) = crate::app::navigation::smooth_step(
+            self.selected, &mut self.smooth_target, self.entries.len(),
+        );
+        self.selected = next;
+        // Only refresh the expensive preview at the final destination.
+        if was_animating && moved && self.smooth_target.is_none() {
             self.refresh_preview();
         }
     }
 
     pub fn help_matches(&self) -> Vec<usize> {
-        let query = self.help_query.trim().to_lowercase();
-        crate::app::PICKER_HELP_ENTRIES
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                query.is_empty()
-                    || format!("{} {} {}", entry.category, entry.key, entry.description)
-                        .to_lowercase()
-                        .contains(&query)
-            })
-            .map(|(index, _)| index)
-            .collect()
+        crate::app::ranked_help_matches(crate::app::PICKER_HELP_ENTRIES, &self.help_query)
     }
 
     /// Immutable match indices for the renderer's current-search counter.

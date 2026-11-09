@@ -25,6 +25,52 @@ pub(crate) fn wrapped_index(current: usize, len: usize, delta: isize) -> usize {
     }
 }
 
+/// Locate a filtered item's position, independent of its original list index.
+/// Returning None on an empty result avoids indexing stale selections.
+pub(crate) fn filtered_position(matches: &[usize], selected: usize) -> Option<usize> {
+    if matches.is_empty() {
+        return None;
+    }
+    Some(matches.iter().position(|&index| index == selected).unwrap_or(0))
+}
+
+/// Move within a list of original indices, optionally wrapping at the ends.
+pub(crate) fn filtered_move(
+    matches: &[usize], selected: usize, delta: isize, wrap: bool,
+) -> Option<(usize, usize)> {
+    let position = filtered_position(matches, selected)?;
+    let next = if wrap {
+        wrapped_index(position, matches.len(), delta)
+    } else {
+        bounded_index(position, matches.len(), delta)
+    };
+    Some((matches[next], next))
+}
+
+/// Animate one row of an already queued smooth scroll. The caller controls
+/// whether its preview updates at *each* row or only at the destination.
+/// The target is cleared on arrival or when the list becomes empty.
+pub(crate) fn smooth_step(
+    selected: usize, target: &mut Option<usize>, len: usize,
+) -> (usize, bool) {
+    if len == 0 {
+        *target = None;
+        return (0, false);
+    }
+    let current = selected.min(len - 1);
+    let Some(destination) = *target else {
+        return (current, false);
+    };
+    let destination = destination.min(len - 1);
+    if destination == current {
+        *target = None;
+        return (current, false);
+    }
+    let next = bounded_index(current, len, if destination > current { 1 } else { -1 });
+    *target = (next != destination).then_some(destination);
+    (next, true)
+}
+
 /// Scroll a viewport just enough to keep its selection inside the requested
 /// margin. Works in *display rows* for wrapped reader content.
 pub(crate) fn reveal_row(
@@ -61,6 +107,30 @@ mod tests {
         assert_eq!(wrapped_index(2, 3, 1), 0);
         assert_eq!(wrapped_index(999, 3, 0), 0);
         assert_eq!(wrapped_index(0, 3, isize::MIN), 1);
+    }
+
+    #[test]
+    fn filtered_navigation_handles_empty_results_and_stale_indices() {
+        let indices = [2, 7, 10];
+        assert_eq!(filtered_move(&[], 123, 1, false), None);
+        assert_eq!(filtered_move(&indices, 7, 1, false), Some((10, 2)));
+        assert_eq!(filtered_move(&indices, 10, 1, false), Some((10, 2)));
+        assert_eq!(filtered_move(&indices, 10, 1, true), Some((2, 0)));
+        assert_eq!(filtered_move(&indices, 999, -1, false), Some((2, 0)));
+    }
+
+    #[test]
+    fn smooth_scroll_steps_to_destination_and_handles_list_shrinking() {
+        let mut target = Some(3);
+        assert_eq!(smooth_step(0, &mut target, 5), (1, true));
+        assert_eq!(target, Some(3));
+        assert_eq!(smooth_step(1, &mut target, 5), (2, true));
+        assert_eq!(smooth_step(2, &mut target, 5), (3, true));
+        assert_eq!(target, None);
+        let mut target = Some(999);
+        assert_eq!(smooth_step(3, &mut target, 4), (3, false));
+        assert_eq!(target, None);
+        assert_eq!(smooth_step(0, &mut target, 0), (0, false));
     }
 
     #[test]

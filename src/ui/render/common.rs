@@ -35,6 +35,37 @@ pub(super) fn centered_rect(area: Rect, max_width: u16, percent_height: u16) -> 
     }
 }
 
+/// A slice of filtered indices with its current selection kept visible.
+/// Both the help palette and theme selector use this instead of rebuilding a
+/// temporary vector of rows every frame.
+pub(super) fn visible_filtered(
+    matches: &[usize], selected: usize, scroll: usize, height: usize,
+) -> &[usize] {
+    if matches.is_empty() || height == 0 {
+        return &[];
+    }
+    let selected_position = matches.iter().position(|&index| index == selected).unwrap_or(0);
+    let max_start = matches.len().saturating_sub(height);
+    let start = scroll
+        .max(selected_position.saturating_sub(height.saturating_sub(1)))
+        .min(selected_position)
+        .min(max_start);
+    &matches[start..(start + height).min(matches.len())]
+}
+
+/// Window of list rows with the cursor kept near the center. Used by
+/// file browsing and attachment lists; only the visible rows are rendered.
+pub(super) fn centered_list_window(
+    selected: usize, len: usize, height: usize,
+) -> std::ops::Range<usize> {
+    if len == 0 || height == 0 {
+        return 0..0;
+    }
+    let selected = selected.min(len - 1);
+    let start = selected.saturating_sub(height / 2).min(len.saturating_sub(height));
+    start..start.saturating_add(height).min(len)
+}
+
 pub(super) fn mailbox_row_text(name: &str, count: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -170,4 +201,27 @@ pub(super) fn relative_number(index: usize, current: usize) -> String {
 pub(super) fn relative_number_width(len: usize) -> u16 {
     let digits = len.max(1).ilog10() + 1;
     u16::try_from(digits + 1).unwrap_or(6).max(3)
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::{centered_list_window, visible_filtered};
+
+    #[test]
+    fn centered_window_tracks_selection_without_overflow() {
+        assert_eq!(centered_list_window(0, 0, 20), 0..0);
+        assert_eq!(centered_list_window(100, 200, 0), 0..0);
+        assert_eq!(centered_list_window(0, 3, 10), 0..3);
+        assert_eq!(centered_list_window(50, 100, 10), 45..55);
+        assert_eq!(centered_list_window(99, 100, 10), 90..100);
+    }
+
+    #[test]
+    fn visible_filtered_is_borrowed_and_keeps_selection_visible() {
+        let indices = [1, 4, 9, 15, 20, 30];
+        assert_eq!(visible_filtered(&indices, 20, 0, 3), &[9, 15, 20]);
+        assert_eq!(visible_filtered(&indices, 4, 4, 3), &[4, 9, 15]);
+        assert_eq!(visible_filtered(&indices, 999, 0, 3), &[1, 4, 9]);
+        assert!(visible_filtered(&indices, 1, 0, 0).is_empty());
+    }
 }

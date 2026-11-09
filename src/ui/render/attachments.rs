@@ -43,10 +43,8 @@ pub(super) fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
     );
     let rows = usize::from(list_area.height.saturating_sub(1));
     let selected = app.attachment_selection.min(count.saturating_sub(1));
-    let start = selected
-        .saturating_sub(rows / 2)
-        .min(count.saturating_sub(rows));
-    let end = (start + rows).min(count);
+    let window = centered_list_window(selected, count, rows);
+    let (start, end) = (window.start, window.end);
     let digits = count.max(1).to_string().len();
     for index in start..end {
         let file = &app.attachment_files[index];
