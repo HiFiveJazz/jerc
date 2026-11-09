@@ -242,11 +242,7 @@ pub(super) fn draw_attachment_destination_picker(frame: &mut Frame<'_>, app: &Ap
         crate::ui::attachment_destination_regions(frame.area());
     let theme = app.theme();
     frame.render_widget(Clear, area);
-    let count = if app.attachment_marked.is_empty() {
-        usize::from(!app.attachment_files.is_empty())
-    } else {
-        app.attachment_marked.len()
-    };
+    let count = app.selected_attachment_indices().len();
     let block = Block::default()
         .title(format!(" Save {count} attachment(s) · choose destination "))
         .borders(Borders::ALL)
@@ -370,13 +366,19 @@ pub(super) fn draw_attachment_destination_picker(frame: &mut Frame<'_>, app: &Ap
             .style(theme.accent()),
             footer,
         );
-    } else {
-        frame.render_widget(
-            Paragraph::new(
-                " [s] Save here  [Enter/l] Open folder  [h] Parent  [n] New folder  [Esc] Cancel",
-            )
-            .style(theme.accent()),
-            footer,
+    }
+    // The destination explorer keeps the footer clear. Use ? for its searchable
+    // keybindings popup, styled like the rest of Jerc's command palettes.
+    if picker.help_visible {
+        let matches = ranked_help_matches(DESTINATION_HELP_ENTRIES, &picker.help_query);
+        draw_help_palette(
+            frame,
+            theme,
+            " Save destination keybindings ",
+            DESTINATION_HELP_ENTRIES,
+            &picker.help_query,
+            &matches,
+            (picker.help_selected, picker.help_scroll),
         );
     }
 }

@@ -278,6 +278,25 @@ impl App {
                     }
                     KeyCode::Char('d' | 'x') => {
                         if let Some((start, end)) = editor.selected_range() {
+                            if key.code == KeyCode::Char('x') {
+                                let cut = editor.selected_text().unwrap_or_default();
+                                if !cut.is_empty() {
+                                    self.yank_register = Some(YankRegister {
+                                        text: cut.clone(),
+                                        linewise: false,
+                                    });
+                                    self.status = match copy_text_to_clipboard(&cut) {
+                                        Ok(()) => StatusLine::temporary(
+                                            "contact selection copied to clipboard",
+                                            Duration::from_secs(2),
+                                        ),
+                                        Err(_) => StatusLine::temporary(
+                                            "cut to internal register (system clipboard unavailable)",
+                                            Duration::from_secs(3),
+                                        ),
+                                    };
+                                }
+                            }
                             editor.delete_range(start, end);
                         }
                         editor.mode = ComposeMode::Normal;
@@ -299,12 +318,14 @@ impl App {
                 if matches!(key.code, KeyCode::Char('y' | 'd' | 'x' | 'p' | 'P')) { return true; }
             }
             match key.code {
-                KeyCode::Char('h') | KeyCode::Left => editor.cursor = editor.cursor.saturating_sub(1),
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                    editor.cursor = editor.cursor.saturating_sub(1);
+                }
                 KeyCode::Char('l') | KeyCode::Right => editor.cursor = (editor.cursor + 1).min(editor.value().chars().count()),
                 KeyCode::Char('w' | 'e') => editor.move_word(true),
                 KeyCode::Char('b') => editor.move_word(false),
-                KeyCode::Char('0') | KeyCode::Home => editor.cursor = 0,
-                KeyCode::Char('$') | KeyCode::End => editor.cursor = editor.value().chars().count(),
+                KeyCode::Char('0' | 'H') | KeyCode::Home => editor.cursor = 0,
+                KeyCode::Char('$' | 'L') | KeyCode::End => editor.cursor = editor.value().chars().count(),
                 KeyCode::Char('i') if editor.mode == ComposeMode::Normal => editor.mode = ComposeMode::Insert,
                 KeyCode::Char('a') if editor.mode == ComposeMode::Normal => {
                     editor.cursor = (editor.cursor + 1).min(editor.value().chars().count());
@@ -331,7 +352,26 @@ impl App {
                     editor.mode = ComposeMode::Visual;
                 }
                 KeyCode::Char('u') if editor.mode == ComposeMode::Normal => editor.undo(),
-                KeyCode::Char('x') if editor.mode == ComposeMode::Normal => editor.delete_range(editor.cursor, editor.cursor + 1),
+                KeyCode::Char('x') if editor.mode == ComposeMode::Normal => {
+                    let cut = editor.value().chars().nth(editor.cursor).map(|ch| ch.to_string());
+                    if let Some(cut) = cut {
+                        self.yank_register = Some(YankRegister {
+                            text: cut.clone(),
+                            linewise: false,
+                        });
+                        self.status = match copy_text_to_clipboard(&cut) {
+                            Ok(()) => StatusLine::temporary(
+                                "contact character copied to clipboard",
+                                Duration::from_secs(2),
+                            ),
+                            Err(_) => StatusLine::temporary(
+                                "cut to internal register (system clipboard unavailable)",
+                                Duration::from_secs(3),
+                            ),
+                        };
+                        editor.delete_range(editor.cursor, editor.cursor + 1);
+                    }
+                },
                 KeyCode::Char('D') if editor.mode == ComposeMode::Normal => {
                     editor.delete_range(editor.cursor, editor.value().chars().count());
                 }

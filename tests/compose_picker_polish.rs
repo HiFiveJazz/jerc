@@ -1,3 +1,4 @@
+use jerc::contacts::{Contact, replace_recipient};
 use jerc::model::OutgoingMessage;
 use jerc::outgoing::{build_outgoing, validate_recipients};
 use mail_parser::MessageParser;
@@ -27,6 +28,87 @@ fn incomplete_recipient_domains_are_rejected_at_the_wire_boundary() {
     let mut outgoing = draft();
     outgoing.bcc = "not-complete@gmail".into();
     assert!(build_outgoing(&outgoing, "sender@example.org").is_err());
+}
+
+#[test]
+fn autocomplete_to_single_self_contact_can_be_previewed_and_sent() {
+    let self_contact = Contact {
+        name: "Jasmeet (Japan) Bhatia".into(),
+        email: "burner@example.org".into(),
+        saved: true,
+        favorite: false,
+    };
+    let mut recipient = "burner".to_owned();
+    let cursor = recipient.chars().count();
+    replace_recipient(&mut recipient, cursor, &self_contact);
+    assert_eq!(
+        recipient,
+        "\"Jasmeet (Japan) Bhatia\" <burner@example.org>, "
+    );
+    validate_recipients(&recipient, "", "").expect("autocomplete To should validate");
+    let mut outgoing = draft();
+    outgoing.to = recipient;
+    let built = build_outgoing(&outgoing, "sender@example.org").expect("outgoing To");
+    assert_eq!(built.envelope().to().len(), 1);
+    assert_eq!(built.envelope().to()[0].to_string(), "burner@example.org");
+}
+
+#[test]
+fn autocomplete_multiple_self_addresses_and_cc_bcc_are_supported() {
+    let contacts = [
+        Contact {
+            name: "Jasmeet (Jazz) Bhatia".into(),
+            email: "main@example.org".into(),
+            saved: true,
+            favorite: false,
+        },
+        Contact {
+            name: "Jasmeet (Japan) Bhatia".into(),
+            email: "burner@example.org".into(),
+            saved: true,
+            favorite: false,
+        },
+        Contact {
+            name: "Doe, Jane".into(),
+            email: "copy@example.net".into(),
+            saved: true,
+            favorite: false,
+        },
+    ];
+    let mut to = String::new();
+    for contact in &contacts[..2] {
+        let cursor = to.chars().count();
+        replace_recipient(&mut to, cursor, contact);
+    }
+    let mut cc = String::new();
+    replace_recipient(&mut cc, 0, &contacts[2]);
+    let bcc = "hidden@example.com, ";
+    validate_recipients(&to, &cc, bcc).expect("all autocomplete recipients valid");
+    let mut outgoing = draft();
+    outgoing.to = to;
+    outgoing.cc = cc;
+    outgoing.bcc = bcc.to_owned();
+    let built = build_outgoing(&outgoing, "sender@example.org").expect("message builder");
+    assert_eq!(built.envelope().to().len(), 4);
+    let wire = String::from_utf8_lossy(&built.formatted()).to_ascii_lowercase();
+    assert!(
+        !wire.contains("hidden@example.com"),
+        "Bcc must not leak into headers"
+    );
+}
+
+#[test]
+fn only_one_unfinished_autocomplete_separator_is_ignored() {
+    for valid in ["one@example.org, ", "one@example.org, two@example.net, "] {
+        validate_recipients(valid, "", "").expect("one terminal autocomplete separator");
+    }
+    for invalid in [
+        ", ",
+        "one@example.org,, ",
+        "one@example",
+    ] {
+        assert!(validate_recipients(invalid, "", "").is_err(), "{invalid:?}");
+    }
 }
 
 #[test]

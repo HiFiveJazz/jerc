@@ -1171,7 +1171,9 @@ impl Composer {
             self.body_preferred_column = None;
         }
         match code {
-            KeyCode::Char('h') | KeyCode::Left => self.move_horizontal(-(count as isize)),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                self.move_horizontal(-(count as isize));
+            }
             KeyCode::Char('l') | KeyCode::Right => self.move_horizontal(count as isize),
             KeyCode::Char('j') | KeyCode::Down => {
                 for _ in 0..count {

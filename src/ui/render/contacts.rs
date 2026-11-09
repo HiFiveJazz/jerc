@@ -200,6 +200,44 @@ pub(super) fn contact_footer_details(
     spans
 }
 
+/// Contact editing uses the same white block cursor as Compose in
+/// Normal/Visual mode. The terminal's native cursor is only used in Insert.
+/// Keep selection highlighting underneath the cursor, just as in Compose.
+pub(super) fn contact_editor_field_spans(
+    label: &str,
+    value: &str,
+    editor: &crate::contacts::ContactEdit,
+    is_email: bool,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let active = editor.active_email == is_email;
+    let style = if active { theme.current_line() } else { theme.text() };
+    let mut spans = vec![Span::styled(format!("{label}: "), style)];
+    let block = Style::default()
+        .fg(Color::Black)
+        .bg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let length = value.chars().count();
+    let cursor = editor.cursor.min(length);
+    let selection = if active && editor.mode == ComposeMode::Visual {
+        editor.selected_range()
+    } else {
+        None
+    };
+    for (index, ch) in value.chars().enumerate() {
+        let at_cursor = active && cursor == index && editor.mode != ComposeMode::Insert;
+        let selected = selection.is_some_and(|(start, end)| (start..end).contains(&index));
+        spans.push(Span::styled(
+            ch.to_string(),
+            if at_cursor { block } else if selected { theme.selected() } else { style },
+        ));
+    }
+    if active && cursor == length && editor.mode != ComposeMode::Insert {
+        spans.push(Span::styled(" ", block));
+    }
+    spans
+}
+
 /// Contacts get the same extra top search row as the message list, only while
 /// actively editing a search. Normal browsing gets the full list height.
 pub(super) fn contacts_search_layout(inner: Rect, searching: bool) -> (Option<Rect>, Rect) {
@@ -464,30 +502,19 @@ pub(super) fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
             } else {
                 theme.text()
             };
-            let range = if edit.active_email == is_email && edit.mode == ComposeMode::Visual {
-                edit.selected_range()
+            let line = if edit.active_email == is_email {
+                Line::from(contact_editor_field_spans(label, value, edit, is_email, &theme))
             } else {
-                None
+                Line::from(Span::styled(
+                    truncate_display_width(&label_text, width as usize),
+                    row_style,
+                ))
             };
-            if let Some((start, end)) = range {
-                    let left = value.chars().take(start).collect::<String>();
-                    let selected = value.chars().skip(start).take(end - start).collect::<String>();
-                    let right = value.chars().skip(end).collect::<String>();
-                    frame.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::styled(format!("{label}: {left}"), row_style),
-                            Span::styled(selected, theme.selected()),
-                            Span::styled(right, row_style),
-                        ])),
-                        Rect::new(edit_area.x + 2, y, width, 1),
-                    );
-            } else {
-                frame.render_widget(
-                    Paragraph::new(truncate_display_width(&label_text, width as usize)).style(row_style),
-                    Rect::new(edit_area.x + 2, y, width, 1),
-                );
-            }
-            if edit.active_email == is_email {
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect::new(edit_area.x + 2, y, width, 1),
+            );
+            if edit.active_email == is_email && edit.mode == ComposeMode::Insert {
                 let prefix = UnicodeWidthStr::width(format!("{label}: ").as_str());
                 let before: String = value.chars().take(edit.cursor).collect();
                 let offset = prefix + UnicodeWidthStr::width(before.as_str());

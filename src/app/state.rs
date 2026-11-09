@@ -13,8 +13,8 @@ use ratatui::widgets::BorderType;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
 use crate::app::{
-    ATTACHMENT_HELP_ENTRIES, CONTACT_HELP_ENTRIES, Command, Focus, HELP_ENTRIES, command_for_key,
-    ranked_help_matches,
+    ATTACHMENT_HELP_ENTRIES, CONTACT_HELP_ENTRIES, DESTINATION_HELP_ENTRIES, Command, Focus,
+    HELP_ENTRIES, command_for_key, ranked_help_matches,
 };
 use crate::backend::MailboxSyncHint;
 use crate::cache::{self, CachedMailbox};
@@ -5092,6 +5092,98 @@ mod tests {
     }
 
     #[test]
+    fn contact_editor_normal_motions_and_backspace_work_in_both_fields() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut modal = ContactsModal {
+            edit: Some(ContactEdit::new(None)),
+            ..ContactsModal::default()
+        };
+        let send = |app: &mut super::App, modal: &mut ContactsModal, code| {
+            app.handle_contacts_modal_key(modal, KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        let editor = modal.edit.as_mut().unwrap();
+        editor.name = "Ada Lovelace".into();
+        editor.email = "ada@example.org".into();
+        editor.cursor = editor.name.chars().count();
+
+        // Esc from Insert must not cancel the editor; Normal motions apply.
+        send(&mut app, &mut modal, KeyCode::Esc);
+        assert_eq!(modal.edit.as_ref().unwrap().mode, ComposeMode::Normal);
+        for (is_email, original) in [(false, "Ada Lovelace"), (true, "ada@example.org")] {
+            if is_email {
+                send(&mut app, &mut modal, KeyCode::Tab);
+            }
+            send(&mut app, &mut modal, KeyCode::Char('H'));
+            assert_eq!(modal.edit.as_ref().unwrap().cursor, 0);
+            send(&mut app, &mut modal, KeyCode::Backspace);
+            assert_eq!(modal.edit.as_ref().unwrap().cursor, 0);
+            send(&mut app, &mut modal, KeyCode::Char('L'));
+            assert_eq!(modal.edit.as_ref().unwrap().cursor, original.chars().count());
+            send(&mut app, &mut modal, KeyCode::Backspace);
+            assert_eq!(modal.edit.as_ref().unwrap().cursor, original.chars().count() - 1);
+            assert_eq!(modal.edit.as_ref().unwrap().value(), original);
+            send(&mut app, &mut modal, KeyCode::Char('v'));
+            send(&mut app, &mut modal, KeyCode::Char('H'));
+            assert_eq!(modal.edit.as_ref().unwrap().cursor, 0);
+            assert_eq!(modal.edit.as_ref().unwrap().mode, ComposeMode::Visual);
+            send(&mut app, &mut modal, KeyCode::Esc);
+            assert_eq!(modal.edit.as_ref().unwrap().mode, ComposeMode::Normal);
+        }
+    }
+
+    #[test]
+    fn contact_editor_x_cuts_into_register_for_name_and_email_and_visual_ranges() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut modal = ContactsModal {
+            edit: Some(ContactEdit::new(None)),
+            ..ContactsModal::default()
+        };
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        {
+            let editor = modal.edit.as_mut().unwrap();
+            editor.name = "Jazz".into();
+            editor.email = "jazz@example.org".into();
+            editor.cursor = 0;
+        }
+        app.handle_contacts_modal_key(&mut modal, esc);
+        app.handle_contacts_modal_key(&mut modal, key('x'));
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "J");
+        assert_eq!(modal.edit.as_ref().unwrap().name, "azz");
+        app.handle_contacts_modal_key(&mut modal, key('p'));
+        assert_eq!(modal.edit.as_ref().unwrap().name, "aJzz");
+
+        app.handle_contacts_modal_key(&mut modal, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_contacts_modal_key(&mut modal, key('0'));
+        app.handle_contacts_modal_key(&mut modal, key('v'));
+        app.handle_contacts_modal_key(&mut modal, key('l'));
+        app.handle_contacts_modal_key(&mut modal, key('x'));
+        assert_eq!(app.yank_register.as_ref().unwrap().text, "ja");
+        assert_eq!(modal.edit.as_ref().unwrap().email, "zz@example.org");
+        assert_eq!(modal.edit.as_ref().unwrap().mode, ComposeMode::Normal);
+    }
+
+    #[test]
+    fn compose_backspace_in_normal_mode_moves_without_deleting() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = Composer::new();
+        composer.to = "test@example.org".into();
+        composer.cursor = composer.to.chars().count();
+        composer.mode = ComposeMode::Normal;
+        app.composer = Some(composer);
+        app.handle_composer_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let composer = app.composer.as_ref().unwrap();
+        assert_eq!(composer.cursor, "test@example.org".chars().count() - 1);
+        assert_eq!(composer.to, "test@example.org");
+    }
+
+    #[test]
     fn contact_editor_uses_compose_modal_keys_for_both_fields() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
@@ -6107,6 +6199,55 @@ mod received_attachment_browser_tests {
     }
 
     #[test]
+    fn saving_an_active_visual_range_saves_every_attachment_without_marking() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = App::new(&config, vec![]);
+        app.attachment_files = Arc::new(vec![
+            attachment("one.txt", b"one"),
+            attachment("two.txt", b"two"),
+            attachment("three.txt", b"three"),
+            attachment("four.txt", b"four"),
+        ]);
+        app.attachment_picker_visible = true;
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        app.handle_attachment_picker_key(key('v'));
+        app.handle_attachment_picker_key(key('j'));
+        app.handle_attachment_picker_key(key('j'));
+        assert_eq!(app.attachment_marked.len(), 0);
+        assert_eq!(app.selected_attachment_indices(), vec![0, 1, 2]);
+
+        let temp = tempfile::tempdir().unwrap();
+        app.attachment_destination_picker = Some(
+            ComposeFilePicker::open_directory_only(temp.path().to_path_buf()).unwrap(),
+        );
+        app.save_selected_attachments();
+        assert_eq!(std::fs::read(temp.path().join("one.txt")).unwrap(), b"one");
+        assert_eq!(std::fs::read(temp.path().join("two.txt")).unwrap(), b"two");
+        assert_eq!(std::fs::read(temp.path().join("three.txt")).unwrap(), b"three");
+        assert!(!temp.path().join("four.txt").exists());
+        assert!(app.attachment_visual_anchor.is_none());
+    }
+
+    #[test]
+    fn visual_attachment_ranges_and_explicit_marks_are_combined_without_duplicates() {
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = App::new(&config, vec![]);
+        app.attachment_files = Arc::new(vec![
+            attachment("one", b"1"),
+            attachment("two", b"2"),
+            attachment("three", b"3"),
+            attachment("four", b"4"),
+        ]);
+        app.attachment_selection = 3;
+        app.attachment_visual_anchor = Some(1);
+        app.attachment_marked.extend([0, 2, 999]);
+        assert_eq!(app.selected_attachment_indices(), vec![0, 1, 2, 3]);
+        app.attachment_visual_anchor = None;
+        assert_eq!(app.selected_attachment_indices(), vec![0, 2]);
+    }
+
+    #[test]
     fn received_attachment_filenames_cannot_escape_destination() {
         assert_eq!(
             attachment_safe_name("../../important.txt", 0),
@@ -6126,6 +6267,53 @@ mod received_attachment_browser_tests {
         file.content_type = "application/octet-stream".into();
         file.filename = "presentation.PDF".into();
         assert!(received_attachment_is_pdf(&file));
+    }
+
+    #[test]
+    fn destination_file_explorer_question_mark_opens_searchable_help_only() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = App::new(&config, vec![]);
+        app.attachment_picker_visible = true;
+        let temp = tempfile::tempdir().unwrap();
+        app.attachment_destination_picker = Some(
+            ComposeFilePicker::open_directory_only(temp.path().to_path_buf()).unwrap(),
+        );
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        app.handle_attachment_picker_key(key(KeyCode::Char('?')));
+        let picker = app.attachment_destination_picker.as_ref().unwrap();
+        assert!(picker.help_visible);
+        assert_eq!(picker.help_query, "");
+        assert_eq!(picker.directory, temp.path());
+
+        for ch in "folder".chars() {
+            app.handle_attachment_picker_key(key(KeyCode::Char(ch)));
+        }
+        let picker = app.attachment_destination_picker.as_ref().unwrap();
+        assert_eq!(picker.help_query, "folder");
+        let matches = crate::app::ranked_help_matches(
+            crate::app::DESTINATION_HELP_ENTRIES,
+            &picker.help_query,
+        );
+        assert!(!matches.is_empty());
+        assert!(matches.iter().all(|&index| {
+            crate::app::DESTINATION_HELP_ENTRIES[index]
+                .description
+                .contains("folder")
+        }));
+        app.handle_attachment_picker_key(key(KeyCode::Backspace));
+        assert_eq!(app.attachment_destination_picker.as_ref().unwrap().help_query, "folde");
+        app.handle_attachment_picker_key(key(KeyCode::Esc));
+        let picker = app.attachment_destination_picker.as_ref().unwrap();
+        assert!(!picker.help_visible);
+        assert_eq!(picker.directory, temp.path());
+        // In help mode, "s" filters help; it must never save attachments.
+        app.handle_attachment_picker_key(key(KeyCode::Char('?')));
+        app.handle_attachment_picker_key(key(KeyCode::Char('s')));
+        assert!(app.attachment_destination_picker.as_ref().unwrap().help_visible);
+        app.handle_attachment_picker_key(key(KeyCode::Char('?')));
+        assert!(!app.attachment_destination_picker.as_ref().unwrap().help_visible);
     }
 
     #[test]

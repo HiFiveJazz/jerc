@@ -11,7 +11,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     ATTACHMENT_HELP_ENTRIES, App, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, ComposeField,
-    ComposeMode, HELP_ENTRIES, HelpEntry, PICKER_HELP_ENTRIES, ReaderSelection,
+    ComposeMode, DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, PICKER_HELP_ENTRIES,
+    ReaderSelection,
     ranked_help_matches,
 };
 use crate::config::VisualSelectionStyle;
@@ -241,6 +242,7 @@ mod tests {
         ReaderView, mailbox_row_text, pad_reader_line, reader_word_at, relative_number,
         rich_html_style, subject_for_list, truncate_display_width, word_match_ranges,
     };
+    use crate::app::ComposeMode;
     use crate::model::HtmlSpanStyle;
     use crate::theme::load_themes;
     use ratatui::style::Color;
@@ -343,6 +345,37 @@ mod tests {
     }
 
     #[test]
+    fn contact_editing_shows_a_block_cursor_in_normal_and_visual_modes() {
+        use crate::contacts::ContactEdit;
+        let theme = load_themes().into_iter().next().expect("theme");
+        let mut edit = ContactEdit::new(None);
+        edit.name = "Jazz".into();
+        edit.cursor = 2;
+        edit.mode = ComposeMode::Normal;
+        let normal = super::contact_editor_field_spans("Name", &edit.name, &edit, false, &theme);
+        assert_eq!(normal[3].content.as_ref(), "z");
+        assert_eq!(normal[3].style.bg, Some(Color::White));
+        assert_eq!(normal[3].style.fg, Some(Color::Black));
+        edit.cursor = edit.name.chars().count();
+        let end = super::contact_editor_field_spans("Name", &edit.name, &edit, false, &theme);
+        assert_eq!(end.last().unwrap().content.as_ref(), " ");
+        assert_eq!(end.last().unwrap().style.bg, Some(Color::White));
+        edit.mode = ComposeMode::Insert;
+        let insert = super::contact_editor_field_spans("Name", &edit.name, &edit, false, &theme);
+        assert_ne!(insert.last().unwrap().style.bg, Some(Color::White));
+        edit.mode = ComposeMode::Visual;
+        edit.visual_anchor = Some(0);
+        edit.cursor = 2;
+        let visual = super::contact_editor_field_spans("Name", &edit.name, &edit, false, &theme);
+        assert_eq!(visual[3].style.bg, Some(Color::White));
+        edit.active_email = true;
+        edit.email = "a@example.org".into();
+        edit.cursor = 0;
+        let email = super::contact_editor_field_spans("Email", &edit.email, &edit, true, &theme);
+        assert_eq!(email[1].style.bg, Some(Color::White));
+    }
+
+    #[test]
     fn editor_highlight_keeps_ordinary_text_unbolded() {
         use ratatui::style::Modifier;
         let theme = load_themes()
@@ -365,6 +398,7 @@ mod tests {
             crate::app::HELP_ENTRIES,
             crate::app::CONTACT_HELP_ENTRIES,
             crate::app::ATTACHMENT_HELP_ENTRIES,
+            crate::app::DESTINATION_HELP_ENTRIES,
             crate::app::PICKER_HELP_ENTRIES,
             crate::app::COMPOSE_HELP_ENTRIES,
         ] {

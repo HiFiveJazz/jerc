@@ -15,6 +15,21 @@ use crate::model::OutgoingMessage;
 
 pub const FORWARD_SEPARATOR: &str = "---------- Forwarded message ---------";
 
+/// Autocomplete leaves a `, ` after the last completed contact so another
+/// recipient can be entered immediately. That separator is UI state, not an
+/// empty mailbox: omit just that one trailing comma when parsing for delivery.
+/// Keep all other separators intact so malformed lists still fail closed.
+fn parse_recipient_list(value: &str, label: &str) -> Result<Mailboxes> {
+    let trimmed = value.trim();
+    let trimmed = trimmed.strip_suffix(',').unwrap_or(trimmed).trim_end();
+    if trimmed.is_empty() || trimmed.ends_with(',') {
+        bail!("invalid {label} recipient list: enter a complete email address");
+    }
+    trimmed
+        .parse()
+        .with_context(|| format!("invalid {label} recipient list"))
+}
+
 /// Restrict interactive outgoing recipients to fully qualified public mail domains.
 /// A syntactically valid but misspelled local part cannot be detected without
 /// confirming with the recipient. Never silently rewrite an address.
@@ -24,9 +39,7 @@ pub fn validate_recipients(to: &str, cc: &str, bcc: &str) -> Result<()> {
         if value.trim().is_empty() {
             continue;
         }
-        let mailboxes: Mailboxes = value
-            .parse()
-            .with_context(|| format!("invalid {label} recipient list"))?;
+        let mailboxes = parse_recipient_list(value, label)?;
         for mailbox in mailboxes {
             let email = mailbox.email.to_string();
             let (_, domain) = email
@@ -359,7 +372,12 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
         if value.trim().is_empty() {
             continue;
         }
-        let mailboxes: Mailboxes = value.parse().context("invalid recipient mailbox list")?;
+        let label = match kind {
+            0 => "To",
+            1 => "Cc",
+            _ => "Bcc",
+        };
+        let mailboxes = parse_recipient_list(value, label)?;
         for mailbox in mailboxes {
             recipients += 1;
             builder = match kind {

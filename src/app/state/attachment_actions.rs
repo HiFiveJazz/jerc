@@ -200,6 +200,79 @@ impl App {
     }
 
     pub(super) fn handle_attachment_destination_key(&mut self, key: KeyEvent) {
+        // The destination explorer owns its own searchable help. In particular,
+        // pressing Esc here must close help rather than cancel the save dialog.
+        if let Some(picker) = self.attachment_destination_picker.as_mut()
+            && picker.help_visible
+        {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    picker.help_visible = false;
+                    picker.help_query.clear();
+                }
+                KeyCode::Backspace => {
+                    picker.help_query.pop();
+                    picker.help_selected = ranked_help_matches(
+                        DESTINATION_HELP_ENTRIES,
+                        &picker.help_query,
+                    )
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
+                    picker.help_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
+                    if key.modifiers.is_empty() =>
+                {
+                    let matches = ranked_help_matches(
+                        DESTINATION_HELP_ENTRIES,
+                        &picker.help_query,
+                    );
+                    if let Some(position) = matches.iter().position(|&i| i == picker.help_selected)
+                    {
+                        let next = match key.code {
+                            KeyCode::Up => position.saturating_sub(1),
+                            KeyCode::Down => (position + 1).min(matches.len() - 1),
+                            KeyCode::Home => 0,
+                            KeyCode::End => matches.len() - 1,
+                            _ => position,
+                        };
+                        picker.help_selected = matches[next];
+                        picker.help_scroll = next.saturating_sub(5);
+                    } else if let Some(&first) = matches.first() {
+                        picker.help_selected = first;
+                        picker.help_scroll = 0;
+                    }
+                }
+                KeyCode::Char(ch)
+                    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                {
+                    picker.help_query.push(ch);
+                    picker.help_selected = ranked_help_matches(
+                        DESTINATION_HELP_ENTRIES,
+                        &picker.help_query,
+                    )
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
+                    picker.help_scroll = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.attachment_new_folder.is_none()
+            && key.code == KeyCode::Char('?')
+            && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+        {
+            if let Some(picker) = self.attachment_destination_picker.as_mut() {
+                picker.help_visible = true;
+                picker.help_query.clear();
+                picker.help_selected = 0;
+                picker.help_scroll = 0;
+            }
+            return;
+        }
         if self.attachment_new_folder.is_some() {
             match key.code {
                 KeyCode::Esc => self.attachment_new_folder = None,
@@ -562,6 +635,27 @@ impl App {
             .and_then(|(_, result)| result.as_ref().err().map(String::as_str))
     }
 
+    /// All rows the attachment picker currently displays as selected.
+    /// Visual selections are actionable without an extra Space-to-mark step.
+    pub(crate) fn selected_attachment_indices(&self) -> Vec<usize> {
+        let total = self.attachment_files.len();
+        let mut indices = self
+            .attachment_marked
+            .iter()
+            .copied()
+            .filter(|&index| index < total)
+            .collect::<Vec<_>>();
+        if let Some(anchor) = self.attachment_visual_anchor.filter(|_| total > 0) {
+            let cursor = self.attachment_selection.min(total - 1);
+            indices.extend(anchor.min(cursor)..=anchor.max(cursor).min(total - 1));
+        } else if indices.is_empty() && total > 0 {
+            indices.push(self.attachment_selection.min(total - 1));
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
     pub(super) fn prompt_attachment_save(&mut self) {
         if self.attachment_files.is_empty() {
             return;
@@ -593,16 +687,7 @@ impl App {
             ));
             return;
         }
-        let mut indices = if self.attachment_marked.is_empty() {
-            if self.attachment_files.is_empty() {
-                Vec::new()
-            } else {
-                vec![self.attachment_selection]
-            }
-        } else {
-            self.attachment_marked.iter().copied().collect::<Vec<_>>()
-        };
-        indices.sort_unstable();
+        let indices = self.selected_attachment_indices();
         let mut saved = 0;
         let mut first_error = None;
         for index in indices {
@@ -626,6 +711,7 @@ impl App {
                 Duration::from_secs(5),
             );
             self.attachment_marked.clear();
+            self.attachment_visual_anchor = None;
         }
         self.queue_attachment_preview();
     }
