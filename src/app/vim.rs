@@ -108,7 +108,6 @@ impl<T> VimHistory<T> {
         Some(next)
     }
 }
-use std::collections::HashSet;
 use std::hash::Hash;
 
 /// One unnamed Vim register is shared by Compose, Contacts, and the reader.

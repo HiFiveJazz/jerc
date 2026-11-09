@@ -346,10 +346,10 @@ impl WorkerHandle {
         // Connection establishment can outlive the UI. Its send channel is
         // disconnected on shutdown, so an old watcher cannot update a reloaded
         // account. Never block quit on a stuck server handshake.
-        if let Some(idle_join) = self.idle_join.take() {
-            if idle_join.is_finished() {
-                let _ = idle_join.join();
-            }
+        if let Some(idle_join) = self.idle_join.take()
+            && idle_join.is_finished()
+        {
+            let _ = idle_join.join();
         }
     }
 }

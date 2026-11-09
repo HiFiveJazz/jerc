@@ -86,10 +86,9 @@ impl App {
                 if account.inbox_poll_inflight.is_none()
                     && account.mailbox_status_inflight.is_none()
                     && account.pending_mutations == 0
+                    && let Ok(request) = account.worker.post(ActionKind::MailboxStatus(name))
                 {
-                    if let Ok(request) = account.worker.post(ActionKind::MailboxStatus(name)) {
-                        account.inbox_poll_inflight = Some(request);
-                    }
+                    account.inbox_poll_inflight = Some(request);
                 }
             }
             WorkerEventKind::MailboxStatus {
