@@ -230,8 +230,7 @@ impl App {
                 if generation_changed {
                     // Cached UIDs may point to entirely different emails after
                     // a server UIDVALIDITY reset: drop all old derived data.
-                    account.mailbox_cache.remove(&name);
-                    account.remove_persistent_folder(&name);
+                    account.forget_cached_folder(&name);
                     account.bodies.clear();
                 }
                 if let Some(validity) = uid_validity {

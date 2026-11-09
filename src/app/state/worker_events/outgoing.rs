@@ -23,27 +23,7 @@ impl App {
                     return;
                 }
                 account.pending_seen.remove(&id);
-                let mut unread_delta = 0isize;
-                if let Some(message) = account.messages.iter_mut().find(|message| message.id == id)
-                {
-                    let was_unread = message.unread();
-                    message.flags.set(MessageFlags::SEEN, seen);
-                    let is_unread = message.unread();
-                    unread_delta = match (was_unread, is_unread) {
-                        (true, false) => -1,
-                        (false, true) => 1,
-                        _ => 0,
-                    };
-                }
-                if unread_delta != 0
-                    && let Some(current) = account.current_mailbox.as_deref()
-                    && let Some(mailbox) = account
-                        .mailboxes
-                        .iter_mut()
-                        .find(|mailbox| mailbox.name == current && mailbox.counts_known)
-                {
-                    mailbox.unread = mailbox.unread.saturating_add_signed(unread_delta);
-                }
+                account.apply_seen_flag(&id, seen);
                 account.persist_current_cache();
                 account.persist_mailboxes();
             }
@@ -73,15 +53,7 @@ impl App {
                 }
                 // Refresh cached Drafts on the next visit, or immediately if
                 // the user is already browsing that folder.
-                account.mailbox_cache.remove(&mailbox);
-                account.remove_persistent_folder(&mailbox);
-                if let Some(folder) = account
-                    .mailboxes
-                    .iter_mut()
-                    .find(|folder| folder.name == mailbox)
-                {
-                    folder.counts_known = false;
-                }
+                account.invalidate_remote_folder(&mailbox);
                 if account.current_mailbox.as_deref() == Some(mailbox.as_str()) {
                     let _ = account.request_mailbox_page(mailbox.clone(), 0);
                 }
@@ -143,15 +115,7 @@ impl App {
                     .map(|mailbox| mailbox.name.clone())
                     .collect::<Vec<_>>();
                 for name in &affected {
-                    account.mailbox_cache.remove(name);
-                    account.remove_persistent_folder(name);
-                    if let Some(mailbox) = account
-                        .mailboxes
-                        .iter_mut()
-                        .find(|mailbox| mailbox.name == *name)
-                    {
-                        mailbox.counts_known = false;
-                    }
+                    account.invalidate_remote_folder(name);
                 }
                 account.queue_unknown_mailbox_statuses(sent_mailbox.as_deref());
                 if account

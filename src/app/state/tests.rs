@@ -2230,3 +2230,111 @@ fn seen_response_must_match_the_pending_request_id() {
     });
     assert!(!app.account().unwrap().pending_seen.contains_key(&id));
 }
+
+// Pass 5: exercise the shared state paths without a live IMAP account.
+fn local_account_fixture() -> (tempfile::TempDir, super::App) {
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+    (root, super::App::new(&config, vec![worker]))
+}
+
+#[test]
+fn seen_transition_is_idempotent_and_does_not_guess_unknown_counts() {
+    let (_root, mut app) = local_account_fixture();
+    let account = app.account_mut().unwrap();
+    let id = MessageId("seen-transition".into());
+    let raw = b"From: Example <a@example.net>\r\nSubject: Test\r\n\r\nbody";
+    account.messages.push(
+        crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, MessageFlags::empty())
+            .unwrap(),
+    );
+    account.current_mailbox = Some("INBOX".into());
+    let mut folder = crate::model::Mailbox::new("INBOX", crate::model::MailboxRole::Inbox);
+    folder.unread = 1;
+    folder.total = 1;
+    folder.counts_known = true;
+    account.mailboxes = vec![folder];
+
+    account.apply_seen_flag(&id, true);
+    assert!(!account.messages[0].unread());
+    assert_eq!(account.mailboxes[0].unread, 0);
+    account.apply_seen_flag(&id, true); // Server ACK must not double-decrement.
+    assert_eq!(account.mailboxes[0].unread, 0);
+    account.apply_seen_flag(&id, false);
+    assert!(account.messages[0].unread());
+    assert_eq!(account.mailboxes[0].unread, 1);
+
+    account.mailboxes[0].counts_known = false;
+    account.apply_seen_flag(&id, true);
+    assert!(!account.messages[0].unread());
+    assert_eq!(account.mailboxes[0].unread, 1); // Next STATUS owns reconciliation.
+}
+
+#[test]
+fn cache_invalidation_forgets_lru_and_explicitly_stales_folder_counts() {
+    let (_root, mut app) = local_account_fixture();
+    let account = app.account_mut().unwrap();
+    let empty = crate::cache::CachedMailbox {
+        messages: Vec::new(),
+        bodies: std::collections::HashMap::new(),
+        message_index: 0,
+        message_view_offset: 0,
+        next_page_offset: 0,
+        has_more: false,
+        uid_validity: Some(9),
+        uid_next: Some(10),
+    };
+    account.remember_mailbox("Drafts".into(), empty.clone());
+    account.remember_mailbox("Sent".into(), empty);
+    assert_eq!(account.warm_folder_order.len(), 2);
+    account.current_mailbox = Some("INBOX".into());
+    let mut draft = crate::model::Mailbox::new("Drafts", crate::model::MailboxRole::Drafts);
+    draft.counts_known = true;
+    account.mailboxes.push(draft);
+
+    account.forget_cached_folder("Drafts");
+    assert!(!account.mailbox_cache.contains_key("Drafts"));
+    assert_eq!(account.warm_folder_order.iter().map(String::as_str).collect::<Vec<_>>(), vec!["Sent"]);
+    assert!(account.mailboxes.last().unwrap().counts_known);
+    account.invalidate_remote_folder("Drafts");
+    assert!(!account.mailboxes.last().unwrap().counts_known);
+    assert_eq!(account.current_mailbox.as_deref(), Some("INBOX"));
+}
+
+#[test]
+fn persistent_and_in_memory_snapshots_share_bounded_cursor_rules() {
+    let (_root, mut app) = local_account_fixture();
+    let account = app.account_mut().unwrap();
+    let raw = b"From: Example <a@example.net>\r\nSubject: Test\r\n\r\nbody";
+    let example = crate::mail::parse_summary(
+        MessageId("one".into()), raw, raw.len() as u64, MessageFlags::empty(),
+    ).unwrap();
+    account.current_mailbox = Some("INBOX".into());
+    account.uid_validities.insert("INBOX".into(), 15);
+    account.uid_nexts.insert("INBOX".into(), 600);
+    account.messages = (0..405).map(|i| {
+        let mut item = example.clone();
+        item.id = MessageId(format!("message-{i}"));
+        item
+    }).collect();
+    account.message_index = 404;
+    account.next_page_offset = 405;
+    let snapshot = account.current_cache_snapshot().unwrap();
+    assert_eq!(snapshot.messages.len(), crate::cache::MAX_MESSAGES_PER_FOLDER);
+    assert_eq!(snapshot.message_index, crate::cache::MAX_MESSAGES_PER_FOLDER - 1);
+    assert_eq!(snapshot.next_page_offset, crate::cache::MAX_MESSAGES_PER_FOLDER);
+    assert!(snapshot.has_more);
+    assert_eq!(snapshot.uid_validity, Some(15));
+    assert_eq!(snapshot.uid_next, Some(600));
+}

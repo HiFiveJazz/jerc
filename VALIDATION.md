@@ -37,3 +37,23 @@ In addition to the automated tests, use a test Gmail or Microsoft 365 account to
 5. Open and mark a message Seen while another background operation runs. An old response must not overwrite a newer Seen request.
 
 The STATUS queue and request-correlation unit tests do not replace these real-account checks.
+
+## Pass 5 cleanup checks
+
+In addition to the unit and Clippy checks above, test the following with disposable
+messages and both a warm and a cold cache:
+
+1. Mark a message read/unread twice, including from a second client; no double
+   decrement or increment should appear in the unread count.
+2. Save a draft, switch away from Drafts, and return. The invalidated folder
+   should refetch instead of restoring a stale in-memory or disk snapshot.
+3. Move/archive/unarchive messages across folders, then revisit both source
+   and destination. The active source must retain its optimistic update, while
+   destination UIDs are loaded from the server.
+4. Scroll beyond 400 headers in a large mailbox, change folders, and restart.
+   Cursor restoration must remain in bounds and load older pages as needed.
+5. Confirm the CLI starts with a warm cache and that memory use plateaus over
+   repeated mailbox switches; verify IMAP IDLE still refreshes on incoming mail.
+
+The Pass 5 unit tests exercise snapshot bounds, cache invalidation bookkeeping,
+and idempotent Seen transitions. They do not replace provider integration tests.

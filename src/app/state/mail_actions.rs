@@ -2,6 +2,31 @@
 
 use super::*;
 
+impl AccountState {
+    /// Apply one Seen state transition exactly once, including the cached
+    /// mailbox unread count. Used by both optimistic UI and worker ACKs:
+    /// applying the same flag a second time must not double-adjust counts.
+    pub(super) fn apply_seen_flag(&mut self, id: &MessageId, seen: bool) {
+        let mut unread_delta = 0isize;
+        if let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) {
+            let was_unread = message.unread();
+            message.flags.set(MessageFlags::SEEN, seen);
+            unread_delta = match (was_unread, message.unread()) {
+                (true, false) => -1,
+                (false, true) => 1,
+                _ => 0,
+            };
+        }
+        if unread_delta != 0
+            && let Some(current) = self.current_mailbox.as_deref()
+            && let Some(mailbox) = self.mailboxes.iter_mut()
+                .find(|mailbox| mailbox.name == current && mailbox.counts_known)
+        {
+            mailbox.unread = mailbox.unread.saturating_add_signed(unread_delta);
+        }
+    }
+}
+
 impl App {
     pub(super) fn toggle_seen(&mut self) {
         let Some(account) = self.account_mut() else {
@@ -19,28 +44,8 @@ impl App {
             return;
         }
 
-        // Optimistic UI: reflect the flag immediately instead of waiting for an
-        // IMAP round trip. The SeenChanged event later confirms the same value,
-        // so its unread delta naturally becomes zero.
-        let mut unread_delta = 0isize;
-        if let Some(message) = account.messages.iter_mut().find(|message| message.id == id) {
-            let was_unread = message.unread();
-            message.flags.set(MessageFlags::SEEN, seen);
-            unread_delta = match (was_unread, message.unread()) {
-                (true, false) => -1,
-                (false, true) => 1,
-                _ => 0,
-            };
-        }
-        if unread_delta != 0
-            && let Some(current) = account.current_mailbox.as_deref()
-            && let Some(mailbox) = account
-                .mailboxes
-                .iter_mut()
-                .find(|mailbox| mailbox.name == current && mailbox.counts_known)
-        {
-            mailbox.unread = mailbox.unread.saturating_add_signed(unread_delta);
-        }
+        // Optimistic UI; the correlated SeenChanged ACK is idempotent.
+        account.apply_seen_flag(&id, seen);
     }
 
     /// Space toggles the current message, then advances one visible row
@@ -710,8 +715,7 @@ impl App {
             && (source.to_ascii_lowercase().starts_with("[gmail]/")
                 || source.to_ascii_lowercase().starts_with("[googlemail]/"))
         {
-            account.mailbox_cache.remove(destination);
-            account.remove_persistent_folder(destination);
+            account.forget_cached_folder(destination);
             if let Some(mailbox) = account
                 .mailboxes
                 .iter_mut()
@@ -753,8 +757,7 @@ impl App {
             // A destination cache cannot know about the moved messages without
             // a server response containing their destination UIDs. Drop only
             // that cache; the active source list stays updated locally.
-            account.mailbox_cache.remove(destination);
-            account.remove_persistent_folder(destination);
+            account.forget_cached_folder(destination);
             if let Some(mailbox) = account
                 .mailboxes
                 .iter_mut()

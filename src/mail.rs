@@ -451,7 +451,10 @@ pub fn render_html_for_terminal(html: &str, width: usize) -> (String, Vec<HtmlLi
     // landmarks as a terminal browser without spawning an external process for
     // every message. The worker produces a fallback layout; reader mode can
     // reflow the preserved HTML when its actual viewport width changes.
-    let normalized_html = flatten_presentation_tables_html(html);
+    let flattened_html = flatten_presentation_tables_html(html);
+    // Terminals cannot vertically offset glyphs, but Unicode superscripts
+    // preserve explicitly marked ordinal suffixes such as 15<sup>th</sup>.
+    let normalized_html = normalize_superscript_ordinals(&flattened_html);
     let rich = html2text::config::rich()
         .use_doc_css()
         .link_footnotes(false)
@@ -487,7 +490,7 @@ pub fn render_html_for_terminal(html: &str, width: usize) -> (String, Vec<HtmlLi
     // Malformed HTML should still be readable. mail-parser's fallback is plain
     // text, so expose it as one unstyled span per line rather than failing the
     // whole message body.
-    let text = clean_reader_text(&mail_parser::html_to_text(html));
+    let text = clean_reader_text(&mail_parser::html_to_text(&normalized_html));
     let lines = text
         .lines()
         .map(|line| HtmlLine {
@@ -498,6 +501,75 @@ pub fn render_html_for_terminal(html: &str, width: usize) -> (String, Vec<HtmlLi
         })
         .collect();
     (text, lines, "mail-parser fallback".to_owned())
+}
+
+// Respect explicit HTML superscripts without rewriting ordinary text like
+// "15th". The terminal cannot move glyphs vertically, so use narrow Unicode
+// equivalents for the four English ordinal suffixes. Other <sup> content is
+// left to the normal HTML renderer (e.g. mathematical expressions or footnotes).
+// The common case stays allocation-free; an owned copy is created only if an
+// ordinal superscript actually needs substituting.
+fn normalize_superscript_ordinals(html: &str) -> Cow<'_, str> {
+    if !html
+        .as_bytes()
+        .windows(4)
+        .any(|window| window.eq_ignore_ascii_case(b"<sup"))
+    {
+        return Cow::Borrowed(html);
+    }
+
+    let mut rewritten = None::<String>;
+    let mut scan = 0usize;
+    let mut copy_from = 0usize;
+    while let Some(relative) = html[scan..].find('<') {
+        let start = scan + relative;
+        let Some(tag_end) = find_html_tag_end(html, start) else {
+            break;
+        };
+        if let Some((suffix, close_end)) = ordinal_superscript_at(html, start, tag_end) {
+            let output = rewritten.get_or_insert_with(|| String::with_capacity(html.len()));
+            output.push_str(&html[copy_from..start]);
+            output.push_str(suffix);
+            copy_from = close_end + 1;
+            scan = copy_from;
+        } else {
+            scan = tag_end + 1;
+        }
+    }
+
+    if let Some(mut output) = rewritten {
+        output.push_str(&html[copy_from..]);
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(html)
+    }
+}
+
+fn ordinal_superscript_at(
+    html: &str,
+    open_start: usize,
+    open_end: usize,
+) -> Option<(&'static str, usize)> {
+    let (closing, name) = html_tag_name(&html[open_start..=open_end]);
+    if closing || !name.is_some_and(|name| name.eq_ignore_ascii_case("sup")) {
+        return None;
+    }
+    // Only handle simple text within a <sup> element. Nested tags and other
+    // superscripts pass through unchanged, retaining their HTML semantics.
+    let close_start = open_end + 1 + html[open_end + 1..].find('<')?;
+    let close_end = find_html_tag_end(html, close_start)?;
+    let (closing, name) = html_tag_name(&html[close_start..=close_end]);
+    if !closing || !name.is_some_and(|name| name.eq_ignore_ascii_case("sup")) {
+        return None;
+    }
+    let suffix = match &html[open_end + 1..close_start] {
+        "st" => "ˢᵗ",
+        "nd" => "ⁿᵈ",
+        "rd" => "ʳᵈ",
+        "th" => "ᵗʰ",
+        _ => return None,
+    };
+    Some((suffix, close_end))
 }
 
 fn flatten_presentation_tables_html(html: &str) -> Cow<'_, str> {
@@ -1501,6 +1573,43 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
             vec!["https://tracking.example/very/long/url".to_owned()]
         );
         assert_eq!(body.html_renderer.as_deref(), Some("html2text-rich"));
+    }
+
+    #[test]
+    fn html_reader_renders_explicit_superscript_ordinals() {
+        // Mirrors the Outlook-generated HTML of a course-assessment email.
+        let raw = b"From: sender@example.com\r\nSubject: Assessments\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>The deadline is January 8<sup>th</sup>, 2027.</p><p>Results January 15<SUP class=\"ordinal\">th</SUP>, 2027.</p>";
+        let body = parse_body(MessageId("ordinal-html".into()), raw).unwrap();
+        let rendered = body.html_text.as_deref().unwrap();
+        assert!(rendered.contains("January 8ᵗʰ, 2027"), "{rendered}");
+        assert!(rendered.contains("January 15ᵗʰ, 2027"), "{rendered}");
+        assert!(
+            body.html_source
+                .as_deref()
+                .is_some_and(|source| source.contains("8<sup>th</sup>")),
+            "original HTML must remain unchanged for forwarding and reflow"
+        );
+        // Reflowing from original HTML must produce identical ordinal glyphs.
+        let (reflow, _, _) = render_html_for_terminal(body.html_source.as_deref().unwrap(), 60);
+        assert!(reflow.contains("January 8ᵗʰ"), "{reflow}");
+        assert!(reflow.contains("January 15ᵗʰ"), "{reflow}");
+    }
+
+    #[test]
+    fn superscript_normalizer_preserves_plain_text_and_other_html() {
+        let html = "15th, 1<sup>st</sup>, 2<sup>nd</sup>, 3<sup>rd</sup>, E<sup>mc2</sup>, X<sup><em>th</em></sup>";
+        assert_eq!(
+            super::normalize_superscript_ordinals(html).as_ref(),
+            "15th, 1ˢᵗ, 2ⁿᵈ, 3ʳᵈ, E<sup>mc2</sup>, X<sup><em>th</em></sup>"
+        );
+        assert!(matches!(
+            super::normalize_superscript_ordinals("plain 15th and no superscripts"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            super::normalize_superscript_ordinals("<sup>unrecognized</sup>"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

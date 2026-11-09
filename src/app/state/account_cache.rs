@@ -27,26 +27,32 @@ impl AccountState {
         }
     }
 
+    /// One bounded representation for both in-session and on-disk snapshots.
+    /// Keeping these paths identical avoids restoring different cursors or
+    /// bodies depending on whether Jerc was restarted between folder visits.
+    pub(super) fn current_cache_snapshot(&self) -> Option<CachedMailbox> {
+        let name = self.current_mailbox.as_deref()?;
+        let max_messages = cache::MAX_MESSAGES_PER_FOLDER;
+        let truncated = self.messages.len() > max_messages;
+        let retained = self.messages.len().min(max_messages);
+        Some(CachedMailbox {
+            messages: self.messages.iter().take(max_messages).cloned().collect(),
+            bodies: cache::persistable_bodies_near(&self.messages, &self.bodies, self.message_index),
+            message_index: self.message_index.min(retained.saturating_sub(1)),
+            message_view_offset: self.message_view_offset,
+            next_page_offset: if truncated { max_messages } else { self.next_page_offset },
+            has_more: truncated || self.has_more,
+            uid_validity: self.uid_validities.get(name).copied(),
+            uid_next: self.uid_nexts.get(name).copied(),
+        })
+    }
+
     pub(super) fn save_current_cache(&mut self) {
-        let Some(name) = self.current_mailbox.clone() else {
-            return;
-        };
-        let uid_validity = self.uid_validities.get(&name).copied();
-        let uid_next = self.uid_nexts.get(&name).copied();
-        let truncated = self.messages.len() > cache::MAX_MESSAGES_PER_FOLDER;
-        self.remember_mailbox(
-            name,
-            CachedMailbox {
-                messages: self.messages.iter().take(cache::MAX_MESSAGES_PER_FOLDER).cloned().collect(),
-                bodies: cache::persistable_bodies_near(&self.messages, &self.bodies, self.message_index),
-                message_index: self.message_index.min(cache::MAX_MESSAGES_PER_FOLDER.saturating_sub(1)),
-                message_view_offset: self.message_view_offset,
-                next_page_offset: if truncated { cache::MAX_MESSAGES_PER_FOLDER } else { self.next_page_offset },
-                has_more: truncated || self.has_more,
-                uid_validity,
-                uid_next,
-            },
-        );
+        if let (Some(name), Some(snapshot)) = (
+            self.current_mailbox.clone(), self.current_cache_snapshot(),
+        ) {
+            self.remember_mailbox(name, snapshot);
+        }
     }
 
     pub(super) fn persist_mailboxes(&self) {
@@ -56,44 +62,38 @@ impl AccountState {
     }
 
     pub(super) fn persist_current_cache(&mut self) {
-        let Some(name) = self.current_mailbox.as_ref() else {
+        let (Some(name), Some(writer)) = (self.current_mailbox.as_deref(), &self.cache_writer)
+        else {
             return;
         };
-        let Some(writer) = &self.cache_writer else {
-            return;
-        };
-        // Don't clone 80 warm preview bodies into the in-session cache and
-        // then clone them *again* for a disk writer that can only keep 12.
-        // In-session snapshots are captured separately when changing folders.
-        let Some(uid_validity) = self.uid_validities.get(name).copied() else {
-            return;
-        };
-        if self.unverified_mailboxes.contains(name) {
+        // Only persist server-verified UIDs. Cached snapshots are display hints,
+        // never an authority for subsequent IMAP mutations.
+        if self.unverified_mailboxes.contains(name) || !self.uid_validities.contains_key(name) {
             return;
         }
-        let truncated = self.messages.len() > cache::MAX_MESSAGES_PER_FOLDER;
-        writer.send(cache::Change::Folder(
-            name.clone(),
-            CachedMailbox {
-                messages: self
-                    .messages
-                    .iter()
-                    .take(cache::MAX_MESSAGES_PER_FOLDER)
-                    .cloned()
-                    .collect(),
-                bodies: cache::persistable_bodies_near(&self.messages, &self.bodies, self.message_index),
-                message_index: self.message_index,
-                message_view_offset: self.message_view_offset,
-                next_page_offset: if truncated {
-                    cache::MAX_MESSAGES_PER_FOLDER
-                } else {
-                    self.next_page_offset
-                },
-                has_more: truncated || self.has_more,
-                uid_validity: Some(uid_validity),
-                uid_next: self.uid_nexts.get(name).copied(),
-            },
-        ));
+        if let Some(snapshot) = self.current_cache_snapshot() {
+            writer.send(cache::Change::Folder(name.to_owned(), snapshot));
+        }
+    }
+
+    /// Invalidate the full derived folder snapshot (in-memory, LRU, disk).
+    /// Call this after a mutation that changes a folder whose new UIDs are
+    /// unknown. It deliberately does not clear the active mailbox: callers
+    /// may still have a valid, optimistically updated source view.
+    pub(super) fn forget_cached_folder(&mut self, name: &str) {
+        self.mailbox_cache.remove(name);
+        self.warm_folder_order.retain(|entry| entry != name);
+        self.remove_persistent_folder(name);
+    }
+
+    /// Invalidate both a remote-changed folder's cache and its STATUS counts.
+    /// Do not call this for optimistically updated mutations: those know the
+    /// count delta but cannot infer the destination UIDs.
+    pub(super) fn invalidate_remote_folder(&mut self, name: &str) {
+        self.forget_cached_folder(name);
+        if let Some(mailbox) = self.mailboxes.iter_mut().find(|mailbox| mailbox.name == name) {
+            mailbox.counts_known = false;
+        }
     }
 
     pub(super) fn remove_persistent_folder(&self, name: &str) {
@@ -137,11 +137,8 @@ impl AccountState {
     }
 
     pub(super) fn invalidate_current_cache(&mut self) {
-        if let Some(name) = self.current_mailbox.as_ref() {
-            self.mailbox_cache.remove(name);
-            self.warm_folder_order.retain(|entry| entry != name);
-            self.remove_persistent_folder(name);
+        if let Some(name) = self.current_mailbox.clone() {
+            self.forget_cached_folder(&name);
         }
     }
-
 }
