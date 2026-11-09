@@ -320,9 +320,7 @@ pub fn recipient_query(text: &str, cursor: usize) -> String {
 }
 
 pub fn char_to_byte(text: &str, char_index: usize) -> usize {
-    text.char_indices()
-        .nth(char_index)
-        .map_or(text.len(), |(i, _)| i)
+    crate::app::vim::byte_offset(text, char_index)
 }
 
 pub fn replace_recipient(text: &mut String, cursor: usize, contact: &Contact) -> usize {
@@ -464,14 +462,7 @@ impl ContactsModal {
             .filter_map(|&id| book.entries.get(id))
             .map(|contact| contact.email.to_ascii_lowercase())
             .collect();
-        let all_marked = addresses.iter().all(|email| self.marked.contains(email));
-        for address in addresses {
-            if all_marked {
-                self.marked.remove(&address);
-            } else {
-                self.marked.insert(address);
-            }
-        }
+        crate::app::vim::toggle_group(&mut self.marked, &addresses);
         self.visual_anchor = None;
     }
 
@@ -480,31 +471,16 @@ impl ContactsModal {
     /// can gather recipients in multiple searches. The UI displays their count.
     #[must_use]
     pub fn action_ids(&self, book: &ContactBook) -> Vec<usize> {
-        let range = self.visual_range();
-        let mut picked = Vec::new();
-        let mut seen = HashSet::new();
-        for (row, &id) in self.matches.iter().enumerate() {
-            let Some(contact) = book.entries.get(id) else {
-                continue;
-            };
-            if (range.is_some_and(|(start, end)| (start..=end).contains(&row))
-                || self.marked.contains(&contact.email.to_ascii_lowercase()))
-                && seen.insert(id)
-            {
-                picked.push(id);
-            }
-        }
-        for (id, contact) in book.entries.iter().enumerate() {
-            if self.marked.contains(&contact.email.to_ascii_lowercase()) && seen.insert(id) {
-                picked.push(id);
-            }
-        }
-        if picked.is_empty()
-            && let Some(&id) = self.matches.get(self.selected)
-        {
-            picked.push(id);
-        }
-        picked
+        // Convert stable email marks to current book IDs only at action time:
+        // contact reorderings and search changes cannot change the recipients.
+        let marked = book.entries.iter().enumerate()
+            .filter(|(_, contact)| self.marked.contains(&contact.email.to_ascii_lowercase()))
+            .map(|(index, _)| index)
+            .collect::<HashSet<_>>();
+        let all = (0..book.entries.len()).collect::<Vec<_>>();
+        crate::app::vim::selected(
+            &self.matches, &all, self.selected, self.visual_anchor, &marked,
+        )
     }
 
     pub fn clear_selection(&mut self) {
@@ -644,12 +620,9 @@ impl ContactEdit {
     }
     pub fn selected_range(&self) -> Option<(usize, usize)> {
         let anchor = self.visual_anchor?;
-        let end = self.value().chars().count();
-        if end == 0 { return None; }
         if self.mode != crate::app::ComposeMode::Visual { return None; }
-        if self.pending_delete { return None; }
-        if self.pending_yank { return None; }
-        Some((anchor.min(self.cursor).min(end), anchor.max(self.cursor).saturating_add(1).min(end)))
+        if self.pending_delete || self.pending_yank { return None; }
+        crate::app::vim::visual_chars(anchor, self.cursor, self.value().chars().count())
     }
     pub fn selected_text(&self) -> Option<String> {
         let (start, end) = self.selected_range()?;
@@ -674,17 +647,7 @@ impl ContactEdit {
         }
     }
     pub fn move_word(&mut self, forward: bool) {
-        let chars: Vec<char> = self.value().chars().collect();
-        let mut n = self.cursor.min(chars.len());
-        if forward {
-            while n < chars.len() && !chars[n].is_whitespace() { n += 1; }
-            while n < chars.len() && chars[n].is_whitespace() { n += 1; }
-        } else {
-            n = n.saturating_sub(1);
-            while n > 0 && chars[n].is_whitespace() { n -= 1; }
-            while n > 0 && !chars[n - 1].is_whitespace() { n -= 1; }
-        }
-        self.cursor = n;
+        self.cursor = crate::app::vim::word_start(self.value(), self.cursor, !forward, true);
     }
 }
 

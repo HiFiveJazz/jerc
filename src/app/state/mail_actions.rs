@@ -195,31 +195,14 @@ impl App {
         let Some(account) = self.account() else {
             return Vec::new();
         };
-        let visible = account.visible_message_indices();
-        let mut selected = Vec::new();
-        let mut seen = HashSet::new();
-        if let Some((start, end)) = self.visual_range() {
-            for &index in &visible[start..=end] {
-                let id = &account.messages[index].id;
-                if seen.insert(id.clone()) {
-                    selected.push(id.clone());
-                }
-            }
-        }
-        // Marks survive filtering, and can be combined with a fresh visual
-        // range. Only messages still in the active mailbox may be acted on.
-        for message in &account.messages {
-            if self.message_marked.contains(&message.id) && seen.insert(message.id.clone()) {
-                selected.push(message.id.clone());
-            }
-        }
-        if selected.is_empty() {
-            return account
-                .selected_message()
-                .map(|m| vec![m.id.clone()])
-                .unwrap_or_default();
-        }
-        selected
+        let visible_indices = account.visible_message_indices();
+        let visible = visible_indices.iter().map(|&index| account.messages[index].id.clone()).collect::<Vec<_>>();
+        let all = account.messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        let selected = visible_indices.iter().position(|&index| index == account.message_index).unwrap_or(0);
+        let anchor = self.visual_anchor.and_then(|index| {
+            visible_indices.iter().position(|&candidate| candidate == index)
+        });
+        crate::app::vim::selected(&visible, &all, selected, anchor, &self.message_marked)
     }
 
     /// Snapshot visible names for confirmation. The preview must match the

@@ -662,20 +662,20 @@ impl App {
                 self.status = StatusLine::temporary(message, Duration::from_secs(2));
             }
             WorkerEventKind::DraftSaveFailed { mailbox, error } => {
-                if self.pending_draft_replacement.as_ref().is_some_and(|(index, _)| *index == event.account) {
-                    self.pending_draft_replacement = None;
-                }
+                self.pending_draft_replacements.remove(&(event.account, event.request_id));
                 self.status = StatusLine::error(format!(
                     "saved locally only: uploading to {mailbox} failed ({error}); Ctrl+n resumes"
                 ));
             }
             WorkerEventKind::DraftSaved { mailbox } => {
-                if let Some((index, source)) = self.pending_draft_replacement.take() {
-                    if index == event.account && source.mailbox == mailbox {
-                        let _ = account.worker.post(ActionKind::Delete {
-                            mailbox: source.mailbox, id: source.id,
-                        });
-                    }
+                let mut cleanup_warning = false;
+                if let Some(source) = self.pending_draft_replacements.remove(&(event.account, event.request_id))
+                    && source.mailbox == mailbox
+                {
+                    // A failed DELETE leaves a harmless duplicate draft, never data loss.
+                    cleanup_warning = account.worker.post(ActionKind::Delete {
+                        mailbox: source.mailbox, id: source.id,
+                    }).is_err();
                 }
                 // Refresh cached Drafts on the next visit, or immediately if
                 // the user is already browsing that folder.
@@ -691,9 +691,13 @@ impl App {
                 if account.current_mailbox.as_deref() == Some(mailbox.as_str()) {
                     let _ = account.request_mailbox_page(mailbox.clone(), 0);
                 }
-                self.status = StatusLine::info(format!(
-                    "draft saved in {mailbox}; Ctrl+n resumes editing local recovery copy"
-                ));
+                self.status = if cleanup_warning {
+                    StatusLine::error("draft saved, but old draft cleanup was not queued; check Drafts for duplicates")
+                } else {
+                    StatusLine::info(format!(
+                        "draft saved in {mailbox}; Ctrl+n resumes editing local recovery copy"
+                    ))
+                };
             }
             WorkerEventKind::MessageSent {
                 smtp_status,
@@ -702,7 +706,11 @@ impl App {
                 sent_copy_warning,
                 sent_copy_disabled,
             } => {
-                if let Some(composer) = &self.composer {
+                let completed_current_send = self.pending_send == Some((event.account, event.request_id));
+                if completed_current_send {
+                    self.pending_send = None;
+                }
+                if completed_current_send && let Some(composer) = &self.composer {
                     let mut changed = false;
                     for field in [&composer.to, &composer.cc, &composer.bcc] {
                         for (name, address) in recipients(field) {
@@ -764,7 +772,7 @@ impl App {
                 }
                 Self::pump_mailbox_status(account);
 
-                if event.account == self.account_index
+                if completed_current_send && event.account == self.account_index
                     && let Some(source) = self.composer.as_ref().and_then(|composer| composer.draft_source.clone())
                 {
                     // Retire the server-side draft only after SMTP accepted the
@@ -774,13 +782,13 @@ impl App {
                         id: source.id,
                     });
                 }
-                if self.resumed_draft_account == Some(event.account) {
+                if completed_current_send && self.resumed_draft_account == Some(event.account) {
                     if let Ok(root) = Self::postponed_drafts_root() {
                         let _ = crate::outgoing::drafts::delete_draft(&root, &account.name);
                     }
                     self.resumed_draft_account = None;
                 }
-                if event.account == self.account_index {
+                if completed_current_send && event.account == self.account_index {
                     self.composer = None;
                 }
                 self.status = if let Some(warning) = sent_copy_warning {
@@ -851,10 +859,13 @@ impl App {
                 {
                     self.pending_compose = None;
                 }
-                if event.account == self.account_index
-                    && let Some(composer) = self.composer.as_mut()
-                {
-                    composer.sending = false;
+                let send_failed = self.pending_send == Some((event.account, event.request_id));
+                if send_failed {
+                    self.pending_send = None;
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.sending = false;
+                        composer.confirm_send = false;
+                    }
                 }
                 if (mutation_failed || seen_failed)
                     && let Some(name) = account.current_mailbox.clone()
@@ -866,7 +877,15 @@ impl App {
                 // folder stuck on an unknown count just because one provider
                 // rejects STATUS for a special mailbox.
                 Self::pump_mailbox_status(account);
-                self.status = StatusLine::error(format!("{}: {error}", account.name));
+                self.status = if send_failed {
+                    // A transport error could happen after the SMTP server accepted
+                    // DATA. Never retry automatically: the user must check Sent.
+                    StatusLine::error(format!(
+                        "send failed or status uncertain: {error}; check Sent before retrying (draft retained)"
+                    ))
+                } else {
+                    StatusLine::error(format!("{}: {error}", account.name))
+                };
             }
             WorkerEventKind::Stopped => {}
         }

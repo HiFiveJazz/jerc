@@ -1571,7 +1571,10 @@ pub struct App {
     contacts_save_due: Option<Instant>,
     pending_compose: Option<PendingCompose>,
     pending_draft: Option<PendingDraft>,
-    pending_draft_replacement: Option<(usize, DraftSource)>,
+    /// Draft replacement cleanup is tied to the exact APPEND response.
+    pending_draft_replacements: HashMap<(usize, u64), DraftSource>,
+    /// Only the corresponding SMTP worker response may close the composer.
+    pending_send: Option<(usize, u64)>,
     resumed_draft_account: Option<usize>,
 }
 
@@ -1804,7 +1807,8 @@ impl App {
             contacts_save_due: None,
             pending_compose: None,
             pending_draft: None,
-            pending_draft_replacement: None,
+            pending_draft_replacements: HashMap::new(),
+            pending_send: None,
             resumed_draft_account: None,
         }
     }
@@ -4321,14 +4325,7 @@ fn reply_attribution(message: &MessageSummary) -> String {
 
 /// A range is marked as a group: if fully marked, Space unmarks all of it.
 fn toggle_message_marks(marked: &mut HashSet<MessageId>, ids: &[MessageId]) {
-    let all_marked = ids.iter().all(|id| marked.contains(id));
-    for id in ids {
-        if all_marked {
-            marked.remove(id);
-        } else {
-            marked.insert(id.clone());
-        }
-    }
+    crate::app::vim::toggle_group(marked, ids);
 }
 
 fn bounded_index(current: usize, len: usize, delta: isize) -> usize {
@@ -4385,6 +4382,99 @@ mod tests {
     use ratatui::layout::Size;
     use ratatui::widgets::BorderType;
     use std::path::PathBuf;
+
+    #[test]
+    fn compose_and_contacts_share_unicode_word_motions() {
+        let mut compose = Composer::new();
+        compose.to = "first 😊-second".into();
+        compose.cursor = 0;
+        compose.move_word_kind(false, true);
+        let mut contact = ContactEdit::new(None);
+        contact.name = compose.to.clone();
+        contact.cursor = 0;
+        contact.move_word(true);
+        assert_eq!(compose.cursor, contact.cursor);
+        compose.move_word_kind(true, true);
+        contact.move_word(false);
+        assert_eq!(compose.cursor, contact.cursor);
+        assert_eq!(contact.cursor, 0);
+    }
+
+    #[test]
+    fn unrelated_worker_failure_cannot_unlock_or_discard_an_inflight_send() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+        use crate::worker::{WorkerEvent, WorkerEventKind, RuntimeEvent, WorkerHandle};
+        let root = tempfile::tempdir().unwrap();
+        let (tx, rx) = sync_channel(16);
+        let worker = WorkerHandle::spawn(
+            0,
+            Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+            None,
+            None, // Fail SMTP deliberately: never reach a network relay.
+            tx,
+        );
+        let config: crate::config::Config = toml::from_str(
+            "[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\"\noutgoing = \"sendmail:///usr/sbin/sendmail\"\nfrom = \"sender@example.org\""
+        ).unwrap();
+        let mut app = super::App::new(&config, vec![worker]);
+        let mut composer = Composer::new();
+        composer.to = "friend@example.net".into();
+        composer.subject = "Don't lose this".into();
+        composer.body = "Unsent private message".into();
+        app.composer = Some(composer);
+        app.send_composer();
+        let (account_id, send_id) = app.pending_send.expect("send queued");
+        assert_eq!(account_id, 0);
+        assert!(app.composer.as_ref().unwrap().sending);
+        app.handle_worker_event(WorkerEvent {
+            account: 0,
+            request_id: send_id.saturating_add(1000),
+            kind: WorkerEventKind::Error("unrelated mailbox error".into()),
+        });
+        assert!(app.composer.as_ref().unwrap().sending, "unrelated error cannot end a send");
+        assert_eq!(app.pending_send, Some((account_id, send_id)));
+        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("expected worker response");
+        };
+        assert_eq!(event.request_id, send_id);
+        app.handle_worker_event(event);
+        assert!(app.pending_send.is_none());
+        let composer = app.composer.as_ref().expect("unsent composer preserved");
+        assert!(!composer.sending);
+        assert_eq!(composer.body, "Unsent private message");
+        assert_eq!(composer.to, "friend@example.net");
+    }
+
+    #[test]
+    fn draft_replacement_failure_only_clears_matching_append_request() {
+        use std::sync::mpsc::sync_channel;
+        use crate::worker::{WorkerEvent, WorkerEventKind, WorkerHandle};
+        let root = tempfile::tempdir().unwrap();
+        let (tx, _rx) = sync_channel(8);
+        let worker = WorkerHandle::spawn(
+            0, Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+            None, None, tx,
+        );
+        let config: crate::config::Config = toml::from_str(
+            "[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\""
+        ).unwrap();
+        let mut app = super::App::new(&config, vec![worker]);
+        let source = super::DraftSource {
+            mailbox: "Drafts".into(), id: MessageId("original".into()),
+        };
+        app.pending_draft_replacements.insert((0, 10), source.clone());
+        app.pending_draft_replacements.insert((0, 11), source);
+        app.handle_worker_event(WorkerEvent {
+            account: 0,
+            request_id: 10,
+            kind: WorkerEventKind::DraftSaveFailed {
+                mailbox: "Drafts".into(), error: "offline".into(),
+            },
+        });
+        assert!(!app.pending_draft_replacements.contains_key(&(0, 10)));
+        assert!(app.pending_draft_replacements.contains_key(&(0, 11)));
+    }
 
     #[test]
     fn rounded_borders_apply_to_every_theme() {

@@ -1,5 +1,6 @@
 mod input;
 mod state;
+pub(crate) mod vim;
 
 pub use input::{
     ATTACHMENT_HELP_ENTRIES, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, Command, Focus,

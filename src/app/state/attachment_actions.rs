@@ -545,18 +545,15 @@ impl App {
             }
             KeyCode::Char(' ') => {
                 if let Some(anchor) = self.attachment_visual_anchor.take() {
-                    let (start, end) = (
-                        anchor.min(self.attachment_selection),
-                        anchor.max(self.attachment_selection),
-                    );
-                    for index in start..=end {
-                        self.attachment_marked.insert(index);
+                    let first = anchor.min(self.attachment_selection);
+                    let last = anchor.max(self.attachment_selection).min(self.attachment_files.len().saturating_sub(1));
+                    if !self.attachment_files.is_empty() {
+                        let indices = (first..=last).collect::<Vec<_>>();
+                        crate::app::vim::toggle_group(&mut self.attachment_marked, &indices);
                     }
                 } else if !self.attachment_files.is_empty() {
                     let index = self.attachment_selection;
-                    if !self.attachment_marked.insert(index) {
-                        self.attachment_marked.remove(&index);
-                    }
+                    crate::app::vim::toggle_group(&mut self.attachment_marked, &[index]);
                     self.move_attachment_selection(index + 1);
                 }
             }
@@ -638,21 +635,12 @@ impl App {
     /// All rows the attachment picker currently displays as selected.
     /// Visual selections are actionable without an extra Space-to-mark step.
     pub(crate) fn selected_attachment_indices(&self) -> Vec<usize> {
-        let total = self.attachment_files.len();
-        let mut indices = self
-            .attachment_marked
-            .iter()
-            .copied()
-            .filter(|&index| index < total)
-            .collect::<Vec<_>>();
-        if let Some(anchor) = self.attachment_visual_anchor.filter(|_| total > 0) {
-            let cursor = self.attachment_selection.min(total - 1);
-            indices.extend(anchor.min(cursor)..=anchor.max(cursor).min(total - 1));
-        } else if indices.is_empty() && total > 0 {
-            indices.push(self.attachment_selection.min(total - 1));
-        }
+        let all = (0..self.attachment_files.len()).collect::<Vec<_>>();
+        let mut indices = crate::app::vim::selected(
+            &all, &all, self.attachment_selection,
+            self.attachment_visual_anchor, &self.attachment_marked,
+        );
         indices.sort_unstable();
-        indices.dedup();
         indices
     }
 

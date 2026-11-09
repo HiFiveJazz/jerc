@@ -358,14 +358,11 @@ impl App {
                             anchor.min(composer.attachment_manager_selected),
                             anchor.max(composer.attachment_manager_selected),
                         );
-                        for index in first..=last {
-                            composer.attachment_manager_marked.insert(index);
-                        }
+                        let indices = (first..=last).collect::<Vec<_>>();
+                        crate::app::vim::toggle_group(&mut composer.attachment_manager_marked, &indices);
                     } else {
                         let index = composer.attachment_manager_selected;
-                        if !composer.attachment_manager_marked.insert(index) {
-                            composer.attachment_manager_marked.remove(&index);
-                        }
+                        crate::app::vim::toggle_group(&mut composer.attachment_manager_marked, &[index]);
                         composer.attachment_manager_selected = index
                             .saturating_add(1)
                             .min(composer.attachment_count().saturating_sub(1));
@@ -893,7 +890,7 @@ impl App {
             .iter()
             .find(|mailbox| mailbox.role == MailboxRole::Drafts)
             .map(|mailbox| mailbox.name.clone());
-        let draft_queued = if let Some(mailbox) = draft_mailbox {
+        let draft_request = if let Some(mailbox) = draft_mailbox {
             let message = match outgoing_from_composer(composer, &account.from) {
                 Ok(message) => message,
                 Err(error) => {
@@ -903,30 +900,26 @@ impl App {
                     return;
                 }
             };
-            if self.account().is_some_and(|account| {
-                account
-                    .worker
-                    .post(ActionKind::SaveDraft { message, mailbox })
-                    .is_ok()
+            match self.account().and_then(|account| {
+                account.worker.post(ActionKind::SaveDraft { message, mailbox }).ok()
             }) {
-                true
-            } else {
-                self.status = StatusLine::error(
-                    "saved local recovery copy; Drafts worker is busy (Ctrl+n resumes)",
-                );
-                return;
+                Some(request_id) => Some(request_id),
+                None => {
+                    self.status = StatusLine::error(
+                        "saved local recovery copy; Drafts worker is busy (Ctrl+n resumes)",
+                    );
+                    return;
+                }
             }
-        } else {
-            false
-        };
-        self.pending_draft_replacement = if draft_queued {
-            composer.draft_source.clone().map(|source| (self.account_index, source))
         } else {
             None
         };
+        if let (Some(request_id), Some(source)) = (draft_request, composer.draft_source.clone()) {
+            self.pending_draft_replacements.insert((self.account_index, request_id), source);
+        }
         self.composer = None;
         self.resumed_draft_account = None;
-        self.status = if draft_queued {
+        self.status = if draft_request.is_some() {
             StatusLine::info("saved local recovery copy; saving to Drafts folder…")
         } else {
             StatusLine::error("saved locally only: no Drafts mailbox found; Ctrl+n resumes")
@@ -997,21 +990,29 @@ impl App {
             .iter()
             .find(|mailbox| mailbox.role == MailboxRole::Sent)
             .map(|mailbox| mailbox.name.clone());
-        if account
-            .worker
-            .post(ActionKind::Send {
-                message,
-                sent_mailbox,
-                copy_to,
-            })
-            .is_ok()
-        {
-            if let Some(composer) = self.composer.as_mut() {
-                composer.sending = true;
+        // Validate the entire wire format BEFORE putting a send on the worker:
+        // headers, MIME, attachments, and SMTP envelope must all be buildable.
+        // Invalid mail remains editable and is never submitted to the relay.
+        if let Err(error) = crate::outgoing::build_outgoing(&message, &account.from) {
+            self.status = StatusLine::error(format!("cannot prepare outgoing email: {error:#}"));
+            return;
+        }
+        match account.worker.post(ActionKind::Send {
+            message,
+            sent_mailbox,
+            copy_to,
+        }) {
+            Ok(request_id) => {
+                self.pending_send = Some((self.account_index, request_id));
+                if let Some(composer) = self.composer.as_mut() {
+                    composer.sending = true;
+                }
+                self.status = StatusLine::info("sending message…");
             }
-            self.status = StatusLine::info("sending message…");
-        } else {
-            self.status = StatusLine::error("mail worker queue is busy; message was not sent");
+            Err(_) => {
+                // An enqueue failure definitely did not send; retain the draft.
+                self.status = StatusLine::error("mail worker queue is busy; message was not sent");
+            }
         }
     }
 }

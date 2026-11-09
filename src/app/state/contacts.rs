@@ -242,8 +242,8 @@ impl App {
             }
             if editor.mode == ComposeMode::Insert {
                 match key.code {
-                    KeyCode::Left => editor.cursor = editor.cursor.saturating_sub(1),
-                    KeyCode::Right => editor.cursor = (editor.cursor + 1).min(editor.value().chars().count()),
+                    KeyCode::Left => editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), -1),
+                    KeyCode::Right => editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), 1),
                     KeyCode::Home => editor.cursor = 0,
                     KeyCode::End => editor.cursor = editor.value().chars().count(),
                     KeyCode::Backspace => editor.backspace(),
@@ -319,9 +319,9 @@ impl App {
             }
             match key.code {
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
-                    editor.cursor = editor.cursor.saturating_sub(1);
+                    editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), -1);
                 }
-                KeyCode::Char('l') | KeyCode::Right => editor.cursor = (editor.cursor + 1).min(editor.value().chars().count()),
+                KeyCode::Char('l') | KeyCode::Right => editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), 1),
                 KeyCode::Char('w' | 'e') => editor.move_word(true),
                 KeyCode::Char('b') => editor.move_word(false),
                 KeyCode::Char('0' | 'H') | KeyCode::Home => editor.cursor = 0,

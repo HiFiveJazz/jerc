@@ -807,9 +807,7 @@ impl Composer {
     }
 
     pub(super) fn byte_index(text: &str, char_index: usize) -> usize {
-        text.char_indices()
-            .nth(char_index)
-            .map_or(text.len(), |(index, _)| index)
+        crate::app::vim::byte_offset(text, char_index)
     }
 
     pub(super) fn insert_char(&mut self, ch: char) {
@@ -861,10 +859,7 @@ impl Composer {
     pub(super) fn move_horizontal(&mut self, delta: isize) {
         self.body_smooth_target = None;
         self.body_preferred_column = None;
-        self.cursor = self
-            .cursor
-            .saturating_add_signed(delta)
-            .min(self.char_count());
+        self.cursor = crate::app::vim::horizontal(self.cursor, self.char_count(), delta);
     }
 
     pub(crate) fn body_rows(&self) -> Vec<ComposeBodyRow> {
@@ -994,33 +989,7 @@ impl Composer {
     }
 
     pub(super) fn move_word_kind(&mut self, backwards: bool, whole: bool) {
-        let chars: Vec<char> = self.field_value().chars().collect();
-        let belongs = |ch: char| {
-            if whole {
-                !ch.is_whitespace()
-            } else {
-                ch.is_alphanumeric() || ch == '_'
-            }
-        };
-        if backwards {
-            let mut i = self.cursor.min(chars.len());
-            while i > 0 && !belongs(chars[i - 1]) {
-                i -= 1;
-            }
-            while i > 0 && belongs(chars[i - 1]) {
-                i -= 1;
-            }
-            self.cursor = i;
-        } else {
-            let mut i = self.cursor.min(chars.len());
-            while i < chars.len() && belongs(chars[i]) {
-                i += 1;
-            }
-            while i < chars.len() && !belongs(chars[i]) {
-                i += 1;
-            }
-            self.cursor = i;
-        }
+        self.cursor = crate::app::vim::word_start(self.field_value(), self.cursor, backwards, whole);
     }
 
     pub(super) fn move_word_end(&mut self, whole: bool) {
