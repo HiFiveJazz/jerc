@@ -361,11 +361,11 @@ impl ComposeFilePicker {
             self.refresh()?;
             return Err(error);
         }
-        if self.directory == previous.parent().unwrap_or(Path::new("")) {
-            if let Some(index) = self.entries.iter().position(|entry| entry.path == previous) {
-                self.selected = index;
-                self.refresh_preview();
-            }
+        if self.directory == previous.parent().unwrap_or(Path::new(""))
+            && let Some(index) = self.entries.iter().position(|entry| entry.path == previous)
+        {
+            self.selected = index;
+            self.refresh_preview();
         }
         Ok(())
     }

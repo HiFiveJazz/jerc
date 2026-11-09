@@ -21,8 +21,7 @@ pub(super) fn draw_help(frame: &mut Frame<'_>, app: &App) {
         entries,
         &app.help_query,
         &matches,
-        app.help_selected,
-        app.help_scroll,
+        (app.help_selected, app.help_scroll),
     );
 }
 
@@ -48,9 +47,9 @@ pub(super) fn draw_help_palette(
     entries: &[HelpEntry],
     query: &str,
     matches: &[usize],
-    selected: usize,
-    scroll: usize,
+    navigation: (usize, usize),
 ) {
+    let (selected, scroll) = navigation;
     let area = centered_rect(frame.area(), 86, 70);
     frame.render_widget(Clear, area);
     let block = Block::default()

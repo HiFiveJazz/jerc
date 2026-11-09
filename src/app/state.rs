@@ -431,7 +431,7 @@ pub struct ComposeFilePicker {
     /// No more than two PDF converters may run simultaneously.
     pdf_preview_inflight: HashSet<PathBuf>,
     /// Worker threads only put completed conversions here; never touch UI state.
-    pdf_preview_results: Arc<Mutex<VecDeque<(PathBuf, Result<Vec<u8>, String>)>>>,
+    pdf_preview_results: Arc<Mutex<VecDeque<PdfPreviewResult>>>,
     /// Small in-memory cache prevents repeated PDF conversion on cursor reversals.
     pdf_preview_cache: VecDeque<(PathBuf, Result<Vec<u8>, String>)>,
 }
@@ -1335,21 +1335,28 @@ pub struct DetachConfirmation {
     pub review: ReviewScroll,
 }
 
+type PdfPreviewResult = (PathBuf, Result<Vec<u8>, String>);
+type AttachmentCacheEntry = (
+    (usize, String, Option<u32>, MessageId),
+    Arc<Vec<OutgoingAttachment>>,
+);
+type AttachmentPreviewResult = (usize, Result<image::DynamicImage, String>);
+
 struct ReaderImage {
     source: String,
     protocol: Protocol,
 }
 
 fn reader_image_target_size(
-    native_width: u32,
-    native_height: u32,
-    html_width: Option<u32>,
-    html_height: Option<u32>,
-    font_width: u16,
-    font_height: u16,
-    max_width_cells: u16,
-    max_height_cells: u16,
+    native: (u32, u32),
+    html: (Option<u32>, Option<u32>),
+    font: (u16, u16),
+    max_cells: (u16, u16),
 ) -> Size {
+    let (native_width, native_height) = native;
+    let (html_width, html_height) = html;
+    let (font_width, font_height) = font;
+    let (max_width_cells, max_height_cells) = max_cells;
     let native_width = native_width.max(1);
     let native_height = native_height.max(1);
     let font_width = u32::from(font_width.max(1));
@@ -1476,10 +1483,7 @@ pub struct App {
     // browser instantaneous instead of refetching the entire raw email.
     // Include UIDVALIDITY to avoid reusing a recycled IMAP UID.
     attachment_source: Option<(usize, String, Option<u32>, MessageId)>,
-    attachment_cache: VecDeque<(
-        (usize, String, Option<u32>, MessageId),
-        Arc<Vec<OutgoingAttachment>>,
-    )>,
+    attachment_cache: VecDeque<AttachmentCacheEntry>,
     pub attachment_marked: HashSet<usize>,
     pub attachment_visual_anchor: Option<usize>,
     pub attachment_save_directory: Option<String>, // legacy path field, no longer used by save UI
@@ -1491,7 +1495,7 @@ pub struct App {
     attachment_smooth_target: Option<usize>,
     attachment_preview_due: Option<(usize, Instant)>,
     attachment_preview_inflight: HashSet<usize>,
-    attachment_preview_results: Arc<Mutex<VecDeque<(usize, Result<image::DynamicImage, String>)>>>,
+    attachment_preview_results: Arc<Mutex<VecDeque<AttachmentPreviewResult>>>,
     attachment_preview_cache: VecDeque<(usize, Result<image::DynamicImage, String>)>,
     attachment_pending: Option<MessageId>,
     attachment_preview: Option<Protocol>,
@@ -1953,17 +1957,18 @@ impl App {
                 wizard.begin_authentication();
                 std::thread::spawn(move || {
                     let name = account.name.clone();
-                    let result = crate::oauth::login_account_quiet(&[account.clone()], &name)
-                        .and_then(|()| {
-                            let settings = crate::oauth::OAuthSettings::for_account(&account)?
-                                .ok_or_else(|| anyhow::anyhow!("OAuth is not configured"))?;
-                            if settings.provider == "microsoft" {
-                                settings.suggested_login_username()
-                            } else {
-                                Ok(None)
-                            }
-                        })
-                        .map_err(|error| format!("{}", error.root_cause()));
+                    let result =
+                        crate::oauth::login_account_quiet(std::slice::from_ref(&account), &name)
+                            .and_then(|()| {
+                                let settings = crate::oauth::OAuthSettings::for_account(&account)?
+                                    .ok_or_else(|| anyhow::anyhow!("OAuth is not configured"))?;
+                                if settings.provider == "microsoft" {
+                                    settings.suggested_login_username()
+                                } else {
+                                    Ok(None)
+                                }
+                            })
+                            .map_err(|error| format!("{}", error.root_cause()));
                     let _ = sender.send(RuntimeEvent::SetupLoginFinished(result));
                 });
             }
@@ -2472,12 +2477,12 @@ impl App {
                 } else if self.message_open {
                     self.close_message();
                 } else {
-                    if let Some(account) = self.account_mut() {
-                        if !account.search_query.is_empty() {
-                            account.search_query.clear();
-                            account.search_editing = false;
-                            account.normalize_search_selection();
-                        }
+                    if let Some(account) = self.account_mut()
+                        && !account.search_query.is_empty()
+                    {
+                        account.search_query.clear();
+                        account.search_editing = false;
+                        account.normalize_search_selection();
                     }
                     self.focus = Focus::Messages;
                 }
@@ -2582,11 +2587,11 @@ impl App {
             modal.advance(length);
             return;
         }
-        if let Some(composer) = self.composer.as_mut() {
-            if composer.body_smooth_target.is_some() {
-                composer.advance_body_smooth_scroll();
-                return;
-            }
+        if let Some(composer) = self.composer.as_mut()
+            && composer.body_smooth_target.is_some()
+        {
+            composer.advance_body_smooth_scroll();
+            return;
         }
         if self.attachment_picker_visible {
             if let Some(picker) = &mut self.attachment_destination_picker {
@@ -3098,12 +3103,10 @@ impl App {
                         && usize::from(mouse.row - list_y) < list_height
                         && !wizard.authenticating
                         && !wizard.discovering
-                    {
-                        if let Some(crate::setup::SetupDisplayRow::Field(field)) =
+                        && let Some(crate::setup::SetupDisplayRow::Field(field)) =
                             rows.get(first + usize::from(mouse.row - list_y))
-                        {
-                            wizard.selected = *field;
-                        }
+                    {
+                        wizard.selected = *field;
                     }
                     // The last interior row presents the primary Continue action.
                     let button_y = if wizard.saved {
@@ -3230,37 +3233,31 @@ impl App {
                 match mouse.kind {
                     MouseEventKind::ScrollDown => picker.move_selection(3),
                     MouseEventKind::ScrollUp => picker.move_selection(-3),
-                    MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
+                    MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left)
                         if mouse.column >= files.x
                             && mouse.column < files.right()
                             && mouse.row >= files.y
-                            && mouse.row < files.bottom()
-                        {
-                            let visible = usize::from(files.height);
-                            let start = picker
-                                .selected
-                                .saturating_sub(visible / 2)
-                                .min(picker.entries.len().saturating_sub(visible));
-                            let next = start
-                                .saturating_add(usize::from(mouse.row - files.y))
-                                .min(picker.entries.len().saturating_sub(1));
-                            let already_selected = next == picker.selected;
-                            if !already_selected {
-                                picker.selected = next;
-                                picker.refresh_preview();
-                            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                            && mouse.row < files.bottom() =>
+                    {
+                        let visible = usize::from(files.height);
+                        let start = picker
+                            .selected
+                            .saturating_sub(visible / 2)
+                            .min(picker.entries.len().saturating_sub(visible));
+                        let next = start
+                            .saturating_add(usize::from(mouse.row - files.y))
+                            .min(picker.entries.len().saturating_sub(1));
+                        let already_selected = next == picker.selected;
+                        if !already_selected {
+                            picker.selected = next;
+                            picker.refresh_preview();
+                        } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                            // Hover selects; clicking a selected folder enters it.
+                            if let Some(entry) = picker.entries.get(next)
+                                && entry.is_directory
+                                && let Err(error) = picker.enter_directory(entry.path.clone())
                             {
-                                // Hover selects; clicking a selected folder enters it.
-                                if let Some(entry) = picker.entries.get(next) {
-                                    if entry.is_directory {
-                                        if let Err(error) =
-                                            picker.enter_directory(entry.path.clone())
-                                        {
-                                            self.status =
-                                                StatusLine::error(format!("file browser: {error}"));
-                                        }
-                                    }
-                                }
+                                self.status = StatusLine::error(format!("file browser: {error}"));
                             }
                         }
                     }
@@ -3440,14 +3437,10 @@ impl App {
         };
         if let Ok(image) = image::load_from_memory(bytes) {
             let target = reader_image_target_size(
-                image.width(),
-                image.height(),
-                None,
-                None,
-                picker.font_size().width,
-                picker.font_size().height,
-                width.max(1),
-                height.max(1),
+                (image.width(), image.height()),
+                (None, None),
+                (picker.font_size().width, picker.font_size().height),
+                (width.max(1), height.max(1)),
             );
             self.compose_file_preview_image = picker
                 .new_protocol(
@@ -3548,14 +3541,13 @@ impl App {
             Ok(image) => {
                 let font_size = picker.font_size();
                 let target = reader_image_target_size(
-                    image.width(),
-                    image.height(),
-                    size_hint.0,
-                    size_hint.1,
-                    font_size.width,
-                    font_size.height,
-                    self.reader_image_target_width,
-                    self.reader_image_target_height,
+                    (image.width(), image.height()),
+                    (size_hint.0, size_hint.1),
+                    (font_size.width, font_size.height),
+                    (
+                        self.reader_image_target_width,
+                        self.reader_image_target_height,
+                    ),
                 );
                 match picker.new_protocol(
                     image,
@@ -3877,10 +3869,7 @@ fn decode_received_attachment_preview(
 }
 
 fn attachment_safe_name(name: &str, index: usize) -> String {
-    let basename = name
-        .rsplit(|ch| ch == '/' || ch == '\\')
-        .next()
-        .unwrap_or("");
+    let basename = name.rsplit(['/', '\\']).next().unwrap_or("");
     let safe = basename
         .chars()
         .filter(|ch| !ch.is_control() && *ch != '/' && *ch != '\\')
@@ -4184,7 +4173,9 @@ fn inner_text_object_range(text: &str, column: usize, delimiter: char) -> Option
             .filter_map(|(index, ch)| (*ch == open).then_some(index))
             .collect::<Vec<_>>();
         positions
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter_map(|pair| {
                 let start = pair[0];
                 let end = pair[1];
@@ -4223,11 +4214,16 @@ fn reader_selection_text(text: &str, selection: ReaderSelection) -> String {
     }
     let end_line = selection.end.line.min(lines.len().saturating_sub(1));
     let mut out = String::new();
-    for line_index in selection.start.line..=end_line {
+    for (line_index, line) in lines
+        .iter()
+        .enumerate()
+        .take(end_line + 1)
+        .skip(selection.start.line)
+    {
         if line_index > selection.start.line {
             out.push('\n');
         }
-        let chars = lines[line_index].chars().collect::<Vec<_>>();
+        let chars = line.chars().collect::<Vec<_>>();
         if chars.is_empty() {
             continue;
         }
@@ -4269,7 +4265,7 @@ fn url_at_cursor(line: &str, column: usize) -> Option<String> {
             '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\'' | '"' | ',' | ';'
         )
     });
-    let token = token.trim_end_matches(|ch: char| matches!(ch, '.' | ':' | '!' | '?'));
+    let token = token.trim_end_matches(['.', ':', '!', '?']);
     (token.starts_with("https://") || token.starts_with("http://")).then(|| token.to_owned())
 }
 
@@ -4498,8 +4494,10 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
         let mut app = super::App::new(&config, vec![]);
-        let mut modal = crate::contacts::ContactsModal::default();
-        modal.visual_anchor = Some(0);
+        let mut modal = crate::contacts::ContactsModal {
+            visual_anchor: Some(0),
+            ..Default::default()
+        };
         modal.marked.insert("person@example.com".into());
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.handle_contacts_modal_key(&mut modal, escape));
@@ -5583,13 +5581,13 @@ mod tests {
         // A typical 2x email logo should use its full backing bitmap instead of
         // being rendered at half-size just because HTML declares the CSS size.
         assert_eq!(
-            reader_image_target_size(148, 48, Some(74), Some(24), 8, 16, 120, 40),
+            reader_image_target_size((148, 48), (Some(74), Some(24)), (8, 16), (120, 40),),
             Size::new(19, 3)
         );
 
         // A genuine 1x asset is still capped at native size and never upscaled.
         assert_eq!(
-            reader_image_target_size(74, 24, Some(300), Some(100), 8, 16, 120, 40),
+            reader_image_target_size((74, 24), (Some(300), Some(100)), (8, 16), (120, 40),),
             Size::new(10, 2)
         );
     }
@@ -5597,11 +5595,11 @@ mod tests {
     #[test]
     fn reader_images_use_full_reader_bounds_instead_of_legacy_caps() {
         assert_eq!(
-            reader_image_target_size(1200, 600, None, None, 8, 16, 120, 40),
+            reader_image_target_size((1200, 600), (None, None), (8, 16), (120, 40),),
             Size::new(120, 38)
         );
         assert_eq!(
-            reader_image_target_size(2400, 1600, None, None, 8, 16, 90, 30),
+            reader_image_target_size((2400, 1600), (None, None), (8, 16), (90, 30),),
             Size::new(90, 30)
         );
     }

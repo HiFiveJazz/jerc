@@ -59,26 +59,26 @@ impl Composer {
     pub(super) fn reply(message: &MessageSummary, body: Option<&MessageBody>, quote: bool) -> Self {
         let subject = reply_subject(&message.subject);
         let mut references = message.references.clone();
-        if let Some(id) = &message.message_id {
-            if references.last() != Some(id) {
-                references.push(id.clone());
-            }
+        if let Some(id) = &message.message_id
+            && references.last() != Some(id)
+        {
+            references.push(id.clone());
         }
-        let quoted = quote
-            .then(|| {
-                body.map_or_else(String::new, |body| {
-                    // quoted replies use the message's textual representation,
-                    // not the rich reader projection. HTML-only messages already
-                    // have a generated plain fallback, so this stays readable while
-                    // avoiding table chrome/image placeholders in mailing-list replies.
-                    body.display_text(false)
-                        .lines()
-                        .map(|line| format!("> {line}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
+        let quoted = if quote {
+            body.map_or_else(String::new, |body| {
+                // quoted replies use the message's textual representation,
+                // not the rich reader projection. HTML-only messages already
+                // have a generated plain fallback, so this stays readable while
+                // avoiding table chrome/image placeholders in mailing-list replies.
+                body.display_text(false)
+                    .lines()
+                    .map(|line| format!("> {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             })
-            .unwrap_or_default();
+        } else {
+            String::new()
+        };
         let body = if quoted.is_empty() {
             "\n\n".to_owned()
         } else {
@@ -401,10 +401,10 @@ impl Composer {
                     picker.update_search_selection();
                 }
                 KeyCode::Tab | KeyCode::Right => {
-                    if let Some(entry) = picker.entries.get(picker.selected) {
-                        if entry.is_directory {
-                            picker.enter_directory(entry.path.clone())?;
-                        }
+                    if let Some(entry) = picker.entries.get(picker.selected)
+                        && entry.is_directory
+                    {
+                        picker.enter_directory(entry.path.clone())?;
                     }
                 }
                 KeyCode::Char(ch) => {
@@ -529,10 +529,10 @@ impl Composer {
                 picker.refresh()?;
             }
             KeyCode::Char('l') | KeyCode::Right if picker.visual_anchor.is_none() => {
-                if let Some(entry) = picker.entries.get(picker.selected) {
-                    if entry.is_directory {
-                        picker.enter_directory(entry.path.clone())?;
-                    }
+                if let Some(entry) = picker.entries.get(picker.selected)
+                    && entry.is_directory
+                {
+                    picker.enter_directory(entry.path.clone())?;
                 }
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
@@ -1185,5 +1185,11 @@ impl Composer {
         } else {
             (cursor, anchor.saturating_add(1).min(self.char_count()))
         })
+    }
+}
+
+impl Default for Composer {
+    fn default() -> Self {
+        Self::new()
     }
 }

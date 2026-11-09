@@ -336,9 +336,7 @@ pub fn mailbox_is_excluded(name: &str, patterns: &[String]) -> bool {
                     }
                 }
                 '?' => {
-                    for i in 1..=chars.len() {
-                        next[i] = matched[i - 1];
-                    }
+                    next[1..].copy_from_slice(&matched[..chars.len()]);
                 }
                 literal => {
                     for i in 1..=chars.len() {
@@ -520,13 +518,12 @@ impl AccountConfig {
             ("imap_username", self.imap_username.as_deref()),
             ("smtp_username", self.smtp_username.as_deref()),
         ] {
-            if let Some(username) = value {
-                if username.trim().is_empty()
+            if let Some(username) = value
+                && (username.trim().is_empty()
                     || username != username.trim()
-                    || username.chars().any(char::is_control)
-                {
-                    return Err(anyhow!("{label} must be a nonempty single-line login name"));
-                }
+                    || username.chars().any(char::is_control))
+            {
+                return Err(anyhow!("{label} must be a nonempty single-line login name"));
             }
         }
         let preset = email.and_then(|email| MailPreset::for_account(self, email));

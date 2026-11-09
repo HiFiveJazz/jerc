@@ -238,7 +238,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Constraint::Min(12),
         Constraint::Length(6),
     ];
-    let column_areas = Layout::horizontal(message_columns.clone())
+    let column_areas = Layout::horizontal(message_columns)
         .spacing(1)
         .split(list_area);
     // Use the actual subject width to preserve wide emoji graphemes.

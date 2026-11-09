@@ -38,7 +38,7 @@ pub(crate) fn attachment_regions(
     ratatui::layout::Rect,
 ) {
     use ratatui::layout::Rect;
-    let width = viewport.width.saturating_sub(2).min(116).max(1);
+    let width = viewport.width.saturating_sub(2).clamp(1, 116);
     let height = (u32::from(viewport.height) * 86 / 100) as u16;
     let height = height.max(5).min(viewport.height.max(1));
     let popup = Rect::new(
@@ -88,7 +88,7 @@ pub(crate) fn attachment_destination_regions(
     ratatui::layout::Rect,
 ) {
     use ratatui::layout::Rect;
-    let width = viewport.width.saturating_sub(4).min(110).max(1);
+    let width = viewport.width.saturating_sub(4).clamp(1, 110);
     let height = (u32::from(viewport.height) * 82 / 100) as u16;
     let height = height.max(7).min(viewport.height.max(1));
     let popup = Rect::new(

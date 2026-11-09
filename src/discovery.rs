@@ -160,7 +160,7 @@ fn valid_domain(domain: &str) -> bool {
         })
         && domain
             .split('.')
-            .last()
+            .next_back()
             .is_some_and(|label| label.len() >= 2 && label.bytes().all(|b| b.is_ascii_alphabetic()))
 }
 
@@ -540,30 +540,28 @@ pub fn discover_with_provider(email: &str, provider: &str) -> Result<MailConfigu
 
     // Check whether a generic mail host ISPDB entry explains the domain,
     // before resorting to provider-specific guesses.
-    if let Some(mx) = mxes.first() {
-        if let Some(base) = mx_base_domain(mx) {
-            if base != domain {
-                let source = "Thunderbird ISPDB (MX-hosted provider)";
-                let attempt = (|| -> Result<MailConfiguration> {
-                    let url =
-                        Url::parse(&format!("https://autoconfig.thunderbird.net/v1.1/{base}"))?;
-                    let mut response = agent
-                        .get(url.as_str())
-                        .call()
-                        .context("fetching MX ISPDB XML")?;
-                    let xml = response
-                        .body_mut()
-                        .with_config()
-                        .limit(MAX_XML_BYTES)
-                        .read_to_string()
-                        .context("reading bounded MX ISPDB XML")?;
-                    parse_autoconfig_with_domain(email, &xml, source, Some(&base))
-                })();
-                match attempt {
-                    Ok(config) => return Ok(config),
-                    Err(error) => failures.push(format!("MX-derived ISPDB ({base}): {error:#}")),
-                }
-            }
+    if let Some(mx) = mxes.first()
+        && let Some(base) = mx_base_domain(mx)
+        && base != domain
+    {
+        let source = "Thunderbird ISPDB (MX-hosted provider)";
+        let attempt = (|| -> Result<MailConfiguration> {
+            let url = Url::parse(&format!("https://autoconfig.thunderbird.net/v1.1/{base}"))?;
+            let mut response = agent
+                .get(url.as_str())
+                .call()
+                .context("fetching MX ISPDB XML")?;
+            let xml = response
+                .body_mut()
+                .with_config()
+                .limit(MAX_XML_BYTES)
+                .read_to_string()
+                .context("reading bounded MX ISPDB XML")?;
+            parse_autoconfig_with_domain(email, &xml, source, Some(&base))
+        })();
+        match attempt {
+            Ok(config) => return Ok(config),
+            Err(error) => failures.push(format!("MX-derived ISPDB ({base}): {error:#}")),
         }
     }
     if let Some(kind) = provider_hint {

@@ -542,16 +542,16 @@ impl App {
                 self.flush_contacts(true);
                 modal.edit = None;
                 modal.matches = self.contacts.filtered(&modal.query);
-                if let Some(old) = editor.original_email.as_deref() {
-                    if modal.marked.remove(&old.to_ascii_lowercase()) {
-                        modal.marked.insert(editor.email.to_ascii_lowercase());
-                    }
+                if let Some(old) = editor.original_email.as_deref()
+                    && modal.marked.remove(&old.to_ascii_lowercase())
+                {
+                    modal.marked.insert(editor.email.to_ascii_lowercase());
                 }
                 modal.visual_anchor = None;
-                if let Some(id) = self.contacts.find(&editor.email) {
-                    if let Some(position) = modal.matches.iter().position(|i| *i == id) {
-                        modal.selected = position;
-                    }
+                if let Some(id) = self.contacts.find(&editor.email)
+                    && let Some(position) = modal.matches.iter().position(|i| *i == id)
+                {
+                    modal.selected = position;
                 }
                 modal.ensure_visible(modal.matches.len());
                 self.status = StatusLine::temporary("contact saved", Duration::from_secs(2));

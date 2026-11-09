@@ -144,13 +144,11 @@ pub(super) fn reader_header_lines(
             }),
         ]));
     }
-    if show_details {
-        if let Some(message_id) = &message.message_id {
-            lines.push(Line::from(vec![
-                Span::styled("Message-ID: ", theme.accent()),
-                Span::raw(format!("<{message_id}>")),
-            ]));
-        }
+    if show_details && let Some(message_id) = &message.message_id {
+        lines.push(Line::from(vec![
+            Span::styled("Message-ID: ", theme.accent()),
+            Span::raw(format!("<{message_id}>")),
+        ]));
     }
     lines
 }
@@ -316,11 +314,13 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             line_index,
                             body_line_count,
                             body_width,
-                            reader_cursor,
-                            reader_column,
-                            reader_visual,
-                            reader_active,
-                            &theme,
+                            ReaderView {
+                                cursor: reader_cursor,
+                                column: reader_column,
+                                visual: reader_visual,
+                                active: reader_active,
+                                theme: &theme,
+                            },
                             diff_lines[line_index],
                             reader_illuminate.as_deref(),
                         )
@@ -335,11 +335,13 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             line_index,
                             body_line_count,
                             body_width,
-                            reader_cursor,
-                            reader_column,
-                            reader_visual,
-                            reader_active,
-                            &theme,
+                            ReaderView {
+                                cursor: reader_cursor,
+                                column: reader_column,
+                                visual: reader_visual,
+                                active: reader_active,
+                                theme: &theme,
+                            },
                             diff_lines[line_index],
                             reader_illuminate.as_deref(),
                         )
@@ -355,11 +357,13 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         line_index,
                         body_line_count,
                         body_width,
-                        reader_cursor,
-                        reader_column,
-                        reader_visual,
-                        reader_active,
-                        &theme,
+                        ReaderView {
+                            cursor: reader_cursor,
+                            column: reader_column,
+                            visual: reader_visual,
+                            active: reader_active,
+                            theme: &theme,
+                        },
                         diff_lines[line_index],
                         reader_illuminate.as_deref(),
                     )
@@ -618,14 +622,17 @@ pub(super) fn plain_reader_line(
     line_index: usize,
     line_count: usize,
     content_width: usize,
-    reader_cursor: usize,
-    reader_column: usize,
-    reader_visual: Option<ReaderSelection>,
-    reader_active: bool,
-    theme: &crate::theme::Theme,
+    view: ReaderView<'_>,
     diff_kind: Option<PatchLineKind>,
     illuminate_word: Option<&str>,
 ) -> Line<'static> {
+    let ReaderView {
+        cursor: reader_cursor,
+        column: reader_column,
+        visual: reader_visual,
+        active: reader_active,
+        theme,
+    } = view;
     let diff = diff_kind.map(|kind| diff_line_style(kind, theme));
     let base = diff.unwrap_or_else(|| {
         if is_quoted_line(text) {
@@ -644,11 +651,13 @@ pub(super) fn plain_reader_line(
         0,
         text.chars().count(),
         line_index,
-        reader_cursor,
-        reader_column,
-        reader_visual,
-        reader_active,
-        theme,
+        ReaderView {
+            cursor: reader_cursor,
+            column: reader_column,
+            visual: reader_visual,
+            active: reader_active,
+            theme,
+        },
         &illuminate_ranges,
     ));
     pad_reader_line(
@@ -656,11 +665,13 @@ pub(super) fn plain_reader_line(
         text.chars().count(),
         content_width,
         line_index,
-        reader_cursor,
-        reader_column,
-        reader_visual,
-        reader_active,
-        theme,
+        ReaderView {
+            cursor: reader_cursor,
+            column: reader_column,
+            visual: reader_visual,
+            active: reader_active,
+            theme,
+        },
         diff.and_then(|style| style.bg),
     );
     Line::from(spans)
@@ -671,14 +682,17 @@ pub(super) fn rich_html_line(
     line_index: usize,
     line_count: usize,
     content_width: usize,
-    reader_cursor: usize,
-    reader_column: usize,
-    reader_visual: Option<ReaderSelection>,
-    reader_active: bool,
-    theme: &crate::theme::Theme,
+    view: ReaderView<'_>,
     diff_kind: Option<PatchLineKind>,
     illuminate_word: Option<&str>,
 ) -> Line<'static> {
+    let ReaderView {
+        cursor: reader_cursor,
+        column: reader_column,
+        visual: reader_visual,
+        active: reader_active,
+        theme,
+    } = view;
     let mut spans = reader_gutter(line_index, line_count, reader_cursor, reader_active, theme);
     let line_len = line
         .spans
@@ -712,11 +726,13 @@ pub(super) fn rich_html_line(
             column,
             line_len,
             line_index,
-            reader_cursor,
-            reader_column,
-            reader_visual,
-            reader_active,
-            theme,
+            ReaderView {
+                cursor: reader_cursor,
+                column: reader_column,
+                visual: reader_visual,
+                active: reader_active,
+                theme,
+            },
             &illuminate_ranges,
         ));
         column = column.saturating_add(span.text.chars().count());
@@ -726,11 +742,13 @@ pub(super) fn rich_html_line(
         column,
         content_width,
         line_index,
-        reader_cursor,
-        reader_column,
-        reader_visual,
-        reader_active,
-        theme,
+        ReaderView {
+            cursor: reader_cursor,
+            column: reader_column,
+            visual: reader_visual,
+            active: reader_active,
+            theme,
+        },
         diff.and_then(|style| style.bg),
     );
     Line::from(spans)
@@ -766,13 +784,16 @@ pub(super) fn reader_fragments(
     global_start: usize,
     line_len: usize,
     line_index: usize,
-    reader_cursor: usize,
-    reader_column: usize,
-    reader_visual: Option<ReaderSelection>,
-    reader_active: bool,
-    theme: &crate::theme::Theme,
+    view: ReaderView<'_>,
     illuminate_ranges: &[(usize, usize)],
 ) -> Vec<Span<'static>> {
+    let ReaderView {
+        cursor: reader_cursor,
+        column: reader_column,
+        visual: reader_visual,
+        active: reader_active,
+        theme,
+    } = view;
     if text.is_empty() {
         return Vec::new();
     }
@@ -929,13 +950,16 @@ pub(super) fn pad_reader_line(
     content_len: usize,
     content_width: usize,
     line_index: usize,
-    reader_cursor: usize,
-    reader_column: usize,
-    reader_visual: Option<ReaderSelection>,
-    reader_active: bool,
-    theme: &crate::theme::Theme,
+    view: ReaderView<'_>,
     diff_background: Option<Color>,
 ) {
+    let ReaderView {
+        cursor: reader_cursor,
+        column: reader_column,
+        visual: reader_visual,
+        active: reader_active,
+        theme,
+    } = view;
     if !reader_active && diff_background.is_none() {
         return;
     }

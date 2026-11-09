@@ -98,8 +98,12 @@ fn worker_preserves_pagination_metadata() {
     worker.shutdown();
 }
 
+// Keep the recorded mailbox, serialized message, and seen flag together.
+type AppendedMessage = (String, Vec<u8>, bool);
+type AppendLog = Arc<Mutex<Vec<AppendedMessage>>>;
+
 struct AppendingBackend {
-    appended: Arc<Mutex<Vec<(String, Vec<u8>, bool)>>>,
+    appended: AppendLog,
     fail_append: bool,
 }
 

@@ -167,11 +167,11 @@ pub fn forward_html(html: &str, attribution: &str, personal_note: &str) -> Strin
         escape(attribution)
     );
     let lower = html.to_ascii_lowercase();
-    if let Some(open) = lower.find("<body") {
-        if let Some(end) = lower[open..].find('>') {
-            let pos = open + end + 1;
-            return format!("{}{}{}", &html[..pos], block, &html[pos..]);
-        }
+    if let Some(open) = lower.find("<body")
+        && let Some(end) = lower[open..].find('>')
+    {
+        let pos = open + end + 1;
+        return format!("{}{}{}", &html[..pos], block, &html[pos..]);
     }
     format!("<html><body>{block}{html}</body></html>")
 }
@@ -242,10 +242,7 @@ pub fn reply_recipients(
             .find("mailto:")
             .ok_or_else(|| anyhow!("List-Post does not contain a mailto URI"))?;
         let after = &header[start + "mailto:".len()..];
-        let address = after
-            .split(|c: char| matches!(c, '?' | '>' | ',' | ' '))
-            .next()
-            .unwrap_or("");
+        let address = after.split(['?', '>', ',', ' ']).next().unwrap_or("");
         let decoded = percent_encoding::percent_decode_str(address)
             .decode_utf8()
             .context("decoding List-Post address")?;

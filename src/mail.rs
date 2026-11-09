@@ -268,11 +268,7 @@ fn attachment_parts<'msg>(
 
 fn attachment_display_name(part: &mail_parser::MessagePart<'_>, index: usize) -> String {
     let raw_name = part.attachment_name().unwrap_or("");
-    let name = raw_name
-        .rsplit(|ch| ch == '/' || ch == '\\')
-        .next()
-        .unwrap_or("")
-        .trim();
+    let name = raw_name.rsplit(['/', '\\']).next().unwrap_or("").trim();
     if name.is_empty() || name == "." || name == ".." {
         if part.is_content_type("text", "calendar") {
             "invite.ics".into()
@@ -824,8 +820,7 @@ fn simplify_layout_table_blocks(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
     let mut output = Vec::with_capacity(lines.len());
     let mut remaining = lines.into_iter().peekable();
     while let Some(line) = remaining.next() {
-        if html_line_is_blank(&line) || remaining.peek().is_none_or(|next| html_line_is_blank(next))
-        {
+        if html_line_is_blank(&line) || remaining.peek().is_none_or(html_line_is_blank) {
             // Single-line prose can never be a layout-table block.
             output.push(line);
             continue;
@@ -1047,10 +1042,10 @@ fn compact_social_link_chrome(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
     let mut output = Vec::with_capacity(lines.len());
     let mut compact_line = Some(compact_line);
     for (index, line) in lines.into_iter().enumerate() {
-        if index == insert_at {
-            if let Some(compact) = compact_line.take() {
-                output.push(compact);
-            }
+        if index == insert_at
+            && let Some(compact) = compact_line.take()
+        {
+            output.push(compact);
         }
         if !remove[index] {
             output.push(line);
@@ -1084,10 +1079,10 @@ fn compact_inline_social_rows(lines: Vec<HtmlLine>) -> Vec<HtmlLine> {
     let mut output = Vec::with_capacity(lines.len());
     let mut replacements = replacements.into_iter().peekable();
     for (index, line) in lines.into_iter().enumerate() {
-        if replacements.peek().is_some_and(|(at, _)| *at == index) {
-            if let Some((_, replacement)) = replacements.next() {
-                output.push(replacement);
-            }
+        if replacements.peek().is_some_and(|(at, _)| *at == index)
+            && let Some((_, replacement)) = replacements.next()
+        {
+            output.push(replacement);
         }
         if !remove[index] {
             output.push(line);

@@ -243,18 +243,17 @@ pub fn microsoft_login_username_hint(token: &str) -> Option<String> {
         {
             continue;
         }
-        if let Some((local, domain)) = value.rsplit_once('@') {
-            if !local.is_empty()
+        if let Some((local, domain)) = value.rsplit_once('@')
+            && (!local.is_empty()
                 && !local.contains('@')
                 && domain.contains('.')
                 && !domain.starts_with('.')
                 && !domain.ends_with('.')
                 && domain
                     .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
-            {
-                return Some(value.to_owned());
-            }
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-'))
+        {
+            return Some(value.to_owned());
         }
     }
     None
@@ -381,20 +380,19 @@ impl OAuthSettings {
                 bail!("unsupported OAuth prompt for the selected provider");
             }
         }
-        if let Some(hint) = &oauth.login_hint {
-            if hint.len() > 254 || hint.is_empty() || hint.chars().any(char::is_control) {
-                bail!("OAuth login_hint must be a nonempty single-line address or username");
-            }
+        if let Some(hint) = &oauth.login_hint
+            && (hint.len() > 254 || hint.is_empty() || hint.chars().any(char::is_control))
+        {
+            bail!("OAuth login_hint must be a nonempty single-line address or username");
         }
-        if let Some(namespace) = oauth.credential_namespace.as_deref() {
-            if namespace.is_empty()
+        if let Some(namespace) = oauth.credential_namespace.as_deref()
+            && (namespace.is_empty()
                 || namespace.len() > 48
                 || !namespace
                     .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-            {
-                bail!("OAuth credential_namespace must contain 1-48 ASCII letters, digits, _ or -");
-            }
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')))
+        {
+            bail!("OAuth credential_namespace must contain 1-48 ASCII letters, digits, _ or -");
         }
         let scope = if let Some(custom) = oauth.scope.as_deref() {
             if custom.trim().is_empty()
@@ -937,7 +935,7 @@ fn open_browser(url: &str) -> bool {
     // limited to actionable status messages; browser errors stay in the UI.
     #[cfg(target_os = "linux")]
     {
-        return spawn_browser(Command::new("xdg-open").arg(url));
+        spawn_browser(Command::new("xdg-open").arg(url))
     }
     #[cfg(target_os = "macos")]
     {

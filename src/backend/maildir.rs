@@ -82,7 +82,7 @@ impl MaildirBackend {
             }
         }
 
-        out.sort_by(|a, b| mailbox_sort_key(&a.0).cmp(&mailbox_sort_key(&b.0)));
+        out.sort_by_key(|a| mailbox_sort_key(&a.0));
         Ok(out)
     }
 

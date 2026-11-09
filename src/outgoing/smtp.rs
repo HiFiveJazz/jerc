@@ -100,12 +100,12 @@ impl SmtpSource {
         } else {
             auth
         };
-        if matches!(auth, SmtpAuth::XOAuth2 | SmtpAuth::OAuthBearer) {
-            if let Some(endpoint) = &token_endpoint {
-                let parsed = Url::parse(endpoint).context("parsing SMTP OAuth token endpoint")?;
-                if parsed.scheme() != "https" {
-                    bail!("SMTP OAuth token_endpoint must use https");
-                }
+        if matches!(auth, SmtpAuth::XOAuth2 | SmtpAuth::OAuthBearer)
+            && let Some(endpoint) = &token_endpoint
+        {
+            let parsed = Url::parse(endpoint).context("parsing SMTP OAuth token endpoint")?;
+            if parsed.scheme() != "https" {
+                bail!("SMTP OAuth token_endpoint must use https");
             }
         }
 
@@ -277,21 +277,20 @@ impl SmtpSender {
     ) -> Result<SmtpConnection> {
         let credential = self.source.credential(self.credential_command.as_deref())?;
         let token = self.source.access_token(&credential)?;
-        if probe {
-            if let Some(oauth) = &self.source.account_oauth {
-                if oauth.provider == "microsoft" {
-                    // Claims can be unavailable/opaque. Never print the token,
-                    // decoded JSON, username, or arbitrary identity fields.
-                    println!(
-                        "  {}",
-                        crate::oauth::safe_smtp_token_diagnostics(
-                            &token,
-                            &oauth.client_id,
-                            &self.source.username,
-                        )
-                    );
-                }
-            }
+        if probe
+            && let Some(oauth) = &self.source.account_oauth
+            && oauth.provider == "microsoft"
+        {
+            // Claims can be unavailable/opaque. Never print the token,
+            // decoded JSON, username, or arbitrary identity fields.
+            println!(
+                "  {}",
+                crate::oauth::safe_smtp_token_diagnostics(
+                    &token,
+                    &oauth.client_id,
+                    &self.source.username,
+                )
+            );
         }
         let hello = ClientId::default();
         let tls = TlsParameters::new(self.source.host.clone())
@@ -595,7 +594,7 @@ fn run_credential_command(command: &str) -> Result<String> {
     }
     let secret = String::from_utf8(output.stdout)
         .context("outgoing_cred_cmd returned non-UTF-8 output")?
-        .trim_end_matches(|ch| ch == '\r' || ch == '\n')
+        .trim_end_matches(['\r', '\n'])
         .to_owned();
     if secret.is_empty() {
         bail!("outgoing_cred_cmd returned an empty credential");

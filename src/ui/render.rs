@@ -18,6 +18,17 @@ use crate::config::VisualSelectionStyle;
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
 use crate::theme::Theme;
 
+/// Reader cursor and appearance state shared by the plain-text and HTML
+/// rendering paths. Keeping it together avoids argument-order mistakes.
+#[derive(Clone, Copy)]
+struct ReaderView<'a> {
+    cursor: usize,
+    column: usize,
+    visual: Option<ReaderSelection>,
+    active: bool,
+    theme: &'a Theme,
+}
+
 // Feature renderers share the original theme and layout helpers through this
 // module. Keep the entry point here so overlay stacking remains explicit.
 mod attachments;
@@ -222,8 +233,8 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::{
-        mailbox_row_text, pad_reader_line, reader_word_at, relative_number, rich_html_style,
-        subject_for_list, truncate_display_width, word_match_ranges,
+        ReaderView, mailbox_row_text, pad_reader_line, reader_word_at, relative_number,
+        rich_html_style, subject_for_list, truncate_display_width, word_match_ranges,
     };
     use crate::model::HtmlSpanStyle;
     use crate::theme::load_themes;
@@ -596,11 +607,13 @@ mod tests {
             0,
             10,
             40,
-            9,
-            0,
-            None,
-            true,
-            &theme,
+            ReaderView {
+                cursor: 9,
+                column: 0,
+                visual: None,
+                active: true,
+                theme: &theme,
+            },
             Some(PatchLineKind::Remove),
             None,
         );
@@ -609,11 +622,13 @@ mod tests {
             0,
             10,
             40,
-            0,
-            0,
-            None,
-            true,
-            &theme,
+            ReaderView {
+                cursor: 0,
+                column: 0,
+                visual: None,
+                active: true,
+                theme: &theme,
+            },
             Some(PatchLineKind::Remove),
             None,
         );
@@ -635,11 +650,13 @@ mod tests {
             0,
             10,
             40,
-            0,
-            0,
-            None,
-            true,
-            &theme,
+            ReaderView {
+                cursor: 0,
+                column: 0,
+                visual: None,
+                active: true,
+                theme: &theme,
+            },
             Some(PatchLineKind::Add),
             None,
         );
@@ -1202,11 +1219,13 @@ mod tests {
             0,
             4,
             1,
-            0,
-            0,
-            None,
-            true,
-            &theme,
+            ReaderView {
+                cursor: 0,
+                column: 0,
+                visual: None,
+                active: true,
+                theme: &theme,
+            },
             &[(0, 4)],
         );
         assert_eq!(fragments.len(), 1);
@@ -1240,11 +1259,13 @@ mod tests {
             0,
             4,
             0,
-            0,
-            0,
-            None,
-            true,
-            &theme,
+            ReaderView {
+                cursor: 0,
+                column: 0,
+                visual: None,
+                active: true,
+                theme: &theme,
+            },
             &[(0, 4)],
         );
         assert_eq!(fragments.len(), 2);
@@ -1260,7 +1281,20 @@ mod tests {
     fn reader_cursor_remains_visible_on_blank_lines() {
         let theme = load_themes().into_iter().next().expect("theme");
         let mut spans = Vec::new();
-        pad_reader_line(&mut spans, 0, 8, 2, 2, 0, None, true, &theme, None);
+        pad_reader_line(
+            &mut spans,
+            0,
+            8,
+            2,
+            ReaderView {
+                cursor: 2,
+                column: 0,
+                visual: None,
+                active: true,
+                theme: &theme,
+            },
+            None,
+        );
 
         assert!(!spans.is_empty());
         assert_eq!(spans[0].content.as_ref(), " ");

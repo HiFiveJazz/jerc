@@ -13,13 +13,13 @@
 
 ---
 
-Jerc brings mail, contacts, and composition together in a responsive terminal interface. Navigate with Vim-style keys, manage multiple accounts, and read rich messages without leaving your terminal.
+Jerc is a batteries-included terminal mail app! Features include contacts, and composition together in a responsive terminal interface. Navigate with Vim-style keys, manage multiple accounts, and read rich messages without leaving your terminal.
 
 ## Features
 
-| Area | Highlights |
+| Feature| Highlights |
 | --- | --- |
-| **Mail, at your pace** | IMAP and Maildir accounts, paginated mailboxes, background refresh, and cached message lists. |
+| **Mail** | IMAP and Maildir accounts, multiple mailboxes, background refresh, and cached message lists. |
 | **Keyboard-first** | Vim-style navigation, relative line numbers, smooth scrolling, searchable `?` help, and mouse support. |
 | **Fast triage** | Visual selection, persistent marks, bulk actions, archive, spam handling, and in-mailbox filtering. |
 | **Rich reading** | HTML and plain-text views, tables, links, attachments, Git patch highlighting, and optional inline images. |
@@ -28,7 +28,7 @@ Jerc brings mail, contacts, and composition together in a responsive terminal in
 
 ### Privacy by default
 
-Remote images start **disabled** to limit tracking requests. Jerc uses TLS for supported network transports, supports OAuth and credential commands, and keeps its native contacts database local. Disk encryption and end-to-end email encryption are **not** provided by Jerc itself.
+Jerc strives to be privacy first by limiting tracking requests. Jerc uses TLS for supported network transports, supports OAuth and credential commands, and keeps its native contacts database local (and soon encrypted). End-to-end email encryption are planned for future Jerc releases! 
 
 See [configuration](docs/configuration.md) for the relevant controls.
 
@@ -67,7 +67,7 @@ The example includes a sample Maildir account; replace or remove it for your own
 | `J` / `K` | Change mailbox |
 | `Enter` | Open message |
 | `/` | Search/filter |
-| `Space` | Mark message and advance |
+| `Space` | Mark message
 | `v` / `V` | Visual selection |
 | `a` / `d` | Archive / confirm deletion |
 | `c` / `r` / `f` | Compose / reply / forward |

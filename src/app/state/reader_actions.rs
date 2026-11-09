@@ -55,10 +55,10 @@ impl App {
 
         if self.reader_pending_inner_object {
             self.reader_pending_inner_object = false;
-            if let KeyCode::Char(delimiter) = key.code {
-                if self.select_reader_inner_object(delimiter) {
-                    return true;
-                }
+            if let KeyCode::Char(delimiter) = key.code
+                && self.select_reader_inner_object(delimiter)
+            {
+                return true;
             }
             self.status = StatusLine::temporary(
                 "no enclosing quote/bracket at reader cursor",

@@ -103,12 +103,12 @@ impl ImapSource {
             }
         }
 
-        if matches!(auth, ImapAuth::OAuthBearer | ImapAuth::XOAuth2) {
-            if let Some(endpoint) = &token_endpoint {
-                let parsed = Url::parse(endpoint).context("parsing OAuth token endpoint")?;
-                if parsed.scheme() != "https" {
-                    bail!("OAuth token_endpoint must use https");
-                }
+        if matches!(auth, ImapAuth::OAuthBearer | ImapAuth::XOAuth2)
+            && let Some(endpoint) = &token_endpoint
+        {
+            let parsed = Url::parse(endpoint).context("parsing OAuth token endpoint")?;
+            if parsed.scheme() != "https" {
+                bail!("OAuth token_endpoint must use https");
             }
         }
 
@@ -347,12 +347,10 @@ impl ImapBackend {
     /// Reject stale cached IDs after SELECT if the server reset this mailbox.
     fn check_uid_generation(&self, id: &MessageId) -> Result<()> {
         let (expected, _) = Self::decode_uid(id)?;
-        if let Some(expected) = expected {
-            if self.selected_uid_validity != Some(expected) {
-                bail!(
-                    "mailbox UIDVALIDITY changed; refresh this folder before acting on cached mail"
-                );
-            }
+        if let Some(expected) = expected
+            && self.selected_uid_validity != Some(expected)
+        {
+            bail!("mailbox UIDVALIDITY changed; refresh this folder before acting on cached mail");
         }
         Ok(())
     }
@@ -475,8 +473,10 @@ impl ImapBackend {
                 MessageDataItemName::BodyStructure,
             ]
             .into();
-            let mut opts = ImapMessageFetchOptions::default();
-            opts.uid = true;
+            let opts = ImapMessageFetchOptions {
+                uid: true,
+                ..Default::default()
+            };
             let started = Instant::now();
             let fetched = self.session()?.fetch(sequence, items, opts);
             crate::perf::record(
@@ -488,10 +488,9 @@ impl ImapBackend {
             let fetched = fetched?;
             for data in fetched.values() {
                 if let Some(summary) = summary_from_fetch(data.as_ref(), self.selected_uid_validity)
+                    && let Ok((_, uid)) = Self::decode_uid(&summary.id)
                 {
-                    if let Ok((_, uid)) = Self::decode_uid(&summary.id) {
-                        new_summaries.insert(uid, summary);
-                    }
+                    new_summaries.insert(uid, summary);
                 }
             }
             if new_summaries.len() != missing.len() {
@@ -530,30 +529,28 @@ impl ImapBackend {
         if offset == 0
             && exists > 0
             && let Some(hint) = hint
+            && !hint.messages.is_empty()
+            && self.selected_uid_validity == Some(hint.uid_validity)
+            && self
+                .selected_uid_next
+                .zip(hint.uid_next)
+                .is_none_or(|(server, previous)| server >= previous)
         {
-            if !hint.messages.is_empty()
-                && self.selected_uid_validity == Some(hint.uid_validity)
-                && self
-                    .selected_uid_next
-                    .zip(hint.uid_next)
-                    .is_none_or(|(server, previous)| server >= previous)
-            {
-                let started = Instant::now();
-                let candidate = self.try_incremental_page(exists, limit, hint);
-                crate::perf::record(
-                    "imap_incremental_reuse",
-                    None,
-                    started.elapsed(),
-                    matches!(&candidate, Ok(Some(_))),
-                );
-                if let Ok(Some(page)) = candidate {
-                    return Ok(page);
-                }
-                // Sequence numbers may have shifted while we were fetching
-                // flags. A new SELECT makes the full-fetch fallback safe.
-                let exists = self.select(name)?.exists.unwrap_or(0);
-                return self.fetch_full_page(name, exists, offset, limit);
+            let started = Instant::now();
+            let candidate = self.try_incremental_page(exists, limit, hint);
+            crate::perf::record(
+                "imap_incremental_reuse",
+                None,
+                started.elapsed(),
+                matches!(&candidate, Ok(Some(_))),
+            );
+            if let Ok(Some(page)) = candidate {
+                return Ok(page);
             }
+            // Sequence numbers may have shifted while we were fetching
+            // flags. A new SELECT makes the full-fetch fallback safe.
+            let exists = self.select(name)?.exists.unwrap_or(0);
+            return self.fetch_full_page(name, exists, offset, limit);
         }
         self.fetch_full_page(name, exists, offset, limit)
     }
@@ -869,7 +866,7 @@ impl MailBackend for ImapBackend {
                 (mailbox_name, role)
             })
             .collect();
-        selectable.sort_by(|a, b| mailbox_sort_key(&a.0, &a.1).cmp(&mailbox_sort_key(&b.0, &b.1)));
+        selectable.sort_by_key(|a| mailbox_sort_key(&a.0, &a.1));
 
         Ok(selectable
             .into_iter()
@@ -1005,8 +1002,7 @@ impl MailBackend for ImapBackend {
         self.ensure_selected(mailbox)?;
         self.check_uid_generation(id)?;
         let sequence = Self::uid_sequence(id)?;
-        let mut opts = ImapMessageStoreOptions::default();
-        opts.uid = true;
+        let opts = ImapMessageStoreOptions { uid: true };
         let kind = if seen {
             StoreType::Add
         } else {
@@ -1022,8 +1018,7 @@ impl MailBackend for ImapBackend {
         self.ensure_selected(mailbox)?;
         self.check_uid_generation(id)?;
         let sequence = Self::uid_sequence(id)?;
-        let mut opts = ImapMessageStoreOptions::default();
-        opts.uid = true;
+        let opts = ImapMessageStoreOptions { uid: true };
         self.session()?
             .store(sequence.clone(), StoreType::Add, vec![Flag::Deleted], opts)
             .context("marking IMAP message deleted")?;
@@ -1041,8 +1036,7 @@ impl MailBackend for ImapBackend {
         self.ensure_selected(mailbox)?;
         self.check_many_uid_generations(ids)?;
         let sequence = Self::uid_sequence_many(ids)?;
-        let mut opts = ImapMessageStoreOptions::default();
-        opts.uid = true;
+        let opts = ImapMessageStoreOptions { uid: true };
         self.session()?
             .store(sequence.clone(), StoreType::Add, vec![Flag::Deleted], opts)
             .context("marking IMAP messages deleted")?;
@@ -1066,8 +1060,7 @@ impl MailBackend for ImapBackend {
             self.ensure_selected(source)?;
             self.check_many_uid_generations(ids)?;
             let uids = Self::uid_sequence_many(ids)?;
-            let mut options = ImapMessageStoreOptions::default();
-            options.uid = true;
+            let options = ImapMessageStoreOptions { uid: true };
             self.session()?
                 .store(uids.clone(), StoreType::Add, vec![Flag::Deleted], options)
                 .context("marking Gmail INBOX labels for removal")?;
@@ -1091,8 +1084,7 @@ impl MailBackend for ImapBackend {
             self.ensure_selected(source)?;
             self.check_many_uid_generations(ids)?;
             let uids = Self::uid_sequence_many(ids)?;
-            let mut options = ImapMessageCopyOptions::default();
-            options.uid = true;
+            let options = ImapMessageCopyOptions { uid: true };
             self.session()?
                 .copy(uids, mailbox_from_name(destination)?, options)
                 .context("restoring Gmail message to INBOX")?;
@@ -1107,8 +1099,7 @@ impl MailBackend for ImapBackend {
         self.check_uid_generation(id)?;
         let destination_mailbox = mailbox_from_name(destination)?;
         let sequence = Self::uid_sequence(id)?;
-        let mut move_opts = ImapMessageMoveOptions::default();
-        move_opts.uid = true;
+        let move_opts = ImapMessageMoveOptions { uid: true };
         if self
             .session()?
             .r#move(sequence.clone(), destination_mailbox.clone(), move_opts)
@@ -1118,13 +1109,11 @@ impl MailBackend for ImapBackend {
             return Ok(());
         }
 
-        let mut copy_opts = ImapMessageCopyOptions::default();
-        copy_opts.uid = true;
+        let copy_opts = ImapMessageCopyOptions { uid: true };
         self.session()?
             .copy(sequence.clone(), destination_mailbox, copy_opts)
             .with_context(|| format!("copying IMAP message to {destination:?}"))?;
-        let mut store_opts = ImapMessageStoreOptions::default();
-        store_opts.uid = true;
+        let store_opts = ImapMessageStoreOptions { uid: true };
         self.session()?
             .store(
                 sequence.clone(),
@@ -1148,8 +1137,7 @@ impl MailBackend for ImapBackend {
         self.check_many_uid_generations(ids)?;
         let destination_mailbox = mailbox_from_name(destination)?;
         let sequence = Self::uid_sequence_many(ids)?;
-        let mut move_opts = ImapMessageMoveOptions::default();
-        move_opts.uid = true;
+        let move_opts = ImapMessageMoveOptions { uid: true };
         if self
             .session()?
             .r#move(sequence.clone(), destination_mailbox.clone(), move_opts)
@@ -1159,13 +1147,11 @@ impl MailBackend for ImapBackend {
             return Ok(());
         }
 
-        let mut copy_opts = ImapMessageCopyOptions::default();
-        copy_opts.uid = true;
+        let copy_opts = ImapMessageCopyOptions { uid: true };
         self.session()?
             .copy(sequence.clone(), destination_mailbox, copy_opts)
             .with_context(|| format!("copying IMAP messages to {destination:?}"))?;
-        let mut store_opts = ImapMessageStoreOptions::default();
-        store_opts.uid = true;
+        let store_opts = ImapMessageStoreOptions { uid: true };
         self.session()?
             .store(
                 sequence.clone(),
@@ -1301,10 +1287,7 @@ fn collect_bodystructure_attachments(
                 let unnamed = filename.is_none();
                 let name = filename.unwrap_or_else(|| format!("attachment-{}", names.len() + 1));
                 // Never treat MIME filenames as filesystem paths.
-                let safe = name
-                    .rsplit(|c| c == '/' || c == '\\')
-                    .next()
-                    .unwrap_or(&name);
+                let safe = name.rsplit(['/', '\\']).next().unwrap_or(&name);
                 // An unnamed text/calendar part often duplicates a named
                 // .ics part (Google Calendar). Keep the type information to
                 // avoid inventing a second filename in the initial summary.

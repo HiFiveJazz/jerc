@@ -406,8 +406,7 @@ pub(super) fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
             CONTACT_HELP_ENTRIES,
             &modal.help_query,
             &matches,
-            modal.help_selected,
-            modal.help_scroll,
+            (modal.help_selected, modal.help_scroll),
         );
         return;
     }

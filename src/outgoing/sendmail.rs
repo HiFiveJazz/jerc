@@ -50,7 +50,7 @@ impl MailSender for SendmailSender {
         let mut command = Command::new(&self.executable);
         command.arg("-i"); // Do not treat a dot-only line as end of message.
         if let Some(from) = envelope.from() {
-            command.arg("-f").arg(from.to_string());
+            command.arg("-f").arg(from);
         }
         // End options before user-provided recipients (required for Postfix's
         // sendmail compatibility interface). Never interpolate into a shell.
@@ -59,7 +59,7 @@ impl MailSender for SendmailSender {
             bail!("no envelope recipients for sendmail");
         }
         for recipient in envelope.to() {
-            command.arg(recipient.to_string());
+            command.arg(recipient);
         }
         let mut child = command
             .stdin(Stdio::piped())

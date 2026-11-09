@@ -624,16 +624,14 @@ impl App {
                         _ => 0,
                     };
                 }
-                if unread_delta != 0 {
-                    if let Some(current) = account.current_mailbox.as_deref() {
-                        if let Some(mailbox) = account
-                            .mailboxes
-                            .iter_mut()
-                            .find(|mailbox| mailbox.name == current && mailbox.counts_known)
-                        {
-                            mailbox.unread = mailbox.unread.saturating_add_signed(unread_delta);
-                        }
-                    }
+                if unread_delta != 0
+                    && let Some(current) = account.current_mailbox.as_deref()
+                    && let Some(mailbox) = account
+                        .mailboxes
+                        .iter_mut()
+                        .find(|mailbox| mailbox.name == current && mailbox.counts_known)
+                {
+                    mailbox.unread = mailbox.unread.saturating_add_signed(unread_delta);
                 }
                 account.persist_current_cache();
                 account.persist_mailboxes();
@@ -816,10 +814,10 @@ impl App {
                 {
                     self.pending_compose = None;
                 }
-                if event.account == self.account_index {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.sending = false;
-                    }
+                if event.account == self.account_index
+                    && let Some(composer) = self.composer.as_mut()
+                {
+                    composer.sending = false;
                 }
                 if (mutation_failed || seen_failed)
                     && let Some(name) = account.current_mailbox.clone()

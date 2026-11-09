@@ -221,14 +221,13 @@ pub struct MessagePage {
 impl MessageBody {
     #[must_use]
     pub fn display_text(&self, prefer_html: bool) -> &str {
-        if prefer_html {
-            if let Some(html) = self
+        if prefer_html
+            && let Some(html) = self
                 .html_text
                 .as_deref()
                 .filter(|text| !text.trim().is_empty())
-            {
-                return html;
-            }
+        {
+            return html;
         }
         if let Some(plain) = self
             .plain_text

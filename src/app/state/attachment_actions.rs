@@ -535,14 +535,10 @@ impl App {
             return;
         };
         let target = reader_image_target_size(
-            image.width(),
-            image.height(),
-            None,
-            None,
-            picker.font_size().width,
-            picker.font_size().height,
-            width,
-            height,
+            (image.width(), image.height()),
+            (None, None),
+            (picker.font_size().width, picker.font_size().height),
+            (width, height),
         );
         self.attachment_preview = picker
             .new_protocol(

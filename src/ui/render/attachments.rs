@@ -286,11 +286,13 @@ pub(super) fn draw_attachment_destination_picker(frame: &mut Frame<'_>, app: &Ap
                 parent_area.height,
             ),
             &picker.parent_entries,
-            Some(picker.parent_selected),
-            false,
             &[],
-            None,
-            app.visual_selection_style,
+            ComposePickerOptions {
+                selected: Some(picker.parent_selected),
+                show_numbers: false,
+                visual: None,
+                mode: app.visual_selection_style,
+            },
             theme,
         );
     }
@@ -310,11 +312,13 @@ pub(super) fn draw_attachment_destination_picker(frame: &mut Frame<'_>, app: &Ap
                 files_area.height,
             ),
             &picker.entries,
-            Some(picker.selected),
-            true,
             &[],
-            None,
-            app.visual_selection_style,
+            ComposePickerOptions {
+                selected: Some(picker.selected),
+                show_numbers: true,
+                visual: None,
+                mode: app.visual_selection_style,
+            },
             theme,
         );
     }

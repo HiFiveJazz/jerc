@@ -257,15 +257,13 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
                     continue;
                 }
                 let value = wizard.fields[*index].as_str();
-                let value = if *index == CLIENT_ID
+                let publisher_configured = (*index == CLIENT_ID
                     && value.is_empty()
-                    && crate::oauth::embedded_client_id(wizard.provider_hint()).is_some()
-                {
-                    "(publisher-configured)"
-                } else if *index == GOOGLE_SECRET
-                    && value.is_empty()
-                    && crate::oauth::embedded_google_client_secret().is_some()
-                {
+                    && crate::oauth::embedded_client_id(wizard.provider_hint()).is_some())
+                    || (*index == GOOGLE_SECRET
+                        && value.is_empty()
+                        && crate::oauth::embedded_google_client_secret().is_some());
+                let value = if publisher_configured {
                     "(publisher-configured)"
                 } else if value.is_empty() {
                     "(enter value)"

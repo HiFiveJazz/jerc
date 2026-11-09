@@ -187,8 +187,8 @@ impl SetupWizard {
             SetupStep::Settings => 23,
         };
         (
-            screen_width.saturating_sub(2).min(96).max(1),
-            screen_height.saturating_sub(2).min(max_height).max(1),
+            screen_width.saturating_sub(2).clamp(1, 96),
+            screen_height.saturating_sub(2).clamp(1, max_height),
         )
     }
 
@@ -546,13 +546,13 @@ impl SetupWizard {
         } else {
             crate::oauth::embedded_client_id(provider)
         };
-        if provider == "google" {
-            if let Some(id) = effective_client_id {
-                ensure!(
-                    crate::oauth::valid_google_desktop_client_id(id),
-                    "Google OAuth client ID is incomplete: keep the full .apps.googleusercontent.com suffix"
-                );
-            }
+        if provider == "google"
+            && let Some(id) = effective_client_id
+        {
+            ensure!(
+                crate::oauth::valid_google_desktop_client_id(id),
+                "Google OAuth client ID is incomplete: keep the full .apps.googleusercontent.com suffix"
+            );
         }
         let google_secret = values[GOOGLE_SECRET].trim();
         ensure!(

@@ -252,6 +252,12 @@ impl WorkerHandle {
         }
     }
 
+    // The caller may retry an unsent action on another worker queue, so preserve
+    // ownership of the original action rather than hiding it behind a thin error.
+    #[expect(
+        clippy::result_large_err,
+        reason = "unsent actions must remain recoverable by callers"
+    )]
     pub fn post(&self, kind: ActionKind) -> Result<u64, TrySendError<Action>> {
         let action = Action::new(kind);
         let id = action.id;
@@ -852,17 +858,17 @@ fn new_mail_preview(backend: &mut dyn MailBackend, mailbox: &str, count: usize) 
     let mut sender = String::new();
     let mut subject = String::new();
     let mut excerpt = String::new();
-    if let Ok(page) = backend.open_mailbox(mailbox, 0, 1) {
-        if let Some(message) = page.messages.first() {
-            sender = if message.from_name.is_empty() {
-                message.from_address.clone()
-            } else {
-                message.from_name.clone()
-            };
-            subject = message.subject.clone();
-            if let Ok(body) = backend.fetch_body(mailbox, &message.id) {
-                excerpt = body.display_text(false).chars().take(400).collect();
-            }
+    if let Ok(page) = backend.open_mailbox(mailbox, 0, 1)
+        && let Some(message) = page.messages.first()
+    {
+        sender = if message.from_name.is_empty() {
+            message.from_address.clone()
+        } else {
+            message.from_name.clone()
+        };
+        subject = message.subject.clone();
+        if let Ok(body) = backend.fetch_body(mailbox, &message.id) {
+            excerpt = body.display_text(false).chars().take(400).collect();
         }
     }
     WorkerEventKind::NewMailPreview {

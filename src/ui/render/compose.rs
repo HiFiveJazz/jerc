@@ -75,17 +75,27 @@ pub(super) fn clipped_wrap_text(value: &str, width: usize, max_rows: usize) -> V
     rows
 }
 
+pub(super) struct ComposePickerOptions {
+    pub(super) selected: Option<usize>,
+    pub(super) show_numbers: bool,
+    pub(super) visual: Option<(usize, usize)>,
+    pub(super) mode: VisualSelectionStyle,
+}
+
 pub(super) fn compose_picker_rows(
     frame: &mut Frame<'_>,
     rect: Rect,
     entries: &[crate::app::ComposeFileEntry],
-    selected: Option<usize>,
-    show_numbers: bool,
     attachments: &[std::path::PathBuf],
-    visual: Option<(usize, usize)>,
-    mode: VisualSelectionStyle,
+    options: ComposePickerOptions,
     theme: &Theme,
 ) {
+    let ComposePickerOptions {
+        selected,
+        show_numbers,
+        visual,
+        mode,
+    } = options;
     if rect.width == 0 || rect.height == 0 {
         return;
     }
@@ -246,11 +256,13 @@ pub(super) fn draw_compose_file_picker(frame: &mut Frame<'_>, app: &mut App) {
                 parent_area.height,
             ),
             &picker.parent_entries,
-            Some(picker.parent_selected),
-            false,
             &[],
-            None,
-            app.visual_selection_style,
+            ComposePickerOptions {
+                selected: Some(picker.parent_selected),
+                show_numbers: false,
+                visual: None,
+                mode: app.visual_selection_style,
+            },
             theme,
         );
     }
@@ -270,11 +282,13 @@ pub(super) fn draw_compose_file_picker(frame: &mut Frame<'_>, app: &mut App) {
                 files_area.height,
             ),
             &picker.entries,
-            Some(picker.selected),
-            true,
             &composer.attachment_paths,
-            picker.visual_anchor.map(|anchor| (anchor, picker.selected)),
-            app.visual_selection_style,
+            ComposePickerOptions {
+                selected: Some(picker.selected),
+                show_numbers: true,
+                visual: picker.visual_anchor.map(|anchor| (anchor, picker.selected)),
+                mode: app.visual_selection_style,
+            },
             theme,
         );
     }
@@ -328,9 +342,9 @@ pub(super) fn draw_compose_file_picker(frame: &mut Frame<'_>, app: &mut App) {
                         // Apply a consistent row background even where tree-sitter
                         // overlays source syntax colors on added code.
                         let patch_background = match fragments.first().map(|f| f.tone) {
-                            Some(PatchTone::Add) => diff_line_style(PatchLineKind::Add, &theme).bg,
+                            Some(PatchTone::Add) => diff_line_style(PatchLineKind::Add, theme).bg,
                             Some(PatchTone::Remove) => {
-                                diff_line_style(PatchLineKind::Remove, &theme).bg
+                                diff_line_style(PatchLineKind::Remove, theme).bg
                             }
                             _ => None,
                         };
@@ -341,9 +355,9 @@ pub(super) fn draw_compose_file_picker(frame: &mut Frame<'_>, app: &mut App) {
                                     PatchTone::Default => theme.text(),
                                     PatchTone::Meta => theme.accent().add_modifier(Modifier::BOLD),
                                     PatchTone::Hunk => theme.accent().add_modifier(Modifier::BOLD),
-                                    PatchTone::Add => diff_line_style(PatchLineKind::Add, &theme),
+                                    PatchTone::Add => diff_line_style(PatchLineKind::Add, theme),
                                     PatchTone::Remove => {
-                                        diff_line_style(PatchLineKind::Remove, &theme)
+                                        diff_line_style(PatchLineKind::Remove, theme)
                                     }
                                     PatchTone::Keyword => Style::default().fg(theme.visual),
                                     PatchTone::String => Style::default().fg(theme.warning),
@@ -998,10 +1012,9 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
                 && rows
                     .get(index + 1)
                     .is_none_or(|next| next.logical_line != row.logical_line)
+                && let Some(cell) = line.spans.get(offset + length)
             {
-                if let Some(cell) = line.spans.get(offset + length) {
-                    spans.push(cell.clone());
-                }
+                spans.push(cell.clone());
             }
         }
         display.push(Line::from(spans));

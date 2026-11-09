@@ -148,25 +148,25 @@ impl ContactBook {
 
     pub fn edit(&mut self, original: Option<&str>, name: &str, email: &str) -> Result<()> {
         let email = email.trim();
-        if let Some(existing) = self.find(email) {
-            if original.is_none_or(|old| !self.entries[existing].email.eq_ignore_ascii_case(old)) {
-                anyhow::bail!("that email address is already in your contacts");
-            }
+        if let Some(existing) = self.find(email)
+            && original.is_none_or(|old| !self.entries[existing].email.eq_ignore_ascii_case(old))
+        {
+            anyhow::bail!("that email address is already in your contacts");
         }
-        if let Some(old) = original {
-            if let Some(index) = self.find(old) {
-                // Validate before replacing the original contact.
-                let mut trial = Self::default();
-                trial.upsert(name, email, true)?;
-                let favorite = self.entries[index].favorite;
-                self.entries[index] = Contact {
-                    name: name.trim().to_owned(),
-                    email: email.to_owned(),
-                    saved: true,
-                    favorite,
-                };
-                return Ok(());
-            }
+        if let Some(old) = original
+            && let Some(index) = self.find(old)
+        {
+            // Validate before replacing the original contact.
+            let mut trial = Self::default();
+            trial.upsert(name, email, true)?;
+            let favorite = self.entries[index].favorite;
+            self.entries[index] = Contact {
+                name: name.trim().to_owned(),
+                email: email.to_owned(),
+                saved: true,
+                favorite,
+            };
+            return Ok(());
         }
         self.upsert(name, email, true)?;
         Ok(())

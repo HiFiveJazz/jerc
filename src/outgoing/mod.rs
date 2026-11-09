@@ -55,17 +55,16 @@ pub fn sender_from_account(account: &AccountConfig) -> String {
     {
         return email.to_owned();
     }
-    if let Some(outgoing) = account.outgoing.as_deref() {
-        if let Ok(smtp) = SmtpSource::parse(outgoing) {
-            if smtp.username.parse::<lettre::message::Mailbox>().is_ok() {
-                return smtp.username;
-            }
-        }
+    if let Some(outgoing) = account.outgoing.as_deref()
+        && let Ok(smtp) = SmtpSource::parse(outgoing)
+        && smtp.username.parse::<lettre::message::Mailbox>().is_ok()
+    {
+        return smtp.username;
     }
-    if let Ok(imap) = crate::backend::ImapSource::parse(&account.source) {
-        if imap.username.parse::<lettre::message::Mailbox>().is_ok() {
-            return imap.username;
-        }
+    if let Ok(imap) = crate::backend::ImapSource::parse(&account.source)
+        && imap.username.parse::<lettre::message::Mailbox>().is_ok()
+    {
+        return imap.username;
     }
     String::new()
 }
