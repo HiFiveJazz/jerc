@@ -21,7 +21,7 @@ source=(
 )
 
 # Replace after publishing v0.6.1 using updpkgsums.
-sha256sums=('SKIP')
+sha256sums=('cb2423a070988d7e85d1d47238df44c9f6d67cc0e8358d691ee36eb0de1d0122')
 
 prepare() {
   cd "${srcdir}/${pkgname}-${pkgver}"
