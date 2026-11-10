@@ -202,17 +202,15 @@ impl App {
                 // accepted DATA, or cut short a queued move/delete. Wait for
                 // these tracked write operations, not for read-only fetching.
                 if self.pending_send.is_some() {
-                    self.status = StatusLine::info(
-                        "message still sending; press q again after it finishes",
-                    );
+                    self.status =
+                        StatusLine::info("message still sending; press q again after it finishes");
                 } else if self
                     .accounts
                     .iter()
                     .any(|account| !account.pending_mutation_labels.is_empty())
                 {
-                    self.status = StatusLine::info(
-                        "mailbox change still running; press q again when done",
-                    );
+                    self.status =
+                        StatusLine::info("mailbox change still running; press q again when done");
                 } else {
                     self.should_quit = true;
                 }

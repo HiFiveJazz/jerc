@@ -47,7 +47,9 @@ fn quit_does_not_interrupt_tracked_mailbox_mutation() {
     );
     let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
     let mut app = super::App::new(&config, vec![worker]);
-    app.accounts[0].pending_mutation_labels.insert(42, "deleted");
+    app.accounts[0]
+        .pending_mutation_labels
+        .insert(42, "deleted");
     app.handle_command(super::Command::Quit);
     assert!(!app.should_quit);
     assert!(app.status.text.contains("mailbox change"));
