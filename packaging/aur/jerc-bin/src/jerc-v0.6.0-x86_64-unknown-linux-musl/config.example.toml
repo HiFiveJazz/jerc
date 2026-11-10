@@ -1,0 +1,192 @@
+# Jerc configuration examples.
+#
+# source_cred_cmd / outgoing_cred_cmd are preferred over putting reusable
+# secrets in TOML. Their stdout becomes the password, access token, or refresh
+# token. Keep this file mode 0600 if it contains any account metadata/secrets.
+
+# Local/offline Maildir remains useful for tests and archives.
+[[accounts]]
+name = "Kernel Maildir"
+source = "maildir://~/Mail/kernel"
+default_mailbox = "INBOX"
+# Optional per-account hidden folders; * and ? wildcards are supported.
+# These are hidden from the sidebar, not deleted or unsubscribed.
+# exclude_mailboxes = ["[Gmail]/Spam", "[Gmail]/All Mail", "Archive/*"]
+
+# Simplest Google OAuth account (remove leading # characters to use):
+# [[accounts]]
+# name = "Personal"
+# email = "you@gmail.com"
+# source = "imap"    # incoming = "imap" is also accepted
+# outgoing = "smtp"  # automatic secure TLS: Gmail 465, Microsoft 587
+# copy_to = ""       # Gmail automatically saves sent mail
+# [accounts.oauth]
+# provider = "google"
+# client_id = "YOUR_REGISTERED_GOOGLE_DESKTOP_CLIENT_ID"
+# Run: jerc --oauth-login Personal
+#
+# For Google Workspace or Microsoft 365 custom domains, the OAuth provider
+# selects known servers. For other domains, set:
+# To discover real servers first: jerc --discover-email "you@example.com"
+# For a Microsoft login UPN different from the visible email address:
+#   jerc --discover-email "alias@university.edu" --discover-provider microsoft --discover-username "login@university.edu"
+# Or after OAuth sign-in to this configured account:
+#   jerc --discover-email "alias@university.edu" --discover-oauth-account "University"
+# The command prints TOML for review; it does NOT alter existing accounts.
+# imap_username = "actual-login@example.com" # if IMAP login differs from `email`
+# smtp_username = "actual-login@example.com" # if SMTP login differs from `email`
+# imap_host = "imap.example.com"
+# smtp_host = "smtp.example.com"
+# Optional imap_port / smtp_port, or outgoing = "starttls" for port 587.
+# outgoing = "smtps" forces implicit TLS on 465; "none" disables sending.
+# Full URI forms and credential commands remain supported; advanced examples:
+#
+# Gmail / normal IMAPS with an app password + SMTP submission.
+# Add as many [[accounts]] blocks as needed. Use Alt-n / Alt-p to rotate
+# accounts, Alt-1..Alt-9 to choose one, or click its tab. Press ! for
+# config warnings; a bad outgoing SMTP URL disables sending but not reading.
+# [[accounts]]
+# name = "Personal"
+# source = "imaps://you%40gmail.com@imap.gmail.com:993"
+# source_cred_cmd = "pass show mail/personal-app-password"
+# from = "Your Name <you@gmail.com>"
+# outgoing = "smtps://you%40gmail.com@smtp.gmail.com:465"
+# outgoing_cred_cmd = "pass show mail/personal-app-password"
+# default_mailbox = "INBOX"
+# Optional per-account hidden folders; * and ? wildcards are supported.
+# These are hidden from the sidebar, not deleted or unsubscribed.
+# exclude_mailboxes = ["[Gmail]/Spam", "[Gmail]/All Mail", "Archive/*"]
+# max_messages = 200 # legacy/headless fallback
+# page_size = 100    # interactive headers per page; smaller = faster huge-folder first paint
+
+# OAuth refresh-token flow. With token_endpoint present, the credential command
+# supplies a refresh token and jerc obtains a short-lived access token.
+# Gmail SMTP uses XOAUTH2 even when the incoming IMAP account uses OAUTHBEARER.
+# [[accounts]]
+# name = "University"
+# source = "imaps+oauthbearer://you%40example.edu@imap.gmail.com:993?client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
+# source_cred_cmd = "pass show mail/university-refresh-token"
+# from = "Your Name <you@example.edu>"
+# outgoing = "smtp+xoauth2://you%40example.edu@smtp.gmail.com:587?client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET&token_endpoint=https%3A%2F%2Foauth2.googleapis.com%2Ftoken"
+# outgoing_cred_cmd = "pass show mail/university-refresh-token"
+# default_mailbox = "INBOX"
+# Optional per-account hidden folders; * and ? wildcards are supported.
+# These are hidden from the sidebar, not deleted or unsubscribed.
+# exclude_mailboxes = ["[Gmail]/Spam", "[Gmail]/All Mail", "Archive/*"]
+# max_messages = 200 # legacy/headless fallback
+# page_size = 100    # interactive headers per page; smaller = faster huge-folder first paint
+
+# URI-embedded credentials also work for one-off testing, but are less
+# safe because the config itself contains the reusable credential.
+# source = "imaps://you%40gmail.com:APP_PASSWORD@imap.gmail.com:993"
+# outgoing = "smtps://you%40gmail.com:APP_PASSWORD@smtp.gmail.com:465"
+
+[ui]
+# Browser layout. Drag the mailbox divider, or press Alt-h / Alt-l to resize.
+# Width is persisted to [ui] here in config.toml after an adjustment.
+# `b` toggles the sidebar; `p` toggles the message preview.
+mailbox_width_percent = 22
+# When `p` enables the split reader, drag its left divider or use
+# Alt-Shift-h / Alt-Shift-l to make the reader wider/narrower.
+# Width is saved here in config.toml after an adjustment.
+preview_width_percent = 57
+
+# Active theme. Press `T` in the TUI to preview/switch themes live; the chosen
+# theme is saved back into [ui].theme in this config.toml.
+theme = "default"
+# Message-list / search: fuzzy subsequence matches by default; use strict
+# for the previous case-insensitive substring filter.
+search_mode = "fuzzy" # "fuzzy" or "strict"
+# Mail browser, Contacts and attachment lists (including Compose pickers):
+# "row" colors the entire selected row; "gutter" keeps the row dark gray and
+# colors only its thicker blue indicator. With the mailbox sidebar visible,
+# mail selection uses the existing mailbox/message divider as that indicator.
+visual_selection_style = "gutter" # "gutter" (default) or "row"
+# Rectangular popups, dialogs, and pane borders: "square" or "rounded".
+# Dividers between mailbox/list/preview remain straight.
+border_style = "square" # "square" (default) or "rounded"
+# Remote images can disclose your IP/read time to senders. Press I to toggle in-session.
+remote_images = false
+# Check Inbox counts in the background every 20 seconds. (IMAP IDLE can
+# replace polling in a future backend release.) Minimum 10 seconds.
+inbox_poll_seconds = 20
+# Optional audible terminal bell when a previously-known Inbox count rises.
+# The terminal's own bell settings determine whether a sound plays.
+new_mail_bell = false
+# Desktop notifications are ON by default. A sound-name hint asks the installed
+# sound theme (including COSMIC, when selected system-wide) to play its email sound.
+# Requires a freedesktop notification daemon and `notify-send` (libnotify).
+# The notification sound-name hint is optional; actual audio requires a sound
+# theme + daemon that honors it. For an optional terminal bell, set
+# new_mail_bell = true and enable audible bell in the terminal.
+# Press N or click the footer bell to toggle desktop alerts and their sound
+# for the current session; the configured value is restored on restart.
+new_mail_notifications = true
+# Fallback symbols always work: ● enabled, ○ muted, ● 3 = three new
+# arrivals observed since launching jerc (not total unread mail).
+# Use "nerd" if your terminal uses a Nerd Font: 󰂚 enabled, 󰂛 muted.
+notification_icon_style = "unicode" # "unicode" or "nerd"
+new_mail_sound_name = "message-new-email"
+# Optional direct sound if your notification daemon ignores sound-name hints.
+# Requires `pw-play` (PipeWire) or `paplay` (PulseAudio), absolute file path.
+# Use the included assets/sounds/new-mail.oga from the repository if desired.
+# new_mail_sound_file = "/absolute/path/to/jerc/assets/sounds/new-mail.oga"
+
+# Legacy layout options are still accepted so existing configs keep loading.
+# sidebar_width = 24
+# message_width_percent = 48
+
+# Other SMTP providers may advertise SASL OAUTHBEARER (RFC 7628).
+# Use smtps+oauthbearer:// on port 465, or smtp+oauthbearer:// on port 587.
+# The same OAuth refresh-token URL parameters and outgoing_cred_cmd apply.
+# Google Gmail SMTP advertises XOAUTH2, so +xoauth2 is recommended for Google.
+# +oauthbearer will also negotiate XOAUTH2 when OAUTHBEARER is unavailable.
+# outgoing = "smtps+oauthbearer://you%40example.net@smtp.example.net:465?token_endpoint=https%3A%2F%2Fauth.example.net%2Ftoken&client_id=YOUR_CLIENT_ID"
+
+# -----------------------------------------------------------------------------
+# Outgoing delivery additions (per account; put these keys in [[accounts]])
+# -----------------------------------------------------------------------------
+# copy_to = ""                 # disable APPEND (recommended for Gmail)
+# copy_to = "Sent"             # force APPEND to specified folder
+# copy_to = "Sent, Archive"    # force APPEND to both folders
+# Omitting copy_to keeps prior jerc behavior: for smtp.gmail.com rely on
+# Gmail's automatic Sent filing; elsewhere append to the detected Sent folder.
+# Explicit Sent on Gmail may cause duplicates. No copying occurs before send succeeds.
+# outgoing = "/usr/sbin/sendmail"          # local MTA, Unix
+# outgoing = "sendmail:///usr/sbin/sendmail" # equivalent URI form
+# The sendmail command uses -i -f <sender> -- <envelope recipients> (incl. Bcc)
+# and sends the RFC 5322 bytes through stdin. No shell is invoked.
+# outgoing = "smtps://you%40example.com@smtp.example.com:465"
+# The unsuffixed scheme now negotiates PLAIN or LOGIN based on TLS EHLO.
+# For OAuth, choose +xoauth2/+oauthbearer or an [accounts.oauth] block.
+
+# Browser OAuth setup example (put this table DIRECTLY after the related
+# [[accounts]] block; do not add it after [ui], which is not an account):
+# [accounts.oauth]
+# provider = "google"  # or "microsoft"
+# client_id = "PUBLISHER_OAUTH_DESKTOP_CLIENT_ID"
+# client_secret = "OPTIONAL_GOOGLE_DESKTOP_PUBLIC_CLIENT_SECRET"
+# tenant = "common"  # Microsoft only; organizational tenant ID also supported
+# flow = "browser"      # default: jerc localhost callback (own registered app)
+# flow = "nativeclient" # Microsoft: copy redirect URL back into terminal
+# flow = "devicecode"   # Microsoft: enter one-time code in browser; no redirect URI
+# callback_host = "localhost" # browser flow only, or "127.0.0.1" (default)
+# callback_path = "/"        # browser flow only; default "/oauth/callback"
+# prompt = "select_account"  # google: consent/select_account/none;
+#                            # microsoft: login/consent/select_account/none
+# login_hint = "you@example.com" # prefill account; does not change consent
+# credential_namespace = "oauth-lab" # optional isolated token store for a local OAuth experiment
+#                         # does not touch the original account's refresh token
+# scope = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
+#                            # advanced override; missing scopes may break IMAP/SMTP
+# Diagnose without network: jerc --oauth-inspect "ACCOUNT NAME"
+# Live verification after --oauth-login: jerc --oauth-probe "ACCOUNT NAME"
+# --oauth-probe checks token refresh, IMAP auth/LIST, and SMTP AUTH without sending mail.
+# Redirect paths and consent are validated against the selected app registration.
+# These settings cannot grant unregistered redirect URIs, app identity, or admin consent.
+# After configuring, run: jerc --oauth-login "ACCOUNT NAME"
+# It opens a browser and stores a private refresh token outside config.toml.
+# Apps can embed public IDs at build-time via JERC_GOOGLE_CLIENT_ID,
+# JERC_GOOGLE_CLIENT_SECRET, and JERC_MICROSOFT_CLIENT_ID.
+# OAuth desktop clients must be registered (and possibly verified) by the
+# publisher. OAuth is not available with a made-up client ID.
