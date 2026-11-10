@@ -24,7 +24,7 @@ done
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-git clone \
+git -c init.defaultBranch=master clone \
   "ssh://aur@aur.archlinux.org/${PKG_NAME}.git" \
   "$TMP/$PKG_NAME"
 
@@ -41,6 +41,6 @@ if git diff --cached --quiet; then
 fi
 
 git commit -m "Update $PKG_NAME packaging"
-git push origin master
+git push origin HEAD:master
 
 echo "Successfully published $PKG_NAME to AUR."

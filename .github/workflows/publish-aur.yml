@@ -119,6 +119,21 @@ jobs:
           GIT_COMMITTER_EMAIL: aur@users.noreply.github.com
         run: ./scripts/publish-aur.sh jerc-bin
 
+      # The source package must compile and pass its check() tests before
+      # it can be submitted or updated on the AUR.
+      - name: Build and test source AUR package
+        if: ${{ vars.AUR_PUBLISH_SOURCE == 'true' }}
+        run: |
+          set -euo pipefail
+          pacman -S --noconfirm --needed rust cargo ca-certificates
+          # makepkg refuses root; the metadata step created this user and
+          # gave it ownership of packaging/aur.
+          runuser -u aur-builder -- bash -c '
+            set -euo pipefail
+            cd packaging/aur/jerc
+            makepkg --cleanbuild --noconfirm
+          '
+
       - name: Publish source package to AUR (opt-in)
         if: ${{ vars.AUR_PUBLISH_SOURCE == 'true' }}
         env:
