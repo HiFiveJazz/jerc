@@ -41,6 +41,26 @@ See [configuration](docs/configuration.md) for the relevant controls.
 
 ## Getting started
 
+### Download a release
+
+Prebuilt binaries for Linux (x86-64, GNU and portable static musl), macOS
+(Apple Silicon and Intel), and Windows (x86-64) are published on
+[GitHub Releases](https://github.com/HiFiveJazz/jerc/releases).
+Download the archive matching your platform, extract it, and run `./jerc` on
+Linux/macOS (or `jerc.exe` on Windows). Each archive also includes the sample
+configuration.
+
+For Linux, try **`x86_64-unknown-linux-musl`** if you want a portable
+statically linked executable without a glibc version requirement; the
+**`x86_64-unknown-linux-gnu`** archive is also available for comparison.
+Both are ordinary extract-and-run archives, with no installer or root access
+needed. The musl binary still uses the host's CA certificates for secure email,
+and optional PDF previews and browser links require installed external programs.
+See `LINUX-SIZES.md` attached to each release for measured size differences.
+macOS release binaries are not code-signed or notarized.
+
+### Build from source
+
 **Requirements:** Rust 1.98 or newer and a terminal with modern Unicode support. Optional terminal graphics require a compatible terminal; PDF thumbnails use `pdftoppm` when installed.
 
 ```sh
@@ -64,7 +84,8 @@ cp config.example.toml ~/.config/jerc/config.toml
 
 The example includes a sample Maildir account; replace or remove it for your own setup. Configuration follows your operating system's user configuration directory (the path above is typical on Linux).
 
-> Jerc is currently built from source. Package-manager installation instructions will be added when packages are published.
+Package-manager installation instructions will be added when packages are published.
+Release maintainers should see [Publishing releases](docs/releasing.md).
 
 ## Essential keys
 
@@ -93,6 +114,6 @@ The full reference lives in **[Keybindings](docs/keybindings.md)**. Press `?` in
 
 ## Project status
 
-Jerc is under active development. IMAP and Maildir reading, SMTP sending, drafts, and the UI are implemented and somewhat finalized. However, email is complex, and as such more advanced features such as full threading and IMAP IDLE are still planned. Expect breaking changes before 1.0.
+Jerc is under active development. IMAP and Maildir reading, SMTP sending, drafts, and the UI are implemented and somewhat finalized. IMAP IDLE synchronization is supported with polling fallback; full conversation threading and server-backed search are planned. Expect breaking changes before 1.0.
 
 Released under the [MIT License](LICENSE).

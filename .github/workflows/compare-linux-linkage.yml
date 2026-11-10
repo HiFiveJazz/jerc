@@ -1,0 +1,65 @@
+name: Compare Linux linkage
+
+# Run this before releasing, without creating a tag or publishing a release.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install musl compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Test the musl target
+        run: cargo test --locked --all-targets --all-features --target x86_64-unknown-linux-musl
+      - name: Build both Linux release variants
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-gnu
+          cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: Confirm the musl executable is fully statically linked
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=target/x86_64-unknown-linux-musl/release/jerc
+          readelf -h "$binary" >/dev/null
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo 'ERROR: musl binary requests a dynamic loader' >&2
+            exit 1
+          fi
+          if readelf -d "$binary" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo 'ERROR: musl binary has shared-library dependencies' >&2
+            exit 1
+          fi
+          "$binary" --version
+      - name: Package and measure the real builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v$(python -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"])')"
+          python scripts/package_release.py --tag "$tag" --target x86_64-unknown-linux-gnu
+          python scripts/package_release.py --tag "$tag" --target x86_64-unknown-linux-musl
+          python scripts/compare_linux_linkage.py --tag "$tag" --directory dist --output dist/LINUX-SIZES.md
+          cat dist/LINUX-SIZES.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-gnu-vs-musl
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

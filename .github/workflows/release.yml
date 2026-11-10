@@ -1,0 +1,150 @@
+name: Release
+
+# A pushed version tag is the only event that can publish a GitHub Release.
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Check version, formatting, and Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Reject tags that don't match Cargo.toml
+        run: python scripts/package_release.py --tag "$GITHUB_REF_NAME" --check-only
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  build:
+    name: Build and test (${{ matrix.target }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      # The target-specific C compiler is needed for Tree-sitter's C grammars.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install musl compiler
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Run native tests
+        if: matrix.target != 'x86_64-unknown-linux-musl'
+        run: cargo test --locked --all-targets --all-features
+      - name: Run statically linked Linux tests
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test --locked --all-targets --all-features --target x86_64-unknown-linux-musl
+      - name: Compile release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Verify the Linux musl binary has no dynamic dependencies
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/x86_64-unknown-linux-musl/release/jerc"
+          readelf -h "$binary" >/dev/null
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo 'ERROR: musl executable has a dynamic loader' >&2
+            exit 1
+          fi
+          if readelf -d "$binary" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo 'ERROR: musl executable requires shared libraries' >&2
+            exit 1
+          fi
+      - name: Verify built version
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/jerc"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then binary+=".exe"; fi
+          "$binary" --version | grep -F "${GITHUB_REF_NAME#v}"
+      - name: Package binary and license
+        shell: bash
+        run: python scripts/package_release.py --tag "$GITHUB_REF_NAME" --target "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Report GNU vs musl binary and download sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/compare_linux_linkage.py --tag "$GITHUB_REF_NAME" --directory dist --output dist/LINUX-SIZES.md
+          cat dist/LINUX-SIZES.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Create SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum jerc-* > SHA256SUMS
+          test "$(find . -maxdepth 1 -type f -name 'jerc-*' | wc -l)" -eq 5
+      - name: Publish tagged release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Jerc $GITHUB_REF_NAME" \
+            --generate-notes
