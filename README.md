@@ -116,4 +116,12 @@ The full reference lives in **[Keybindings](docs/keybindings.md)**. Press `?` in
 
 Jerc is under active development. IMAP and Maildir reading, SMTP sending, drafts, and the UI are implemented and somewhat finalized. IMAP IDLE synchronization is supported with polling fallback; full conversation threading and server-backed search are planned. Expect breaking changes before 1.0.
 
-Released under the [MIT License](LICENSE).
+## License
+
+Copyright (C) 2026 Jerc contributors.
+
+Jerc's original source code is licensed under the [GNU General Public License,
+version 3 only](LICENSE) (`GPL-3.0-only`). The bundled COSMIC notification
+sound is separately licensed under [Creative Commons Attribution-ShareAlike
+4.0](licenses/COSMIC-SOUND-LICENSE). Other third-party material retains its
+respective license and notices.

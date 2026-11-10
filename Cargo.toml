@@ -4,7 +4,7 @@ version = "0.6.0"
 edition = "2024"
 rust-version = "1.98"
 description = "A keyboard-driven terminal email client written in Rust"
-license = "MIT"
+license = "GPL-3.0-only"
 publish = false
 
 # Normal release builds retain full syntax-aware patch previews.

@@ -4,6 +4,10 @@ Thanks for improving Jerc. This is a terminal email client, so changes can
 involve untrusted MIME content and private account information. Keep changes
 small, testable, and focused on one subsystem.
 
+Contributions intended for inclusion in Jerc are submitted under the project's
+`GPL-3.0-only` license. Keep third-party copyright, license, and attribution
+notices intact; bundled third-party assets may have separate licenses.
+
 ## Find the right code
 
 | Area | Start here |
