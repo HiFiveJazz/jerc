@@ -1,0 +1,111 @@
+name: BSD (experimental)
+# Native BSD compatibility checks. No BSD binaries are published to Releases
+# until their interactive IMAP, OAuth, rendering, and terminal behavior is tested.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bsd.yml'
+      - 'scripts/ci-bsd.sh'
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    paths:
+      - '.github/workflows/bsd.yml'
+      - 'scripts/ci-bsd.sh'
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+jobs:
+  freebsd:
+    name: FreeBSD 15.0 (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test in FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.0'
+          arch: x86_64
+          sync: rsync
+          prepare: |
+            pkg install -y rust
+          run: |
+            sh scripts/ci-bsd.sh
+      - name: Save experimental FreeBSD binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: jerc-freebsd-amd64-experimental
+          path: bsd-dist/jerc-*-x86_64-unknown-freebsd.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  openbsd:
+    name: OpenBSD 8.0 (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test in OpenBSD
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: '8.0'
+          arch: x86_64
+          sync: rsync
+          prepare: |
+            pkg_add -I rust
+          run: |
+            sh scripts/ci-bsd.sh
+      - name: Save experimental OpenBSD binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: jerc-openbsd-amd64-experimental
+          path: bsd-dist/jerc-*-x86_64-unknown-openbsd.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  netbsd:
+    name: NetBSD 11.1 (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test in NetBSD
+        uses: vmactions/netbsd-vm@v1
+        with:
+          release: '11.1'
+          arch: x86_64
+          sync: rsync
+          prepare: |
+            # pkgsrc's packaged Rust may lag Jerc's Rust 1.98 MSRV.
+            export PKG_PATH="https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/$(uname -p)/11.1/All/"
+            /usr/sbin/pkg_add curl mozilla-rootcerts
+            /usr/pkg/sbin/mozilla-rootcerts install
+            /usr/pkg/bin/curl --fail --show-error --silent --location \
+              https://sh.rustup.rs -o /tmp/jerc-rustup-install.sh
+            sh /tmp/jerc-rustup-install.sh -y --profile minimal --default-toolchain 1.99.1
+          run: |
+            export PATH="$HOME/.cargo/bin:/usr/pkg/bin:/usr/pkg/sbin:$PATH"
+            sh scripts/ci-bsd.sh
+      - name: Save experimental NetBSD binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: jerc-netbsd-amd64-experimental
+          path: bsd-dist/jerc-*-x86_64-unknown-netbsd.tar.gz
+          if-no-files-found: error
+          retention-days: 7
