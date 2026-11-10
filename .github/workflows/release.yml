@@ -40,8 +40,6 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
           - os: macos-15
             target: aarch64-apple-darwin
@@ -52,8 +50,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       # The target-specific C compiler is needed for Tree-sitter's C grammars.
+      # Compile Tree-sitter's C code with musl, but leave the final Rust
+      # linker under rustc's control. Forcing musl-gcc as the final linker can
+      # produce a broken dynamic PIE with an ld-musl interpreter.
       CC_x86_64_unknown_linux_musl: musl-gcc
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
       - uses: actions/checkout@v4
         with:
@@ -124,19 +124,13 @@ jobs:
           pattern: binary-*
           path: dist
           merge-multiple: true
-      - name: Report GNU vs musl binary and download sizes
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/compare_linux_linkage.py --tag "$GITHUB_REF_NAME" --directory dist --output dist/LINUX-SIZES.md
-          cat dist/LINUX-SIZES.md >> "$GITHUB_STEP_SUMMARY"
       - name: Create SHA-256 checksums
         shell: bash
         run: |
           set -euo pipefail
           cd dist
           sha256sum jerc-* > SHA256SUMS
-          test "$(find . -maxdepth 1 -type f -name 'jerc-*' | wc -l)" -eq 5
+          test "$(find . -maxdepth 1 -type f -name 'jerc-*' | wc -l)" -eq 4
       - name: Publish tagged release with generated notes
         env:
           GH_TOKEN: ${{ github.token }}

@@ -46,23 +46,22 @@ When a version tag is pushed, the workflow:
 2. Runs the full test suite on Linux (including a musl-target test run), both
    macOS architectures, and Windows; builds a `--release --locked` binary for
    each target.
-3. Packages both GNU/glibc and statically linked musl Linux `.tar.gz` archives,
-   macOS `.tar.gz` archives, and a Windows `.zip`, each with a binary,
-   `LICENSE`, `README.md`, and `config.example.toml`. The release checks that
-   the musl executable has no ELF interpreter or shared-library dependencies.
-4. Produces `SHA256SUMS` and a `LINUX-SIZES.md` comparison of actual binary
-   and compressed archive sizes. Publishes all five binaries in a GitHub Release
+3. Packages one fully statically linked musl Linux `.tar.gz` archive, two macOS
+   `.tar.gz` archives, and a Windows `.zip`, each with a binary, `LICENSE`,
+   `README.md`, and `config.example.toml`. The workflow rejects a musl binary
+   with an ELF interpreter or required shared libraries.
+4. Produces `SHA256SUMS` and publishes all four binaries in a GitHub Release
    with automatically generated notes **only if all jobs succeed**.
 
 Watch the workflow under **GitHub → Actions → Release**. Its artifacts are
 published at <https://github.com/HiFiveJazz/jerc/releases>.
 
-Archives are built on GitHub-hosted runners. The GNU/Linux archive requires a
-compatible glibc, whereas the musl variant is statically linked and does not
-require glibc. Neither variant embeds trusted CA certificates or optional
-programs such as `pdftoppm` and a browser. macOS artifacts are
-unsigned and unnotarized. No crate is published to crates.io (`publish = false`
-in `Cargo.toml`).
+Archives are built on GitHub-hosted runners. The Linux release uses static musl
+and does not require glibc. It still relies on host CA certificates and optional
+programs such as `pdftoppm` and a browser. macOS artifacts are unsigned and
+unnotarized. No crate is published to crates.io (`publish = false` in
+`Cargo.toml`). GNU/glibc builds remain available by building from source with
+`cargo build --release --target x86_64-unknown-linux-gnu`.
 
 ## If the workflow fails
 
@@ -90,17 +89,32 @@ Alternatively, on Arch Linux with Rust via rustup:
 sudo pacman -S --needed musl gcc
 rustup target add x86_64-unknown-linux-musl
 cargo build --locked --release --target x86_64-unknown-linux-gnu
-CC_x86_64_unknown_linux_musl=musl-gcc \
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+# Use musl-gcc to compile native C dependencies only. Do not set it as
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rustc's default link step
+# is intended to produce a self-contained binary.
+env -u CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER \
+  -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+  CC_x86_64_unknown_linux_musl=musl-gcc \
   cargo build --locked --release --target x86_64-unknown-linux-musl
 
-# No program interpreter or NEEDED shared-library entries should be present.
-readelf -l target/x86_64-unknown-linux-musl/release/jerc | grep INTERP || true
-readelf -d target/x86_64-unknown-linux-musl/release/jerc | grep NEEDED || true
+# Both checks must find no entries; then verify the binary actually starts.
+binary=target/x86_64-unknown-linux-musl/release/jerc
+if readelf -l "$binary" | grep -q INTERP; then echo 'unexpected dynamic loader' >&2; exit 1; fi
+if readelf -d "$binary" | grep -q NEEDED; then echo 'unexpected shared dependency' >&2; exit 1; fi
+"$binary" --version
 ls -lh target/x86_64-unknown-linux-{gnu,musl}/release/jerc
 ```
 
+If the musl binary still has a `/lib/ld-musl-x86_64.so.1` interpreter,
+check `$CARGO_HOME/config.toml`, `~/.cargo/config.toml`, and parent `.cargo`
+config files for a musl `linker = "musl-gcc"` override. Remove it for the
+final Rust link. A binary with an `INTERP` entry must **not** be published as
+statically linked, even if it has no `NEEDED` libraries. A startup crash is a
+release blocker; do not work around it by changing the ELF interpreter.
+
 If you use Arch's system Rust instead, install the matching musl standard
 library package (`rust-musl`); do not mix the system Rust target libraries
-with a different rustup toolchain. Preserve both release variants until the
-size and behavior comparisons justify changing the default recommendation.
+with a different rustup toolchain.
+
+The release workflow intentionally publishes only the musl Linux build.
+The optional comparison workflow is retained for development and debugging.

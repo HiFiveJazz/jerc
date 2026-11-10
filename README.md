@@ -43,20 +43,20 @@ See [configuration](docs/configuration.md) for the relevant controls.
 
 ### Download a release
 
-Prebuilt binaries for Linux (x86-64, GNU and portable static musl), macOS
+Prebuilt binaries for Linux (x86-64, fully static musl), macOS
 (Apple Silicon and Intel), and Windows (x86-64) are published on
 [GitHub Releases](https://github.com/HiFiveJazz/jerc/releases).
 Download the archive matching your platform, extract it, and run `./jerc` on
 Linux/macOS (or `jerc.exe` on Windows). Each archive also includes the sample
 configuration.
 
-For Linux, try **`x86_64-unknown-linux-musl`** if you want a portable
-statically linked executable without a glibc version requirement; the
-**`x86_64-unknown-linux-gnu`** archive is also available for comparison.
-Both are ordinary extract-and-run archives, with no installer or root access
-needed. The musl binary still uses the host's CA certificates for secure email,
-and optional PDF previews and browser links require installed external programs.
-See `LINUX-SIZES.md` attached to each release for measured size differences.
+For Linux, download **`x86_64-unknown-linux-musl`**, the recommended fully
+statically linked executable. It requires no glibc or shared system libraries
+and is an extract-and-run archive with no installer or root access needed.
+The binary still uses the host's CA certificates for secure email, and optional
+PDF previews and browser links require installed external programs. Users who
+prefer a GNU/glibc build can compile from source with
+`cargo build --release --target x86_64-unknown-linux-gnu`.
 macOS release binaries are not code-signed or notarized.
 
 ### Build from source

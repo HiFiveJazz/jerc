@@ -2,3 +2,7 @@
 JERC_GOOGLE_CLIENT_ID = "406964657835-aq8lmia8j95dhl1a2bvharmfk3t1hgqj.apps.googleusercontent.com"
 JERC_GOOGLE_CLIENT_SECRET = "kSmqreRr0qwBWJgbf5Y-PjSU"
 JERC_MICROSOFT_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+
+# Statically Linked Binary
+# [build]
+# target = "x86_64-unknown-linux-musl"

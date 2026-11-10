@@ -11,8 +11,10 @@ jobs:
   compare:
     runs-on: ubuntu-24.04
     env:
+      # Compile Tree-sitter's C code with musl, but leave the final Rust
+      # linker under rustc's control. Forcing musl-gcc as the final linker can
+      # produce a broken dynamic PIE with an ld-musl interpreter.
       CC_x86_64_unknown_linux_musl: musl-gcc
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
       - uses: actions/checkout@v4
         with:
