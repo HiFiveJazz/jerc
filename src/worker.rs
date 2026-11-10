@@ -330,6 +330,26 @@ impl WorkerHandle {
         Ok(id)
     }
 
+    /// Do not make process exit wait for a slow IMAP request or a full action
+    /// queue. Dropping a JoinHandle detaches the worker; the process will exit
+    /// after the UI finishes its local cleanup. Unlike `shutdown`, this is
+    /// ONLY for final process exit, never account reload or tests that need to
+    /// observe all queued work finishing.
+    ///
+    /// The UI refuses ordinary quit while a send or tracked mailbox mutation
+    /// is outstanding. Read-only fetches and prefetches can be abandoned.
+    pub fn detach_for_exit(&mut self) {
+        self.idle_stop.store(true, Ordering::Relaxed);
+        // No blocking send: the action channels may already be full.
+        // No join: an IMAP operation may remain stuck until its I/O timeout.
+        drop(self.join.take());
+        drop(self.status_join.take());
+        drop(self.idle_join.take());
+        // Disconnect the background queue when possible. The IDLE watcher may
+        // still hold a clone until it observes the stop flag.
+        drop(self.status_sender.take());
+    }
+
     pub fn shutdown(&mut self) {
         let Some(join) = self.join.take() else {
             return;
@@ -1010,7 +1030,7 @@ mod tests {
     use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage};
     use std::collections::VecDeque;
     use std::sync::mpsc::{self, Receiver, SyncSender};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[cfg(unix)]
     #[test]
@@ -1392,6 +1412,46 @@ mod tests {
         assert!(matches!(event.kind, WorkerEventKind::MailboxOpened { .. }));
         release_tx.send(()).unwrap();
         worker.shutdown();
+    }
+
+    #[test]
+    fn final_exit_does_not_wait_for_busy_worker_or_full_queue() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let backend = Box::new(TestBackend {
+            status_started: Some(started_tx),
+            status_release: Some(release_rx),
+        });
+        let (events_tx, events_rx) = mpsc::sync_channel(128);
+        let mut worker = WorkerHandle::spawn(0, backend, None, None, events_tx);
+        let open = || ActionKind::OpenMailbox {
+            name: "INBOX".into(),
+            offset: 0,
+            limit: 10,
+            hint: None,
+        };
+        worker.post(open()).unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("foreground request must have started");
+        // The first request is waiting for the test to release it. Fill the
+        // worker's bounded queue, which used to block shutdown's send().
+        for _ in 0..64 {
+            worker.post(open()).unwrap();
+        }
+        let started = Instant::now();
+        worker.detach_for_exit();
+        drop(worker);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "final exit should not wait on the IMAP worker"
+        );
+        // Release the blocked read and disconnect the event channel. This
+        // lets the detached test thread stop rather than processing 64 reads.
+        drop(started_rx);
+        drop(events_rx);
+        release_tx.send(()).unwrap();
+        drop(release_tx);
     }
 
     #[test]

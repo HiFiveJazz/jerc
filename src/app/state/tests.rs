@@ -12,6 +12,51 @@ use ratatui::widgets::BorderType;
 use std::path::PathBuf;
 
 #[test]
+fn quit_is_immediate_without_outstanding_writes() {
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    app.handle_command(super::Command::Quit);
+    assert!(app.should_quit);
+}
+
+#[test]
+fn quit_does_not_interrupt_pending_smtp_send() {
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    app.pending_send = Some((0, 123));
+    app.handle_command(super::Command::Quit);
+    assert!(!app.should_quit);
+    assert!(app.status.text.contains("sending"));
+    app.pending_send = None;
+    app.handle_command(super::Command::Quit);
+    assert!(app.should_quit);
+}
+
+#[test]
+fn quit_does_not_interrupt_tracked_mailbox_mutation() {
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
+    let mut app = super::App::new(&config, vec![worker]);
+    app.accounts[0].pending_mutation_labels.insert(42, "deleted");
+    app.handle_command(super::Command::Quit);
+    assert!(!app.should_quit);
+    assert!(app.status.text.contains("mailbox change"));
+    app.accounts[0].pending_mutation_labels.remove(&42);
+    app.handle_command(super::Command::Quit);
+    assert!(app.should_quit);
+}
+
+#[test]
 fn quoted_diff_mode_toggles_without_changing_the_message() {
     let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
     let mut app = super::App::new(&config, vec![]);

@@ -197,7 +197,26 @@ impl App {
         }
 
         match command {
-            Command::Quit => self.should_quit = true,
+            Command::Quit => {
+                // Abrupt process exit could interrupt SMTP after the server
+                // accepted DATA, or cut short a queued move/delete. Wait for
+                // these tracked write operations, not for read-only fetching.
+                if self.pending_send.is_some() {
+                    self.status = StatusLine::info(
+                        "message still sending; press q again after it finishes",
+                    );
+                } else if self
+                    .accounts
+                    .iter()
+                    .any(|account| !account.pending_mutation_labels.is_empty())
+                {
+                    self.status = StatusLine::info(
+                        "mailbox change still running; press q again when done",
+                    );
+                } else {
+                    self.should_quit = true;
+                }
+            }
             Command::NextAccount => self.change_account(1),
             Command::PreviousAccount => self.change_account(-1),
             Command::SelectAccount(index) => self.select_account(index),

@@ -3,6 +3,14 @@
 use super::*;
 
 impl App {
+    /// Final process exit only: network reads must not delay returning to the
+    /// shell. The cache writers still perform their ordinary local flush.
+    pub fn detach_network_workers_for_exit(&mut self) {
+        for account in &mut self.accounts {
+            account.worker.detach_for_exit();
+        }
+    }
+
     pub fn new(config: &Config, workers: Vec<WorkerHandle>) -> Self {
         // A crash may bypass TempPath's normal cleanup. Best-effort removal
         // of old private attachment exports runs once, off the UI startup path.

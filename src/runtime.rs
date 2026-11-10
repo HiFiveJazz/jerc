@@ -60,8 +60,12 @@ pub fn run_tui(config: Config) -> Result<()> {
 
     // Redraw once with the resolved image protocol before entering the event loop.
     render(&mut terminal, &mut app)?;
-    event_loop(&mut terminal, &mut app, runtime_rx, runtime_tx)?;
-    Ok(())
+    // Quit must not wait for a busy IMAP SELECT/FETCH or for a full worker
+    // queue. Keep the normal graceful worker shutdown for account reloads,
+    // but detach network workers on final process exit (including UI errors).
+    let result = event_loop(&mut terminal, &mut app, runtime_rx, runtime_tx);
+    app.detach_network_workers_for_exit();
+    result
 }
 
 /// Invalid account URIs must not keep correctly configured accounts from
