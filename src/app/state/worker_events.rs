@@ -38,8 +38,7 @@ impl App {
             | WorkerEventKind::DraftSaveFailed { .. }
             | WorkerEventKind::DraftSaved { .. }
             | WorkerEventKind::MessageSent { .. } => EventGroup::Outgoing,
-            WorkerEventKind::Error(..)
-            | WorkerEventKind::Stopped => EventGroup::Errors,
+            WorkerEventKind::Error(..) | WorkerEventKind::Stopped => EventGroup::Errors,
         };
         match group {
             EventGroup::Mailbox => self.handle_mailbox_event(event),

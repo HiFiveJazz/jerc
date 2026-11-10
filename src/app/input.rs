@@ -487,17 +487,61 @@ pub const PICKER_HELP_ENTRIES: &[HelpEntry] = &[
 /// Searchable help for choosing where to save received attachments.
 /// Kept separate from the Compose file picker because the actions differ.
 pub const DESTINATION_HELP_ENTRIES: &[HelpEntry] = &[
-    HelpEntry { category: "Actions", key: "s", description: "save selected attachments here" },
-    HelpEntry { category: "Actions", key: "n", description: "create a new folder" },
-    HelpEntry { category: "Browse", key: "Enter / l", description: "open selected folder" },
-    HelpEntry { category: "Browse", key: "h / Backspace", description: "go to parent folder" },
-    HelpEntry { category: "Browse", key: "~", description: "go to home directory" },
-    HelpEntry { category: "Browse", key: ".", description: "toggle hidden files" },
-    HelpEntry { category: "Navigation", key: "j / k", description: "move down / up" },
-    HelpEntry { category: "Navigation", key: "gg / G", description: "first / last folder" },
-    HelpEntry { category: "Navigation", key: "Ctrl-j / Ctrl-k", description: "smooth scroll 22 rows" },
-    HelpEntry { category: "Window", key: "?", description: "search destination keybindings" },
-    HelpEntry { category: "Window", key: "Esc / q", description: "cancel save destination" },
+    HelpEntry {
+        category: "Actions",
+        key: "s",
+        description: "save selected attachments here",
+    },
+    HelpEntry {
+        category: "Actions",
+        key: "n",
+        description: "create a new folder",
+    },
+    HelpEntry {
+        category: "Browse",
+        key: "Enter / l",
+        description: "open selected folder",
+    },
+    HelpEntry {
+        category: "Browse",
+        key: "h / Backspace",
+        description: "go to parent folder",
+    },
+    HelpEntry {
+        category: "Browse",
+        key: "~",
+        description: "go to home directory",
+    },
+    HelpEntry {
+        category: "Browse",
+        key: ".",
+        description: "toggle hidden files",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "j / k",
+        description: "move down / up",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "gg / G",
+        description: "first / last folder",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "Ctrl-j / Ctrl-k",
+        description: "smooth scroll 22 rows",
+    },
+    HelpEntry {
+        category: "Window",
+        key: "?",
+        description: "search destination keybindings",
+    },
+    HelpEntry {
+        category: "Window",
+        key: "Esc / q",
+        description: "cancel save destination",
+    },
 ];
 
 /// Compose-specific, searchable modal shortcuts. Do not clutter the editor.

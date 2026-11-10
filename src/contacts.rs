@@ -59,7 +59,10 @@ impl ContactBook {
             let identity = crate::outgoing::sender_from_account(account);
             if let Ok(mailbox) = identity.parse::<lettre::message::Mailbox>() {
                 let email = mailbox.email.to_string();
-                if self.find(&email).is_none_or(|index| !self.entries[index].saved) {
+                if self
+                    .find(&email)
+                    .is_none_or(|index| !self.entries[index].saved)
+                {
                     let name = mailbox.name.unwrap_or_else(|| account.name.clone());
                     let _ = self.upsert(&name, &email, true);
                 }
@@ -473,13 +476,20 @@ impl ContactsModal {
     pub fn action_ids(&self, book: &ContactBook) -> Vec<usize> {
         // Convert stable email marks to current book IDs only at action time:
         // contact reorderings and search changes cannot change the recipients.
-        let marked = book.entries.iter().enumerate()
+        let marked = book
+            .entries
+            .iter()
+            .enumerate()
             .filter(|(_, contact)| self.marked.contains(&contact.email.to_ascii_lowercase()))
             .map(|(index, _)| index)
             .collect::<HashSet<_>>();
         let all = (0..book.entries.len()).collect::<Vec<_>>();
         crate::app::vim::selected(
-            &self.matches, &all, self.selected, self.visual_anchor, &marked,
+            &self.matches,
+            &all,
+            self.selected,
+            self.visual_anchor,
+            &marked,
         )
     }
 
@@ -509,9 +519,8 @@ impl ContactsModal {
         self.smooth_target = (target != self.selected).then_some(target);
     }
     pub fn advance(&mut self, length: usize) {
-        let (next, moved) = crate::app::navigation::smooth_step(
-            self.selected, &mut self.smooth_target, length,
-        );
+        let (next, moved) =
+            crate::app::navigation::smooth_step(self.selected, &mut self.smooth_target, length);
         if moved {
             self.selected = next;
             self.ensure_visible(length);
@@ -570,7 +579,12 @@ impl ContactEdit {
         self.vim_sequence.clear();
     }
     fn snapshot(&self) -> (String, String, bool, usize) {
-        (self.name.clone(), self.email.clone(), self.active_email, self.cursor)
+        (
+            self.name.clone(),
+            self.email.clone(),
+            self.active_email,
+            self.cursor,
+        )
     }
     fn restore(&mut self, snapshot: (String, String, bool, usize)) {
         (self.name, self.email, self.active_email, self.cursor) = snapshot;
@@ -596,7 +610,9 @@ impl ContactEdit {
     pub fn delete_range(&mut self, start: usize, end: usize) {
         let end = end.min(self.value().chars().count());
         let start = start.min(end);
-        if start == end { return; }
+        if start == end {
+            return;
+        }
         self.record_edit();
         let a = char_to_byte(self.value(), start);
         let b = char_to_byte(self.value(), end);
@@ -610,8 +626,12 @@ impl ContactEdit {
     }
     pub fn selected_range(&self) -> Option<(usize, usize)> {
         let anchor = self.visual_anchor?;
-        if self.mode != crate::app::ComposeMode::Visual { return None; }
-        if self.vim_sequence.has_operator() { return None; }
+        if self.mode != crate::app::ComposeMode::Visual {
+            return None;
+        }
+        if self.vim_sequence.has_operator() {
+            return None;
+        }
         crate::app::vim::visual_chars(anchor, self.cursor, self.value().chars().count())
     }
     pub fn selected_text(&self) -> Option<String> {
@@ -619,7 +639,9 @@ impl ContactEdit {
         Some(self.value().chars().skip(start).take(end - start).collect())
     }
     pub fn insert_text(&mut self, text: &str) {
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         self.record_edit();
         let offset = char_to_byte(self.value(), self.cursor);
         self.value_mut().insert_str(offset, text);
@@ -647,11 +669,35 @@ mod tests {
     #[test]
     fn autocontact_display_quotes_parenthesized_names_for_send() {
         let recipients = [
-            Contact { name: "Jasmeet (Jazz) Bhatia".into(), email: "jazz@example.org".into(), saved: true, favorite: false },
-            Contact { name: "Jasmeet (Japan) Bhatia".into(), email: "japan@example.org".into(), saved: true, favorite: false },
-            Contact { name: "James Schneider".into(), email: "james@example.org".into(), saved: true, favorite: false },
-            Contact { name: "Björk (B)".into(), email: "bjork@example.org".into(), saved: true, favorite: false },
-        ].iter().map(Contact::display).collect::<Vec<_>>().join(", ");
+            Contact {
+                name: "Jasmeet (Jazz) Bhatia".into(),
+                email: "jazz@example.org".into(),
+                saved: true,
+                favorite: false,
+            },
+            Contact {
+                name: "Jasmeet (Japan) Bhatia".into(),
+                email: "japan@example.org".into(),
+                saved: true,
+                favorite: false,
+            },
+            Contact {
+                name: "James Schneider".into(),
+                email: "james@example.org".into(),
+                saved: true,
+                favorite: false,
+            },
+            Contact {
+                name: "Björk (B)".into(),
+                email: "bjork@example.org".into(),
+                saved: true,
+                favorite: false,
+            },
+        ]
+        .iter()
+        .map(Contact::display)
+        .collect::<Vec<_>>()
+        .join(", ");
         assert!(recipients.contains("\"Jasmeet (Jazz) Bhatia\""));
         assert!(crate::outgoing::validate_recipients(&recipients, "", "").is_ok());
     }
@@ -685,7 +731,10 @@ mod tests {
         .unwrap();
         let mut book = super::ContactBook::default();
         book.include_account_identities(&config.accounts);
-        assert_eq!(book.suggest("j", &std::collections::HashSet::new()), vec![0]);
+        assert_eq!(
+            book.suggest("j", &std::collections::HashSet::new()),
+            vec![0]
+        );
         assert_eq!(book.entries[0].display(), "Jazz <me@example.org>");
         book.edit(Some("me@example.org"), "Preferred Name", "me@example.org")
             .unwrap();

@@ -257,7 +257,9 @@ impl ComposeFilePicker {
     pub(super) fn advance_smooth_scroll(&mut self) {
         let was_animating = self.smooth_target.is_some();
         let (next, moved) = crate::app::navigation::smooth_step(
-            self.selected, &mut self.smooth_target, self.entries.len(),
+            self.selected,
+            &mut self.smooth_target,
+            self.entries.len(),
         );
         self.selected = next;
         // Only refresh the expensive preview at the final destination.

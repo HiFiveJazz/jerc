@@ -42,7 +42,10 @@ impl MailboxStatusQueue {
             .iter()
             .position(|request| request.name == name)
             .and_then(|index| self.pending.remove(index));
-        let reason = if existing.as_ref().is_some_and(|request| request.reason == StatusReason::Refresh) {
+        let reason = if existing
+            .as_ref()
+            .is_some_and(|request| request.reason == StatusReason::Refresh)
+        {
             StatusReason::Refresh
         } else {
             reason
@@ -86,7 +89,10 @@ impl MailboxStatusQueue {
 
     fn start(&mut self, request_id: u64, request: StatusRequest) {
         debug_assert!(self.in_flight.is_none());
-        self.in_flight = Some(StatusInFlight { request_id, request });
+        self.in_flight = Some(StatusInFlight {
+            request_id,
+            request,
+        });
     }
 
     /// Stale completions from another request must not clear the live request.
@@ -158,9 +164,14 @@ impl App {
             return;
         }
         if let Some(request) = account.status_requests.pop_ready(&account.mailboxes) {
-            match account.worker.post(ActionKind::MailboxStatus(request.name.clone())) {
+            match account
+                .worker
+                .post(ActionKind::MailboxStatus(request.name.clone()))
+            {
                 Ok(request_id) => account.status_requests.start(request_id, request),
-                Err(_) => account.status_requests.enqueue(request.name, request.reason),
+                Err(_) => account
+                    .status_requests
+                    .enqueue(request.name, request.reason),
             }
         }
     }
@@ -189,7 +200,10 @@ mod tests {
             queue.enqueue("INBOX".into(), StatusReason::Refresh);
         }
         assert_eq!(queue.pending.len(), 1);
-        assert_eq!(queue.pop_ready(&[known("INBOX", true)]).unwrap().reason, StatusReason::Refresh);
+        assert_eq!(
+            queue.pop_ready(&[known("INBOX", true)]).unwrap().reason,
+            StatusReason::Refresh
+        );
     }
 
     #[test]
@@ -202,7 +216,10 @@ mod tests {
         assert!(queue.finish(41).is_none());
         assert!(queue.busy());
         assert_eq!(queue.finish(42).unwrap().reason, StatusReason::Initial);
-        assert_eq!(queue.pop_ready(&[known("INBOX", true)]).unwrap().reason, StatusReason::Refresh);
+        assert_eq!(
+            queue.pop_ready(&[known("INBOX", true)]).unwrap().reason,
+            StatusReason::Refresh
+        );
         assert!(!queue.busy());
     }
 
@@ -222,6 +239,9 @@ mod tests {
         queue.enqueue("INBOX".into(), StatusReason::Refresh);
         queue.enqueue("INBOX".into(), StatusReason::Initial);
         assert_eq!(queue.pending.len(), 1);
-        assert_eq!(queue.pop_ready(&[known("INBOX", true)]).unwrap().reason, StatusReason::Refresh);
+        assert_eq!(
+            queue.pop_ready(&[known("INBOX", true)]).unwrap().reason,
+            StatusReason::Refresh
+        );
     }
 }

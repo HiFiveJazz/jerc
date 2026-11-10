@@ -102,11 +102,7 @@ fn only_one_unfinished_autocomplete_separator_is_ignored() {
     for valid in ["one@example.org, ", "one@example.org, two@example.net, "] {
         validate_recipients(valid, "", "").expect("one terminal autocomplete separator");
     }
-    for invalid in [
-        ", ",
-        "one@example.org,, ",
-        "one@example",
-    ] {
+    for invalid in [", ", "one@example.org,, ", "one@example"] {
         assert!(validate_recipients(invalid, "", "").is_err(), "{invalid:?}");
     }
 }

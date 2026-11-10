@@ -5,7 +5,11 @@ use super::*;
 /// Shared compact two-button confirmation. The caller owns the action and
 /// this renderer only draws the same themed layout in each context.
 fn draw_short_confirmation(
-    frame: &mut Frame<'_>, theme: &Theme, width: u16, title: &str, message: &str,
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    width: u16,
+    title: &str,
+    message: &str,
 ) {
     let viewport = frame.area();
     let width = viewport.width.min(width);
@@ -27,16 +31,21 @@ fn draw_short_confirmation(
         Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
     );
     draw_confirmation_buttons(
-        frame, theme,
+        frame,
+        theme,
         Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2),
-        setup_button_style(theme), destructive_button_style(theme),
+        setup_button_style(theme),
+        destructive_button_style(theme),
     );
 }
 
 /// Yes saves the draft; No discards it. Esc returns to editing.
 pub(super) fn draw_compose_exit_prompt(frame: &mut Frame<'_>, theme: &Theme) {
     draw_short_confirmation(
-        frame, theme, 62, " Save unsent email? ",
+        frame,
+        theme,
+        62,
+        " Save unsent email? ",
         "Save this email to Drafts before closing?",
     );
 }
@@ -44,7 +53,10 @@ pub(super) fn draw_compose_exit_prompt(frame: &mut Frame<'_>, theme: &Theme) {
 /// The saved draft stays visible behind the confirmation popup.
 pub(super) fn draw_draft_resume_confirmation(frame: &mut Frame<'_>, theme: &Theme) {
     draw_short_confirmation(
-        frame, theme, 68, " Continue saved draft? ",
+        frame,
+        theme,
+        68,
+        " Continue saved draft? ",
         "Continue composing this saved email?",
     );
 }
@@ -55,7 +67,13 @@ pub(super) fn draw_remove_account_confirmation(frame: &mut Frame<'_>, app: &App)
     };
     let theme = app.theme();
     let area = centered_rect(frame.area(), 72, 27);
-    let inner = popup_inner(frame, theme, area, " Remove local email account ", theme.error());
+    let inner = popup_inner(
+        frame,
+        theme,
+        area,
+        " Remove local email account ",
+        theme.error(),
+    );
     frame.render_widget(Paragraph::new(format!(
         "Remove account {:?} from jerc?\n\nThis edits only config.toml. \
          No messages or folders on the server are deleted. Cached OAuth tokens\nare not revoked.\n\n[y] Remove   [n/Esc] Cancel", name))
@@ -236,7 +254,13 @@ pub(super) fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
         frame.area().width.saturating_sub(4).min(100),
         88,
     );
-    let inner = popup_inner(frame, theme, area, " Review outgoing email ", theme.accent());
+    let inner = popup_inner(
+        frame,
+        theme,
+        area,
+        " Review outgoing email ",
+        theme.accent(),
+    );
     if inner.height < 8 {
         return;
     }
@@ -278,7 +302,13 @@ pub(super) fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
         y += 1;
     }
     let mut filenames = compose_attachment_names(composer);
-    filenames.extend(composer.preview_forwarded_attachments.iter().filter(|name| !composer.draft_attachment_names.contains(name)).cloned());
+    filenames.extend(
+        composer
+            .preview_forwarded_attachments
+            .iter()
+            .filter(|name| !composer.draft_attachment_names.contains(name))
+            .cloned(),
+    );
     let files = if filenames.is_empty() {
         "none".to_owned()
     } else {

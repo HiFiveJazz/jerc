@@ -17,7 +17,11 @@ pub(crate) fn wrapped_index(current: usize, len: usize, delta: isize) -> usize {
     let current = current % len;
     let step = delta.unsigned_abs() % len;
     if delta < 0 {
-        if step <= current { current - step } else { len - (step - current) }
+        if step <= current {
+            current - step
+        } else {
+            len - (step - current)
+        }
     } else if current >= len - step {
         current - (len - step)
     } else {
@@ -31,12 +35,20 @@ pub(crate) fn filtered_position(matches: &[usize], selected: usize) -> Option<us
     if matches.is_empty() {
         return None;
     }
-    Some(matches.iter().position(|&index| index == selected).unwrap_or(0))
+    Some(
+        matches
+            .iter()
+            .position(|&index| index == selected)
+            .unwrap_or(0),
+    )
 }
 
 /// Move within a list of original indices, optionally wrapping at the ends.
 pub(crate) fn filtered_move(
-    matches: &[usize], selected: usize, delta: isize, wrap: bool,
+    matches: &[usize],
+    selected: usize,
+    delta: isize,
+    wrap: bool,
 ) -> Option<(usize, usize)> {
     let position = filtered_position(matches, selected)?;
     let next = if wrap {
@@ -51,7 +63,9 @@ pub(crate) fn filtered_move(
 /// whether its preview updates at *each* row or only at the destination.
 /// The target is cleared on arrival or when the list becomes empty.
 pub(crate) fn smooth_step(
-    selected: usize, target: &mut Option<usize>, len: usize,
+    selected: usize,
+    target: &mut Option<usize>,
+    len: usize,
 ) -> (usize, bool) {
     if len == 0 {
         *target = None;
@@ -88,7 +102,10 @@ pub(crate) fn reveal_row(
     if index < upper_guard {
         index.saturating_sub(scrolloff).min(max_scroll)
     } else if index > lower_guard {
-        index.saturating_add(scrolloff + 1).saturating_sub(height).min(max_scroll)
+        index
+            .saturating_add(scrolloff + 1)
+            .saturating_sub(height)
+            .min(max_scroll)
     } else {
         offset
     }

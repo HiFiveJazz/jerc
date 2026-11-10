@@ -27,7 +27,9 @@ pub fn save_draft(root: &Path, account: &str, draft: &Composer) -> Result<()> {
         .context("creating private postponed draft temp file")?;
     use std::io::Write;
     file.write_all(&bytes).context("writing postponed draft")?;
-    file.as_file().sync_all().context("syncing postponed draft")?;
+    file.as_file()
+        .sync_all()
+        .context("syncing postponed draft")?;
     file.persist(&path).context("committing postponed draft")?;
     Ok(())
 }
@@ -87,13 +89,23 @@ mod hardening_tests {
         save_draft(&root, "Personal", &draft).unwrap();
         draft.body = "second complete draft".into();
         save_draft(&root, "Personal", &draft).unwrap();
-        assert_eq!(load_draft(&root, "Personal").unwrap().unwrap().body, draft.body);
-        let files = fs::read_dir(&root).unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            load_draft(&root, "Personal").unwrap().unwrap().body,
+            draft.body
+        );
+        let files = fs::read_dir(&root)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(files.len(), 1, "unique temporary files must be cleaned up");
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             let mode = files[0].metadata().unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "private postponed draft must not be world-readable");
+            assert_eq!(
+                mode, 0o600,
+                "private postponed draft must not be world-readable"
+            );
         }
     }
 }

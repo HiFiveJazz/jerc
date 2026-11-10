@@ -11,12 +11,11 @@ impl AccountState {
             cached.next_page_offset = limit;
             cached.has_more = true;
         }
-        cached.message_index = cached.message_index.min(cached.messages.len().saturating_sub(1));
-        cached.bodies = cache::persistable_bodies_near(
-            &cached.messages,
-            &cached.bodies,
-            cached.message_index,
-        );
+        cached.message_index = cached
+            .message_index
+            .min(cached.messages.len().saturating_sub(1));
+        cached.bodies =
+            cache::persistable_bodies_near(&cached.messages, &cached.bodies, cached.message_index);
         self.mailbox_cache.insert(name.clone(), cached);
         self.warm_folder_order.retain(|entry| entry != &name);
         self.warm_folder_order.push_back(name);
@@ -37,10 +36,18 @@ impl AccountState {
         let retained = self.messages.len().min(max_messages);
         Some(CachedMailbox {
             messages: self.messages.iter().take(max_messages).cloned().collect(),
-            bodies: cache::persistable_bodies_near(&self.messages, &self.bodies, self.message_index),
+            bodies: cache::persistable_bodies_near(
+                &self.messages,
+                &self.bodies,
+                self.message_index,
+            ),
             message_index: self.message_index.min(retained.saturating_sub(1)),
             message_view_offset: self.message_view_offset,
-            next_page_offset: if truncated { max_messages } else { self.next_page_offset },
+            next_page_offset: if truncated {
+                max_messages
+            } else {
+                self.next_page_offset
+            },
             has_more: truncated || self.has_more,
             uid_validity: self.uid_validities.get(name).copied(),
             uid_next: self.uid_nexts.get(name).copied(),
@@ -48,9 +55,9 @@ impl AccountState {
     }
 
     pub(super) fn save_current_cache(&mut self) {
-        if let (Some(name), Some(snapshot)) = (
-            self.current_mailbox.clone(), self.current_cache_snapshot(),
-        ) {
+        if let (Some(name), Some(snapshot)) =
+            (self.current_mailbox.clone(), self.current_cache_snapshot())
+        {
             self.remember_mailbox(name, snapshot);
         }
     }
@@ -91,7 +98,11 @@ impl AccountState {
     /// count delta but cannot infer the destination UIDs.
     pub(super) fn invalidate_remote_folder(&mut self, name: &str) {
         self.forget_cached_folder(name);
-        if let Some(mailbox) = self.mailboxes.iter_mut().find(|mailbox| mailbox.name == name) {
+        if let Some(mailbox) = self
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == name)
+        {
             mailbox.counts_known = false;
         }
     }

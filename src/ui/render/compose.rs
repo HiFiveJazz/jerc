@@ -443,8 +443,13 @@ pub(super) fn draw_compose_file_picker_help(
 ) {
     let matches = picker.help_matches();
     draw_help_palette(
-        frame, app.theme(), " File picker keybindings ", PICKER_HELP_ENTRIES,
-        &picker.help_query, &matches, (picker.help_selected, picker.help_scroll),
+        frame,
+        app.theme(),
+        " File picker keybindings ",
+        PICKER_HELP_ENTRIES,
+        &picker.help_query,
+        &matches,
+        (picker.help_selected, picker.help_scroll),
     );
 }
 
@@ -472,12 +477,12 @@ pub(super) fn draw_compose_attachment_manager(frame: &mut Frame<'_>, app: &App) 
         let label = if composer.draft_attachment_names.is_empty() {
             " No files attached".to_owned()
         } else {
-            format!(" Saved draft attachment(s) retained: {}", composer.draft_attachment_names.join(", "))
+            format!(
+                " Saved draft attachment(s) retained: {}",
+                composer.draft_attachment_names.join(", ")
+            )
         };
-        frame.render_widget(
-            Paragraph::new(label).style(theme.muted()),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(label).style(theme.muted()), inner);
         return;
     }
     let selected = composer.attachment_manager_selected.min(files.len() - 1);
@@ -536,7 +541,13 @@ pub(super) fn draw_compose_advanced_options(frame: &mut Frame<'_>, app: &App) {
     };
     let theme = app.theme();
     let area = centered_rect(frame.area(), 82, 32);
-    let inner = popup_inner(frame, theme, area, " Advanced compose options ", theme.accent());
+    let inner = popup_inner(
+        frame,
+        theme,
+        area,
+        " Advanced compose options ",
+        theme.accent(),
+    );
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(1),
@@ -576,8 +587,13 @@ pub(super) fn draw_compose_help(frame: &mut Frame<'_>, app: &App) {
     };
     let matches = composer.compose_help_matches();
     draw_help_palette(
-        frame, app.theme(), " Compose keybindings ", COMPOSE_HELP_ENTRIES,
-        &composer.help_query, &matches, (composer.help_selected, composer.help_scroll),
+        frame,
+        app.theme(),
+        " Compose keybindings ",
+        COMPOSE_HELP_ENTRIES,
+        &composer.help_query,
+        &matches,
+        (composer.help_selected, composer.help_scroll),
     );
 }
 

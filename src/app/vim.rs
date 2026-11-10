@@ -45,10 +45,15 @@ impl VimSequence {
 
     /// `0` without an existing count remains a normal Vim motion.
     pub(crate) fn push_digit(&mut self, digit: char, max: usize) -> bool {
-        let Some(value) = digit.to_digit(10) else { return false };
-        if value == 0 && self.count.is_none() { return false; }
+        let Some(value) = digit.to_digit(10) else {
+            return false;
+        };
+        if value == 0 && self.count.is_none() {
+            return false;
+        }
         self.count = Some(
-            self.count.unwrap_or(0)
+            self.count
+                .unwrap_or(0)
                 .saturating_mul(10)
                 .saturating_add(value as usize)
                 .min(max),
@@ -80,30 +85,42 @@ pub(crate) struct VimHistory<T> {
 }
 
 impl<T> Default for VimHistory<T> {
-    fn default() -> Self { Self::new(200) }
+    fn default() -> Self {
+        Self::new(200)
+    }
 }
 
 impl<T> VimHistory<T> {
     pub(crate) fn new(limit: usize) -> Self {
-        Self { undo: VecDeque::new(), redo: VecDeque::new(), limit: limit.max(1) }
+        Self {
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+            limit: limit.max(1),
+        }
     }
 
     pub(crate) fn record(&mut self, snapshot: T) {
-        if self.undo.len() == self.limit { self.undo.pop_front(); }
+        if self.undo.len() == self.limit {
+            self.undo.pop_front();
+        }
         self.undo.push_back(snapshot);
         self.redo.clear();
     }
 
     pub(crate) fn undo(&mut self, current: T) -> Option<T> {
         let previous = self.undo.pop_back()?;
-        if self.redo.len() == self.limit { self.redo.pop_front(); }
+        if self.redo.len() == self.limit {
+            self.redo.pop_front();
+        }
         self.redo.push_back(current);
         Some(previous)
     }
 
     pub(crate) fn redo(&mut self, current: T) -> Option<T> {
         let next = self.redo.pop_back()?;
-        if self.undo.len() == self.limit { self.undo.pop_front(); }
+        if self.undo.len() == self.limit {
+            self.undo.pop_front();
+        }
         self.undo.push_back(current);
         Some(next)
     }
@@ -119,7 +136,9 @@ pub(crate) struct YankRegister {
 }
 
 pub(crate) fn byte_offset(text: &str, cursor: usize) -> usize {
-    text.char_indices().nth(cursor).map_or(text.len(), |(at, _)| at)
+    text.char_indices()
+        .nth(cursor)
+        .map_or(text.len(), |(at, _)| at)
 }
 
 /// Return a character-indexed selection without splitting UTF-8 codepoints.
@@ -166,7 +185,11 @@ pub(crate) fn word_start(text: &str, cursor: usize, backward: bool, whole: bool)
 }
 
 fn is_word_part(ch: char, whole: bool) -> bool {
-    if whole { !ch.is_whitespace() } else { is_word_char(ch) }
+    if whole {
+        !ch.is_whitespace()
+    } else {
+        is_word_char(ch)
+    }
 }
 
 /// Move to the final character of the next Vim word, without allocating a
@@ -174,7 +197,9 @@ fn is_word_part(ch: char, whole: bool) -> bool {
 /// behavior when the cursor starts on punctuation or at the end of a field.
 pub(crate) fn word_end(text: &str, cursor: usize, whole: bool) -> usize {
     let len = text.chars().count();
-    if len == 0 { return 0; }
+    if len == 0 {
+        return 0;
+    }
     let mut index = cursor.min(len - 1);
     let mut chars = text.chars().skip(index).peekable();
     if chars.peek().is_some_and(|ch| is_word_part(*ch, whole)) && index < len - 1 {
@@ -212,7 +237,11 @@ fn delimiter_pair(delimiter: char) -> Option<(char, char)> {
     }
 }
 
-pub(crate) fn inner_text_object_range(text: &str, column: usize, delimiter: char) -> Option<(usize, usize)> {
+pub(crate) fn inner_text_object_range(
+    text: &str,
+    column: usize,
+    delimiter: char,
+) -> Option<(usize, usize)> {
     let (open, close) = delimiter_pair(delimiter)?;
     let chars = text.chars().collect::<Vec<_>>();
     if chars.is_empty() {
@@ -286,7 +315,9 @@ pub(crate) fn selected<T: Eq + Hash + Clone>(
         let from = anchor.min(end).min(cursor.min(end));
         let to = anchor.min(end).max(cursor.min(end));
         for item in &visible[from..=to] {
-            if seen.insert(item.clone()) { chosen.push(item.clone()); }
+            if seen.insert(item.clone()) {
+                chosen.push(item.clone());
+            }
         }
     }
     for item in all {
@@ -294,7 +325,9 @@ pub(crate) fn selected<T: Eq + Hash + Clone>(
             chosen.push(item.clone());
         }
     }
-    if chosen.is_empty() && let Some(item) = visible.get(cursor) {
+    if chosen.is_empty()
+        && let Some(item) = visible.get(cursor)
+    {
         chosen.push(item.clone());
     }
     chosen
@@ -302,10 +335,16 @@ pub(crate) fn selected<T: Eq + Hash + Clone>(
 
 /// One semantic toggle for visual ranges in mail, contacts, and attachments.
 pub(crate) fn toggle_group<T: Eq + Hash + Clone>(marked: &mut HashSet<T>, items: &[T]) {
-    if items.is_empty() { return; }
+    if items.is_empty() {
+        return;
+    }
     let all_marked = items.iter().all(|item| marked.contains(item));
     for item in items {
-        if all_marked { marked.remove(item); } else { marked.insert(item.clone()); }
+        if all_marked {
+            marked.remove(item);
+        } else {
+            marked.insert(item.clone());
+        }
     }
 }
 
@@ -335,9 +374,18 @@ mod tests {
 
     #[test]
     fn nested_text_objects_work_in_reader_and_composer() {
-        assert_eq!(inner_text_object_range(r#"say "hello" now"#, 6, '"'), Some((5, 9)));
-        assert_eq!(inner_text_object_range("call(foo[bar])", 9, ']'), Some((9, 11)));
-        assert_eq!(inner_text_object_range("call(foo[bar])", 9, ')'), Some((5, 12)));
+        assert_eq!(
+            inner_text_object_range(r#"say "hello" now"#, 6, '"'),
+            Some((5, 9))
+        );
+        assert_eq!(
+            inner_text_object_range("call(foo[bar])", 9, ']'),
+            Some((9, 11))
+        );
+        assert_eq!(
+            inner_text_object_range("call(foo[bar])", 9, ')'),
+            Some((5, 12))
+        );
         assert_eq!(inner_text_object_range("{empty}", 0, '('), None);
         assert!(is_word_char('é'));
         assert!(!is_word_char('-'));
@@ -350,7 +398,10 @@ mod tests {
         let marks = HashSet::from([2, 3]);
         assert_eq!(selected(&visible, &all, 2, Some(1), &marks), vec![3, 5, 2]);
         assert_eq!(selected(&visible, &all, 0, None, &HashSet::new()), vec![1]);
-        assert_eq!(selected(&visible, &all, 9, None, &HashSet::new()), Vec::<i32>::new());
+        assert_eq!(
+            selected(&visible, &all, 9, None, &HashSet::new()),
+            Vec::<i32>::new()
+        );
     }
 
     #[test]

@@ -60,6 +60,9 @@ fn postponed_draft_preserves_server_source_and_existing_attachments() {
     let source = restored.draft_source.unwrap();
     assert_eq!(source.mailbox, "Drafts");
     assert_eq!(source.id.0, "draft:42");
-    assert_eq!(restored.draft_attachment_names, draft.draft_attachment_names);
+    assert_eq!(
+        restored.draft_attachment_names,
+        draft.draft_attachment_names
+    );
     assert_eq!(restored.draft_raw, draft.draft_raw);
 }

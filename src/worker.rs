@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -133,7 +133,9 @@ pub enum WorkerEventKind {
         total: usize,
         unread: usize,
     },
-    MailboxChanged { name: String },
+    MailboxChanged {
+        name: String,
+    },
     NewMailPreview {
         count: usize,
         sender: String,
@@ -314,7 +316,9 @@ impl WorkerHandle {
             }
         } else if matches!(
             &action.kind,
-            ActionKind::MailboxStatus(_) | ActionKind::WatchMailboxChanged(_) | ActionKind::NewMailPreview { .. }
+            ActionKind::MailboxStatus(_)
+                | ActionKind::WatchMailboxChanged(_)
+                | ActionKind::NewMailPreview { .. }
         ) {
             self.status_sender
                 .as_ref()
@@ -372,14 +376,18 @@ fn run_idle_worker(
         let started = Instant::now();
         let result = (|| -> anyhow::Result<()> {
             backend.connect()?;
-            let inbox = backend.list_mailboxes()?.into_iter()
+            let inbox = backend
+                .list_mailboxes()?
+                .into_iter()
                 .find(|mailbox| mailbox.role == crate::model::MailboxRole::Inbox);
             let Some(inbox) = inbox else { return Ok(()) };
             let mut last_wake = Instant::now() - Duration::from_secs(2);
             backend.watch_mailbox(&inbox.name, &stop, &mut || {
                 // A UID+FLAGS event burst only needs one STATUS reconciliation.
                 if last_wake.elapsed() >= Duration::from_secs(1) {
-                    let _ = wake.try_send(Action::new(ActionKind::WatchMailboxChanged(inbox.name.clone())));
+                    let _ = wake.try_send(Action::new(ActionKind::WatchMailboxChanged(
+                        inbox.name.clone(),
+                    )));
                     last_wake = Instant::now();
                 }
             })
@@ -389,7 +397,9 @@ fn run_idle_worker(
             break; // No IDLE capability / huge Inbox: retain existing polling.
         }
         for _ in 0..backoff_secs {
-            if stop.load(Ordering::Relaxed) { return; }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             thread::sleep(Duration::from_secs(1));
         }
         backoff_secs = (backoff_secs * 2).min(60);
@@ -802,11 +812,14 @@ fn run_status_worker(
                 }
             }
             ActionKind::WatchMailboxChanged(name) => {
-                if runtime_tx.try_send(RuntimeEvent::Worker(WorkerEvent {
-                    account,
-                    request_id: action.id,
-                    kind: WorkerEventKind::MailboxChanged { name },
-                })).is_err() {
+                if runtime_tx
+                    .try_send(RuntimeEvent::Worker(WorkerEvent {
+                        account,
+                        request_id: action.id,
+                        kind: WorkerEventKind::MailboxChanged { name },
+                    }))
+                    .is_err()
+                {
                     // The periodic STATUS poll will reconcile this missed wake.
                 }
             }
@@ -974,7 +987,9 @@ fn write_export_stream(
     }
     // Private from creation, atomic on success, and automatically removed
     // after a partial network failure.
-    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("missing export parent"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing export parent"))?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     stream(tmp.as_file_mut())?;
     if tmp.as_file().metadata()?.len() == 0 {
@@ -1005,11 +1020,18 @@ mod tests {
         std::fs::write(&victim, b"untouched").unwrap();
         let export = dir.path().join("message.eml");
         std::os::unix::fs::symlink(&victim, &export).unwrap();
-        write_export_stream(&export, |writer| { std::io::Write::write_all(writer, b"confidential")?; Ok(()) }).unwrap();
+        write_export_stream(&export, |writer| {
+            std::io::Write::write_all(writer, b"confidential")?;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
         assert_eq!(std::fs::read(&export).unwrap(), b"confidential");
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&export).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&export).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -1377,7 +1399,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("message.eml");
         let raw = b"From: test@example.com\r\nSubject: debug\r\n\r\nbody\r\n";
-        write_export_stream(&path, |writer| { std::io::Write::write_all(writer, raw)?; Ok(()) }).unwrap();
+        write_export_stream(&path, |writer| {
+            std::io::Write::write_all(writer, raw)?;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), raw);
         #[cfg(unix)]
         {

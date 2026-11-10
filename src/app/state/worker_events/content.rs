@@ -101,7 +101,9 @@ impl App {
                     // extraction ran. Never pop up the old message's files.
                     if event.account != self.account_index
                         || account.current_mailbox.as_deref() != Some(mailbox.as_str())
-                        || !account.selected_message().is_some_and(|message| message.id == id)
+                        || !account
+                            .selected_message()
+                            .is_some_and(|message| message.id == id)
                     {
                         self.attachment_pending = None;
                         self.attachment_source = None;
@@ -167,11 +169,13 @@ impl App {
                             if let Some(pending) = self.pending_draft.as_mut() {
                                 pending.composer = Some(composer);
                             }
-                            self.status = StatusLine::info("Draft preview ready: [Y]es edit / [N]o preview");
+                            self.status =
+                                StatusLine::info("Draft preview ready: [Y]es edit / [N]o preview");
                         }
                         Err(error) => {
                             self.pending_draft = None;
-                            self.status = StatusLine::error(format!("cannot open draft: {error:#}"));
+                            self.status =
+                                StatusLine::error(format!("cannot open draft: {error:#}"));
                         }
                     }
                     return;

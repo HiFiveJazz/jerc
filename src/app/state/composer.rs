@@ -62,32 +62,39 @@ impl Composer {
         // as autocomplete, rather than passing unquoted parentheses to Lettre.
         macro_rules! recipients_in {
             ($value:expr) => {
-                $value.map(|list| {
-                    list.mailboxes().filter_map(|mb| {
-                        let address = mb.address()?.trim();
-                        if address.is_empty() { return None; }
-                        Some(crate::contacts::Contact {
-                            name: mb.name().unwrap_or_default().to_owned(),
-                            email: address.to_owned(),
-                            saved: false,
-                            favorite: false,
-                        }.display())
-                    }).collect::<Vec<_>>().join(", ")
-                }).unwrap_or_default()
+                $value
+                    .map(|list| {
+                        list.mailboxes()
+                            .filter_map(|mb| {
+                                let address = mb.address()?.trim();
+                                if address.is_empty() {
+                                    return None;
+                                }
+                                Some(
+                                    crate::contacts::Contact {
+                                        name: mb.name().unwrap_or_default().to_owned(),
+                                        email: address.to_owned(),
+                                        saved: false,
+                                        favorite: false,
+                                    }
+                                    .display(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default()
             };
         }
-        let summary = crate::mail::parse_summary(
-            id.clone(), &raw, raw.len() as u64, MessageFlags::empty()
-        )?;
+        let summary =
+            crate::mail::parse_summary(id.clone(), &raw, raw.len() as u64, MessageFlags::empty())?;
         let body = crate::mail::parse_body(id, &raw)?;
         let mut composer = Self::new();
         composer.to = recipients_in!(parsed.to());
         composer.cc = recipients_in!(parsed.cc());
         composer.bcc = recipients_in!(parsed.bcc());
         composer.subject = summary.subject;
-        composer.body = body.plain_text
-            .or(body.plain_fallback)
-            .unwrap_or_default();
+        composer.body = body.plain_text.or(body.plain_fallback).unwrap_or_default();
         composer.in_reply_to = summary.in_reply_to;
         composer.references = summary.references;
         // Attachments remain encoded in the original RFC5322 payload until
@@ -144,7 +151,8 @@ impl Composer {
                     email: message.from_address.clone(),
                     saved: false,
                     favorite: false,
-                }.display()
+                }
+                .display()
             },
             cc: String::new(),
             bcc: String::new(),
@@ -254,12 +262,18 @@ impl Composer {
         // Only parse/reflow rich mail and attachment metadata upon opening the
         // preview, never while the terminal draws successive frames.
         self.preview_forwarded_attachments = self.draft_attachment_names.clone();
-        self.preview_forwarded_attachments.extend(self
-            .forwarded_raw
-            .as_deref()
-            .and_then(|raw| crate::mail::extract_attachments(raw).ok())
-            .map(|parts| parts.into_iter().map(|part| part.filename).collect::<Vec<_>>())
-            .unwrap_or_default());
+        self.preview_forwarded_attachments.extend(
+            self.forwarded_raw
+                .as_deref()
+                .and_then(|raw| crate::mail::extract_attachments(raw).ok())
+                .map(|parts| {
+                    parts
+                        .into_iter()
+                        .map(|part| part.filename)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        );
         self.preview_rich_lines = self
             .outgoing_html_preview()?
             .map(|html| render_html_for_terminal(&html, 90).1);
@@ -741,7 +755,9 @@ impl Composer {
         } else {
             self.edit_history.undo(current)
         };
-        let Some((field, text, cursor)) = previous else { return; };
+        let Some((field, text, cursor)) = previous else {
+            return;
+        };
         self.field = field;
         *self.field_mut() = text;
         self.cursor = cursor.min(self.char_count());
@@ -934,7 +950,8 @@ impl Composer {
     }
 
     pub(super) fn move_word_kind(&mut self, backwards: bool, whole: bool) {
-        self.cursor = crate::app::vim::word_start(self.field_value(), self.cursor, backwards, whole);
+        self.cursor =
+            crate::app::vim::word_start(self.field_value(), self.cursor, backwards, whole);
     }
 
     pub(super) fn move_word_end(&mut self, whole: bool) {
@@ -1237,7 +1254,9 @@ impl Composer {
         if register.linewise && self.field == ComposeField::Body {
             let content = register.text.strip_suffix('\n').unwrap_or(&register.text);
             // Repeating a linewise register repeats complete logical lines.
-            let repeated = std::iter::repeat_n(content, count).collect::<Vec<_>>().join("\n");
+            let repeated = std::iter::repeat_n(content, count)
+                .collect::<Vec<_>>()
+                .join("\n");
             if after {
                 let end = self.line_end();
                 let has_newline = self.body.chars().nth(end) == Some('\n');

@@ -147,7 +147,10 @@ pub(super) fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
 
     let matches = app.theme_matches();
     let shown = visible_filtered(
-        &matches, app.theme_selected, app.theme_scroll, usize::from(chunks[1].height),
+        &matches,
+        app.theme_selected,
+        app.theme_scroll,
+        usize::from(chunks[1].height),
     );
     if shown.is_empty() {
         frame.render_widget(

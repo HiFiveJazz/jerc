@@ -4,19 +4,36 @@ use super::*;
 
 impl App {
     pub(super) fn prepare_draft_resume(&mut self) {
-        let Some(account) = self.account() else { return; };
-        if !account.outgoing_configured { return; }
-        let Some(mailbox) = account.selected_mailbox()
+        let Some(account) = self.account() else {
+            return;
+        };
+        if !account.outgoing_configured {
+            return;
+        }
+        let Some(mailbox) = account
+            .selected_mailbox()
             .filter(|folder| folder.role == MailboxRole::Drafts)
-            .map(|folder| folder.name.clone()) else { return; };
-        let Some(message_id) = account.selected_message().map(|m| m.id.clone()) else { return; };
+            .map(|folder| folder.name.clone())
+        else {
+            return;
+        };
+        let Some(message_id) = account.selected_message().map(|m| m.id.clone()) else {
+            return;
+        };
         let account_index = self.account_index;
-        let queued = account.worker.post(ActionKind::FetchRawForCompose {
-            mailbox: mailbox.clone(), id: message_id.clone(),
-        }).is_ok();
+        let queued = account
+            .worker
+            .post(ActionKind::FetchRawForCompose {
+                mailbox: mailbox.clone(),
+                id: message_id.clone(),
+            })
+            .is_ok();
         if queued {
             self.pending_draft = Some(PendingDraft {
-                account: account_index, mailbox, message_id, composer: None,
+                account: account_index,
+                mailbox,
+                message_id,
+                composer: None,
             });
             self.status = StatusLine::info("loading draft for preview…");
         } else {
@@ -25,16 +42,24 @@ impl App {
     }
 
     pub(super) fn resume_server_draft(&mut self) {
-        let Some(mut pending) = self.pending_draft.take() else { return; };
-        let Some(mut composer) = pending.composer.take() else { return; };
-        if self.account_index != pending.account { return; }
+        let Some(mut pending) = self.pending_draft.take() else {
+            return;
+        };
+        let Some(mut composer) = pending.composer.take() else {
+            return;
+        };
+        if self.account_index != pending.account {
+            return;
+        }
         composer.draft_source = Some(DraftSource {
-            mailbox: pending.mailbox, id: pending.message_id,
+            mailbox: pending.mailbox,
+            id: pending.message_id,
         });
         self.close_message();
         self.composer = Some(composer);
         self.resumed_draft_account = None;
-        self.status = StatusLine::info("editing saved draft; original preserved until replacement succeeds");
+        self.status =
+            StatusLine::info("editing saved draft; original preserved until replacement succeeds");
     }
 
     pub(super) fn begin_compose(&mut self) {
@@ -331,10 +356,16 @@ impl App {
                             anchor.max(composer.attachment_manager_selected),
                         );
                         let indices = (first..=last).collect::<Vec<_>>();
-                        crate::app::vim::toggle_group(&mut composer.attachment_manager_marked, &indices);
+                        crate::app::vim::toggle_group(
+                            &mut composer.attachment_manager_marked,
+                            &indices,
+                        );
                     } else {
                         let index = composer.attachment_manager_selected;
-                        crate::app::vim::toggle_group(&mut composer.attachment_manager_marked, &[index]);
+                        crate::app::vim::toggle_group(
+                            &mut composer.attachment_manager_marked,
+                            &[index],
+                        );
                         composer.attachment_manager_selected = index
                             .saturating_add(1)
                             .min(composer.attachment_count().saturating_sub(1));
@@ -512,7 +543,9 @@ impl App {
         // Match the reader's C toggle while editing quoted replies. In Insert
         // mode uppercase C remains literal text, as in a regular Vim buffer.
         if key.code == KeyCode::Char('C')
-            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             && self
                 .composer
                 .as_ref()
@@ -628,7 +661,9 @@ impl App {
                         KeyCode::Char('$') => Some(composer.yank_to_line_end()),
                         _ => None,
                     };
-                    if let Some(register) = copied { self.yank_register = Some(register); }
+                    if let Some(register) = copied {
+                        self.yank_register = Some(register);
+                    }
                     return;
                 }
                 VimPrefix::Delete => {
@@ -652,15 +687,19 @@ impl App {
             return;
         }
         if key.code == KeyCode::Char('g') {
-            composer.vim_sequence.start(crate::app::vim::VimPrefix::Goto);
+            composer
+                .vim_sequence
+                .start(crate::app::vim::VimPrefix::Goto);
             return;
         }
         if matches!(key.code, KeyCode::Char('f' | 'F')) {
-            composer.vim_sequence.start(if key.code == KeyCode::Char('f') {
-                crate::app::vim::VimPrefix::FindForward
-            } else {
-                crate::app::vim::VimPrefix::FindBackward
-            });
+            composer
+                .vim_sequence
+                .start(if key.code == KeyCode::Char('f') {
+                    crate::app::vim::VimPrefix::FindForward
+                } else {
+                    crate::app::vim::VimPrefix::FindBackward
+                });
             return;
         }
         let count = composer.vim_sequence.take_count();
@@ -705,13 +744,12 @@ impl App {
                     // Switching header fields places the caret after the last
                     // character. Vim Visual mode must still select that last
                     // character rather than starting with an empty range.
-                    let anchor = if composer.field != ComposeField::Body
-                        && composer.char_count() > 0
-                    {
-                        composer.cursor.min(composer.char_count() - 1)
-                    } else {
-                        composer.cursor.min(composer.char_count())
-                    };
+                    let anchor =
+                        if composer.field != ComposeField::Body && composer.char_count() > 0 {
+                            composer.cursor.min(composer.char_count() - 1)
+                        } else {
+                            composer.cursor.min(composer.char_count())
+                        };
                     composer.cursor = anchor;
                     composer.visual_anchor = Some(anchor);
                     composer.visual_linewise = false;
@@ -724,7 +762,9 @@ impl App {
                 }
                 KeyCode::Char('u') => composer.undo_edit(false),
                 KeyCode::Char('y') => {
-                    composer.vim_sequence.start(crate::app::vim::VimPrefix::Yank);
+                    composer
+                        .vim_sequence
+                        .start(crate::app::vim::VimPrefix::Yank);
                     composer.vim_sequence.set_count(count);
                 }
                 KeyCode::Char('Y') => self.yank_register = Some(composer.yank_lines(count)),
@@ -756,7 +796,9 @@ impl App {
                     composer.delete_range(composer.cursor, end);
                 }
                 KeyCode::Char('d') => {
-                    composer.vim_sequence.start(crate::app::vim::VimPrefix::Delete);
+                    composer
+                        .vim_sequence
+                        .start(crate::app::vim::VimPrefix::Delete);
                     composer.vim_sequence.set_count(count);
                 }
                 KeyCode::Char('o') if composer.field == ComposeField::Body => {
@@ -776,7 +818,9 @@ impl App {
                     composer.mode = ComposeMode::Normal;
                 }
                 KeyCode::Char('V') => composer.visual_linewise = !composer.visual_linewise,
-                KeyCode::Char('i') => composer.vim_sequence.start(crate::app::vim::VimPrefix::Inner),
+                KeyCode::Char('i') => composer
+                    .vim_sequence
+                    .start(crate::app::vim::VimPrefix::Inner),
                 KeyCode::Char('y') => {
                     if let Some(register) = composer.yank_visual() {
                         self.yank_register = Some(register);
@@ -792,7 +836,8 @@ impl App {
                 }
                 KeyCode::Char('x') => {
                     if let Some((start, end)) = composer.visual_range() {
-                        let linewise = composer.visual_linewise && composer.field == ComposeField::Body;
+                        let linewise =
+                            composer.visual_linewise && composer.field == ComposeField::Body;
                         let cut = crate::app::vim::text_range(composer.field_value(), start, end)
                             .map(str::to_owned);
                         composer.delete_range(start, end);
@@ -909,7 +954,10 @@ impl App {
                 }
             };
             match self.account().and_then(|account| {
-                account.worker.post(ActionKind::SaveDraft { message, mailbox }).ok()
+                account
+                    .worker
+                    .post(ActionKind::SaveDraft { message, mailbox })
+                    .ok()
             }) {
                 Some(request_id) => Some(request_id),
                 None => {
@@ -923,7 +971,8 @@ impl App {
             None
         };
         if let (Some(request_id), Some(source)) = (draft_request, composer.draft_source.clone()) {
-            self.pending_draft_replacements.insert((self.account_index, request_id), source);
+            self.pending_draft_replacements
+                .insert((self.account_index, request_id), source);
         }
         self.composer = None;
         self.resumed_draft_account = None;

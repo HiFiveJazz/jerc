@@ -28,13 +28,15 @@ fn saving_an_active_visual_range_saves_every_attachment_without_marking() {
     assert_eq!(app.selected_attachment_indices(), vec![0, 1, 2]);
 
     let temp = tempfile::tempdir().unwrap();
-    app.attachment_destination_picker = Some(
-        ComposeFilePicker::open_directory_only(temp.path().to_path_buf()).unwrap(),
-    );
+    app.attachment_destination_picker =
+        Some(ComposeFilePicker::open_directory_only(temp.path().to_path_buf()).unwrap());
     app.save_selected_attachments();
     assert_eq!(std::fs::read(temp.path().join("one.txt")).unwrap(), b"one");
     assert_eq!(std::fs::read(temp.path().join("two.txt")).unwrap(), b"two");
-    assert_eq!(std::fs::read(temp.path().join("three.txt")).unwrap(), b"three");
+    assert_eq!(
+        std::fs::read(temp.path().join("three.txt")).unwrap(),
+        b"three"
+    );
     assert!(!temp.path().join("four.txt").exists());
     assert!(app.attachment_visual_anchor.is_none());
 }
@@ -86,9 +88,8 @@ fn destination_file_explorer_question_mark_opens_searchable_help_only() {
     let mut app = App::new(&config, vec![]);
     app.attachment_picker_visible = true;
     let temp = tempfile::tempdir().unwrap();
-    app.attachment_destination_picker = Some(
-        ComposeFilePicker::open_directory_only(temp.path().to_path_buf()).unwrap(),
-    );
+    app.attachment_destination_picker =
+        Some(ComposeFilePicker::open_directory_only(temp.path().to_path_buf()).unwrap());
     let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
     app.handle_attachment_picker_key(key(KeyCode::Char('?')));
@@ -102,10 +103,8 @@ fn destination_file_explorer_question_mark_opens_searchable_help_only() {
     }
     let picker = app.attachment_destination_picker.as_ref().unwrap();
     assert_eq!(picker.help_query, "folder");
-    let matches = crate::app::ranked_help_matches(
-        crate::app::DESTINATION_HELP_ENTRIES,
-        &picker.help_query,
-    );
+    let matches =
+        crate::app::ranked_help_matches(crate::app::DESTINATION_HELP_ENTRIES, &picker.help_query);
     assert!(!matches.is_empty());
     assert!(matches.iter().all(|&index| {
         crate::app::DESTINATION_HELP_ENTRIES[index]
@@ -113,7 +112,13 @@ fn destination_file_explorer_question_mark_opens_searchable_help_only() {
             .contains("folder")
     }));
     app.handle_attachment_picker_key(key(KeyCode::Backspace));
-    assert_eq!(app.attachment_destination_picker.as_ref().unwrap().help_query, "folde");
+    assert_eq!(
+        app.attachment_destination_picker
+            .as_ref()
+            .unwrap()
+            .help_query,
+        "folde"
+    );
     app.handle_attachment_picker_key(key(KeyCode::Esc));
     let picker = app.attachment_destination_picker.as_ref().unwrap();
     assert!(!picker.help_visible);
@@ -121,9 +126,19 @@ fn destination_file_explorer_question_mark_opens_searchable_help_only() {
     // In help mode, "s" filters help; it must never save attachments.
     app.handle_attachment_picker_key(key(KeyCode::Char('?')));
     app.handle_attachment_picker_key(key(KeyCode::Char('s')));
-    assert!(app.attachment_destination_picker.as_ref().unwrap().help_visible);
+    assert!(
+        app.attachment_destination_picker
+            .as_ref()
+            .unwrap()
+            .help_visible
+    );
     app.handle_attachment_picker_key(key(KeyCode::Char('?')));
-    assert!(!app.attachment_destination_picker.as_ref().unwrap().help_visible);
+    assert!(
+        !app.attachment_destination_picker
+            .as_ref()
+            .unwrap()
+            .help_visible
+    );
 }
 
 #[test]
@@ -148,13 +163,15 @@ fn attachment_session_cache_keys_include_mailbox_account_and_uidvalidity() {
 
 #[test]
 fn opened_attachment_temp_file_is_deleted_when_dropped() {
-    let path = super::export_attachment_for_open(&attachment("secret.txt", b"sensitive"))
-        .unwrap();
+    let path = super::export_attachment_for_open(&attachment("secret.txt", b"sensitive")).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"sensitive");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
     let location = path.to_path_buf();
     drop(path);
@@ -165,12 +182,9 @@ fn opened_attachment_temp_file_is_deleted_when_dropped() {
 fn saving_multiple_same_named_attachments_never_overwrites() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("report.txt"), "existing").unwrap();
-    let first = save_attachment_without_overwrite(
-        directory.path(),
-        &attachment("report.txt", b"first"),
-        0,
-    )
-    .unwrap();
+    let first =
+        save_attachment_without_overwrite(directory.path(), &attachment("report.txt", b"first"), 0)
+            .unwrap();
     let second = save_attachment_without_overwrite(
         directory.path(),
         &attachment("../../report.txt", b"second"),

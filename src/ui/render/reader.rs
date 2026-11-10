@@ -335,10 +335,10 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     let rendered = body.display_text(true).lines().collect::<Vec<_>>();
                     body_line_count = rendered.len();
                     let diff_lines = if quoted_diff_highlighting {
-                    classify_patch_lines_with_quotes(&rendered, true)
-                } else {
-                    classify_patch_lines(&rendered)
-                };
+                        classify_patch_lines_with_quotes(&rendered, true)
+                    } else {
+                        classify_patch_lines(&rendered)
+                    };
                     lines.extend(rendered.into_iter().enumerate().map(|(line_index, line)| {
                         plain_reader_line(
                             line,
@@ -818,7 +818,11 @@ pub(super) fn rich_html_line(
         None
     };
     let quote_color = if quote_depth > 0 && diff.is_none() {
-        Some(quoted_body_style(quote_depth, theme).fg.unwrap_or(theme.visual))
+        Some(
+            quoted_body_style(quote_depth, theme)
+                .fg
+                .unwrap_or(theme.visual),
+        )
     } else {
         None
     };
@@ -843,7 +847,9 @@ pub(super) fn rich_html_line(
             quoted_diff_highlighting: view.quoted_diff_highlighting,
             theme,
         };
-        let marker_len = prefix_chars.saturating_sub(column).min(span.text.chars().count());
+        let marker_len = prefix_chars
+            .saturating_sub(column)
+            .min(span.text.chars().count());
         if quote_depth > 0 && marker_len > 0 {
             // Use a UTF-8-safe boundary: the quote prefix can end halfway
             // through an HTML span that also contains multibyte text.

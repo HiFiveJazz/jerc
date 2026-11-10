@@ -4,10 +4,10 @@ use std::thread;
 use std::time::Duration;
 
 use image::DynamicImage;
-use url::Url;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use ureq::{Error as HttpError, config::Config, http::Uri};
+use url::Url;
 
 use crate::worker::RuntimeEvent;
 
@@ -64,13 +64,22 @@ fn image_host(source: &str) -> Result<String, String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err("remote image URLs cannot contain credentials".into());
     }
-    let host = url.host_str().ok_or_else(|| "remote image URL has no host".to_owned())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "remote image URL has no host".to_owned())?;
     if host.parse::<IpAddr>().is_ok()
         || !host.contains('.')
         || host.ends_with('.')
-        || [".localhost", ".local", ".internal", ".test", ".invalid", ".example"]
-            .iter()
-            .any(|suffix| host.to_ascii_lowercase().ends_with(suffix))
+        || [
+            ".localhost",
+            ".local",
+            ".internal",
+            ".test",
+            ".invalid",
+            ".example",
+        ]
+        .iter()
+        .any(|suffix| host.to_ascii_lowercase().ends_with(suffix))
     {
         return Err("remote image host is not a public DNS hostname".into());
     }
@@ -83,11 +92,15 @@ fn public_image_ip(address: IpAddr) -> bool {
             let [a, b, c, _] = ip.octets();
             // Reject RFC1918, CGNAT, loopback, link-local, documentation,
             // benchmarking, unspecified, multicast and reserved ranges.
-            !(a == 0 || a == 10 || a == 127 || a >= 224
+            !(a == 0
+                || a == 10
+                || a == 127
+                || a >= 224
                 || (a == 100 && (64..=127).contains(&b))
                 || (a == 169 && b == 254)
                 || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && (b == 168 || (b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99)))
+                || (a == 192
+                    && (b == 168 || (b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99)))
                 || (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))
                 || (a == 203 && b == 0 && c == 113))
         }
@@ -95,8 +108,7 @@ fn public_image_ip(address: IpAddr) -> bool {
             let segments = ip.segments();
             // Only globally scoped unicast; ::ffff IPv4-mapped, fc00::/7,
             // fe80::/10, documentation, and special-purpose ranges are denied.
-            segments[0] & 0xe000 == 0x2000
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+            segments[0] & 0xe000 == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
         }
     }
 }
@@ -152,7 +164,9 @@ fn load_remote_image(source: &str) -> Result<DynamicImage, String> {
     limits.max_image_height = Some(4096);
     limits.max_alloc = Some(32 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader.decode().map_err(|error| format!("image decode failed: {error}"))?;
+    let image = reader
+        .decode()
+        .map_err(|error| format!("image decode failed: {error}"))?;
     // Ignore the classic tracking-pixel shape even if its URL did not make the
     // conservative URL filter in MessageBody::html_images().
     if image.width() <= 2 && image.height() <= 2 {
@@ -180,14 +194,29 @@ mod security_tests {
         ] {
             assert!(image_host(url).is_err(), "should reject {url}");
         }
-        assert_eq!(image_host("https://cdn.example.org/pic.png").unwrap(), "cdn.example.org");
+        assert_eq!(
+            image_host("https://cdn.example.org/pic.png").unwrap(),
+            "cdn.example.org"
+        );
     }
 
     #[test]
     fn remote_images_reject_private_dns_answers() {
-        for ip in ["127.0.0.1", "10.1.2.3", "192.168.1.1", "100.64.0.1",
-                   "169.254.169.254", "172.20.1.1", "198.18.0.1", "192.0.2.1", "::1",
-                   "fc00::1", "fe80::1", "::ffff:127.0.0.1", "2001:db8::1"] {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.1",
+            "100.64.0.1",
+            "169.254.169.254",
+            "172.20.1.1",
+            "198.18.0.1",
+            "192.0.2.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "2001:db8::1",
+        ] {
             assert!(!public_image_ip(ip.parse::<IpAddr>().unwrap()), "{ip}");
         }
         assert!(public_image_ip("8.8.8.8".parse().unwrap()));

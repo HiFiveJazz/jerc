@@ -39,7 +39,8 @@ impl App {
                 warm_names.retain(|name| name != &config.default_mailbox);
                 warm_names.insert(0, config.default_mailbox.clone());
                 warm_names.truncate(MAX_WARM_MAILBOXES);
-                let warm_folder_order = warm_names.into_iter()
+                let warm_folder_order = warm_names
+                    .into_iter()
                     .filter(|name| snapshot.folders.contains_key(name))
                     .collect::<VecDeque<_>>();
                 let mut warm_folders = snapshot.folders;

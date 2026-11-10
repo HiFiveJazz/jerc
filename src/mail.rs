@@ -1427,7 +1427,10 @@ pub fn read_all_limited(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
         .read_to_end(&mut out)
         .context("reading message")?;
     if out.len() > limit {
-        anyhow::bail!("message exceeds the {} MiB in-memory limit", limit / (1024 * 1024));
+        anyhow::bail!(
+            "message exceeds the {} MiB in-memory limit",
+            limit / (1024 * 1024)
+        );
     }
     Ok(out)
 }
@@ -1435,9 +1438,9 @@ pub fn read_all_limited(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_all_limited, compact_bare_list_markers, compact_decorative_horizontal_rules,
+        compact_bare_list_markers, compact_decorative_horizontal_rules,
         compact_generic_image_alt_lines, compact_prose_whitespace, compact_social_link_chrome,
-        extract_thread_headers, parse_body, parse_summary, read_header_block,
+        extract_thread_headers, parse_body, parse_summary, read_all_limited, read_header_block,
         render_html_for_terminal, simplify_layout_table_blocks,
     };
     use crate::model::{HtmlLine, HtmlSpan, HtmlSpanStyle, MessageFlags, MessageId};

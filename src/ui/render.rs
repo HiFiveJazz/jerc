@@ -12,8 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{
     ATTACHMENT_HELP_ENTRIES, App, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, ComposeField,
     ComposeMode, DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, PICKER_HELP_ENTRIES,
-    ReaderSelection,
-    ranked_help_matches,
+    ReaderSelection, ranked_help_matches,
 };
 use crate::config::VisualSelectionStyle;
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
@@ -40,8 +39,8 @@ mod contacts;
 mod dialogs;
 mod help;
 mod mail_list;
-mod reader;
 mod quote;
+mod reader;
 mod setup;
 mod status;
 
@@ -52,8 +51,8 @@ use self::contacts::*;
 use self::dialogs::*;
 use self::help::*;
 use self::mail_list::*;
-use self::reader::*;
 use self::quote::*;
+use self::reader::*;
 use self::setup::*;
 use self::status::*;
 
@@ -723,14 +722,37 @@ mod tests {
         let own = super::plain_reader_line("My response", 0, 4, 30, view, None, None);
         let first = super::plain_reader_line("> Original", 1, 4, 30, view, None, None);
         let nested = super::plain_reader_line("> > Earlier", 2, 4, 30, view, None, None);
-        let intro = super::plain_reader_line(
-            "On Monday, Phillip wrote:", 3, 4, 30, view, None, None,
-        );
+        let intro =
+            super::plain_reader_line("On Monday, Phillip wrote:", 3, 4, 30, view, None, None);
         assert_eq!(own.spans[0].style.fg, Some(theme.foreground));
-        assert_eq!(first.spans.iter().map(|span| span.content.as_ref()).collect::<String>(), "> Original");
-        assert!(first.spans.iter().all(|span| span.style.fg == Some(theme.visual)));
-        assert_eq!(nested.spans.iter().map(|span| span.content.as_ref()).collect::<String>(), "> > Earlier");
-        assert!(nested.spans.iter().all(|span| span.style.fg == Some(theme.warning)));
+        assert_eq!(
+            first
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "> Original"
+        );
+        assert!(
+            first
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.visual))
+        );
+        assert_eq!(
+            nested
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "> > Earlier"
+        );
+        assert!(
+            nested
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.warning))
+        );
         assert_eq!(intro.spans[0].style.fg, Some(theme.visual));
         let patch = super::plain_reader_line(
             "> + added",
@@ -741,7 +763,12 @@ mod tests {
             Some(super::PatchLineKind::Add),
             None,
         );
-        assert!(patch.spans.iter().all(|span| span.style.fg == Some(theme.visual)));
+        assert!(
+            patch
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.visual))
+        );
         assert!(patch.spans.iter().all(|span| span.style.bg.is_none()));
     }
 
@@ -1128,23 +1155,50 @@ mod tests {
         // The reader pads each visual row to its viewport width. Verify the
         // actual message text and the padding separately, rather than treating
         // the intentional trailing spaces as part of the quotation.
-        let rendered = line.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
         assert_eq!(rendered.trim_end_matches(' '), "> +added");
         assert_eq!(rendered.chars().count(), 40);
         assert_eq!(line.spans[0].style.fg, Some(theme.visual));
         assert_eq!(line.spans[1].style.fg, Some(theme.unread));
         assert!(line.spans[1].style.bg.is_some());
         let plain_quote = plain_reader_line("> +mentioned in prose", 0, 1, 40, view, None, None);
-        assert!(plain_quote.spans.iter().all(|span| span.style.fg == Some(theme.visual)));
+        assert!(
+            plain_quote
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.visual))
+        );
         assert!(plain_quote.spans.iter().all(|span| span.style.bg.is_none()));
         let html_line = HtmlLine {
             spans: vec![
-                HtmlSpan { text: "> ".into(), style: HtmlSpanStyle::default() },
-                HtmlSpan { text: "-removed".into(), style: HtmlSpanStyle::default() },
+                HtmlSpan {
+                    text: "> ".into(),
+                    style: HtmlSpanStyle::default(),
+                },
+                HtmlSpan {
+                    text: "-removed".into(),
+                    style: HtmlSpanStyle::default(),
+                },
             ],
         };
-        let rich = rich_html_line(&html_line, 0, 1, 40, view, Some(PatchLineKind::Remove), None);
-        let rich_rendered = rich.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let rich = rich_html_line(
+            &html_line,
+            0,
+            1,
+            40,
+            view,
+            Some(PatchLineKind::Remove),
+            None,
+        );
+        let rich_rendered = rich
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
         assert_eq!(rich_rendered.trim_end_matches(' '), "> -removed");
         assert_eq!(rich_rendered.chars().count(), 40);
         assert_eq!(rich.spans[0].style.fg, Some(theme.visual));
@@ -1163,7 +1217,11 @@ mod tests {
             "Thanks for reviewing the patch.",
             "+not a code addition",
         ];
-        assert!(super::classify_patch_lines(&lines).iter().all(Option::is_none));
+        assert!(
+            super::classify_patch_lines(&lines)
+                .iter()
+                .all(Option::is_none)
+        );
     }
 
     #[test]
@@ -1197,12 +1255,19 @@ mod tests {
                 None,
             );
             assert_eq!(
-                rendered.spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+                rendered
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
                 input,
             );
             let expected = quoted_body_style(depth, &theme).fg;
             assert!(
-                rendered.spans.iter().all(|s| s.style.fg == expected && s.style.bg.is_none()),
+                rendered
+                    .spans
+                    .iter()
+                    .all(|s| s.style.fg == expected && s.style.bg.is_none()),
                 "quote depth {depth} lost styling on part of the line"
             );
         }
@@ -1237,8 +1302,14 @@ mod tests {
             .unwrap();
         let line = HtmlLine {
             spans: vec![
-                HtmlSpan { text: ">".into(), style: HtmlSpanStyle::default() },
-                HtmlSpan { text: "> From ".into(), style: HtmlSpanStyle::default() },
+                HtmlSpan {
+                    text: ">".into(),
+                    style: HtmlSpanStyle::default(),
+                },
+                HtmlSpan {
+                    text: "> From ".into(),
+                    style: HtmlSpanStyle::default(),
+                },
                 HtmlSpan {
                     text: "Jérôme: quoted full text".into(),
                     style: HtmlSpanStyle {
@@ -1267,12 +1338,21 @@ mod tests {
         );
         let expected = quoted_body_style(2, &theme).fg;
         assert_eq!(
-            rendered.spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+            rendered
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
             ">> From Jérôme: quoted full text"
         );
         assert!(rendered.spans.iter().all(|span| span.style.fg == expected));
         assert!(rendered.spans.iter().all(|span| span.style.bg.is_none()));
-        assert!(rendered.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            rendered.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -1294,10 +1374,12 @@ mod tests {
 
     #[test]
     fn composer_quote_diff_mode_preserves_quote_markers_and_only_colors_patch_hunks() {
-        use super::{diff_line_style, editor_text, quoted_body_style, PatchLineKind};
+        use super::{PatchLineKind, diff_line_style, editor_text, quoted_body_style};
         use crate::app::{ComposeMode, Composer};
-        let theme = load_themes().into_iter()
-            .find(|theme| theme.id == "tokyo-night").unwrap();
+        let theme = load_themes()
+            .into_iter()
+            .find(|theme| theme.id == "tokyo-night")
+            .unwrap();
         let mut composer = Composer::new();
         composer.mode = ComposeMode::Insert; // Do not mask text with the Normal block cursor.
         composer.body = "> @@ -1 +1 @@\n> -before\n> +after\n> plain prose".into();
@@ -1308,12 +1390,27 @@ mod tests {
             assert_eq!(line.spans[2].style.fg, quoted_body_style(1, &theme).fg);
         }
         let diff = editor_text(&composer.body, &composer, false, &theme, true);
-        assert_eq!(diff.lines[0].spans[2].style.fg, diff_line_style(PatchLineKind::Hunk, &theme).fg);
-        assert_eq!(diff.lines[1].spans[2].style.bg, diff_line_style(PatchLineKind::Remove, &theme).bg);
-        assert_eq!(diff.lines[2].spans[2].style.bg, diff_line_style(PatchLineKind::Add, &theme).bg);
-        assert_eq!(diff.lines[3].spans[2].style.fg, quoted_body_style(1, &theme).fg);
+        assert_eq!(
+            diff.lines[0].spans[2].style.fg,
+            diff_line_style(PatchLineKind::Hunk, &theme).fg
+        );
+        assert_eq!(
+            diff.lines[1].spans[2].style.bg,
+            diff_line_style(PatchLineKind::Remove, &theme).bg
+        );
+        assert_eq!(
+            diff.lines[2].spans[2].style.bg,
+            diff_line_style(PatchLineKind::Add, &theme).bg
+        );
+        assert_eq!(
+            diff.lines[3].spans[2].style.fg,
+            quoted_body_style(1, &theme).fg
+        );
         // The leading '>' and the following space are still conversation styling.
-        assert_eq!(diff.lines[1].spans[0].style.fg, quoted_body_style(1, &theme).fg);
+        assert_eq!(
+            diff.lines[1].spans[0].style.fg,
+            quoted_body_style(1, &theme).fg
+        );
         assert!(diff.lines[1].spans[0].style.bg.is_none());
     }
 

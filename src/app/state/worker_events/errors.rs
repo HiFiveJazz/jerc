@@ -30,11 +30,13 @@ impl App {
                 }
                 // Correlate errors by request ID: a failed background action
                 // must not silently unlock every other pending mail mutation.
-                let mutation_failed = account.pending_mutation_labels
+                let mutation_failed = account
+                    .pending_mutation_labels
                     .remove(&event.request_id)
                     .is_some();
-                let failed_seen = account.pending_seen.iter()
-                    .find_map(|(id, request_id)| (*request_id == event.request_id).then(|| id.clone()));
+                let failed_seen = account.pending_seen.iter().find_map(|(id, request_id)| {
+                    (*request_id == event.request_id).then(|| id.clone())
+                });
                 if let Some(id) = &failed_seen {
                     account.pending_seen.remove(id);
                 }

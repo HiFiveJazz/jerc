@@ -22,11 +22,7 @@ pub(super) fn quote_prefix(line: &str) -> (usize, usize) {
             offset += 1;
         }
     }
-    if depth == 0 {
-        (0, 0)
-    } else {
-        (depth, offset)
-    }
+    if depth == 0 { (0, 0) } else { (depth, offset) }
 }
 
 /// Remove quotation markers while preserving the leading Git diff context
@@ -88,7 +84,10 @@ pub(super) fn attribution_style(theme: &Theme) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_reply_attribution, quote_prefix, quoted_body_style, quoted_prefix_style, quoted_patch_payload};
+    use super::{
+        is_reply_attribution, quote_prefix, quoted_body_style, quoted_patch_payload,
+        quoted_prefix_style,
+    };
     use crate::theme::load_themes;
     use ratatui::style::Modifier;
 
@@ -120,7 +119,11 @@ mod tests {
             }
             assert_ne!(first.fg, third.fg, "{}", theme.id);
             assert_eq!(quoted_prefix_style(2, &theme).fg, second.fg);
-            assert!(quoted_prefix_style(2, &theme).add_modifier.contains(Modifier::BOLD));
+            assert!(
+                quoted_prefix_style(2, &theme)
+                    .add_modifier
+                    .contains(Modifier::BOLD)
+            );
         }
     }
 

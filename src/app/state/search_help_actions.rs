@@ -195,9 +195,9 @@ impl App {
 
     pub(super) fn move_theme_selection(&mut self, delta: isize) {
         let matches = self.theme_matches();
-        if let Some((index, position)) = crate::app::navigation::filtered_move(
-            &matches, self.theme_selected, delta, true,
-        ) {
+        if let Some((index, position)) =
+            crate::app::navigation::filtered_move(&matches, self.theme_selected, delta, true)
+        {
             self.theme_selected = index;
             self.theme_index = index;
             self.theme_scroll = position.saturating_sub(4);

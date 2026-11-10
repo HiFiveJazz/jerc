@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU32;
 use std::io::{self, Write};
+use std::num::NonZeroU32;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -49,7 +49,10 @@ struct LimitedMessageWriter {
 
 impl LimitedMessageWriter {
     fn new(limit: usize) -> Self {
-        Self { bytes: Vec::new(), limit }
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
     }
 }
 
@@ -65,9 +68,10 @@ impl Write for LimitedMessageWriter {
         Ok(buf.len())
     }
 
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImapAuth {
@@ -913,7 +917,10 @@ impl MailBackend for ImapBackend {
             return Ok(());
         }
         let mailbox = mailbox_from_name(name)?;
-        let mut session = self.session.take().ok_or_else(|| anyhow!("IMAP not connected"))?;
+        let mut session = self
+            .session
+            .take()
+            .ok_or_else(|| anyhow!("IMAP not connected"))?;
         // Only use IDLE when the server explicitly advertises RFC 2177.
         let capability = session.capability().context("reading IMAP capabilities")?;
         if !capability.contains(&Capability::Idle) {
@@ -925,7 +932,8 @@ impl MailBackend for ImapBackend {
             idle_timeout: Some(Duration::from_secs(25 * 60)),
             poll: None,
         };
-        let watch = session.watch_mailbox(mailbox, &capability, opts)
+        let watch = session
+            .watch_mailbox(mailbox, &capability, opts)
             .context("starting IMAP IDLE mailbox watcher")?;
         // The watcher owns the connection, leaving all foreground navigation
         // and the independent STATUS/prefetch worker unaffected.
@@ -933,7 +941,7 @@ impl MailBackend for ImapBackend {
             match watch.recv_timeout(Duration::from_secs(1)) {
                 Ok(Ok(_)) => changed(),
                 Ok(Err(error)) => return Err(error.into()),
-                Err(RecvTimeoutError::Timeout) => {},
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => bail!("IMAP IDLE stream stopped"),
             }
         }
@@ -1045,12 +1053,18 @@ impl MailBackend for ImapBackend {
         self.fetch_raw_limited(mailbox, id, MAX_RAW_MESSAGE_BYTES)
     }
 
-    fn export_raw_into(&mut self, mailbox: &str, id: &MessageId, writer: &mut dyn Write) -> Result<()> {
+    fn export_raw_into(
+        &mut self,
+        mailbox: &str,
+        id: &MessageId,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
         self.ensure_selected(mailbox)?;
         self.check_uid_generation(id)?;
         let uid = Self::uid_from_id(id)?;
         let uid = NonZeroU32::new(uid).ok_or_else(|| anyhow!("IMAP UID cannot be zero"))?;
-        self.session()?.fetch_body_stream(uid, true, writer)
+        self.session()?
+            .fetch_body_stream(uid, true, writer)
             .with_context(|| format!("streaming IMAP message UID {uid} to disk"))?;
         Ok(())
     }
@@ -1650,5 +1664,4 @@ mod tests {
         writer.write_all(b"45").unwrap();
         assert_eq!(writer.bytes, b"12345");
     }
-
 }

@@ -39,12 +39,18 @@ pub(super) fn centered_rect(area: Rect, max_width: u16, percent_height: u16) -> 
 /// Both the help palette and theme selector use this instead of rebuilding a
 /// temporary vector of rows every frame.
 pub(super) fn visible_filtered(
-    matches: &[usize], selected: usize, scroll: usize, height: usize,
+    matches: &[usize],
+    selected: usize,
+    scroll: usize,
+    height: usize,
 ) -> &[usize] {
     if matches.is_empty() || height == 0 {
         return &[];
     }
-    let selected_position = matches.iter().position(|&index| index == selected).unwrap_or(0);
+    let selected_position = matches
+        .iter()
+        .position(|&index| index == selected)
+        .unwrap_or(0);
     let max_start = matches.len().saturating_sub(height);
     let start = scroll
         .max(selected_position.saturating_sub(height.saturating_sub(1)))
@@ -56,13 +62,17 @@ pub(super) fn visible_filtered(
 /// Window of list rows with the cursor kept near the center. Used by
 /// file browsing and attachment lists; only the visible rows are rendered.
 pub(super) fn centered_list_window(
-    selected: usize, len: usize, height: usize,
+    selected: usize,
+    len: usize,
+    height: usize,
 ) -> std::ops::Range<usize> {
     if len == 0 || height == 0 {
         return 0..0;
     }
     let selected = selected.min(len - 1);
-    let start = selected.saturating_sub(height / 2).min(len.saturating_sub(height));
+    let start = selected
+        .saturating_sub(height / 2)
+        .min(len.saturating_sub(height));
     start..start.saturating_add(height).min(len)
 }
 

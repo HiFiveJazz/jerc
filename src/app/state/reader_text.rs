@@ -61,23 +61,35 @@ pub(super) fn reader_word_target(
             if next < length && current.chars().nth(next).is_some_and(is_word_char) {
                 return Some(ReaderPosition { line, column: next });
             }
-            text.lines().enumerate().skip(line + 1).find_map(|(line, text)| {
-                text.chars().position(is_word_char).map(|column| ReaderPosition { line, column })
-            })
+            text.lines()
+                .enumerate()
+                .skip(line + 1)
+                .find_map(|(line, text)| {
+                    text.chars()
+                        .position(is_word_char)
+                        .map(|column| ReaderPosition { line, column })
+                })
         }
         ReaderWordMotion::PreviousStart => {
             if column > 0 {
                 let previous = crate::app::vim::word_start(current, at, true, false);
                 if previous < length && current.chars().nth(previous).is_some_and(is_word_char) {
-                    return Some(ReaderPosition { line, column: previous });
+                    return Some(ReaderPosition {
+                        line,
+                        column: previous,
+                    });
                 }
             }
-            text.lines().enumerate().take(line).filter_map(|(line, text)| {
-                let length = text.chars().count();
-                let column = crate::app::vim::word_start(text, length, true, false);
-                (column < length && text.chars().nth(column).is_some_and(is_word_char))
-                    .then_some(ReaderPosition { line, column })
-            }).last()
+            text.lines()
+                .enumerate()
+                .take(line)
+                .filter_map(|(line, text)| {
+                    let length = text.chars().count();
+                    let column = crate::app::vim::word_start(text, length, true, false);
+                    (column < length && text.chars().nth(column).is_some_and(is_word_char))
+                        .then_some(ReaderPosition { line, column })
+                })
+                .last()
         }
     }
 }
@@ -91,20 +103,29 @@ pub(super) fn reader_selection_text(text: &str, selection: ReaderSelection) -> S
     }
     let end_line = selection.end.line.min(lines.len() - 1);
     let mut out = String::new();
-    for (line_index, line) in lines.iter().enumerate()
-        .take(end_line + 1).skip(selection.start.line)
+    for (line_index, line) in lines
+        .iter()
+        .enumerate()
+        .take(end_line + 1)
+        .skip(selection.start.line)
     {
         if line_index > selection.start.line {
             out.push('\n');
         }
         let count = line.chars().count();
-        if count == 0 { continue; }
+        if count == 0 {
+            continue;
+        }
         let start = if line_index == selection.start.line {
             selection.start.column.min(count - 1)
-        } else { 0 };
+        } else {
+            0
+        };
         let end = if line_index == end_line {
             selection.end.column.min(count - 1)
-        } else { count - 1 };
+        } else {
+            count - 1
+        };
         if let Some(slice) = crate::app::vim::text_range(line, start, end.saturating_add(1)) {
             out.push_str(slice);
         }
@@ -145,6 +166,10 @@ pub(super) fn reader_scroll_for_visual_cursor(
     max_scroll: usize,
 ) -> usize {
     crate::app::navigation::reveal_row(
-        current, cursor_row, view_height, max_scroll, READER_SCROLL_OFF,
+        current,
+        cursor_row,
+        view_height,
+        max_scroll,
+        READER_SCROLL_OFF,
     )
 }

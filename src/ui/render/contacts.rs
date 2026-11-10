@@ -211,7 +211,11 @@ pub(super) fn contact_editor_field_spans(
     theme: &Theme,
 ) -> Vec<Span<'static>> {
     let active = editor.active_email == is_email;
-    let style = if active { theme.current_line() } else { theme.text() };
+    let style = if active {
+        theme.current_line()
+    } else {
+        theme.text()
+    };
     let mut spans = vec![Span::styled(format!("{label}: "), style)];
     let block = Style::default()
         .fg(Color::Black)
@@ -229,7 +233,13 @@ pub(super) fn contact_editor_field_spans(
         let selected = selection.is_some_and(|(start, end)| (start..end).contains(&index));
         spans.push(Span::styled(
             ch.to_string(),
-            if at_cursor { block } else if selected { theme.selected() } else { style },
+            if at_cursor {
+                block
+            } else if selected {
+                theme.selected()
+            } else {
+                style
+            },
         ));
     }
     if active && cursor == length && editor.mode != ComposeMode::Insert {
@@ -503,7 +513,9 @@ pub(super) fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
                 theme.text()
             };
             let line = if edit.active_email == is_email {
-                Line::from(contact_editor_field_spans(label, value, edit, is_email, &theme))
+                Line::from(contact_editor_field_spans(
+                    label, value, edit, is_email, &theme,
+                ))
             } else {
                 Line::from(Span::styled(
                     truncate_display_width(&label_text, width as usize),
@@ -525,8 +537,10 @@ pub(super) fn draw_contacts(frame: &mut Frame<'_>, app: &mut App) {
         }
         if edit_area.height > 8 {
             frame.render_widget(
-                Paragraph::new("Tab switch · Esc Normal/cancel · i Insert · v Visual · Enter next/save")
-                    .style(theme.muted()),
+                Paragraph::new(
+                    "Tab switch · Esc Normal/cancel · i Insert · v Visual · Enter next/save",
+                )
+                .style(theme.muted()),
                 Rect::new(
                     edit_area.x + 2,
                     edit_area.bottom().saturating_sub(2),

@@ -47,7 +47,11 @@ fn outgoing_message_has_unique_id_and_utf8_headers() {
 fn plain_mail_has_minimal_utf8_mime_without_html_or_client_branding() {
     let (_, raw) = wire(&draft());
     let headers = String::from_utf8_lossy(&raw);
-    let headers = headers.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+    let headers = headers
+        .split("\r\n\r\n")
+        .next()
+        .unwrap()
+        .to_ascii_lowercase();
     assert!(headers.contains("mime-version: 1.0"));
     assert!(headers.contains("content-type: text/plain; charset=utf-8"));
     assert_eq!(headers.matches("mime-version:").count(), 1);
@@ -62,12 +66,16 @@ fn plain_mail_has_minimal_utf8_mime_without_html_or_client_branding() {
     // mail-parser exposes a plain-text fallback through html_body() when an
     // actual HTML alternative is absent. Check the underlying part kind, not
     // the fallback iterator's length.
-    assert!(parsed
-        .html_body()
-        .all(|part| !matches!(part.kind(), mail_parser::PartKind::Html)));
-    assert!(parsed.text_body().any(|part| part
-        .text()
-        .is_some_and(|text| text.contains("héllo"))));
+    assert!(
+        parsed
+            .html_body()
+            .all(|part| !matches!(part.kind(), mail_parser::PartKind::Html))
+    );
+    assert!(
+        parsed
+            .text_body()
+            .any(|part| part.text().is_some_and(|text| text.contains("héllo")))
+    );
 }
 
 #[test]

@@ -1182,7 +1182,11 @@ mod tests {
     fn panel_widths_create_ui_section_and_clamp_out_of_range_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\"\n",
+        )
+        .unwrap();
         super::save_ui_panel_width(&path, super::PanelWidth::Mailbox, 99).unwrap();
         super::save_ui_panel_width(&path, super::PanelWidth::Preview, 1).unwrap();
         let config = super::Config::load(Some(&path)).unwrap();

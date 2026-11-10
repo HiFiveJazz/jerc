@@ -1,9 +1,9 @@
 use super::{
-    ComposeField, ComposeMode, Composer, ReaderPosition, ReaderSelection, ReaderWordMotion,
-    SMOOTH_SCROLL_ROWS, bounded_index, inner_text_object_range, message_view_offset,
-    offset_index, preview_neighbor_positions, preview_travel_positions,
+    ComposeField, ComposeMode, Composer, Focus, PendingDraft, ReaderPosition, ReaderSelection,
+    ReaderWordMotion, SMOOTH_SCROLL_ROWS, bounded_index, inner_text_object_range,
+    message_view_offset, offset_index, preview_neighbor_positions, preview_travel_positions,
     reader_image_target_size, reader_scroll_for_visual_cursor, reader_selection_text,
-    reader_word_target, reply_attribution, url_at_cursor, Focus, PendingDraft,
+    reader_word_target, reply_attribution, url_at_cursor,
 };
 use crate::contacts::{ContactEdit, ContactsModal};
 use crate::model::{MessageFlags, MessageId, MessageSummary};
@@ -47,8 +47,8 @@ fn compose_shift_c_toggles_diff_mode_without_editing_text_or_insert_key() {
 
 #[test]
 fn unverified_cached_mail_never_appears_as_live_mail() {
-    use std::sync::mpsc::sync_channel;
     use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
     let root = tempfile::tempdir().unwrap();
     let (tx, _rx) = sync_channel(8);
     let worker = WorkerHandle::spawn(
@@ -58,14 +58,16 @@ fn unverified_cached_mail_never_appears_as_live_mail() {
         None,
         tx,
     );
-    let config = crate::config::Config::single_maildir(
-        "Local".into(), root.path().to_path_buf()
-    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
     let mut app = super::App::new(&config, vec![worker]);
     let raw = b"From: Example <example@example.org>\r\nSubject: Already deleted\r\n\r\nold";
     let message = crate::mail::parse_summary(
-        MessageId("old-uid".into()), raw, raw.len() as u64, MessageFlags::empty()
-    ).unwrap();
+        MessageId("old-uid".into()),
+        raw,
+        raw.len() as u64,
+        MessageFlags::empty(),
+    )
+    .unwrap();
     let account = app.account_mut().unwrap();
     account.current_mailbox = Some("INBOX".into());
     account.messages = vec![message];
@@ -77,13 +79,16 @@ fn unverified_cached_mail_never_appears_as_live_mail() {
     // which its real rows (not disk-only guesses) can be displayed.
     account.unverified_mailboxes.remove("INBOX");
     assert_eq!(account.visible_message_indices(), vec![0]);
-    assert_eq!(account.selected_message().unwrap().subject, "Already deleted");
+    assert_eq!(
+        account.selected_message().unwrap().subject,
+        "Already deleted"
+    );
 }
 
 #[test]
 fn ctrl_a_does_not_open_attachment_browser_for_known_empty_mime() {
-    use std::sync::mpsc::sync_channel;
     use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
     let root = tempfile::tempdir().unwrap();
     let (tx, _rx) = sync_channel(8);
     let worker = WorkerHandle::spawn(
@@ -93,13 +98,13 @@ fn ctrl_a_does_not_open_attachment_browser_for_known_empty_mime() {
         None,
         tx,
     );
-    let config = crate::config::Config::single_maildir(
-        "Local".into(), root.path().to_path_buf()
-    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
     let mut app = super::App::new(&config, vec![worker]);
     let raw = b"From: Sender <sender@example.org>\r\nSubject: No files\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello";
     let id = MessageId("empty-attachment-test".into());
-    let message = crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, MessageFlags::empty()).unwrap();
+    let message =
+        crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, MessageFlags::empty())
+            .unwrap();
     let body = crate::mail::parse_body(id.clone(), raw).unwrap();
     assert_eq!(body.attachment_count, 0);
     let account = app.account_mut().unwrap();
@@ -117,7 +122,9 @@ fn ctrl_a_does_not_open_attachment_browser_for_known_empty_mime() {
     app.account_mut().unwrap().bodies.clear();
     app.open_attachment_picker();
     assert!(!app.attachment_picker_visible);
-    let request_id = app.attachment_pending_request_id.expect("attachment check queued");
+    let request_id = app
+        .attachment_pending_request_id
+        .expect("attachment check queued");
     app.handle_worker_event(crate::worker::WorkerEvent {
         account: 0,
         request_id,
@@ -152,10 +159,13 @@ fn shared_cut_writes_clipboard_and_keeps_register_on_clipboard_failure() {
     assert!(register.as_ref().unwrap().linewise);
 
     let mut clipboard_called = false;
-    assert!(super::record_cut_with(&mut register, String::new(), false, |_text| {
-        clipboard_called = true;
-        Ok(())
-    }).is_none());
+    assert!(
+        super::record_cut_with(&mut register, String::new(), false, |_text| {
+            clipboard_called = true;
+            Ok(())
+        })
+        .is_none()
+    );
     assert!(!clipboard_called);
     assert_eq!(register.as_ref().unwrap().text, "other");
 }
@@ -185,7 +195,11 @@ fn compose_normal_x_cuts_to_register_in_every_header_and_body() {
         // Counted x uses Unicode character offsets, not UTF-8 bytes.
         app.handle_composer_key(key('2'));
         app.handle_composer_key(key('x'));
-        assert_eq!(app.composer.as_ref().unwrap().field_value(), "ac", "{field:?}");
+        assert_eq!(
+            app.composer.as_ref().unwrap().field_value(),
+            "ac",
+            "{field:?}"
+        );
         assert_eq!(app.yank_register.as_ref().unwrap().text, "😊b", "{field:?}");
         assert!(!app.yank_register.as_ref().unwrap().linewise);
 
@@ -230,11 +244,19 @@ fn compose_visual_x_cuts_selected_unicode_in_every_field_and_can_undo() {
         app.handle_composer_key(key('v'));
         app.handle_composer_key(key('l'));
         app.handle_composer_key(key('x'));
-        assert_eq!(app.composer.as_ref().unwrap().field_value(), "ac", "{field:?}");
+        assert_eq!(
+            app.composer.as_ref().unwrap().field_value(),
+            "ac",
+            "{field:?}"
+        );
         assert_eq!(app.yank_register.as_ref().unwrap().text, "😊b", "{field:?}");
         assert_eq!(app.composer.as_ref().unwrap().mode, ComposeMode::Normal);
         app.handle_composer_key(key('u'));
-        assert_eq!(app.composer.as_ref().unwrap().field_value(), "a😊bc", "{field:?}");
+        assert_eq!(
+            app.composer.as_ref().unwrap().field_value(),
+            "a😊bc",
+            "{field:?}"
+        );
     }
 }
 
@@ -290,9 +312,9 @@ fn compose_and_contacts_share_unicode_word_motions() {
 
 #[test]
 fn unrelated_worker_failure_cannot_unlock_or_discard_an_inflight_send() {
+    use crate::worker::{RuntimeEvent, WorkerEvent, WorkerEventKind, WorkerHandle};
     use std::sync::mpsc::sync_channel;
     use std::time::Duration;
-    use crate::worker::{WorkerEvent, WorkerEventKind, RuntimeEvent, WorkerHandle};
     let root = tempfile::tempdir().unwrap();
     let (tx, rx) = sync_channel(16);
     let worker = WorkerHandle::spawn(
@@ -320,7 +342,10 @@ fn unrelated_worker_failure_cannot_unlock_or_discard_an_inflight_send() {
         request_id: send_id.saturating_add(1000),
         kind: WorkerEventKind::Error("unrelated mailbox error".into()),
     });
-    assert!(app.composer.as_ref().unwrap().sending, "unrelated error cannot end a send");
+    assert!(
+        app.composer.as_ref().unwrap().sending,
+        "unrelated error cannot end a send"
+    );
     assert_eq!(app.pending_send, Some((account_id, send_id)));
     let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
         panic!("expected worker response");
@@ -336,28 +361,33 @@ fn unrelated_worker_failure_cannot_unlock_or_discard_an_inflight_send() {
 
 #[test]
 fn draft_replacement_failure_only_clears_matching_append_request() {
-    use std::sync::mpsc::sync_channel;
     use crate::worker::{WorkerEvent, WorkerEventKind, WorkerHandle};
+    use std::sync::mpsc::sync_channel;
     let root = tempfile::tempdir().unwrap();
     let (tx, _rx) = sync_channel(8);
     let worker = WorkerHandle::spawn(
-        0, Box::new(crate::backend::MaildirBackend::new(root.path().into())),
-        None, None, tx,
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
     );
-    let config: crate::config::Config = toml::from_str(
-        "[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\""
-    ).unwrap();
+    let config: crate::config::Config =
+        toml::from_str("[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\"").unwrap();
     let mut app = super::App::new(&config, vec![worker]);
     let source = super::DraftSource {
-        mailbox: "Drafts".into(), id: MessageId("original".into()),
+        mailbox: "Drafts".into(),
+        id: MessageId("original".into()),
     };
-    app.pending_draft_replacements.insert((0, 10), source.clone());
+    app.pending_draft_replacements
+        .insert((0, 10), source.clone());
     app.pending_draft_replacements.insert((0, 11), source);
     app.handle_worker_event(WorkerEvent {
         account: 0,
         request_id: 10,
         kind: WorkerEventKind::DraftSaveFailed {
-            mailbox: "Drafts".into(), error: "offline".into(),
+            mailbox: "Drafts".into(),
+            error: "offline".into(),
         },
     });
     assert!(!app.pending_draft_replacements.contains_key(&(0, 10)));
@@ -366,8 +396,7 @@ fn draft_replacement_failure_only_clears_matching_append_request() {
 
 #[test]
 fn rounded_borders_apply_to_every_theme() {
-    let config: crate::config::Config =
-        toml::from_str("[ui]\nborder_style = \"rounded\"").unwrap();
+    let config: crate::config::Config = toml::from_str("[ui]\nborder_style = \"rounded\"").unwrap();
     let app = super::App::new(&config, vec![]);
     assert!(
         app.themes
@@ -452,7 +481,10 @@ fn compose_yy_p_p_and_undo_preserve_linewise_unicode() {
     app.handle_composer_key(key('p'));
     assert_eq!(app.composer.as_ref().unwrap().body, "αβ\nαβ\nsecond\nthird");
     app.handle_composer_key(key('P'));
-    assert_eq!(app.composer.as_ref().unwrap().body, "αβ\nαβ\nαβ\nsecond\nthird");
+    assert_eq!(
+        app.composer.as_ref().unwrap().body,
+        "αβ\nαβ\nαβ\nsecond\nthird"
+    );
     app.handle_composer_key(key('u'));
     assert_eq!(app.composer.as_ref().unwrap().body, "αβ\nαβ\nsecond\nthird");
     app.handle_composer_key(key('u'));
@@ -509,7 +541,10 @@ fn compose_linewise_paste_at_end_and_counted_yank() {
     assert_eq!(app.yank_register.as_ref().unwrap().text, "one\ntwo\n");
     app.composer.as_mut().unwrap().cursor = 8; // 'three' at EOF
     app.handle_composer_key(key('p'));
-    assert_eq!(app.composer.as_ref().unwrap().body, "one\ntwo\nthree\none\ntwo");
+    assert_eq!(
+        app.composer.as_ref().unwrap().body,
+        "one\ntwo\nthree\none\ntwo"
+    );
 }
 
 #[test]
@@ -591,14 +626,22 @@ fn compose_header_yank_and_paste_work_for_every_address_and_subject_field() {
         // at the end after Tab/field navigation.
         app.handle_composer_key(key('y'));
         app.handle_composer_key(key('y'));
-        assert_eq!(app.yank_register.as_ref().unwrap().text, "Alex", "{field:?}");
+        assert_eq!(
+            app.yank_register.as_ref().unwrap().text,
+            "Alex",
+            "{field:?}"
+        );
         assert!(!app.yank_register.as_ref().unwrap().linewise);
 
         // V should select the whole field, not a zero-width selection.
         app.handle_composer_key(key('V'));
         assert_eq!(app.composer.as_ref().unwrap().visual_range(), Some((0, 4)));
         app.handle_composer_key(key('y'));
-        assert_eq!(app.yank_register.as_ref().unwrap().text, "Alex", "{field:?}");
+        assert_eq!(
+            app.yank_register.as_ref().unwrap().text,
+            "Alex",
+            "{field:?}"
+        );
         assert_eq!(app.composer.as_ref().unwrap().mode, ComposeMode::Normal);
 
         // v at the end of a header must select the final character.
@@ -611,12 +654,24 @@ fn compose_header_yank_and_paste_work_for_every_address_and_subject_field() {
         // Paste and undo work in the same field, without changing the
         // register or any of the other Compose fields.
         app.handle_composer_key(key('P'));
-        assert_eq!(app.composer.as_ref().unwrap().field_value(), "AleAlexx", "{field:?}");
+        assert_eq!(
+            app.composer.as_ref().unwrap().field_value(),
+            "AleAlexx",
+            "{field:?}"
+        );
         app.handle_composer_key(key('u'));
-        assert_eq!(app.composer.as_ref().unwrap().field_value(), "Alex", "{field:?}");
+        assert_eq!(
+            app.composer.as_ref().unwrap().field_value(),
+            "Alex",
+            "{field:?}"
+        );
         app.composer.as_mut().unwrap().cursor = 0;
         app.handle_composer_key(key('p'));
-        assert_eq!(app.composer.as_ref().unwrap().field_value(), "AAlexlex", "{field:?}");
+        assert_eq!(
+            app.composer.as_ref().unwrap().field_value(),
+            "AAlexlex",
+            "{field:?}"
+        );
         app.handle_composer_key(key('u'));
         assert_eq!(app.composer.as_ref().unwrap().field_value(), "Alex");
     }
@@ -635,7 +690,10 @@ fn compose_yank_register_pastes_between_recipient_fields_and_subject() {
     let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
 
     app.handle_composer_key(key('Y'));
-    assert_eq!(app.yank_register.as_ref().unwrap().text, "person@example.org");
+    assert_eq!(
+        app.yank_register.as_ref().unwrap().text,
+        "person@example.org"
+    );
     for field in [ComposeField::Cc, ComposeField::Bcc, ComposeField::Subject] {
         app.composer.as_mut().unwrap().switch_field(field);
         app.handle_composer_key(key('p'));
@@ -646,7 +704,10 @@ fn compose_yank_register_pastes_between_recipient_fields_and_subject() {
         );
     }
     assert_eq!(app.composer.as_ref().unwrap().to, "person@example.org");
-    assert_eq!(app.yank_register.as_ref().unwrap().text, "person@example.org");
+    assert_eq!(
+        app.yank_register.as_ref().unwrap().text,
+        "person@example.org"
+    );
 }
 
 #[test]
@@ -676,7 +737,11 @@ fn compose_header_yank_motion_visual_replace_and_multiline_paste_are_safe() {
         app.handle_composer_key(key('v'));
         app.handle_composer_key(key('l'));
         app.handle_composer_key(key('p'));
-        assert_eq!(app.composer.as_ref().unwrap().field_value(), "ébcbc", "{field:?}");
+        assert_eq!(
+            app.composer.as_ref().unwrap().field_value(),
+            "ébcbc",
+            "{field:?}"
+        );
         assert_eq!(app.yank_register.as_ref().unwrap().text, "ébc");
         app.handle_composer_key(key('u'));
         assert_eq!(app.composer.as_ref().unwrap().field_value(), "Aébc");
@@ -918,8 +983,7 @@ fn reader_scroll_respects_short_viewports_and_end_of_document() {
 fn alt_a_opens_account_setup_without_stealing_compose_ctrl_a() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let config: crate::config::Config =
-        toml::from_str("[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\"")
-            .unwrap();
+        toml::from_str("[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\"").unwrap();
     let mut app = super::App::new(&config, vec![]);
     assert!(app.setup.is_none());
     app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
@@ -932,8 +996,7 @@ fn alt_a_opens_account_setup_without_stealing_compose_ctrl_a() {
 fn received_attachment_help_is_searchable_and_keeps_viewer_open() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let config: crate::config::Config =
-        toml::from_str("[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\"")
-            .unwrap();
+        toml::from_str("[[accounts]]\nname = \"Test\"\nsource = \"maildir:///tmp/mail\"").unwrap();
     let mut app = super::App::new(&config, vec![]);
     app.attachment_picker_visible = true;
     app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
@@ -1098,9 +1161,15 @@ fn contact_editor_normal_motions_and_backspace_work_in_both_fields() {
         send(&mut app, &mut modal, KeyCode::Backspace);
         assert_eq!(modal.edit.as_ref().unwrap().cursor, 0);
         send(&mut app, &mut modal, KeyCode::Char('L'));
-        assert_eq!(modal.edit.as_ref().unwrap().cursor, original.chars().count());
+        assert_eq!(
+            modal.edit.as_ref().unwrap().cursor,
+            original.chars().count()
+        );
         send(&mut app, &mut modal, KeyCode::Backspace);
-        assert_eq!(modal.edit.as_ref().unwrap().cursor, original.chars().count() - 1);
+        assert_eq!(
+            modal.edit.as_ref().unwrap().cursor,
+            original.chars().count() - 1
+        );
         assert_eq!(modal.edit.as_ref().unwrap().value(), original);
         send(&mut app, &mut modal, KeyCode::Char('v'));
         send(&mut app, &mut modal, KeyCode::Char('H'));
@@ -1166,10 +1235,15 @@ fn contact_editor_uses_compose_modal_keys_for_both_fields() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
     let mut app = super::App::new(&config, vec![]);
-    let mut modal = ContactsModal { edit: Some(ContactEdit::new(None)), ..ContactsModal::default() };
+    let mut modal = ContactsModal {
+        edit: Some(ContactEdit::new(None)),
+        ..ContactsModal::default()
+    };
     let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
     let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
-    for ch in "Jazz".chars() { app.handle_contacts_modal_key(&mut modal, key(ch)); }
+    for ch in "Jazz".chars() {
+        app.handle_contacts_modal_key(&mut modal, key(ch));
+    }
     assert_eq!(modal.edit.as_ref().unwrap().name, "Jazz");
     app.handle_contacts_modal_key(&mut modal, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(modal.edit.as_ref().unwrap().mode, ComposeMode::Normal);
@@ -1202,7 +1276,8 @@ fn draft_resume_decline_keeps_reader_and_accept_opens_composer() {
     let mut app = super::App::new(&config, vec![]);
     app.setup = None;
     let make_pending = || PendingDraft {
-        account: 0, mailbox: "Drafts".into(),
+        account: 0,
+        mailbox: "Drafts".into(),
         message_id: MessageId("draft:42".into()),
         composer: Some(Composer::new()),
     };
@@ -1216,8 +1291,27 @@ fn draft_resume_decline_keeps_reader_and_accept_opens_composer() {
     app.pending_draft = Some(make_pending());
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     assert!(!app.message_open);
-    assert_eq!(app.composer.as_ref().unwrap().draft_source.as_ref().unwrap().mailbox, "Drafts");
-    assert_eq!(app.composer.as_ref().unwrap().draft_source.as_ref().unwrap().id.0, "draft:42");
+    assert_eq!(
+        app.composer
+            .as_ref()
+            .unwrap()
+            .draft_source
+            .as_ref()
+            .unwrap()
+            .mailbox,
+        "Drafts"
+    );
+    assert_eq!(
+        app.composer
+            .as_ref()
+            .unwrap()
+            .draft_source
+            .as_ref()
+            .unwrap()
+            .id
+            .0,
+        "draft:42"
+    );
 }
 
 #[test]
@@ -1226,17 +1320,29 @@ fn compose_ctrl_w_clears_each_field_or_one_body_line_and_is_undoable() {
     let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
     let mut app = super::App::new(&config, vec![]);
     let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
-    for field in [ComposeField::To, ComposeField::Cc, ComposeField::Bcc, ComposeField::Subject] {
+    for field in [
+        ComposeField::To,
+        ComposeField::Cc,
+        ComposeField::Bcc,
+        ComposeField::Subject,
+    ] {
         let mut editor = Composer::new();
         editor.switch_field(field);
         *editor.field_mut() = "Jasmeet (Jazz) Bhatia".into();
         editor.cursor = 4;
         app.composer = Some(editor);
         app.handle_composer_key(ctrl_w);
-        assert_eq!(app.composer.as_ref().unwrap().field_value(), "", "{field:?}");
+        assert_eq!(
+            app.composer.as_ref().unwrap().field_value(),
+            "",
+            "{field:?}"
+        );
         app.handle_composer_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_composer_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-        assert_eq!(app.composer.as_ref().unwrap().field_value(), "Jasmeet (Jazz) Bhatia");
+        assert_eq!(
+            app.composer.as_ref().unwrap().field_value(),
+            "Jasmeet (Jazz) Bhatia"
+        );
     }
     let mut editor = Composer::new();
     editor.switch_field(ComposeField::Body);
@@ -1533,8 +1639,7 @@ fn picker_visual_range_attaches_files_after_count_motion() {
         std::fs::write(temp.path().join(format!("{index}.txt")), b"hi").unwrap();
     }
     let mut composer = Composer::new();
-    composer.file_picker =
-        Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+    composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
     let key = |ch| crossterm::event::KeyCode::Char(ch);
     composer.file_picker_key(key('v')).unwrap();
     composer.file_picker_key(key('5')).unwrap();
@@ -1575,8 +1680,7 @@ fn picker_space_advances_and_stays_at_end_and_search_help_is_local() {
         std::fs::write(temp.path().join(name), b"ok").unwrap();
     }
     let mut composer = Composer::new();
-    composer.file_picker =
-        Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+    composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
     let key = |ch| crossterm::event::KeyCode::Char(ch);
     composer.file_picker_key(key(' ')).unwrap();
     assert_eq!(composer.file_picker.as_ref().unwrap().selected, 1);
@@ -1618,8 +1722,7 @@ fn picker_slash_search_accepts_current_match_and_tab_opens_folder() {
     }
     std::fs::write(temp.path().join("photos.txt"), b"hello").unwrap();
     let mut composer = Composer::new();
-    composer.file_picker =
-        Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+    composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
     let key = |ch| crossterm::event::KeyCode::Char(ch);
     composer.file_picker_key(key('/')).unwrap();
     for ch in "photos".chars() {
@@ -1665,8 +1768,7 @@ fn picker_visual_x_detaches_multiple_files_without_touching_others() {
         std::fs::write(temp.path().join(name), b"ok").unwrap();
     }
     let mut composer = Composer::new();
-    composer.file_picker =
-        Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+    composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
     let key = |ch| crossterm::event::KeyCode::Char(ch);
     composer.file_picker_key(key('v')).unwrap();
     composer.file_picker_key(key('2')).unwrap();
@@ -1700,8 +1802,7 @@ fn picker_visual_space_detaches_only_when_every_file_is_attached() {
         std::fs::write(temp.path().join(name), b"hello").unwrap();
     }
     let mut composer = Composer::new();
-    composer.file_picker =
-        Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
+    composer.file_picker = Some(super::ComposeFilePicker::open(temp.path().to_path_buf()).unwrap());
     let key = |ch| crossterm::event::KeyCode::Char(ch);
     assert!(composer.file_picker.as_ref().unwrap().entries[0].is_directory);
     // Attach a and b while selecting a directory too (which must be ignored).
@@ -2215,18 +2316,27 @@ fn seen_response_must_match_the_pending_request_id() {
     let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
     let mut app = super::App::new(&config, vec![worker]);
     let id = MessageId("test-seen".into());
-    app.account_mut().unwrap().pending_seen.insert(id.clone(), 203);
+    app.account_mut()
+        .unwrap()
+        .pending_seen
+        .insert(id.clone(), 203);
 
     app.handle_worker_event(WorkerEvent {
         account: 0,
         request_id: 202,
-        kind: WorkerEventKind::SeenChanged { id: id.clone(), seen: true },
+        kind: WorkerEventKind::SeenChanged {
+            id: id.clone(),
+            seen: true,
+        },
     });
     assert_eq!(app.account().unwrap().pending_seen.get(&id), Some(&203));
     app.handle_worker_event(WorkerEvent {
         account: 0,
         request_id: 203,
-        kind: WorkerEventKind::SeenChanged { id: id.clone(), seen: true },
+        kind: WorkerEventKind::SeenChanged {
+            id: id.clone(),
+            seen: true,
+        },
     });
     assert!(!app.account().unwrap().pending_seen.contains_key(&id));
 }
@@ -2305,7 +2415,14 @@ fn cache_invalidation_forgets_lru_and_explicitly_stales_folder_counts() {
 
     account.forget_cached_folder("Drafts");
     assert!(!account.mailbox_cache.contains_key("Drafts"));
-    assert_eq!(account.warm_folder_order.iter().map(String::as_str).collect::<Vec<_>>(), vec!["Sent"]);
+    assert_eq!(
+        account
+            .warm_folder_order
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["Sent"]
+    );
     assert!(account.mailboxes.last().unwrap().counts_known);
     account.invalidate_remote_folder("Drafts");
     assert!(!account.mailboxes.last().unwrap().counts_known);
@@ -2318,22 +2435,37 @@ fn persistent_and_in_memory_snapshots_share_bounded_cursor_rules() {
     let account = app.account_mut().unwrap();
     let raw = b"From: Example <a@example.net>\r\nSubject: Test\r\n\r\nbody";
     let example = crate::mail::parse_summary(
-        MessageId("one".into()), raw, raw.len() as u64, MessageFlags::empty(),
-    ).unwrap();
+        MessageId("one".into()),
+        raw,
+        raw.len() as u64,
+        MessageFlags::empty(),
+    )
+    .unwrap();
     account.current_mailbox = Some("INBOX".into());
     account.uid_validities.insert("INBOX".into(), 15);
     account.uid_nexts.insert("INBOX".into(), 600);
-    account.messages = (0..405).map(|i| {
-        let mut item = example.clone();
-        item.id = MessageId(format!("message-{i}"));
-        item
-    }).collect();
+    account.messages = (0..405)
+        .map(|i| {
+            let mut item = example.clone();
+            item.id = MessageId(format!("message-{i}"));
+            item
+        })
+        .collect();
     account.message_index = 404;
     account.next_page_offset = 405;
     let snapshot = account.current_cache_snapshot().unwrap();
-    assert_eq!(snapshot.messages.len(), crate::cache::MAX_MESSAGES_PER_FOLDER);
-    assert_eq!(snapshot.message_index, crate::cache::MAX_MESSAGES_PER_FOLDER - 1);
-    assert_eq!(snapshot.next_page_offset, crate::cache::MAX_MESSAGES_PER_FOLDER);
+    assert_eq!(
+        snapshot.messages.len(),
+        crate::cache::MAX_MESSAGES_PER_FOLDER
+    );
+    assert_eq!(
+        snapshot.message_index,
+        crate::cache::MAX_MESSAGES_PER_FOLDER - 1
+    );
+    assert_eq!(
+        snapshot.next_page_offset,
+        crate::cache::MAX_MESSAGES_PER_FOLDER
+    );
     assert!(snapshot.has_more);
     assert_eq!(snapshot.uid_validity, Some(15));
     assert_eq!(snapshot.uid_next, Some(600));

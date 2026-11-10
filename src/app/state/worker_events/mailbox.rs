@@ -109,7 +109,8 @@ impl App {
                 let mut new_count = 0usize;
                 let mut changed = false;
                 if let Some(mailbox) = account.mailboxes.iter_mut().find(|m| m.name == name) {
-                    changed = mailbox.counts_known && (mailbox.total != total || mailbox.unread != unread);
+                    changed = mailbox.counts_known
+                        && (mailbox.total != total || mailbox.unread != unread);
                     new_count = inbox_new_mail_count(
                         from_poll && mailbox.role == MailboxRole::Inbox,
                         mailbox.counts_known,
@@ -172,7 +173,8 @@ impl App {
                         }
                     }
                 }
-                if (changed || (from_poll && account.pending_inbox_refresh)) && new_count == 0
+                if (changed || (from_poll && account.pending_inbox_refresh))
+                    && new_count == 0
                     && account.current_mailbox.as_deref() == Some(name.as_str())
                 {
                     if account.page_inflight.is_some()

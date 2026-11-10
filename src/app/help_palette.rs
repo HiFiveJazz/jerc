@@ -4,8 +4,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{HelpEntry, ranked_help_matches};
 use super::navigation::filtered_move;
+use super::{HelpEntry, ranked_help_matches};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HelpKeys {
@@ -16,9 +16,18 @@ pub(crate) struct HelpKeys {
 }
 
 impl HelpKeys {
-    pub const GLOBAL: Self = Self { close_on_question: true, wrap: true };
-    pub const MODAL: Self = Self { close_on_question: true, wrap: false };
-    pub const TEXT_MODAL: Self = Self { close_on_question: false, wrap: false };
+    pub const GLOBAL: Self = Self {
+        close_on_question: true,
+        wrap: true,
+    };
+    pub const MODAL: Self = Self {
+        close_on_question: true,
+        wrap: false,
+    };
+    pub const TEXT_MODAL: Self = Self {
+        close_on_question: false,
+        wrap: false,
+    };
 }
 
 /// Returns true if the caller should close the help popup. Other changes are
@@ -33,8 +42,7 @@ pub(crate) fn handle_help_key(
 ) -> bool {
     if key.modifiers.is_empty()
         && (key.code == KeyCode::Esc
-            || (key.code == KeyCode::Char('?')
-                && (options.close_on_question || query.is_empty())))
+            || (key.code == KeyCode::Char('?') && (options.close_on_question || query.is_empty())))
     {
         return true;
     }
@@ -53,7 +61,9 @@ pub(crate) fn handle_help_key(
             KeyCode::Char('j') if query.is_empty() => Some(1),
             _ => None,
         }
-    } else { None };
+    } else {
+        None
+    };
     if let Some(delta) = movement {
         let matches = ranked_help_matches(entries, query);
         if let Some((index, position)) = filtered_move(&matches, *selected, delta, options.wrap) {
@@ -70,13 +80,19 @@ pub(crate) fn handle_help_key(
             matches.last()
         } {
             *selected = index;
-            *scroll = if key.code == KeyCode::Home { 0 } else { matches.len().saturating_sub(7) };
+            *scroll = if key.code == KeyCode::Home {
+                0
+            } else {
+                matches.len().saturating_sub(7)
+            };
         }
         return false;
     }
 
     if let KeyCode::Char(ch) = key.code
-        && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         query.push(ch);
         reset_help(entries, query, selected, scroll);
@@ -85,9 +101,15 @@ pub(crate) fn handle_help_key(
 }
 
 pub(crate) fn reset_help(
-    entries: &[HelpEntry], query: &str, selected: &mut usize, scroll: &mut usize,
+    entries: &[HelpEntry],
+    query: &str,
+    selected: &mut usize,
+    scroll: &mut usize,
 ) {
-    *selected = ranked_help_matches(entries, query).first().copied().unwrap_or(0);
+    *selected = ranked_help_matches(entries, query)
+        .first()
+        .copied()
+        .unwrap_or(0);
     *scroll = 0;
 }
 
@@ -95,28 +117,66 @@ pub(crate) fn reset_help(
 mod tests {
     use super::*;
     const ENTRIES: &[HelpEntry] = &[
-        HelpEntry { category: "Action", key: "a", description: "archive" },
-        HelpEntry { category: "Action", key: "d", description: "delete" },
-        HelpEntry { category: "Action", key: "r", description: "reply" },
+        HelpEntry {
+            category: "Action",
+            key: "a",
+            description: "archive",
+        },
+        HelpEntry {
+            category: "Action",
+            key: "d",
+            description: "delete",
+        },
+        HelpEntry {
+            category: "Action",
+            key: "r",
+            description: "reply",
+        },
     ];
     fn press(code: KeyCode, query: &mut String, selected: &mut usize, scroll: &mut usize) -> bool {
-        handle_help_key(KeyEvent::new(code, KeyModifiers::NONE), ENTRIES,
-            query, selected, scroll, HelpKeys::MODAL)
+        handle_help_key(
+            KeyEvent::new(code, KeyModifiers::NONE),
+            ENTRIES,
+            query,
+            selected,
+            scroll,
+            HelpKeys::MODAL,
+        )
     }
 
     #[test]
     fn navigation_is_bounded_and_search_resets_selection() {
         let (mut query, mut selected, mut scroll) = (String::new(), 0, 0);
-        assert!(!press(KeyCode::Down, &mut query, &mut selected, &mut scroll));
+        assert!(!press(
+            KeyCode::Down,
+            &mut query,
+            &mut selected,
+            &mut scroll
+        ));
         assert_eq!(selected, 1);
         assert!(!press(KeyCode::End, &mut query, &mut selected, &mut scroll));
         assert_eq!(selected, 2);
-        assert!(!press(KeyCode::Down, &mut query, &mut selected, &mut scroll));
+        assert!(!press(
+            KeyCode::Down,
+            &mut query,
+            &mut selected,
+            &mut scroll
+        ));
         assert_eq!(selected, 2);
-        assert!(!press(KeyCode::Char('d'), &mut query, &mut selected, &mut scroll));
+        assert!(!press(
+            KeyCode::Char('d'),
+            &mut query,
+            &mut selected,
+            &mut scroll
+        ));
         assert_eq!(query, "d");
         assert_eq!(selected, 1);
-        assert!(!press(KeyCode::Backspace, &mut query, &mut selected, &mut scroll));
+        assert!(!press(
+            KeyCode::Backspace,
+            &mut query,
+            &mut selected,
+            &mut scroll
+        ));
         assert_eq!(selected, 0);
         assert!(press(KeyCode::Esc, &mut query, &mut selected, &mut scroll));
     }
@@ -124,8 +184,14 @@ mod tests {
     #[test]
     fn question_can_still_be_typed_in_text_mode() {
         let (mut query, mut selected, mut scroll) = (String::from("a"), 0, 0);
-        assert!(!handle_help_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
-            ENTRIES, &mut query, &mut selected, &mut scroll, HelpKeys::TEXT_MODAL));
+        assert!(!handle_help_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            ENTRIES,
+            &mut query,
+            &mut selected,
+            &mut scroll,
+            HelpKeys::TEXT_MODAL
+        ));
         assert_eq!(query, "a?");
     }
 }

@@ -19,7 +19,9 @@ impl AccountState {
         }
         if unread_delta != 0
             && let Some(current) = self.current_mailbox.as_deref()
-            && let Some(mailbox) = self.mailboxes.iter_mut()
+            && let Some(mailbox) = self
+                .mailboxes
+                .iter_mut()
                 .find(|mailbox| mailbox.name == current && mailbox.counts_known)
         {
             mailbox.unread = mailbox.unread.saturating_add_signed(unread_delta);
@@ -201,11 +203,23 @@ impl App {
             return Vec::new();
         };
         let visible_indices = account.visible_message_indices();
-        let visible = visible_indices.iter().map(|&index| account.messages[index].id.clone()).collect::<Vec<_>>();
-        let all = account.messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
-        let selected = visible_indices.iter().position(|&index| index == account.message_index).unwrap_or(0);
+        let visible = visible_indices
+            .iter()
+            .map(|&index| account.messages[index].id.clone())
+            .collect::<Vec<_>>();
+        let all = account
+            .messages
+            .iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>();
+        let selected = visible_indices
+            .iter()
+            .position(|&index| index == account.message_index)
+            .unwrap_or(0);
         let anchor = self.visual_anchor.and_then(|index| {
-            visible_indices.iter().position(|&candidate| candidate == index)
+            visible_indices
+                .iter()
+                .position(|&candidate| candidate == index)
         });
         crate::app::vim::selected(&visible, &all, selected, anchor, &self.message_marked)
     }

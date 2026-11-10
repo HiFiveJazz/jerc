@@ -36,20 +36,27 @@ impl App {
                 Self::pump_mailbox_status(account);
             }
             WorkerEventKind::DraftSaveFailed { mailbox, error } => {
-                self.pending_draft_replacements.remove(&(event.account, event.request_id));
+                self.pending_draft_replacements
+                    .remove(&(event.account, event.request_id));
                 self.status = StatusLine::error(format!(
                     "saved locally only: uploading to {mailbox} failed ({error}); Ctrl+n resumes"
                 ));
             }
             WorkerEventKind::DraftSaved { mailbox } => {
                 let mut cleanup_warning = false;
-                if let Some(source) = self.pending_draft_replacements.remove(&(event.account, event.request_id))
+                if let Some(source) = self
+                    .pending_draft_replacements
+                    .remove(&(event.account, event.request_id))
                     && source.mailbox == mailbox
                 {
                     // A failed DELETE leaves a harmless duplicate draft, never data loss.
-                    cleanup_warning = account.worker.post(ActionKind::Delete {
-                        mailbox: source.mailbox, id: source.id,
-                    }).is_err();
+                    cleanup_warning = account
+                        .worker
+                        .post(ActionKind::Delete {
+                            mailbox: source.mailbox,
+                            id: source.id,
+                        })
+                        .is_err();
                 }
                 // Refresh cached Drafts on the next visit, or immediately if
                 // the user is already browsing that folder.
@@ -58,7 +65,9 @@ impl App {
                     let _ = account.request_mailbox_page(mailbox.clone(), 0);
                 }
                 self.status = if cleanup_warning {
-                    StatusLine::error("draft saved, but old draft cleanup was not queued; check Drafts for duplicates")
+                    StatusLine::error(
+                        "draft saved, but old draft cleanup was not queued; check Drafts for duplicates",
+                    )
                 } else {
                     StatusLine::info(format!(
                         "draft saved in {mailbox}; Ctrl+n resumes editing local recovery copy"
@@ -72,7 +81,8 @@ impl App {
                 sent_copy_warning,
                 sent_copy_disabled,
             } => {
-                let completed_current_send = self.pending_send == Some((event.account, event.request_id));
+                let completed_current_send =
+                    self.pending_send == Some((event.account, event.request_id));
                 if completed_current_send {
                     self.pending_send = None;
                 }
@@ -130,8 +140,12 @@ impl App {
                 }
                 Self::pump_mailbox_status(account);
 
-                if completed_current_send && event.account == self.account_index
-                    && let Some(source) = self.composer.as_ref().and_then(|composer| composer.draft_source.clone())
+                if completed_current_send
+                    && event.account == self.account_index
+                    && let Some(source) = self
+                        .composer
+                        .as_ref()
+                        .and_then(|composer| composer.draft_source.clone())
                 {
                     // Retire the server-side draft only after SMTP accepted the
                     // outgoing message. A failure leaves the draft untouched.

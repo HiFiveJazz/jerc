@@ -130,7 +130,8 @@ impl PendingChanges {
                 }
             }
             Change::RemoveFolder(name) => {
-                if self.folders.len() == MAX_FOLDERS && !self.folders.contains_key(&name)
+                if self.folders.len() == MAX_FOLDERS
+                    && !self.folders.contains_key(&name)
                     && let Some(evict) = self.folders.keys().next().cloned()
                 {
                     self.folders.remove(&evict);

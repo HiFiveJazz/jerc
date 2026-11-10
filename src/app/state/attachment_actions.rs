@@ -50,7 +50,9 @@ impl App {
         // message, so unknown bodies are checked on the worker first.
         if cached.as_ref().is_some_and(|files| files.is_empty())
             || (cached.is_none()
-                && account.selected_body().is_some_and(|body| body.attachment_count == 0))
+                && account
+                    .selected_body()
+                    .is_some_and(|body| body.attachment_count == 0))
         {
             self.status = StatusLine::info("no attachments to preview");
             return;
@@ -238,7 +240,9 @@ impl App {
         }
         if self.attachment_new_folder.is_none()
             && key.code == KeyCode::Char('?')
-            && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
         {
             if let Some(picker) = self.attachment_destination_picker.as_mut() {
                 picker.help_visible = true;
@@ -521,7 +525,9 @@ impl App {
             KeyCode::Char(' ') => {
                 if let Some(anchor) = self.attachment_visual_anchor.take() {
                     let first = anchor.min(self.attachment_selection);
-                    let last = anchor.max(self.attachment_selection).min(self.attachment_files.len().saturating_sub(1));
+                    let last = anchor
+                        .max(self.attachment_selection)
+                        .min(self.attachment_files.len().saturating_sub(1));
                     if !self.attachment_files.is_empty() {
                         let indices = (first..=last).collect::<Vec<_>>();
                         crate::app::vim::toggle_group(&mut self.attachment_marked, &indices);
@@ -612,8 +618,11 @@ impl App {
     pub(crate) fn selected_attachment_indices(&self) -> Vec<usize> {
         let all = (0..self.attachment_files.len()).collect::<Vec<_>>();
         let mut indices = crate::app::vim::selected(
-            &all, &all, self.attachment_selection,
-            self.attachment_visual_anchor, &self.attachment_marked,
+            &all,
+            &all,
+            self.attachment_selection,
+            self.attachment_visual_anchor,
+            &self.attachment_marked,
         );
         indices.sort_unstable();
         indices

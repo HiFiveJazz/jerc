@@ -7,7 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::backend::MailBackend;
-use crate::mail::{MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body, parse_summary, read_all_limited, read_header_block};
+use crate::mail::{
+    MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body, parse_summary, read_all_limited,
+    read_header_block,
+};
 use crate::model::{
     Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage,
     MessageSummary,
@@ -241,7 +244,12 @@ impl MailBackend for MaildirBackend {
             .with_context(|| format!("reading message from {}", path.display()))
     }
 
-    fn export_raw_into(&mut self, mailbox: &str, id: &MessageId, writer: &mut dyn Write) -> Result<()> {
+    fn export_raw_into(
+        &mut self,
+        mailbox: &str,
+        id: &MessageId,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
         let path = self.locate(mailbox, id)?;
         io::copy(&mut File::open(&path)?, writer)?;
         Ok(())
@@ -492,9 +500,11 @@ mod tests {
         let path = dir.path().join("message");
         super::write_private_new(&path, b"private data").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"private data");
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(super::write_private_new(&path, b"overwrite").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"private data");
     }
-
 }

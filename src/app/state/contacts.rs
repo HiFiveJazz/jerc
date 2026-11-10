@@ -193,19 +193,40 @@ impl App {
                 return true;
             }
             if key.code == KeyCode::Enter {
-                if editor.active_email { self.save_contact_editor(modal); }
-                else { editor.toggle(); }
+                if editor.active_email {
+                    self.save_contact_editor(modal);
+                } else {
+                    editor.toggle();
+                }
                 return true;
             }
             if editor.mode == ComposeMode::Insert {
                 match key.code {
-                    KeyCode::Left => editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), -1),
-                    KeyCode::Right => editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), 1),
+                    KeyCode::Left => {
+                        editor.cursor = crate::app::vim::horizontal(
+                            editor.cursor,
+                            editor.value().chars().count(),
+                            -1,
+                        )
+                    }
+                    KeyCode::Right => {
+                        editor.cursor = crate::app::vim::horizontal(
+                            editor.cursor,
+                            editor.value().chars().count(),
+                            1,
+                        )
+                    }
                     KeyCode::Home => editor.cursor = 0,
                     KeyCode::End => editor.cursor = editor.value().chars().count(),
                     KeyCode::Backspace => editor.backspace(),
                     KeyCode::Delete => editor.delete_range(editor.cursor, editor.cursor + 1),
-                    KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => editor.insert(ch),
+                    KeyCode::Char(ch)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                    {
+                        editor.insert(ch)
+                    }
                     _ => {}
                 }
                 return true;
@@ -214,7 +235,8 @@ impl App {
                 match (prefix, key.code) {
                     (crate::app::vim::VimPrefix::Yank, KeyCode::Char('y')) => {
                         self.yank_register = Some(YankRegister {
-                            text: editor.value().to_owned(), linewise: false,
+                            text: editor.value().to_owned(),
+                            linewise: false,
                         });
                     }
                     (crate::app::vim::VimPrefix::Delete, KeyCode::Char('d')) => {
@@ -228,7 +250,10 @@ impl App {
                 match key.code {
                     KeyCode::Char('y') => {
                         if let Some(text) = editor.selected_text() {
-                            self.yank_register = Some(YankRegister { text, linewise: false });
+                            self.yank_register = Some(YankRegister {
+                                text,
+                                linewise: false,
+                            });
                         }
                         editor.mode = ComposeMode::Normal;
                         editor.visual_anchor = None;
@@ -241,7 +266,8 @@ impl App {
                                 .map(str::to_owned);
                             editor.delete_range(start, end);
                             if let Some(cut) = cut
-                                && let Some(status) = record_cut(&mut self.yank_register, cut, false)
+                                && let Some(status) =
+                                    record_cut(&mut self.yank_register, cut, false)
                             {
                                 self.status = status;
                             }
@@ -262,21 +288,37 @@ impl App {
                     }
                     _ => {}
                 }
-                if matches!(key.code, KeyCode::Char('y' | 'd' | 'x' | 'p' | 'P')) { return true; }
+                if matches!(key.code, KeyCode::Char('y' | 'd' | 'x' | 'p' | 'P')) {
+                    return true;
+                }
             }
             match key.code {
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
-                    editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), -1);
+                    editor.cursor = crate::app::vim::horizontal(
+                        editor.cursor,
+                        editor.value().chars().count(),
+                        -1,
+                    );
                 }
-                KeyCode::Char('l') | KeyCode::Right => editor.cursor = crate::app::vim::horizontal(editor.cursor, editor.value().chars().count(), 1),
+                KeyCode::Char('l') | KeyCode::Right => {
+                    editor.cursor = crate::app::vim::horizontal(
+                        editor.cursor,
+                        editor.value().chars().count(),
+                        1,
+                    )
+                }
                 KeyCode::Char('w') => editor.move_word(true),
                 KeyCode::Char('e') => {
                     editor.cursor = crate::app::vim::word_end(editor.value(), editor.cursor, true);
-                },
+                }
                 KeyCode::Char('b') => editor.move_word(false),
                 KeyCode::Char('0' | 'H') | KeyCode::Home => editor.cursor = 0,
-                KeyCode::Char('$' | 'L') | KeyCode::End => editor.cursor = editor.value().chars().count(),
-                KeyCode::Char('i') if editor.mode == ComposeMode::Normal => editor.mode = ComposeMode::Insert,
+                KeyCode::Char('$' | 'L') | KeyCode::End => {
+                    editor.cursor = editor.value().chars().count()
+                }
+                KeyCode::Char('i') if editor.mode == ComposeMode::Normal => {
+                    editor.mode = ComposeMode::Insert
+                }
                 KeyCode::Char('a') if editor.mode == ComposeMode::Normal => {
                     editor.cursor = (editor.cursor + 1).min(editor.value().chars().count());
                     editor.mode = ComposeMode::Insert;
@@ -312,14 +354,21 @@ impl App {
                             self.status = status;
                         }
                     }
-                },
+                }
                 KeyCode::Char('D') if editor.mode == ComposeMode::Normal => {
                     editor.delete_range(editor.cursor, editor.value().chars().count());
                 }
-                KeyCode::Char('d') if editor.mode == ComposeMode::Normal => editor.vim_sequence.start(crate::app::vim::VimPrefix::Delete),
-                KeyCode::Char('y') if editor.mode == ComposeMode::Normal => editor.vim_sequence.start(crate::app::vim::VimPrefix::Yank),
+                KeyCode::Char('d') if editor.mode == ComposeMode::Normal => editor
+                    .vim_sequence
+                    .start(crate::app::vim::VimPrefix::Delete),
+                KeyCode::Char('y') if editor.mode == ComposeMode::Normal => {
+                    editor.vim_sequence.start(crate::app::vim::VimPrefix::Yank)
+                }
                 KeyCode::Char('Y') if editor.mode == ComposeMode::Normal => {
-                    self.yank_register = Some(YankRegister { text: editor.value().to_owned(), linewise: false });
+                    self.yank_register = Some(YankRegister {
+                        text: editor.value().to_owned(),
+                        linewise: false,
+                    });
                 }
                 KeyCode::Char('p' | 'P') if editor.mode == ComposeMode::Normal => {
                     if let Some(register) = self.yank_register.as_ref() {

@@ -12,16 +12,16 @@ use ratatui::layout::Size;
 use ratatui::widgets::BorderType;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
-use crate::app::navigation::{bounded_index, wrapped_index as offset_index, reveal_row};
-use crate::app::vim::{YankRegister, inner_text_object_range};
+pub use self::reader_text::{ReaderPosition, ReaderSelection};
 use self::reader_text::{
     ReaderWordMotion, reader_scroll_for_visual_cursor, reader_selection_text, reader_word_target,
     url_at_cursor,
 };
-pub use self::reader_text::{ReaderPosition, ReaderSelection};
+use crate::app::navigation::{bounded_index, reveal_row, wrapped_index as offset_index};
+use crate::app::vim::{YankRegister, inner_text_object_range};
 
 use crate::app::{
-    ATTACHMENT_HELP_ENTRIES, CONTACT_HELP_ENTRIES, DESTINATION_HELP_ENTRIES, Command, Focus,
+    ATTACHMENT_HELP_ENTRIES, CONTACT_HELP_ENTRIES, Command, DESTINATION_HELP_ENTRIES, Focus,
     HELP_ENTRIES, command_for_key, ranked_help_matches,
 };
 use crate::backend::MailboxSyncHint;
@@ -1413,7 +1413,9 @@ pub struct App {
 impl App {
     #[must_use]
     pub fn draft_resume_prompt_open(&self) -> bool {
-        self.pending_draft.as_ref().is_some_and(|pending| pending.composer.is_some())
+        self.pending_draft
+            .as_ref()
+            .is_some_and(|pending| pending.composer.is_some())
     }
 
     #[must_use]
@@ -2355,10 +2357,11 @@ impl App {
                         );
                     }
                     Err(error) => {
-                        self.status = StatusLine::error(format!("could not open attachment: {error}"));
+                        self.status =
+                            StatusLine::error(format!("could not open attachment: {error}"));
                     }
                 }
-            },
+            }
             Err(error) => {
                 self.status = StatusLine::error(format!("could not export attachment: {error:#}"))
             }
@@ -2874,18 +2877,33 @@ fn cleanup_stale_attachment_files() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::time::SystemTime;
 
-    let Ok(identity) = tempfile::NamedTempFile::new() else { return; };
-    let Ok(owner) = identity.as_file().metadata() else { return; };
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return; };
+    let Ok(identity) = tempfile::NamedTempFile::new() else {
+        return;
+    };
+    let Ok(owner) = identity.as_file().metadata() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue; };
-        if !name.starts_with("jerc-attachment-") { continue; }
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue; };
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("jerc-attachment-") {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
         if meta.file_type().is_file()
             && meta.uid() == owner.uid()
             && meta.permissions().mode() & 0o777 == 0o600
-            && meta.modified().ok().and_then(|time| SystemTime::now().duration_since(time).ok())
+            && meta
+                .modified()
+                .ok()
+                .and_then(|time| SystemTime::now().duration_since(time).ok())
                 .is_some_and(|age| age >= Duration::from_secs(7 * 24 * 60 * 60))
         {
             let _ = std::fs::remove_file(entry.path());
@@ -2995,10 +3013,10 @@ fn toggle_message_marks(marked: &mut HashSet<MessageId>, ids: &[MessageId]) {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod inbox_poll_tests;
+#[cfg(test)]
+mod preview_width_tests;
 #[cfg(test)]
 mod received_attachment_browser_tests;
 #[cfg(test)]
-mod preview_width_tests;
+mod tests;

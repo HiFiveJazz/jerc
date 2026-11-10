@@ -181,7 +181,9 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         draw_search_header(frame, chunks[0], &search_query, app);
     }
 
-    let unverified = app.account().is_some_and(|account| account.cached_mailbox_unverified());
+    let unverified = app
+        .account()
+        .is_some_and(|account| account.cached_mailbox_unverified());
     // Present the disk snapshot immediately, even on slow Gmail connections.
     // It is explicitly labeled provisional and stays read-only: mutation and
     // opening paths still use verified visible_message_indices/selected_message.
@@ -192,7 +194,12 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .style(theme.muted()),
             banner,
         );
-        Rect::new(list_area.x, list_area.y + 1, list_area.width, list_area.height - 1)
+        Rect::new(
+            list_area.x,
+            list_area.y + 1,
+            list_area.width,
+            list_area.height - 1,
+        )
     } else {
         list_area
     };
