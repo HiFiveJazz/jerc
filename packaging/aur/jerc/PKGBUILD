@@ -14,6 +14,10 @@ optdepends=(
   'xdg-utils: open links in the default browser'
 )
 
+# ring's C/assembly objects cannot be linked with makepkg's GCC LTO flags
+# when Rust links the final executable using lld.
+options=('!lto')
+
 conflicts=('jerc-bin')
 
 source=(
