@@ -74,10 +74,20 @@ Official nixpkgs inclusion still requires an upstream pull request.
   **unsigned** Alpine APK for x86-64, tested with `apk add --allow-untrusted`.
 - `scripts/package-linux-xbps.sh` generates native Void glibc and musl XBPS
   archives, tested against local XBPS repository indexes on both Void variants.
-- `scripts/package-linux-gentoo.py` generates a versioned `jerc-bin` Gentoo
-  Portage overlay tarball and hashes its actual release source in `Manifest`.
+- `scripts/package-linux-gentoo.py` generates a versioned Gentoo overlay
+  containing `mail-client/jerc` (source) and `mail-client/jerc-bin` (binary),
+  each with a verified Manifest.
   CI validates metadata and executes Jerc in Gentoo; full `emerge` integration
   has not been tested yet.
+
+The source recipes share an immutable release archive
+`jerc-vVERSION-vendored.tar.gz` generated from the exact Git tag and
+`Cargo.lock` by `scripts/package-linux-source.py`. Its source and vendored
+crates compile without fetching dependencies at build time. The generated
+Alpine `APKBUILD` and Void `xbps-src` template (with real SHA hashes) are
+shipped together as `jerc-source-recipes-vVERSION.tar.gz`. This extra source
+archive is not used by the precompiled binary package installers. All source
+recipes still need review by their respective distro maintainers.
 
 Run the manual [Test Linux distribution packages](../../.github/workflows/test-linux-packages.yml)
 workflow with an existing release tag to exercise these formats in parallel.

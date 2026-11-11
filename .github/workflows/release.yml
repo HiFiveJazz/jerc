@@ -266,6 +266,7 @@ jobs:
         run: |
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@stable
       - name: Package Alpine APK
         run: ./scripts/package-linux-apk.sh "$GITHUB_REF_NAME"
       - name: Package Void XBPS for glibc and musl
@@ -275,11 +276,14 @@ jobs:
           docker run --rm -v "$PWD:/repo" -w /repo \
             -e JERC_TAG="$GITHUB_REF_NAME" \
             ghcr.io/void-linux/void-musl-full:latest \
-            bash -euo pipefail -c './scripts/package-linux-xbps.sh "$JERC_TAG"'
+            sh -ec './scripts/package-linux-xbps.sh "$JERC_TAG"'
       - name: Build and verify Gentoo Portage overlay
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/package-linux-source.py "$GITHUB_REF_NAME"
+          python3 scripts/generate-linux-source-recipes.py "$GITHUB_REF_NAME"
+          tar -czf "dist/jerc-source-recipes-${GITHUB_REF_NAME}.tar.gz" -C dist source-recipes
           python3 scripts/package-linux-gentoo.py "$GITHUB_REF_NAME"
           python3 scripts/verify-gentoo-overlay.py "$GITHUB_REF_NAME"
       - uses: actions/upload-artifact@v4
@@ -289,6 +293,8 @@ jobs:
             dist/jerc-*.apk
             dist/jerc-*.xbps
             dist/jerc-gentoo-overlay-*.tar.gz
+            dist/jerc-v*-vendored.tar.gz
+            dist/jerc-source-recipes-*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -357,7 +363,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          # Download four archives plus tested RPM, DEB, APK, XBPS and Gentoo overlay.
+          # Four platform archives, five packages, Gentoo overlay and two source assets.
           path: dist
           merge-multiple: true
       - name: Create SHA-256 checksums
@@ -366,7 +372,7 @@ jobs:
           set -euo pipefail
           cd dist
           sha256sum jerc-* jerc_*.deb > SHA256SUMS
-          test "$(find . -maxdepth 1 -type f \( -name 'jerc-*' -o -name 'jerc_*.deb' \) | wc -l)" -eq 10
+          test "$(find . -maxdepth 1 -type f \( -name 'jerc-*' -o -name 'jerc_*.deb' \) | wc -l)" -eq 12
       - name: Publish tagged release with generated notes
         env:
           GH_TOKEN: ${{ github.token }}

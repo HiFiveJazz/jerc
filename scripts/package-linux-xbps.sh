@@ -1,12 +1,12 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Create native Void XBPS packages for both x86_64 glibc and x86_64 musl.
 # Run inside ghcr.io/void-linux/void-musl-full:latest (xbps-create is supplied there).
 # Usage: ./scripts/package-linux-xbps.sh v0.6.3 [archive.tar.gz]
-set -euo pipefail
+set -eu
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(CDPATH= cd "$(dirname "$0")/.." && pwd)"
 TAG="${1:-}"
-[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+printf "%s\n" "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
   echo 'Usage: package-linux-xbps.sh vMAJOR.MINOR.PATCH [archive.tar.gz]' >&2
   exit 2
 }
@@ -17,7 +17,7 @@ done
 VERSION="${TAG#v}"
 BUNDLE="jerc-${TAG}-x86_64-unknown-linux-musl"
 ARCHIVE="${2:-$ROOT/dist/$BUNDLE.tar.gz}"
-[[ -s "$ARCHIVE" ]] || { echo "Missing release archive: $ARCHIVE" >&2; exit 1; }
+[ -s "$ARCHIVE" ] || { echo "Missing release archive: $ARCHIVE" >&2; exit 1; }
 STAGE="$ROOT/dist/xbps-stage"
 rm -rf -- "$STAGE"
 mkdir -p -- "$STAGE/usr/bin" "$STAGE/usr/share/licenses/jerc" "$STAGE/usr/share/doc/jerc"
@@ -28,7 +28,7 @@ for filename in jerc LICENSE README.md config.example.toml; do
     *) destination="$STAGE/usr/share/doc/jerc/$filename" ;;
   esac
   tar -xOzf "$ARCHIVE" "$BUNDLE/$filename" > "$destination"
-  [[ -s "$destination" ]] || { echo "Empty: $filename" >&2; exit 1; }
+  [ -s "$destination" ] || { echo "Empty: $filename" >&2; exit 1; }
 done
 chmod 0755 "$STAGE/usr/bin/jerc"
 chmod 0644 "$STAGE/usr/share/licenses/jerc/LICENSE" "$STAGE/usr/share/doc/jerc/"*
@@ -47,6 +47,6 @@ for arch in x86_64 x86_64-musl; do
     --dependencies 'ca-certificates' \
     "$STAGE"
   output="$ROOT/dist/jerc-${VERSION}_1.${arch}.xbps"
-  [[ -s "$output" ]] || { echo "XBPS not generated: $output" >&2; exit 1; }
+  [ -s "$output" ] || { echo "XBPS not generated: $output" >&2; exit 1; }
   echo "Created $output"
 done

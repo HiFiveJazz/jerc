@@ -29,11 +29,13 @@ case "$JERC_PACKAGE_MANAGER" in
     # The Portage ebuild is separately validated by a host-side Manifest test;
     # a full emerge test requires a working portage tree/profile in CI.
     overlay="/packages/jerc-gentoo-overlay-v${JERC_VERSION}.tar.gz"
+    source="/packages/jerc-v${JERC_VERSION}-vendored.tar.gz"
     archive="/packages/jerc-v${JERC_VERSION}-x86_64-unknown-linux-musl.tar.gz"
-    test -s "$overlay" && test -s "$archive"
+    test -s "$overlay" && test -s "$archive" && test -s "$source"
     mkdir -p /tmp/jerc-gentoo
     tar -xzf "$overlay" -C /tmp/jerc-gentoo
-    test -s "/tmp/jerc-gentoo/jerc-overlay/app-misc/jerc-bin/jerc-bin-${JERC_VERSION}.ebuild"
+    test -s "/tmp/jerc-gentoo/jerc-overlay/mail-client/jerc-bin/jerc-bin-${JERC_VERSION}.ebuild"
+    test -s "/tmp/jerc-gentoo/jerc-overlay/mail-client/jerc/jerc-${JERC_VERSION}.ebuild"
     member="jerc-v${JERC_VERSION}-x86_64-unknown-linux-musl/jerc"
     tar -xOzf "$archive" "$member" > /tmp/jerc-gentoo/jerc
     chmod 0755 /tmp/jerc-gentoo/jerc

@@ -1,0 +1,32 @@
+# Source build for Alpine aports (not the downloadable prebuilt APK).
+# Generated from the pinned, vendored archive; no network needed during abuild.
+# Maintainer: upstream project (set a real Alpine maintainer before submitting)
+pkgname=jerc
+pkgver=@VERSION@
+pkgrel=0
+pkgdesc="Keyboard-driven terminal email client written in Rust"
+url="https://github.com/HiFiveJazz/jerc"
+arch="all"
+license="GPL-3.0-only"
+makedepends="rust cargo-auditable build-base"
+source="jerc-v$pkgver-vendored.tar.gz::https://github.com/HiFiveJazz/jerc/releases/download/v$pkgver/jerc-v$pkgver-vendored.tar.gz"
+builddir="$srcdir/jerc-$pkgver"
+
+build() {
+    cargo auditable build --release --locked --offline
+}
+
+check() {
+    cargo test --locked --offline
+}
+
+package() {
+    install -Dm755 target/release/jerc "$pkgdir/usr/bin/jerc"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/jerc/LICENSE"
+    install -Dm644 config.example.toml "$pkgdir/usr/share/doc/jerc/config.example.toml"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/jerc/README.md"
+}
+
+sha512sums="
+@SHA512@  jerc-v$pkgver-vendored.tar.gz
+"

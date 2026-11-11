@@ -54,8 +54,12 @@ When a version tag is pushed, the workflow:
    archive. RPM installation is checked on Fedora 44 and openSUSE Tumbleweed;
    DEB installation is checked on Debian 13 and Ubuntu 24.04 LTS. Distro smoke
    tests run concurrently where their package artifacts are ready.
-5. Produces `SHA256SUMS` and publishes the four archives plus RPM and DEB
-   in a GitHub Release with generated notes **only if all checks succeed**.
+5. Builds an Alpine APK, both Void XBPS variants and a Gentoo overlay with
+   source and binary ebuilds. It also archives the tagged Rust source and
+   locked vendor crates for offline builds, then generates checksummed Alpine
+   and Void source recipes.
+6. Produces `SHA256SUMS` for all twelve release assets and publishes them
+   **only if the package and runtime checks succeed**.
 
 To test packaging of an **existing** release without a new tag or publication,
 run `gh workflow run test-linux-packages.yml -f tag=v0.6.2`. The manual
@@ -169,11 +173,14 @@ The optional comparison workflow is retained for development and debugging.
 ## Additional Linux distributions
 
 The release pipeline also generates and smoke-tests an Alpine x86-64 `.apk`,
-Void x86-64 glibc and musl `.xbps` packages, and a versioned Gentoo `jerc-bin`
-local overlay tarball. All reuse the same verified static musl Linux release.
+Void x86-64 glibc and musl `.xbps` packages, and a versioned Gentoo overlay
+with `mail-client/jerc` (source) and `mail-client/jerc-bin` (binary). All reuse the same verified static musl Linux release.
 Alpine and Void are installed through their native package managers in CI.
-The Gentoo job validates the ebuild layout and Manifest, and executes the
-binary on Gentoo stage3; a real `emerge` install is not yet covered.
+The Gentoo job validates both ebuilds and Manifests and executes the binary on
+Gentoo stage3; a real `emerge` source compilation is not yet covered. Alpine
+and Void also get versioned native source-build recipes with checksum-pinned
+`jerc-vVERSION-vendored.tar.gz` archives. These source recipes need native
+abuild/xbps-src/Portage compilation testing before upstream submission.
 
 To test these formats with existing v0.6.2 release assets without re-tagging:
 

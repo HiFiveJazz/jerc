@@ -24,3 +24,12 @@ sudo xbps-install --repository=/tmp/jerc-xbps -y jerc
 
 An official Void `void-packages` template and upstream review are required to
 make Jerc available directly via regular `xbps-install -S jerc`.
+
+
+## Native source recipe
+
+`source/template.in` is the maintained xbps-src `build_style=cargo`
+recipe. CI renders it to `dist/source-recipes/void/srcpkgs/jerc/template`
+with the release's vendored archive SHA256. Void builds the Rust source
+for its own libc/architecture. Replace the example maintainer address
+before submitting to void-packages.

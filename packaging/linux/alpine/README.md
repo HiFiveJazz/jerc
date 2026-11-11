@@ -15,3 +15,13 @@ This is a local install, **not** an Alpine repository package. To support
 ordinary `apk add jerc` and repository-managed updates, submit a source-based
 `APKBUILD` to Alpine's `aports` (typically `testing` first). A signed repository
 would be another option.
+
+
+## Native source recipe
+
+`source/APKBUILD.in` is the maintained source-build template. The CI
+packager produces a **versioned and checksummed** `APKBUILD` in
+`dist/source-recipes/alpine/` using the tagged vendored source archive.
+Its `cargo auditable build` and `cargo test` phases use locked, offline
+dependencies; Alpine `abuild` must provide a Rust toolchain >= 1.98.
+The template is for review in aports, not an automatic repository submission.

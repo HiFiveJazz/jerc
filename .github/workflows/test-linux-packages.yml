@@ -20,7 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v6
         with:
           go-version: '1.26.x'
@@ -65,7 +67,10 @@ jobs:
           docker run --rm -v "$PWD:/repo" -w /repo \
             -e JERC_TAG="$JERC_TAG" \
             ghcr.io/void-linux/void-musl-full:latest \
-            bash -euo pipefail -c './scripts/package-linux-xbps.sh "$JERC_TAG"'
+            sh -ec './scripts/package-linux-xbps.sh "$JERC_TAG"'
+          python3 scripts/package-linux-source.py "$JERC_TAG"
+          python3 scripts/generate-linux-source-recipes.py "$JERC_TAG"
+          tar -czf "dist/jerc-source-recipes-${JERC_TAG}.tar.gz" -C dist source-recipes
           python3 scripts/package-linux-gentoo.py "$JERC_TAG"
           python3 scripts/verify-gentoo-overlay.py "$JERC_TAG"
       - uses: actions/upload-artifact@v4
@@ -77,9 +82,41 @@ jobs:
             dist/jerc-*.apk
             dist/jerc-*.xbps
             dist/jerc-gentoo-overlay-*.tar.gz
+            dist/jerc-v*-vendored.tar.gz
+            dist/jerc-source-recipes-*.tar.gz
             dist/jerc-v*-x86_64-unknown-linux-musl.tar.gz
           if-no-files-found: error
           retention-days: 7
+
+  source_smoke:
+    name: Compile vendored Rust source offline
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-installers
+          path: dist
+      - name: Verify source recipes and compile from vendored sources
+        env:
+          JERC_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-recipes"
+          tar -xzf "dist/jerc-source-recipes-${JERC_TAG}.tar.gz" -C "$RUNNER_TEMP/source-recipes"
+          sh -n "$RUNNER_TEMP/source-recipes/source-recipes/alpine/APKBUILD"
+          sh -n "$RUNNER_TEMP/source-recipes/source-recipes/void/srcpkgs/jerc/template"
+          tar -tzf "dist/jerc-gentoo-overlay-${JERC_TAG}.tar.gz" | grep -q 'mail-client/jerc/'
+          mkdir -p "$RUNNER_TEMP/jerc-source"
+          tar -xzf "dist/jerc-${JERC_TAG}-vendored.tar.gz" -C "$RUNNER_TEMP/jerc-source"
+          cd "$RUNNER_TEMP/jerc-source/jerc-${JERC_TAG#v}"
+          CARGO_NET_OFFLINE=true cargo build --locked --offline --release
+          ./target/release/jerc --version | grep -F "${JERC_TAG#v}"
 
   smoke:
     name: Test ${{ matrix.name }} install

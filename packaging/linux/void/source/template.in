@@ -1,0 +1,21 @@
+# Source build for void-linux/void-packages (not our prebuilt XBPS).
+# Template is generated from the immutable vendored release source archive.
+pkgname=jerc
+version=@VERSION@
+revision=1
+build_style=cargo
+hostmakedepends="pkg-config"
+depends="ca-certificates"
+short_desc="Keyboard-driven terminal email client written in Rust"
+maintainer="HiFiveJazz <maintainer@example.invalid>" # Replace before upstream submission.
+license="GPL-3.0-only"
+homepage="https://github.com/HiFiveJazz/jerc"
+distfiles="https://github.com/HiFiveJazz/jerc/releases/download/v${version}/jerc-v${version}-vendored.tar.gz"
+checksum=@SHA256@
+wrksrc="jerc-${version}"
+
+post_install() {
+    vlicense LICENSE
+    vdoc README.md
+    vdoc config.example.toml
+}
