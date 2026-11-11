@@ -12,3 +12,6 @@
 
 # Keep AUR metadata
 !/packaging/linux/aur/*/.SRCINFO
+
+# Nix build output
+/result

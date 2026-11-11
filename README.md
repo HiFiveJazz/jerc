@@ -78,6 +78,19 @@ Prebuilt downloads are available for x86-64 Linux (static musl), macOS Intel /
 Apple Silicon, and x86-64 Windows. Other targets may fall back to compiling
 from source. `cargo-binstall` is a separate Cargo subcommand to install first.
 
+### Install with Nix / NixOS
+
+The source-built Nix flake supports x86-64 and ARM64 Linux:
+
+```sh
+nix run github:HiFiveJazz/jerc -- --version
+nix profile install github:HiFiveJazz/jerc
+```
+
+See [NixOS packaging](packaging/linux/nix/README.md) for declarative NixOS
+and Home Manager installations. Jerc is **not yet in official nixpkgs**; a
+separate upstream pull request is required for `nixpkgs#jerc`.
+
 ### Build from source
 
 **Requirements:** Rust 1.98 or newer and a terminal with modern Unicode support. Optional terminal graphics require a compatible terminal; PDF thumbnails use `pdftoppm` when installed.

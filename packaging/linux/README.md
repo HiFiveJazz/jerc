@@ -59,3 +59,11 @@ gh workflow run test-linux-packages.yml -f tag=v0.6.2
 Future release-tag workflows also require both installers and all distro
 checks to pass before publishing GitHub assets. The RPM remains unsigned;
 Copr/OBS and an APT repository are separate future milestones.
+
+## Nix / NixOS flake
+
+`nix/default.nix` builds Jerc from Rust source and the checked-in Cargo.lock.
+The repository-root `flake.nix` exposes `packages.<system>.jerc` and
+`apps.<system>.jerc` for x86-64 and ARM64 Linux. The dedicated `Nix package`
+workflow verifies the build. See [nix/README.md](nix/README.md).
+Official nixpkgs inclusion still requires an upstream pull request.

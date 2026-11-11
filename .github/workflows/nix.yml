@@ -1,0 +1,53 @@
+name: Nix package
+
+# Build the same source package that NixOS users install from the Jerc flake.
+# This does not publish to nixpkgs; nixpkgs inclusion requires a separate PR.
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+    paths:
+      - flake.nix
+      - flake.lock
+      - packaging/linux/nix/**
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - .github/workflows/nix.yml
+  pull_request:
+    paths:
+      - flake.nix
+      - flake.lock
+      - packaging/linux/nix/**
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - .github/workflows/nix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nix:
+    name: Build and test Nix package (x86_64-linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate flake outputs
+        run: nix flake check --no-build --show-trace
+      - name: Build source-based Jerc package
+        run: nix build .#jerc --print-build-logs
+      - name: Smoke-test Jerc version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          ./result/bin/jerc --version | grep -F "$version"
