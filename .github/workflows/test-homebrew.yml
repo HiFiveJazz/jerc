@@ -81,6 +81,5 @@ jobs:
             --output "$RUNNER_TEMP/local/Formula/jerc.rb"
           ruby -c "$RUNNER_TEMP/public/Formula/jerc.rb"
           ruby -c "$RUNNER_TEMP/local/Formula/jerc.rb"
-          brew install --formula "$RUNNER_TEMP/local/Formula/jerc.rb"
-          brew test "$RUNNER_TEMP/local/Formula/jerc.rb"
-          "$(brew --prefix jerc)/bin/jerc" --version | grep -F "${JERC_TAG#v}"
+          ./scripts/smoke-homebrew-tap.sh \
+            "$RUNNER_TEMP/local/Formula/jerc.rb" "${JERC_TAG#v}"

@@ -199,9 +199,8 @@ jobs:
             --tag "$GITHUB_REF_NAME" --archives dist --local-assets \
             --output "$RUNNER_TEMP/local/Formula/jerc.rb"
           ruby -c "$RUNNER_TEMP/local/Formula/jerc.rb"
-          brew install --formula "$RUNNER_TEMP/local/Formula/jerc.rb"
-          brew test "$RUNNER_TEMP/local/Formula/jerc.rb"
-          "$(brew --prefix jerc)/bin/jerc" --version | grep -F "${GITHUB_REF_NAME#v}"
+          ./scripts/smoke-homebrew-tap.sh \
+            "$RUNNER_TEMP/local/Formula/jerc.rb" "${GITHUB_REF_NAME#v}"
 
   deb:
     name: Package Debian/Ubuntu DEB
