@@ -7,6 +7,11 @@ on:
     types: [published]
   repository_dispatch:
     types: [jerc_release_ready]
+  # Package-only changes should be published without a new GitHub release.
+  push:
+    branches: [main]
+    paths:
+      - 'packaging/aur/*/PKGBUILD'
   workflow_dispatch:
     inputs:
       tag:
@@ -43,7 +48,7 @@ jobs:
         -o GlobalKnownHostsFile=/dev/null
     steps:
       - name: Install tools
-        run: pacman -Syu --noconfirm --needed git openssh curl
+        run: pacman -Syu --noconfirm --needed git openssh curl jq
 
       - name: Check out packaging sources
         uses: actions/checkout@v4
@@ -82,9 +87,36 @@ jobs:
             aur@aur.archlinux.org help > /dev/null
           echo 'Verified AUR host identity and CI key authentication'
 
+      - name: Resolve GitHub Release tag
+        id: release_tag
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name || github.event.client_payload.tag || inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$EVENT_TAG" ]]; then
+            tag="$EVENT_TAG"
+          else
+            # For a packaging-only push, reuse the latest published release.
+            tag="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" \
+              | jq -er '.tag_name')"
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid or missing GitHub release tag: $tag" >&2
+            exit 1
+          }
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          echo "Preparing AUR packages for $tag"
+
+      - name: Test automatic pkgrel versioning
+        run: ./scripts/test-aur-pkgrel.sh
+
       - name: Generate release PKGBUILDs and .SRCINFO
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || github.event.client_payload.tag || inputs.tag }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           set -euo pipefail
           # makepkg refuses to run as root, even when printing metadata.
@@ -94,7 +126,7 @@ jobs:
 
       - name: Commit packaging metadata to GitHub
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || github.event.client_payload.tag || inputs.tag }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           set -euo pipefail
           git config --global --add safe.directory "$GITHUB_WORKSPACE"

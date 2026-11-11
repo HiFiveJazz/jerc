@@ -13,7 +13,7 @@ VERSION="${TAG#v}"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 UPSTREAM='https://github.com/HiFiveJazz/jerc'
 
-for cmd in curl sha256sum makepkg sed grep; do
+for cmd in curl sha256sum makepkg sed grep git; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "Required command not found: $cmd" >&2
     exit 1
@@ -61,15 +61,30 @@ for name in jerc-bin jerc; do
 
   sed -i -E \
     -e "s/^pkgver=.*/pkgver=${VERSION}/" \
-    -e 's/^pkgrel=.*/pkgrel=1/' \
     -e "s/^${sum_field}=.*/${sum_field}=('${sum}')/" \
     "$TMP/$name/PKGBUILD"
+
+  # Compare against the published AUR package, not our local pkgrel.
+  # A new upstream release starts at 1; a packaging-only change increments.
+  # Re-running unchanged metadata preserves the already-published pkgrel.
+  published="$TMP/aur-$name"
+  git clone --quiet --depth 1 "https://aur.archlinux.org/${name}.git" "$published" || {
+    echo "Cannot inspect published AUR package $name; refusing an unsafe pkgrel update" >&2
+    exit 1
+  }
+  pkgrel="$("$ROOT/scripts/next-aur-pkgrel.sh" \
+    "$TMP/$name/PKGBUILD" "$published/PKGBUILD")"
+  sed -i -E "s/^pkgrel=.*/pkgrel=${pkgrel}/" "$TMP/$name/PKGBUILD"
 
   (
     cd "$TMP/$name"
     makepkg --printsrcinfo > .SRCINFO
     grep -Fqx $'\tpkgver = '"$VERSION" .SRCINFO || {
       echo "Generated .SRCINFO has the wrong version for $name" >&2
+      exit 1
+    }
+    grep -Fqx $'\t'"pkgrel = ${pkgrel}" .SRCINFO || {
+      echo "Generated .SRCINFO has the wrong pkgrel for $name" >&2
       exit 1
     }
     grep -Fq $'\t'"${sum_field} = ${sum}" .SRCINFO || {
@@ -79,7 +94,7 @@ for name in jerc-bin jerc; do
   )
 
   packages+=("$name")
-  echo "Staged $name $VERSION-1 ($sum)"
+  echo "Staged $name $VERSION-$pkgrel ($sum)"
 done
 
 if (( ${#packages[@]} == 0 )); then
