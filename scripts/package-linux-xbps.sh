@@ -44,7 +44,7 @@ for arch in x86_64 x86_64-musl; do
     --license 'GPL-3.0-only' \
     --homepage 'https://github.com/HiFiveJazz/jerc' \
     --maintainer 'HiFiveJazz' \
-    --dependencies 'ca-certificates' \
+    --dependencies 'ca-certificates>=0' \
     "$STAGE"
   output="$ROOT/dist/jerc-${VERSION}_1.${arch}.xbps"
   [ -s "$output" ] || { echo "XBPS not generated: $output" >&2; exit 1; }

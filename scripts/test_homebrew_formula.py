@@ -49,10 +49,20 @@ class HomebrewFormulaTests(unittest.TestCase):
         published = module.generate("v0.6.2", self.root)
         local = module.generate("v0.6.2", self.root, local_assets=True)
         for archive in self.archives.values():
-            self.assertIn(archive.as_uri(), local)
+            self.assertIn(archive.resolve().as_uri(), local)
             self.assertIn(hashlib.sha256(archive.read_bytes()).hexdigest(), local)
         self.assertNotIn("releases/download", local)
         self.assertEqual(published.count("sha256"), local.count("sha256"))
+
+    def test_local_formula_resolves_symlinked_archive_directory(self):
+        # macOS aliases /var to /private/var. Path.resolve() should produce
+        # the same canonical file URI for the formula and test expectations.
+        alias = self.root / "archive-alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        local = module.generate("v0.6.2", alias, local_assets=True)
+        for archive in self.archives.values():
+            self.assertIn(archive.resolve().as_uri(), local)
+            self.assertIn(hashlib.sha256(archive.read_bytes()).hexdigest(), local)
 
     def test_rejects_invalid_tag_and_missing_or_nonexecutable_binary(self):
         with self.assertRaises(ValueError):
