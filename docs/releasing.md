@@ -214,3 +214,27 @@ gh run list --workflow test-homebrew.yml --limit 3
 The generated formula does **not** create or publish a Homebrew tap. Refer to
 `packaging/macos/homebrew/README.md` for creating a separate `homebrew-jerc` tap
 and eventually submitting a separate source-build formula to Homebrew/core.
+
+## Windows package managers (Scoop, WinGet, Chocolatey)
+
+The Windows release ZIP is used to generate checksum-pinned Scoop and WinGet
+manifests and a self-contained Chocolatey `.nupkg`. The normal Release workflow
+checks those artifacts and installs the Chocolatey package before publication.
+Two additional assets are uploaded with each successful release:
+`jerc-windows-packages-vVERSION.zip` and `jerc.VERSION.nupkg`.
+
+After publishing a release, validate native Windows installations on GitHub's
+Windows runners without creating a new tag:
+
+```sh
+gh workflow run test-windows-packages.yml -f tag=v0.6.2
+```
+
+The post-release test runs Scoop and Chocolatey install/uninstall, and native
+WinGet validation/install **if `winget` is available on the runner**. When not
+available, WinGet's Python metadata checks still run, but its native install
+remains unverified and the workflow reports the limitation explicitly.
+
+The Scoop manifest requires a public bucket and the WinGet manifest requires a
+PR to `microsoft/winget-pkgs`; Chocolatey's package needs an upstream submission.
+Generating GitHub assets alone does not list Jerc in those package managers.

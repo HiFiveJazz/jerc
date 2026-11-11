@@ -1,0 +1,120 @@
+name: Test Windows package managers
+
+# Uses a previously published ZIP. This does not publish to package repositories.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release (for example v0.6.2)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows_packages:
+    name: Windows ${{ matrix.manager }} install
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        manager: [scoop, winget, chocolatey]
+    env:
+      JERC_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Download and checksum-verify published Windows archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:JERC_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Invalid tag' }
+          $archive = "jerc-$env:JERC_TAG-x86_64-pc-windows-msvc.zip"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          gh release download $env:JERC_TAG --repo $env:GITHUB_REPOSITORY --pattern $archive --dir dist
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download Windows ZIP' }
+          gh release download $env:JERC_TAG --repo $env:GITHUB_REPOSITORY --pattern SHA256SUMS --dir dist
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download release checksums' }
+          $match = @(Get-Content dist/SHA256SUMS | Where-Object { $_.EndsWith("  $archive") })
+          if ($match.Count -ne 1) { throw "Missing or duplicate checksum for $archive" }
+          $actual = (Get-FileHash "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if (-not $match[0].StartsWith("$actual  ")) { throw "SHA-256 mismatch for $archive" }
+          python scripts/generate-windows-packages.py --tag $env:JERC_TAG `
+            --archive "dist/$archive" --output dist/windows-metadata `
+            --choco-stage dist/choco-stage --bundle "dist/jerc-windows-packages-$env:JERC_TAG.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest generation failed' }
+          python scripts/test_windows_packages.py
+          if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
+      - name: Install with Scoop, verify version and uninstall
+        if: matrix.manager == 'scoop'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+            $installer = Join-Path $env:RUNNER_TEMP 'install-scoop.ps1'
+            Invoke-WebRequest -Uri 'https://get.scoop.sh' -OutFile $installer
+            & $installer -RunAsAdmin
+            if (-not $?) { throw 'Scoop bootstrap failed' }
+            $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
+          }
+          scoop install (Resolve-Path dist/windows-metadata/scoop/jerc.json).Path
+          if ($LASTEXITCODE -ne 0) { throw 'Scoop installation failed' }
+          $version = & "$env:USERPROFILE\scoop\shims\jerc.exe" --version
+          if ($version -notlike "*$($env:JERC_TAG.Substring(1))*") { throw "Wrong installed Jerc version: $version" }
+          scoop uninstall jerc
+          if ($LASTEXITCODE -ne 0) { throw 'Scoop uninstall failed' }
+      - name: Validate and install with WinGet when available
+        if: matrix.manager == 'winget'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:JERC_TAG.Substring(1)
+          $manifest = (Resolve-Path "dist/windows-metadata/winget/manifests/h/HiFiveJazz/Jerc/$version").Path
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Write-Warning 'Native WinGet is unavailable on this Windows Server runner. Manifest structure and ZIP were checked, but native WinGet install is NOT VERIFIED.'
+            '### WinGet: native validation/install unavailable on this runner' >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          winget validate --manifest $manifest
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet manifest validation failed' }
+          winget settings --enable LocalManifestFiles
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enable WinGet local manifests' }
+          try {
+            winget install --manifest $manifest --accept-package-agreements --accept-source-agreements --disable-interactivity
+            if ($LASTEXITCODE -ne 0) { throw 'WinGet installation failed' }
+            winget list --id HiFiveJazz.Jerc --exact --accept-source-agreements
+            if ($LASTEXITCODE -ne 0) { throw 'WinGet cannot find the installed Jerc package' }
+          } finally {
+            winget uninstall --id HiFiveJazz.Jerc --exact --disable-interactivity
+            winget settings --disable LocalManifestFiles
+          }
+      - name: Install with Chocolatey, verify version and uninstall
+        if: matrix.manager == 'chocolatey'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) { throw 'Chocolatey is missing on the runner' }
+          $version = $env:JERC_TAG.Substring(1)
+          $distPath = (Resolve-Path dist).Path
+          Push-Location dist/choco-stage
+          try {
+            choco pack jerc.nuspec --outputdirectory $distPath --limit-output
+            if ($LASTEXITCODE -ne 0) { throw 'Chocolatey pack failed' }
+          } finally { Pop-Location }
+          $archive = "dist/jerc-$env:JERC_TAG-x86_64-pc-windows-msvc.zip"
+          python scripts/verify-windows-nupkg.py --tag $env:JERC_TAG --archive $archive --package "dist/jerc.$version.nupkg"
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey package verification failed' }
+          choco install jerc --version $version --source (Resolve-Path dist).Path -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey install failed' }
+          $shim = Join-Path $env:ChocolateyInstall 'bin/jerc.exe'
+          if (-not (Test-Path $shim)) { throw 'Chocolatey shim was not created' }
+          $reported = & $shim --version
+          if ($reported -notlike "*$version*") { throw "Wrong Chocolatey Jerc version: $reported" }
+          choco uninstall jerc --version $version -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey uninstall failed' }

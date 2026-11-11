@@ -33,6 +33,8 @@ jobs:
         run: python scripts/test_binstall_metadata.py
       - name: Test Homebrew formula generation
         run: python scripts/test_homebrew_formula.py
+      - name: Test Windows package manifests and archive assumptions
+        run: python scripts/test_windows_packages.py
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
@@ -441,9 +443,67 @@ jobs:
             -e JERC_XBPS_ARCH="$XBPS_ARCH" \
             "$DISTRO_IMAGE" sh /usr/local/bin/jerc-extra-smoke
 
+  windows_packages:
+    name: Generate Scoop WinGet and Chocolatey packages
+    needs: build
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-pc-windows-msvc
+          path: dist
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Generate metadata and self-contained Chocolatey package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "dist/jerc-$env:GITHUB_REF_NAME-x86_64-pc-windows-msvc.zip"
+          python scripts/test_windows_packages.py
+          if ($LASTEXITCODE -ne 0) { throw 'Windows metadata unit tests failed' }
+          python scripts/generate-windows-packages.py --tag $env:GITHUB_REF_NAME `
+            --archive $archive --output dist/windows-metadata --choco-stage dist/choco-stage `
+            --bundle "dist/jerc-windows-packages-$env:GITHUB_REF_NAME.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows package generation failed' }
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) { throw 'Chocolatey is missing' }
+          $distPath = (Resolve-Path dist).Path
+          Push-Location dist/choco-stage
+          try {
+            choco pack jerc.nuspec --outputdirectory $distPath --limit-output
+            if ($LASTEXITCODE -ne 0) { throw 'Chocolatey pack failed' }
+          } finally { Pop-Location }
+          python scripts/verify-windows-nupkg.py --tag $env:GITHUB_REF_NAME `
+            --archive $archive --package "dist/jerc.$($env:GITHUB_REF_NAME.Substring(1)).nupkg"
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey package integrity check failed' }
+      - name: Install and uninstall the Chocolatey package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          choco install jerc --version $version --source (Resolve-Path dist).Path -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey install failed' }
+          $shim = Join-Path $env:ChocolateyInstall 'bin/jerc.exe'
+          if (-not (Test-Path $shim)) { throw 'Chocolatey shim is missing' }
+          $reported = & $shim --version
+          if ($reported -notlike "*$version*") { throw "Wrong version: $reported" }
+          choco uninstall jerc --version $version -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey uninstall failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: |
+            dist/jerc-windows-packages-*.zip
+            dist/jerc.*.nupkg
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub Release
-    needs: [build, rpm, deb, deb_smoke, opensuse_smoke, extra_packages, extra_smoke, homebrew_formula, homebrew_smoke]
+    needs: [build, rpm, deb, deb_smoke, opensuse_smoke, extra_packages, extra_smoke, homebrew_formula, homebrew_smoke, windows_packages]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -453,7 +513,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          # Four platform archives, five packages, Gentoo overlay, two source assets, and Homebrew formula.
+          # Four platform archives, Linux packages/overlays/source assets, Homebrew formula, and two Windows packages.
           path: dist
           merge-multiple: true
       - name: Create SHA-256 checksums
@@ -461,8 +521,8 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum jerc-* jerc_*.deb > SHA256SUMS
-          test "$(find . -maxdepth 1 -type f \( -name 'jerc-*' -o -name 'jerc_*.deb' \) | wc -l)" -eq 13
+          sha256sum jerc-* jerc_*.deb jerc.*.nupkg > SHA256SUMS
+          test "$(find . -maxdepth 1 -type f \( -name 'jerc-*' -o -name 'jerc_*.deb' -o -name 'jerc.*.nupkg' \) | wc -l)" -eq 15
       - name: Publish tagged release with generated notes
         env:
           GH_TOKEN: ${{ github.token }}
