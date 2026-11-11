@@ -17,6 +17,10 @@ impl App {
         else {
             return;
         };
+        if account.cached_mailbox_unverified() {
+            self.status = StatusLine::info("draft preview requires a verified server connection");
+            return;
+        }
         let Some(message_id) = account.selected_message().map(|m| m.id.clone()) else {
             return;
         };
@@ -114,6 +118,15 @@ impl App {
             return;
         }
 
+        if self
+            .account()
+            .is_some_and(AccountState::cached_mailbox_unverified)
+        {
+            self.status = StatusLine::info(
+                "reply/forward requires verified original MIME; cached mail remains readable",
+            );
+            return;
+        }
         // Fetch the original MIME for every reply/forward. Reply targets must
         // come from the real To/Cc/Reply-To/List-Post headers, not the reader
         // projection or the sender summary. Forwarding preserves raw bytes.

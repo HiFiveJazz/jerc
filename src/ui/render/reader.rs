@@ -387,6 +387,11 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             }
         } else if account.is_loading_body() {
             lines.push(Line::styled("Loading message…", theme.muted()));
+        } else if account.cached_mailbox_unverified() {
+            lines.push(Line::styled(
+                "Body not cached · reconnect to fetch this message",
+                theme.muted(),
+            ));
         } else {
             lines.push(Line::styled("Message body not loaded", theme.muted()));
         }

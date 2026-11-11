@@ -24,17 +24,17 @@ impl App {
         let Some(mailbox) = account.current_mailbox.clone() else {
             return;
         };
+        // Display-only cached rows are safe to inspect. The read-only IMAP
+        // backend checks UIDVALIDITY itself before fetching missing MIME data;
+        // already-cached MIME needs no connection at all.
         let id = message.id.clone();
         let validity = account.uid_validities.get(&mailbox).copied();
         let source = (self.account_index, mailbox.clone(), validity, id.clone());
-        let cached = if account.unverified_mailboxes.contains(&mailbox) {
-            None
-        } else {
-            self.attachment_cache
-                .iter()
-                .find(|(key, _)| key == &source)
-                .map(|(_, files)| Arc::clone(files))
-        };
+        let cached = self
+            .attachment_cache
+            .iter()
+            .find(|(key, _)| key == &source)
+            .map(|(_, files)| Arc::clone(files));
         crate::perf::record(
             if cached.is_some() {
                 "ui_attachment_cache_hit"
@@ -64,12 +64,21 @@ impl App {
                 self.status = StatusLine::info("checking attachments…");
                 return;
             }
+            let cache = validity
+                .filter(|validity| id.0.starts_with(&format!("imap-uid:{validity}:")))
+                .and_then(|validity| {
+                    account
+                        .raw_store
+                        .as_ref()
+                        .map(|store| (store.dir.clone(), validity))
+                });
             let request = account.worker.post(ActionKind::FetchAttachments {
                 mailbox,
                 id: id.clone(),
+                cache,
             });
             let Ok(request_id) = request else {
-                self.status = StatusLine::error("mail worker busy; cannot load attachments");
+                self.status = StatusLine::error("attachment worker busy; retry shortly");
                 return;
             };
             self.attachment_source = Some(source);

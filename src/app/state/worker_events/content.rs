@@ -38,6 +38,7 @@ impl App {
                 if account.bodies.contains_key(&id) {
                     crate::perf::record("ui_selected_body_duplicate", None, Duration::ZERO, true);
                 }
+                account.persist_body(&body);
                 account.bodies.insert(id.clone(), body);
                 account.trim_preview_bodies();
                 account.persist_current_cache();
@@ -68,6 +69,7 @@ impl App {
                     return;
                 }
                 crate::perf::record("ui_prefetch_applied", None, Duration::ZERO, true);
+                account.persist_body(&body);
                 account.bodies.insert(id.clone(), body);
                 account.trim_preview_bodies();
                 if event.account == self.account_index

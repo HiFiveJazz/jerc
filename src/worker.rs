@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::backend::{MailBackend, MailboxSyncHint};
+use crate::cache::RawStore;
 use crate::mail_image::MailImageEvent;
 use crate::model::{
     Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingAttachment, OutgoingMessage,
@@ -22,6 +23,8 @@ pub enum ActionKind {
     Connect,
     ListMailboxes,
     MailboxStatus(String),
+    /// Wake token for the independent priority queue; never sent to IMAP.
+    WakePriority,
     /// Wake from a dedicated IDLE session; the UI owns STATUS reconciliation.
     WatchMailboxChanged(String),
     /// A single newest message preview after a known Inbox count increase.
@@ -51,6 +54,9 @@ pub enum ActionKind {
     FetchAttachments {
         mailbox: String,
         id: MessageId,
+        /// Present only for generation-scoped IMAP UIDs; never trust a
+        /// recycled UID or write a cache entry without UIDVALIDITY.
+        cache: Option<(PathBuf, u32)>,
     },
     ExportRaw {
         mailbox: String,
@@ -221,6 +227,9 @@ pub struct WorkerHandle {
     // STATUS runs on a separate IMAP session. A stalled unread-count lookup
     // must never get ahead of an interactive SELECT or FETCH.
     status_sender: Option<SyncSender<Action>>,
+    // Explicit reads must not fail just because speculative prefetch/STATUS
+    // filled the background queue. Both channels feed the SAME IMAP session.
+    priority_sender: Option<SyncSender<Action>>,
     join: Option<JoinHandle<()>>,
     status_join: Option<JoinHandle<()>>,
     idle_stop: Arc<AtomicBool>,
@@ -256,16 +265,20 @@ impl WorkerHandle {
                 run_worker(account, &mut *backend, &mut outgoing, receiver, runtime_tx);
             })
             .expect("failed to spawn mail worker");
-        let (status_sender, status_join) = if let Some(status_backend) = status_backend {
-            let (tx, rx) = sync_channel::<Action>(16);
-            let join = thread::Builder::new()
-                .name(format!("mail-status-{account}"))
-                .spawn(move || run_status_worker(account, status_backend, rx, status_events))
-                .expect("failed to spawn mailbox status worker");
-            (Some(tx), Some(join))
-        } else {
-            (None, None)
-        };
+        let (status_sender, priority_sender, status_join) =
+            if let Some(status_backend) = status_backend {
+                let (tx, rx) = sync_channel::<Action>(16);
+                let (priority_tx, priority_rx) = sync_channel::<Action>(8);
+                let join = thread::Builder::new()
+                    .name(format!("mail-status-{account}"))
+                    .spawn(move || {
+                        run_status_worker(account, status_backend, rx, priority_rx, status_events)
+                    })
+                    .expect("failed to spawn mailbox status worker");
+                (Some(tx), Some(priority_tx), Some(join))
+            } else {
+                (None, None, None)
+            };
         let idle_stop = Arc::new(AtomicBool::new(false));
         let idle_join = idle_backend.map(|backend| {
             let stop = Arc::clone(&idle_stop);
@@ -278,6 +291,7 @@ impl WorkerHandle {
         Self {
             sender,
             status_sender,
+            priority_sender,
             join: Some(join),
             status_join,
             idle_stop,
@@ -294,15 +308,29 @@ impl WorkerHandle {
     pub fn post(&self, kind: ActionKind) -> Result<u64, TrySendError<Action>> {
         let action = Action::new(kind);
         let id = action.id;
-        if matches!(&action.kind, ActionKind::FetchBody { .. }) {
-            // Prioritize explicit reads on the separate session while a
-            // foreground header fetch is in flight. If that queue is full or
-            // gone, the foreground worker is a safe fallback.
-            if let Some(sender) = &self.status_sender {
-                match sender.try_send(action) {
-                    Ok(()) => {}
+        if matches!(
+            &action.kind,
+            ActionKind::FetchBody { .. } | ActionKind::FetchAttachments { .. }
+        ) {
+            // Priority has a separate bounded input queue, but runs on the
+            // existing read-only IMAP connection. A flood of speculative
+            // prefetches cannot fill this queue. Wake the worker if it is
+            // sleeping on its ordinary STATUS queue.
+            if let Some(priority) = &self.priority_sender {
+                match priority.try_send(action) {
+                    Ok(()) => {
+                        if let Some(status) = &self.status_sender {
+                            let _ = status.try_send(Action::new(ActionKind::WakePriority));
+                        }
+                    }
                     Err(TrySendError::Full(action) | TrySendError::Disconnected(action)) => {
-                        self.sender.try_send(action)?;
+                        if matches!(&action.kind, ActionKind::FetchBody { .. }) {
+                            // Preserve the existing body fallback, but don't
+                            // make attachments wait behind a page-long FETCH.
+                            self.sender.try_send(action)?;
+                        } else {
+                            return Err(TrySendError::Full(action));
+                        }
                     }
                 }
             } else {
@@ -348,6 +376,7 @@ impl WorkerHandle {
         // Disconnect the background queue when possible. The IDLE watcher may
         // still hold a clone until it observes the stop flag.
         drop(self.status_sender.take());
+        drop(self.priority_sender.take());
     }
 
     pub fn shutdown(&mut self) {
@@ -362,6 +391,7 @@ impl WorkerHandle {
         if let Some(sender) = self.status_sender.take() {
             let _ = sender.send(Action::new(ActionKind::Shutdown));
         }
+        drop(self.priority_sender.take());
         let _ = self.sender.send(Action::new(ActionKind::Shutdown));
         let _ = join.join();
         if let Some(status_join) = self.status_join.take() {
@@ -463,6 +493,7 @@ fn run_worker(
             ActionKind::Connect => "worker_connect",
             ActionKind::ListMailboxes => "worker_list_mailboxes",
             ActionKind::MailboxStatus(_) => "worker_mailbox_status",
+            ActionKind::WakePriority => "worker_wake_priority",
             ActionKind::WatchMailboxChanged(_) => "worker_idle_changed",
             ActionKind::NewMailPreview { .. } => "worker_new_mail_preview",
             ActionKind::OpenMailbox { .. } => "worker_open_mailbox",
@@ -529,10 +560,9 @@ fn run_worker(
             ActionKind::FetchRawForCompose { mailbox, id } => backend
                 .fetch_raw(&mailbox, &id)
                 .map(|raw| WorkerEventKind::RawLoaded { id, raw }),
-            ActionKind::FetchAttachments { mailbox, id } => backend
-                .fetch_raw(&mailbox, &id)
-                .and_then(|raw| crate::mail::extract_attachments(&raw))
-                .map(|attachments| WorkerEventKind::AttachmentsLoaded { mailbox, id, attachments }),
+            ActionKind::FetchAttachments { mailbox, id, cache } =>
+                fetch_attachments(backend, &mailbox, &id, cache.as_ref())
+                    .map(|attachments| WorkerEventKind::AttachmentsLoaded { mailbox, id, attachments }),
             ActionKind::ExportRaw { mailbox, id, path } =>
                 write_export_stream(&path, |output| backend.export_raw_into(&mailbox, &id, output))
                     .map(|()| WorkerEventKind::MessageExported { path }),
@@ -608,6 +638,7 @@ fn run_worker(
                     "no outgoing transport configured for this account"
                 )),
             },
+            ActionKind::WakePriority => unreachable!("priority wake belongs to status worker"),
             ActionKind::Shutdown => unreachable!(),
         }
         .unwrap_or_else(|err| WorkerEventKind::Error(format!("{err:#}")));
@@ -696,15 +727,31 @@ fn pop_background_action(
     pending: &mut VecDeque<Action>,
     bodies_since_status: usize,
 ) -> Option<Action> {
-    // Interactive reads have priority even over unread-count polling; only
-    // one in-flight IMAP operation may precede the newest selected message.
-    if let Some(index) = pending
-        .iter()
-        .rposition(|action| matches!(&action.kind, ActionKind::FetchBody { .. }))
-    {
-        let newest = pending.remove(index);
-        pending.retain(|action| !matches!(&action.kind, ActionKind::FetchBody { .. }));
-        return newest;
+    // Explicit requests (selected bodies and attachments) outrank both STATUS
+    // and speculative prefetch. Keep every attachment request; only an old
+    // selected-body request is safely superseded by a newer body request.
+    if let Some(index) = pending.iter().position(|action| {
+        matches!(
+            &action.kind,
+            ActionKind::FetchBody { .. } | ActionKind::FetchAttachments { .. }
+        )
+    }) {
+        let chosen = pending.remove(index);
+        if chosen
+            .as_ref()
+            .is_some_and(|action| matches!(&action.kind, ActionKind::FetchBody { .. }))
+        {
+            // The latest requested reader body should win if navigation raced.
+            if let Some(newer) = pending
+                .iter()
+                .rposition(|action| matches!(&action.kind, ActionKind::FetchBody { .. }))
+            {
+                let latest = pending.remove(newer);
+                pending.retain(|action| !matches!(&action.kind, ActionKind::FetchBody { .. }));
+                return latest;
+            }
+        }
+        return chosen;
     }
     let status_index = (bodies_since_status >= 4)
         .then(|| {
@@ -735,6 +782,7 @@ fn run_status_worker(
     account: usize,
     mut backend: Box<dyn MailBackend>,
     receiver: Receiver<Action>,
+    priority_receiver: Receiver<Action>,
     runtime_tx: SyncSender<RuntimeEvent>,
 ) {
     let mut connected = false;
@@ -754,6 +802,9 @@ fn run_status_worker(
         }
         while let Ok(action) = receiver.try_recv() {
             pending.push_back(action);
+        }
+        while let Ok(action) = priority_receiver.try_recv() {
+            pending.push_front(action);
         }
         if pending
             .iter()
@@ -806,6 +857,53 @@ fn run_status_worker(
                     break;
                 }
             }
+            ActionKind::FetchAttachments { mailbox, id, cache } => {
+                // A cache hit works even when IMAP is offline or authenticating.
+                // Otherwise connect this independent read-only session and
+                // validate UIDVALIDITY during the server fetch.
+                let result = (|| {
+                    if let Some((dir, validity)) = cache.as_ref()
+                        && let Some(raw) =
+                            (RawStore { dir: dir.clone() }).read(&mailbox, *validity, &id)
+                        && let Ok(attachments) = crate::mail::extract_attachments(&raw)
+                    {
+                        crate::perf::record("attachment_raw_disk_hit", None, Duration::ZERO, true);
+                        return Ok(attachments);
+                    }
+                    if !connected {
+                        backend.connect()?;
+                        connected = true;
+                    }
+                    fetch_attachments(&mut *backend, &mailbox, &id, cache.as_ref())
+                })();
+                if result.is_err() {
+                    connected = false;
+                }
+                crate::perf::record(
+                    "worker_fetch_attachments",
+                    Some(queue_wait),
+                    started.elapsed(),
+                    result.is_ok(),
+                );
+                let kind = match result {
+                    Ok(attachments) => WorkerEventKind::AttachmentsLoaded {
+                        mailbox,
+                        id,
+                        attachments,
+                    },
+                    Err(error) => WorkerEventKind::Error(format!("{error:#}")),
+                };
+                if runtime_tx
+                    .send(RuntimeEvent::Worker(WorkerEvent {
+                        account,
+                        request_id: action.id,
+                        kind,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
+            }
             ActionKind::NewMailPreview { mailbox, count } => {
                 let result = (|| {
                     if !connected {
@@ -831,6 +929,7 @@ fn run_status_worker(
                     break;
                 }
             }
+            ActionKind::WakePriority => {}
             ActionKind::WatchMailboxChanged(name) => {
                 if runtime_tx
                     .try_send(RuntimeEvent::Worker(WorkerEvent {
@@ -935,6 +1034,9 @@ fn run_status_worker(
                     while let Ok(new_action) = receiver.try_recv() {
                         pending.push_back(new_action);
                     }
+                    while let Ok(new_action) = priority_receiver.try_recv() {
+                        pending.push_front(new_action);
+                    }
                     if pending.iter().any(|next| {
                         matches!(
                             &next.kind,
@@ -943,9 +1045,12 @@ fn run_status_worker(
                     }) {
                         break; // Superseded window or shutdown: abandon the rest.
                     }
-                    let interactive_waiting = pending
-                        .iter()
-                        .any(|next| matches!(&next.kind, ActionKind::FetchBody { .. }));
+                    let interactive_waiting = pending.iter().any(|next| {
+                        matches!(
+                            &next.kind,
+                            ActionKind::FetchBody { .. } | ActionKind::FetchAttachments { .. }
+                        )
+                    });
                     let status_waiting = bodies_since_status >= 4
                         && pending
                             .iter()
@@ -969,6 +1074,33 @@ fn run_status_worker(
             _ => {} // The background worker never performs foreground mutations.
         }
     }
+}
+
+/// One attachment fetch, shared by the foreground fallback and the
+/// independent read-only worker. Reuse raw MIME across sessions; never block
+/// the UI on reading, parsing, writing, or pruning the on-disk store.
+fn fetch_attachments(
+    backend: &mut dyn MailBackend,
+    mailbox: &str,
+    id: &MessageId,
+    cache: Option<&(PathBuf, u32)>,
+) -> anyhow::Result<Vec<OutgoingAttachment>> {
+    if let Some((dir, validity)) = cache
+        && let Some(raw) = (RawStore { dir: dir.clone() }).read(mailbox, *validity, id)
+        && let Ok(attachments) = crate::mail::extract_attachments(&raw)
+    {
+        crate::perf::record("attachment_raw_disk_hit", None, Duration::ZERO, true);
+        return Ok(attachments);
+    }
+    crate::perf::record("attachment_raw_disk_miss", None, Duration::ZERO, true);
+    let raw = backend.fetch_raw(mailbox, id)?;
+    // Don't store corrupt raw MIME. A successful fetch and extraction can be
+    // cached for future restarts, including when offline.
+    let attachments = crate::mail::extract_attachments(&raw)?;
+    if let Some((dir, validity)) = cache {
+        let _ = (RawStore { dir: dir.clone() }).write(mailbox, *validity, id, &raw);
+    }
+    Ok(attachments)
 }
 
 /// Best effort: a failed/empty body still yields the sender and subject.
@@ -1234,7 +1366,7 @@ mod tests {
             })
         }
         fn fetch_raw(&mut self, _mailbox: &str, _id: &MessageId) -> anyhow::Result<Vec<u8>> {
-            anyhow::bail!("not needed for this test")
+            Ok(b"From: sender@example.org\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nbody\r\n--x\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=test.txt\r\n\r\nfile contents\r\n--x--\r\n".to_vec())
         }
         fn set_seen(&mut self, _mailbox: &str, _id: &MessageId, _seen: bool) -> anyhow::Result<()> {
             Ok(())
@@ -1368,6 +1500,162 @@ mod tests {
             }
             other => panic!("unexpected prefetch event: {other:?}"),
         }
+        worker.shutdown();
+    }
+
+    #[test]
+    fn attachment_request_does_not_wait_for_foreground_header_fetch() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let foreground = Box::new(TestBackend {
+            status_started: Some(started_tx),
+            status_release: Some(release_rx),
+        });
+        let background = Box::new(TestBackend {
+            status_started: None,
+            status_release: None,
+        });
+        let (tx, rx) = mpsc::sync_channel(8);
+        let mut worker = WorkerHandle::spawn(0, foreground, Some(background), None, tx);
+        worker
+            .post(ActionKind::OpenMailbox {
+                name: "INBOX".into(),
+                offset: 0,
+                limit: 100,
+                hint: None,
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("foreground headers should block");
+        let requested = worker
+            .post(ActionKind::FetchAttachments {
+                mailbox: "INBOX".into(),
+                id: MessageId("imap-uid:42:7".into()),
+                cache: None,
+            })
+            .unwrap();
+        let RuntimeEvent::Worker(event) = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("attachment extraction must not wait for foreground header FETCH")
+        else {
+            panic!("expected attachment event");
+        };
+        assert_eq!(event.request_id, requested);
+        assert!(
+            matches!(event.kind, WorkerEventKind::AttachmentsLoaded { attachments, .. }
+            if attachments.len() == 1 && attachments[0].filename == "test.txt")
+        );
+        release_tx.send(()).unwrap();
+        worker.shutdown();
+    }
+
+    #[test]
+    fn attachment_preempts_prefetch_and_survives_status_queue_compaction() {
+        let attachment_id = MessageId("imap-uid:22:3".into());
+        let mut pending = VecDeque::from([
+            Action::new(ActionKind::MailboxStatus("INBOX".into())),
+            Action::new(ActionKind::PrefetchBodies {
+                mailbox: "INBOX".into(),
+                ids: vec![],
+            }),
+            Action::new(ActionKind::FetchAttachments {
+                mailbox: "INBOX".into(),
+                id: attachment_id.clone(),
+                cache: None,
+            }),
+            Action::new(ActionKind::PrefetchBodies {
+                mailbox: "Sent".into(),
+                ids: vec![],
+            }),
+        ]);
+        let next = pop_background_action(&mut pending, 0).unwrap();
+        assert!(
+            matches!(next.kind, ActionKind::FetchAttachments { id, .. } if id == attachment_id)
+        );
+        assert!(
+            pending
+                .iter()
+                .all(|action| !matches!(&action.kind, ActionKind::FetchAttachments { .. }))
+        );
+    }
+
+    #[test]
+    fn raw_mime_disk_hit_does_not_use_imap() {
+        struct Offline;
+        impl MailBackend for Offline {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities::IMAP_BASIC
+            }
+            fn connect(&mut self) -> anyhow::Result<()> {
+                anyhow::bail!("offline")
+            }
+            fn list_mailboxes(&mut self) -> anyhow::Result<Vec<Mailbox>> {
+                anyhow::bail!("offline")
+            }
+            fn mailbox_status(&mut self, _: &str) -> anyhow::Result<(usize, usize)> {
+                anyhow::bail!("offline")
+            }
+            fn open_mailbox(&mut self, _: &str, _: usize, _: usize) -> anyhow::Result<MessagePage> {
+                anyhow::bail!("offline")
+            }
+            fn fetch_body(&mut self, _: &str, _: &MessageId) -> anyhow::Result<MessageBody> {
+                anyhow::bail!("offline")
+            }
+            fn fetch_raw(&mut self, _: &str, _: &MessageId) -> anyhow::Result<Vec<u8>> {
+                anyhow::bail!("offline")
+            }
+            fn set_seen(&mut self, _: &str, _: &MessageId, _: bool) -> anyhow::Result<()> {
+                anyhow::bail!("offline")
+            }
+            fn delete(&mut self, _: &str, _: &MessageId) -> anyhow::Result<()> {
+                anyhow::bail!("offline")
+            }
+            fn move_to(&mut self, _: &str, _: &str, _: &MessageId) -> anyhow::Result<()> {
+                anyhow::bail!("offline")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::cache::RawStore {
+            dir: dir.path().join("raw"),
+        };
+        let id = MessageId("imap-uid:42:7".into());
+        let mut backend = TestBackend {
+            status_started: None,
+            status_release: None,
+        };
+        let initial =
+            super::fetch_attachments(&mut backend, "INBOX", &id, Some(&(store.dir.clone(), 42)))
+                .unwrap();
+        assert_eq!(initial.len(), 1);
+        let offline =
+            super::fetch_attachments(&mut Offline, "INBOX", &id, Some(&(store.dir.clone(), 42)))
+                .unwrap();
+        assert_eq!(offline[0].filename, "test.txt");
+
+        // Exercise the real priority worker path: a cache hit must complete
+        // without even attempting connect() on either offline backend.
+        let (tx, rx) = mpsc::sync_channel(8);
+        let mut worker =
+            WorkerHandle::spawn(0, Box::new(Offline), Some(Box::new(Offline)), None, tx);
+        let requested = worker
+            .post(ActionKind::FetchAttachments {
+                mailbox: "INBOX".into(),
+                id,
+                cache: Some((store.dir, 42)),
+            })
+            .unwrap();
+        let RuntimeEvent::Worker(event) = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("cached attachment must load offline")
+        else {
+            panic!("worker event expected")
+        };
+        assert_eq!(event.request_id, requested);
+        assert!(
+            matches!(event.kind, WorkerEventKind::AttachmentsLoaded { attachments, .. }
+            if attachments.len() == 1)
+        );
         worker.shutdown();
     }
 

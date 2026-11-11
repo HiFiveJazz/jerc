@@ -730,6 +730,8 @@ pub struct AccountState {
     mailbox_cache: HashMap<String, CachedMailbox>,
     warm_folder_order: VecDeque<String>,
     cache_writer: Option<cache::Writer>,
+    body_store: Option<cache::BodyStore>,
+    raw_store: Option<cache::RawStore>,
     uid_validities: HashMap<String, u32>,
     uid_nexts: HashMap<String, u32>,
     unverified_mailboxes: HashSet<String>,
@@ -739,6 +741,9 @@ pub struct AccountState {
     pub bodies: HashMap<MessageId, MessageBody>,
     pub pending_bodies: HashSet<MessageId>,
     pub pending_seen: HashMap<MessageId, u64>,
+    deferred_seen: Vec<cache::DeferredSeen>,
+    // Correlates ACKs with the original mailbox, including after navigation.
+    inflight_deferred_seen: HashMap<u64, cache::DeferredSeen>,
     status_requests: MailboxStatusQueue,
     pending_inbox_refresh: bool,
     pending_mutation_labels: HashMap<u64, &'static str>,
@@ -763,11 +768,20 @@ impl AccountState {
             .is_some_and(|name| self.unverified_mailboxes.contains(name))
     }
 
+    /// Only foreground mailbox synchronization is shown as a progress spinner.
+    /// Background STATUS polling and IDLE do not keep the spinner running.
+    #[must_use]
+    pub fn syncing_with_server(&self) -> bool {
+        self.connecting
+            || self.mailboxes_loading
+            || self.messages_loading
+            || self.page_inflight.is_some()
+    }
+
     #[must_use]
     pub fn selected_message(&self) -> Option<&MessageSummary> {
-        if self.cached_mailbox_unverified() {
-            return None;
-        }
+        // Unverified cached rows are safe to READ. Only UID-bearing server
+        // requests must wait for SELECT to verify UIDVALIDITY.
         self.messages.get(self.message_index)
     }
 
@@ -804,11 +818,8 @@ impl AccountState {
 
     #[must_use]
     pub fn visible_message_indices(&self) -> Vec<usize> {
-        // Disk snapshots are hints for fast IMAP delta synchronization, not
-        // verified current folder contents. Do not flash already-deleted mail.
-        if self.cached_mailbox_unverified() {
-            return Vec::new();
-        }
+        // Cached rows stay navigable while IMAP reconciliation runs. They are
+        // provisional, so all server-facing UID actions check verification.
         let query = self.search_query.trim().to_lowercase();
         if query.is_empty() {
             return (0..self.messages.len()).collect();
@@ -959,6 +970,18 @@ impl AccountState {
             crate::perf::record("ui_preview_cache_hit", None, Duration::ZERO, true);
             return;
         }
+        // Reading offline is safe before SELECT; only UID mutations need a
+        // verified server generation. Do not start a network fetch on a hit.
+        if let (Some(store), Some(validity)) = (
+            self.body_store.as_ref(),
+            self.uid_validities.get(&mailbox).copied(),
+        ) && let Some(body) = store.read(&mailbox, validity, &id)
+        {
+            self.bodies.insert(id, body);
+            self.trim_preview_bodies();
+            crate::perf::record("ui_preview_disk_hit", None, Duration::ZERO, true);
+            return;
+        }
         if self.pending_bodies.contains(&id) || self.unverified_mailboxes.contains(&mailbox) {
             return;
         }
@@ -1053,6 +1076,15 @@ impl AccountState {
                 !self.bodies.contains_key(&message.id) && !self.pending_bodies.contains(&message.id)
             })
             .filter(|message| {
+                // Disk-cached messages are loaded when selected. Preloading
+                // them again over IMAP wastes bandwidth and server latency.
+                !self.body_store.as_ref().is_some_and(|store| {
+                    self.uid_validities.get(&mailbox).is_some_and(|validity| {
+                        store.has_candidate(&mailbox, *validity, &message.id)
+                    })
+                })
+            })
+            .filter(|message| {
                 if raw_bytes.saturating_add(message.size) > MAX_PREFETCH_WINDOW_RAW_BYTES {
                     false
                 } else {
@@ -1119,22 +1151,135 @@ impl AccountState {
         self.bodies.retain(|id, _| keep.contains(id));
     }
 
+    /// Record a read/unread preference immediately; the server is reconciled
+    /// later, but only after SELECT confirms UIDVALIDITY and the UID is still
+    /// present. The on-disk journal is coalesced and bounded.
     fn request_seen(&mut self, id: MessageId, seen: bool) -> bool {
         let Some(mailbox) = self.current_mailbox.clone() else {
             return false;
         };
-        if self.pending_seen.contains_key(&id) {
+        let verified = !self.unverified_mailboxes.contains(&mailbox);
+        let validity = self.uid_validities.get(&mailbox).copied();
+        if !self.messages.iter().any(|message| message.id == id) {
             return false;
         }
-        if let Ok(request_id) = self.worker.post(ActionKind::SetSeen {
+        // Maildir and IMAP accounts without persistent caching retain the
+        // original immediate-worker behavior. Never send an unverified UID.
+        if validity.is_none() && verified {
+            if self.pending_seen.contains_key(&id) {
+                return false;
+            }
+            if let Ok(request_id) = self.worker.post(ActionKind::SetSeen {
+                mailbox,
+                id: id.clone(),
+                seen,
+            }) {
+                self.pending_seen.insert(id.clone(), request_id);
+                self.apply_seen_flag(&id, seen);
+                return true;
+            }
+            return false;
+        }
+        let Some(validity) = validity else {
+            return false;
+        };
+        let entry = cache::DeferredSeen {
             mailbox,
+            validity,
             id: id.clone(),
             seen,
-        }) {
-            self.pending_seen.insert(id, request_id);
-            true
+        };
+        if !entry.has_valid_identity() {
+            return false;
+        }
+        if let Some(previous) = self
+            .deferred_seen
+            .iter_mut()
+            .find(|previous| previous.mailbox == entry.mailbox && previous.id == entry.id)
+        {
+            previous.seen = seen;
         } else {
-            false
+            if self.deferred_seen.len() >= cache::MAX_DEFERRED_SEEN {
+                return false;
+            }
+            self.deferred_seen.push(entry);
+        }
+        self.apply_seen_flag(&id, seen);
+        self.persist_deferred_seen();
+        // Offline flag changes are stored in the journal, but the cached
+        // mailbox count stays at its last server-derived value. Persisting an
+        // optimistic count would double-apply this change on next startup.
+        self.persist_current_cache();
+        if verified {
+            self.persist_mailboxes();
+        }
+        self.pump_deferred_seen();
+        true
+    }
+
+    fn persist_deferred_seen(&self) {
+        if let Some(writer) = &self.cache_writer {
+            writer.send(cache::Change::DeferredSeen(self.deferred_seen.clone()));
+        }
+    }
+
+    /// Reapply local preferences after a fresh server FLAGS snapshot (or
+    /// restoring a cached mailbox). This does not issue network operations.
+    fn overlay_deferred_seen(&mut self) {
+        let Some(mailbox) = self.current_mailbox.clone() else {
+            return;
+        };
+        let Some(validity) = self.uid_validities.get(&mailbox).copied() else {
+            return;
+        };
+        let updates = self
+            .deferred_seen
+            .iter()
+            .filter(|entry| entry.mailbox == mailbox && entry.validity == validity)
+            .map(|entry| (entry.id.clone(), entry.seen))
+            .collect::<Vec<_>>();
+        for (id, seen) in updates {
+            self.apply_seen_flag(&id, seen);
+        }
+    }
+
+    /// Replay only for a confirmed generation and UIDs present in the loaded
+    /// server page. Missing UIDs remain pending for later pages; changed
+    /// generations are discarded rather than risking a write to another mail.
+    fn pump_deferred_seen(&mut self) {
+        let Some(mailbox) = self.current_mailbox.clone() else {
+            return;
+        };
+        if self.unverified_mailboxes.contains(&mailbox) {
+            return;
+        }
+        let Some(validity) = self.uid_validities.get(&mailbox).copied() else {
+            return;
+        };
+        let ready =
+            self.deferred_seen
+                .iter()
+                .filter(|entry| entry.mailbox == mailbox && entry.validity == validity)
+                .filter(|entry| self.messages.iter().any(|message| message.id == entry.id))
+                .filter(|entry| !self.pending_seen.contains_key(&entry.id))
+                .filter(|entry| {
+                    !self.inflight_deferred_seen.values().any(|inflight| {
+                        inflight.mailbox == entry.mailbox && inflight.id == entry.id
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+        for entry in ready {
+            if let Ok(request_id) = self.worker.post(ActionKind::SetSeen {
+                mailbox: entry.mailbox.clone(),
+                id: entry.id.clone(),
+                seen: entry.seen,
+            }) {
+                self.pending_seen.insert(entry.id.clone(), request_id);
+                self.inflight_deferred_seen.insert(request_id, entry);
+            } else {
+                break;
+            }
         }
     }
 }
@@ -1289,6 +1434,7 @@ pub struct App {
     pub account_index: usize,
     pub focus: Focus,
     pub status: StatusLine,
+    sync_spinner_frame: usize,
     pub startup_warnings: Vec<String>,
     pub show_startup_warnings: bool,
     pub should_quit: bool,
@@ -1430,6 +1576,24 @@ impl App {
     #[must_use]
     pub fn theme(&self) -> &Theme {
         &self.themes[self.theme_index.min(self.themes.len().saturating_sub(1))]
+    }
+
+    /// The active account's initial mailbox/connection work runs independently
+    /// from the cached reader. Keep this a *display* signal, not a UI gate.
+    #[must_use]
+    pub fn syncing_with_server(&self) -> bool {
+        self.account()
+            .is_some_and(AccountState::syncing_with_server)
+    }
+
+    #[must_use]
+    pub fn sync_spinner(&self) -> &'static str {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        FRAMES[self.sync_spinner_frame % FRAMES.len()]
+    }
+
+    pub fn advance_sync_spinner(&mut self) {
+        self.sync_spinner_frame = self.sync_spinner_frame.wrapping_add(1);
     }
 
     #[must_use]
@@ -2139,6 +2303,10 @@ impl App {
         let Some(mailbox) = account.current_mailbox.clone() else {
             return;
         };
+        if account.cached_mailbox_unverified() {
+            self.status = StatusLine::info("raw MIME export requires a verified server connection");
+            return;
+        }
         let Some(id) = account.selected_message().map(|message| message.id.clone()) else {
             return;
         };

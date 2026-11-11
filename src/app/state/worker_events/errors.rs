@@ -40,6 +40,15 @@ impl App {
                 if let Some(id) = &failed_seen {
                     account.pending_seen.remove(id);
                 }
+                if account
+                    .inflight_deferred_seen
+                    .remove(&event.request_id)
+                    .is_some()
+                {
+                    // SetSeen is idempotent; keep the desired value in the
+                    // durable journal for a later verified connection.
+                    account.persist_deferred_seen();
+                }
                 account.connecting = false;
                 account.mailboxes_loading = false;
                 // A failure in an unrelated mutation/compose request must not
@@ -67,9 +76,7 @@ impl App {
                         composer.confirm_send = false;
                     }
                 }
-                if (mutation_failed || failed_seen.is_some())
-                    && let Some(name) = account.current_mailbox.clone()
-                {
+                if mutation_failed && let Some(name) = account.current_mailbox.clone() {
                     account.invalidate_current_cache();
                     let _ = account.request_mailbox_page(name, 0);
                 }

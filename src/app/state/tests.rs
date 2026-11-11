@@ -93,7 +93,7 @@ fn compose_shift_c_toggles_diff_mode_without_editing_text_or_insert_key() {
 }
 
 #[test]
-fn unverified_cached_mail_never_appears_as_live_mail() {
+fn unverified_cached_mail_is_navigable_and_readable_but_not_server_mutable() {
     use crate::worker::WorkerHandle;
     use std::sync::mpsc::sync_channel;
     let root = tempfile::tempdir().unwrap();
@@ -120,16 +120,70 @@ fn unverified_cached_mail_never_appears_as_live_mail() {
     account.messages = vec![message];
     account.unverified_mailboxes.insert("INBOX".into());
     assert!(account.cached_mailbox_unverified());
-    assert!(account.visible_message_indices().is_empty());
-    assert!(account.selected_message().is_none());
-    // A first-page server response marks this folder verified, after
-    // which its real rows (not disk-only guesses) can be displayed.
-    account.unverified_mailboxes.remove("INBOX");
     assert_eq!(account.visible_message_indices(), vec![0]);
     assert_eq!(
         account.selected_message().unwrap().subject,
         "Already deleted"
     );
+    app.open_selection();
+    assert!(app.message_open, "Enter must not wait for IMAP SELECT");
+    assert!(app.account().unwrap().pending_seen.is_empty());
+    // An offline header is provisional, not proof it still exists remotely.
+    app.start_mutation(
+        "INBOX".into(),
+        vec![MessageId("old-uid".into())],
+        super::MutationKind::Delete,
+    );
+    assert!(app.status.is_error);
+    assert!(app.account().unwrap().pending_mutation_labels.is_empty());
+}
+
+#[test]
+fn attachment_picker_is_not_blocked_by_cached_mailbox_verification() {
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
+    let mut app = super::App::new(&config, vec![worker]);
+    let raw = b"From: Sender <sender@example.org>\r\nSubject: With files\r\n\r\nbody";
+    let id = MessageId("cached-uid".into());
+    let message =
+        crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, MessageFlags::empty())
+            .unwrap();
+    let account = app.account_mut().unwrap();
+    account.current_mailbox = Some("INBOX".into());
+    account.messages = vec![message];
+    account.unverified_mailboxes.insert("INBOX".into());
+    assert!(account.cached_mailbox_unverified());
+    app.open_attachment_picker();
+    assert_eq!(app.attachment_pending.as_ref(), Some(&id));
+    let request_id = app
+        .attachment_pending_request_id
+        .expect("queued MIME check");
+    assert!(!app.status.text.contains("requires server verification"));
+    app.handle_worker_event(crate::worker::WorkerEvent {
+        account: 0,
+        request_id,
+        kind: crate::worker::WorkerEventKind::AttachmentsLoaded {
+            mailbox: "INBOX".into(),
+            id,
+            attachments: vec![crate::model::OutgoingAttachment {
+                filename: "readme.txt".into(),
+                content_type: "text/plain".into(),
+                data: b"contents".to_vec(),
+            }],
+        },
+    });
+    assert!(app.attachment_picker_visible);
+    assert_eq!(app.attachment_files[0].filename, "readme.txt");
 }
 
 #[test]
@@ -2516,4 +2570,184 @@ fn persistent_and_in_memory_snapshots_share_bounded_cursor_rules() {
     assert!(snapshot.has_more);
     assert_eq!(snapshot.uid_validity, Some(15));
     assert_eq!(snapshot.uid_next, Some(600));
+}
+
+#[test]
+fn offline_cached_reader_queues_seen_without_sending_unverified_uid() {
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
+    let mut app = super::App::new(&config, vec![worker]);
+    let raw = b"From: Test <test@example.org>\r\nSubject: Cached\r\n\r\nOffline";
+    let id = MessageId("imap-uid:100:5".into());
+    let message =
+        crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, MessageFlags::empty())
+            .unwrap();
+    let body = crate::mail::parse_body(id.clone(), raw).unwrap();
+    let account = app.account_mut().unwrap();
+    account.current_mailbox = Some("INBOX".into());
+    account.messages = vec![message];
+    account.bodies.insert(id.clone(), body);
+    account.uid_validities.insert("INBOX".into(), 100);
+    account.unverified_mailboxes.insert("INBOX".into());
+    super::App::mark_cached_selected_seen(account);
+    assert!(account.pending_seen.is_empty());
+    assert_eq!(account.deferred_seen.len(), 1);
+    assert_eq!(account.deferred_seen[0].id, id);
+    assert!(account.deferred_seen[0].seen);
+    assert!(!account.messages[0].unread());
+    // Updating a pending preference coalesces it rather than creating a
+    // second potentially conflicting network request.
+    assert!(account.request_seen(account.messages[0].id.clone(), false));
+    assert_eq!(account.deferred_seen.len(), 1);
+    assert!(!account.deferred_seen[0].seen);
+    assert!(account.messages[0].unread());
+    // Even if a different generation has been verified, the old UID cannot
+    // be submitted to the worker.
+    account.uid_validities.insert("INBOX".into(), 101);
+    account.unverified_mailboxes.remove("INBOX");
+    account.pump_deferred_seen();
+    assert!(account.pending_seen.is_empty());
+}
+
+#[test]
+fn restoring_cached_mailbox_reapplies_pending_offline_read_flags() {
+    let (_root, mut app) = local_account_fixture();
+    let account = app.account_mut().unwrap();
+    let raw = b"From: Test <test@example.org>\r\nSubject: Cache\r\n\r\nOffline";
+    let id = MessageId("imap-uid:19:8".into());
+    let message =
+        crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, MessageFlags::empty())
+            .unwrap();
+    account.uid_validities.insert("INBOX".into(), 19);
+    account.unverified_mailboxes.insert("INBOX".into());
+    account.deferred_seen.push(crate::cache::DeferredSeen {
+        mailbox: "INBOX".into(),
+        validity: 19,
+        id: id.clone(),
+        seen: true,
+    });
+    account.mailbox_cache.insert(
+        "INBOX".into(),
+        crate::cache::CachedMailbox {
+            messages: vec![message],
+            bodies: std::collections::HashMap::new(),
+            message_index: 0,
+            message_view_offset: 0,
+            next_page_offset: 1,
+            has_more: false,
+            uid_validity: Some(19),
+            uid_next: Some(9),
+        },
+    );
+    assert!(account.restore_cached_mailbox("INBOX"));
+    assert_eq!(account.visible_message_indices(), vec![0]);
+    assert!(!account.selected_message().unwrap().unread());
+}
+
+#[test]
+fn seen_ack_after_mailbox_switch_commits_original_journal_only() {
+    use crate::worker::{WorkerEvent, WorkerEventKind};
+    let (_root, mut app) = local_account_fixture();
+    let entry = crate::cache::DeferredSeen {
+        mailbox: "INBOX".into(),
+        validity: 10,
+        id: MessageId("imap-uid:10:5".into()),
+        seen: true,
+    };
+    let account = app.account_mut().unwrap();
+    account.deferred_seen.push(entry.clone());
+    account.inflight_deferred_seen.insert(1234, entry.clone());
+    // Switching mailboxes clears per-view pending state, but the ACK is still
+    // for the original message. Never apply it to the new mailbox's UIDs.
+    account.current_mailbox = Some("Sent".into());
+    account.pending_seen.clear();
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 1234,
+        kind: WorkerEventKind::SeenChanged {
+            id: entry.id,
+            seen: true,
+        },
+    });
+    assert!(app.account().unwrap().deferred_seen.is_empty());
+    assert!(app.account().unwrap().inflight_deferred_seen.is_empty());
+}
+
+#[test]
+fn cached_rows_keep_normal_colors_and_sync_is_footer_only() {
+    use crate::worker::WorkerHandle;
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
+    let mut app = super::App::new(&config, vec![worker]);
+    let raw = b"From: Example <example@example.org>\r\nSubject: Jerc cached reader\r\n\r\nHello";
+    let message = crate::mail::parse_summary(
+        MessageId("cached-uid".into()),
+        raw,
+        raw.len() as u64,
+        MessageFlags::empty(),
+    )
+    .unwrap();
+    let account = app.account_mut().unwrap();
+    account.current_mailbox = Some("INBOX".into());
+    account.messages = vec![message];
+    account.unverified_mailboxes.insert("INBOX".into());
+    account.connecting = true;
+    app.sidebar_visible = false;
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = (0..100u16)
+        .map(|x| buffer[(x, 1)].symbol())
+        .collect::<Vec<_>>()
+        .concat();
+    assert!(
+        row.contains("Jerc cached reader"),
+        "mail starts at first row: {row}"
+    );
+    assert!(!row.contains("Cached mail"), "no cache banner: {row}");
+    let subject_x = (0..100u16)
+        .find(|&x| buffer[(x, 1)].symbol() == "J")
+        .unwrap();
+    let theme = app.theme();
+    let subject_style = buffer[(subject_x, 1)].style();
+    assert_eq!(
+        subject_style.fg,
+        theme.unread().fg,
+        "mail must not be dimmed"
+    );
+    assert_eq!(subject_style.bg, Some(theme.popup_bg));
+    let footer = (0..100u16)
+        .map(|x| buffer[(x, 11)].symbol())
+        .collect::<Vec<_>>()
+        .concat();
+    assert!(footer.contains("Syncing with server"), "footer: {footer}");
+    assert!(footer.contains(app.sync_spinner()));
+
+    let before = app.sync_spinner().to_owned();
+    app.advance_sync_spinner();
+    assert_ne!(app.sync_spinner(), before);
 }

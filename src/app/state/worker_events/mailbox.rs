@@ -246,6 +246,15 @@ impl App {
                     account.uid_nexts.remove(&name);
                 }
                 account.unverified_mailboxes.remove(&name);
+                if first_page {
+                    let before = account.deferred_seen.len();
+                    account.deferred_seen.retain(|entry| {
+                        entry.mailbox != name || Some(entry.validity) == uid_validity
+                    });
+                    if account.deferred_seen.len() != before {
+                        account.persist_deferred_seen();
+                    }
+                }
                 let selected_name = account
                     .selected_mailbox()
                     .map(|mailbox| mailbox.name.clone());
@@ -289,6 +298,8 @@ impl App {
                 );
                 account.current_mailbox = Some(name.clone());
                 if page.offset == 0 {
+                    let previous_index = account.message_index;
+                    let previous_offset = account.message_view_offset;
                     let selected_id = (!generation_changed)
                         .then(|| account.selected_message().map(|message| message.id.clone()))
                         .flatten();
@@ -298,7 +309,12 @@ impl App {
                         .or_else(|| account.restore_message_index.take())
                         .unwrap_or(0)
                         .min(account.messages.len().saturating_sub(1));
-                    account.message_view_offset = 0;
+                    // Reconcile rows in place. A background arrival should not
+                    // jump the user's viewport to the top of the folder.
+                    account.message_view_offset = account
+                        .message_index
+                        .saturating_sub(previous_index.saturating_sub(previous_offset))
+                        .min(account.messages.len().saturating_sub(1));
                     let live = account
                         .messages
                         .iter()
@@ -323,8 +339,12 @@ impl App {
                 account.next_page_offset = page.next_offset;
                 account.has_more = page.has_more;
                 if first_page {
-                    account.preview_scroll = 0;
-                    account.preview_max_scroll = 0;
+                    // Don't tear down an open offline reader when its cached
+                    // mailbox finishes background reconciliation.
+                    if !self.message_open || event.account != self.account_index {
+                        account.preview_scroll = 0;
+                        account.preview_max_scroll = 0;
+                    }
                     account.smooth_message_target = None;
                     account.smooth_preview_target = None;
                     // A verified same-folder refresh can finish while the
@@ -341,7 +361,12 @@ impl App {
                         account.pending_bodies.clear();
                         account.body_request_id = None;
                     }
-                    account.pending_seen.clear();
+                    // Preserve live Seen request IDs across regular page
+                    // refreshes. Clearing them would make valid ACKs look
+                    // stale and cause duplicate journal replay.
+                    if generation_changed {
+                        account.pending_seen.clear();
+                    }
                 }
                 account.last_scan_micros = Some(elapsed_micros);
                 // Learn only lightweight envelope addresses already fetched
@@ -397,6 +422,8 @@ impl App {
                         }
                     }
                 }
+                account.overlay_deferred_seen();
+                account.pump_deferred_seen();
                 account.persist_current_cache();
                 account.clamp_selection();
                 account.normalize_search_selection();
@@ -442,7 +469,11 @@ impl App {
                 if event.account == self.account_index {
                     account.prefetch_near_cursor(1);
                 }
-                if self.preview_split && event.account == self.account_index {
+                // If the reader opened a cached *header* before SELECT, the
+                // missing body should start loading automatically once the
+                // mailbox generation is verified. No close/reopen required.
+                if (self.preview_split || self.message_open) && event.account == self.account_index
+                {
                     account.request_selected_body();
                     Self::mark_cached_selected_seen(account);
                 }

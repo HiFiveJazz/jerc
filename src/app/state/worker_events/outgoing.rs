@@ -19,13 +19,43 @@ impl App {
         };
         match event.kind {
             WorkerEventKind::SeenChanged { id, seen } => {
-                if account.pending_seen.get(&id) != Some(&event.request_id) {
+                // A pending write can finish after switching to another
+                // mailbox, which clears the visible pending_seen map. Its
+                // journal record is still correlated by the request ID.
+                let matches_visible = account.pending_seen.get(&id) == Some(&event.request_id);
+                if !matches_visible
+                    && !account
+                        .inflight_deferred_seen
+                        .get(&event.request_id)
+                        .is_some_and(|pending| pending.id == id)
+                {
                     return;
                 }
-                account.pending_seen.remove(&id);
-                account.apply_seen_flag(&id, seen);
-                account.persist_current_cache();
-                account.persist_mailboxes();
+                if matches_visible {
+                    account.pending_seen.remove(&id);
+                }
+                if let Some(sent) = account.inflight_deferred_seen.remove(&event.request_id) {
+                    // The user may have toggled again while the write was in
+                    // flight; keep that newer preference queued for replay.
+                    if let Some(position) = account.deferred_seen.iter().position(|entry| {
+                        entry.mailbox == sent.mailbox
+                            && entry.validity == sent.validity
+                            && entry.id == sent.id
+                            && entry.seen == sent.seen
+                    }) {
+                        account.deferred_seen.remove(position);
+                        account.persist_deferred_seen();
+                    }
+                    if account.current_mailbox.as_deref() == Some(sent.mailbox.as_str()) {
+                        account.overlay_deferred_seen();
+                        account.persist_current_cache();
+                    }
+                    account.pump_deferred_seen();
+                } else {
+                    account.apply_seen_flag(&id, seen);
+                    account.persist_current_cache();
+                    account.persist_mailboxes();
+                }
             }
             WorkerEventKind::MutationComplete => {
                 // Only a tracked, completed mutation may resolve the pending

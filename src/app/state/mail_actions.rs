@@ -42,12 +42,7 @@ impl App {
         }) else {
             return;
         };
-        if !account.request_seen(id.clone(), seen) {
-            return;
-        }
-
-        // Optimistic UI; the correlated SeenChanged ACK is idempotent.
-        account.apply_seen_flag(&id, seen);
+        let _ = account.request_seen(id, seen);
     }
 
     /// Space toggles the current message, then advances one visible row
@@ -636,6 +631,18 @@ impl App {
         kind: MutationKind,
     ) {
         if ids.is_empty() {
+            return;
+        }
+        // Moving/deleting a cached row before SELECT could mutate a different
+        // email if the server recycled UIDs. These actions are intentionally
+        // unavailable offline until we have a validated operation journal.
+        if self
+            .account()
+            .is_some_and(|account| account.unverified_mailboxes.contains(&source))
+        {
+            self.status = StatusLine::error(
+                "cached mailbox is still syncing; delete/archive requires server verification",
+            );
             return;
         }
         let action = match &kind {

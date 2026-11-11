@@ -200,7 +200,7 @@ fn event_loop(
     // stream of worker events (mailbox STATUS refreshes are a common example)
     // could starve Ctrl-j/Ctrl-k for hundreds of milliseconds.
     let mut next_animation_frame = Instant::now();
-    let mut next_setup_spinner_frame = Instant::now();
+    let mut next_spinner_frame = Instant::now();
     let mut next_inbox_poll = Instant::now() + app.inbox_poll_interval();
 
     while !app.should_quit {
@@ -226,24 +226,28 @@ fn event_loop(
             next_animation_frame = Instant::now();
         }
 
-        // Browser OAuth and provider discovery happen on worker threads. They
-        // may generate no terminal events for many seconds, so animate their
-        // progress indicator on its own deadline (without blocking input).
+        // Spin during background mailbox synchronization even if no IMAP
+        // event arrives for several seconds. This is only a footer animation;
+        // the mail list and reader continue accepting input normally.
         let setup_busy = app
             .setup
             .as_ref()
             .is_some_and(|wizard| wizard.authenticating || wizard.discovering);
-        if setup_busy {
-            if Instant::now() >= next_setup_spinner_frame {
-                if let Some(wizard) = app.setup.as_mut() {
+        let mail_sync_busy = app.syncing_with_server();
+        if setup_busy || mail_sync_busy {
+            if Instant::now() >= next_spinner_frame {
+                if setup_busy && let Some(wizard) = app.setup.as_mut() {
                     wizard.spin();
                 }
-                next_setup_spinner_frame = Instant::now() + Duration::from_millis(120);
+                if mail_sync_busy {
+                    app.advance_sync_spinner();
+                }
+                next_spinner_frame = Instant::now() + Duration::from_millis(120);
                 render(terminal, app)?;
                 continue;
             }
         } else {
-            next_setup_spinner_frame = Instant::now();
+            next_spinner_frame = Instant::now();
         }
 
         let deadline = if app.animation_active() {
@@ -251,8 +255,8 @@ fn event_loop(
         } else {
             next_inbox_poll
         };
-        let deadline = if setup_busy {
-            deadline.min(next_setup_spinner_frame)
+        let deadline = if setup_busy || mail_sync_busy {
+            deadline.min(next_spinner_frame)
         } else {
             deadline
         };

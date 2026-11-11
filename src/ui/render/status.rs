@@ -72,12 +72,11 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             // while the Vim reader cursor rests on a hyperlink. Never follow it
             // automatically: the user can inspect the complete URL first.
             spans.push(Span::styled(format!("URL: {url}"), theme.accent()));
-        } else if account.connecting {
-            spans.push(Span::raw("Connecting…"));
-        } else if account.mailboxes_loading {
-            spans.push(Span::raw("Loading mailboxes…"));
-        } else if account.messages_loading {
-            spans.push(Span::raw("Loading messages…"));
+        } else if account.syncing_with_server() {
+            spans.push(Span::styled(
+                format!("{} Syncing with server…", app.sync_spinner()),
+                theme.muted(),
+            ));
         } else if account.is_loading_body() {
             spans.push(Span::raw("Loading message…"));
         } else {

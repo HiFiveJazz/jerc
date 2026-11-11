@@ -679,6 +679,8 @@ impl App {
     }
 
     pub(super) fn mark_cached_selected_seen(account: &mut AccountState) {
+        // Local reads are allowed before SELECT. request_seen records a
+        // deferred change and never sends unverified UIDs to IMAP.
         let Some(id) = account
             .selected_message()
             .filter(|message| message.unread() && account.bodies.contains_key(&message.id))

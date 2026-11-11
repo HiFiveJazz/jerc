@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -23,6 +23,33 @@ const MAX_FOLDERS: usize = 256;
 pub(crate) const MAX_MESSAGES_PER_FOLDER: usize = 400;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_BODIES_PER_FOLDER: usize = 12;
+// Keep the startup index small. Additional bodies live in a separate, lazily
+// accessed, per-account disk store. No database dependency or eager scan.
+const MAX_BODY_FILE_BYTES: u64 = 512 * 1024;
+const MAX_BODY_STORE_BYTES: u64 = 64 * 1024 * 1024;
+const PRUNE_AFTER_WRITES: usize = 8;
+/// Bounded pending flag changes, scoped to the server's mailbox generation.
+pub(crate) const MAX_DEFERRED_SEEN: usize = 512;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DeferredSeen {
+    pub mailbox: String,
+    pub validity: u32,
+    pub id: MessageId,
+    pub seen: bool,
+}
+
+impl DeferredSeen {
+    pub(crate) fn has_valid_identity(&self) -> bool {
+        !self.mailbox.is_empty()
+            && self.mailbox.len() <= 512
+            && self.id.0.len() <= 128
+            && self
+                .id
+                .0
+                .starts_with(&format!("imap-uid:{}:", self.validity))
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CachedMailbox {
@@ -45,6 +72,9 @@ pub(crate) struct Snapshot {
     pub mailboxes: Vec<Mailbox>,
     #[serde(default)]
     pub folders: HashMap<String, CachedMailbox>,
+    /// Pending idempotent read/unread changes (not offline deletes or moves).
+    #[serde(default)]
+    pub deferred_seen: Vec<DeferredSeen>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,6 +140,8 @@ pub(crate) enum Change {
     Mailboxes(Vec<Mailbox>),
     Folder(String, CachedMailbox),
     RemoveFolder(String),
+    Body(String, u32, MessageBody),
+    DeferredSeen(Vec<DeferredSeen>),
 }
 
 /// A single latest change per folder. The wake channel only holds a token;
@@ -118,15 +150,24 @@ pub(crate) enum Change {
 struct PendingChanges {
     mailboxes: Option<Vec<Mailbox>>,
     folders: HashMap<String, Option<CachedMailbox>>,
+    bodies: HashMap<(String, MessageId), (u32, MessageBody)>,
+    deferred_seen: Option<Vec<DeferredSeen>>,
 }
 
 impl PendingChanges {
     fn insert(&mut self, change: Change) {
         match change {
             Change::Mailboxes(mailboxes) => self.mailboxes = Some(mailboxes),
+            Change::DeferredSeen(entries) => self.deferred_seen = Some(entries),
             Change::Folder(name, folder) => {
                 if self.folders.len() < MAX_FOLDERS || self.folders.contains_key(&name) {
                     self.folders.insert(name, Some(folder));
+                }
+            }
+            Change::Body(mailbox, validity, body) => {
+                let key = (mailbox, body.id.clone());
+                if self.bodies.len() < 64 || self.bodies.contains_key(&key) {
+                    self.bodies.insert(key, (validity, body));
                 }
             }
             Change::RemoveFolder(name) => {
@@ -141,9 +182,21 @@ impl PendingChanges {
         }
     }
 
-    fn drain_into(&mut self, snapshot: &mut Snapshot) {
+    fn drain_bodies(&mut self) -> Vec<(String, u32, MessageBody)> {
+        std::mem::take(&mut self.bodies)
+            .into_iter()
+            .map(|((mailbox, _), (validity, body))| (mailbox, validity, body))
+            .collect()
+    }
+
+    fn drain_into(&mut self, snapshot: &mut Snapshot) -> bool {
+        let changed =
+            self.mailboxes.is_some() || !self.folders.is_empty() || self.deferred_seen.is_some();
         if let Some(mailboxes) = self.mailboxes.take() {
             apply(snapshot, Change::Mailboxes(mailboxes));
+        }
+        if let Some(entries) = self.deferred_seen.take() {
+            apply(snapshot, Change::DeferredSeen(entries));
         }
         for (name, folder) in self.folders.drain() {
             match folder {
@@ -151,6 +204,7 @@ impl PendingChanges {
                 None => apply(snapshot, Change::RemoveFolder(name)),
             }
         }
+        changed
     }
 }
 
@@ -158,9 +212,20 @@ pub(crate) struct Writer {
     wake: Option<SyncSender<()>>,
     pending: Arc<Mutex<PendingChanges>>,
     join: Option<JoinHandle<()>>,
+    body_store: BodyStore,
 }
 
 impl Writer {
+    pub(crate) fn body_store(&self) -> BodyStore {
+        self.body_store.clone()
+    }
+
+    pub(crate) fn raw_store(&self) -> RawStore {
+        RawStore {
+            dir: self.body_store.dir.with_extension("raw"),
+        }
+    }
+
     pub(crate) fn send(&self, change: Change) {
         let Some(wake) = &self.wake else { return };
         if let Ok(mut pending) = self.pending.lock() {
@@ -198,6 +263,9 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
     let identity = crate::backend::redact_source(&account.source);
     let hash = stable_key(&format!("{}\0{identity}", account.name));
     let path = dir.join(format!("{hash:016x}.json"));
+    let body_store = BodyStore {
+        dir: dir.join(format!("{hash:016x}.bodies")),
+    };
     let cache_start = Instant::now();
     let loaded = read_snapshot(&path);
     // A successful disk read with no usable folders is not a warm mailbox
@@ -214,25 +282,56 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
     let (wake, rx) = mpsc::sync_channel::<()>(1);
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let thread_pending = Arc::clone(&pending);
-    let mut stored = snapshot.clone();
+    // The original snapshot belongs to the UI. Reopen the small index on the
+    // background writer instead of cloning all cached rows on startup.
+    let writer_body_store = body_store.clone();
     let join = thread::Builder::new()
         .name("mail-cache-writer".into())
         .spawn(move || {
+            let mut stored = read_snapshot(&path).unwrap_or_default();
+            let mut body_writes = 0;
             while rx.recv().is_ok() {
                 // Coalesce status replies and quick reader changes into a
                 // single disk write, without ever queueing duplicate bodies.
                 while rx.recv_timeout(Duration::from_millis(160)).is_ok() {}
-                if let Ok(mut changes) = thread_pending.lock() {
-                    changes.drain_into(&mut stored);
+                let (index_changed, bodies) = if let Ok(mut changes) = thread_pending.lock() {
+                    let changed = changes.drain_into(&mut stored);
+                    (changed, changes.drain_bodies())
+                } else {
+                    (false, Vec::new())
+                };
+                if index_changed {
+                    let _ = write_snapshot(&path, &stored);
                 }
+                for (mailbox, validity, body) in bodies {
+                    if writer_body_store.write(&mailbox, validity, &body).is_ok() {
+                        body_writes += 1;
+                    }
+                }
+                if body_writes >= PRUNE_AFTER_WRITES {
+                    let _ = writer_body_store.prune();
+                    body_writes = 0;
+                }
+            }
+            // Final flush includes updates sent while another write was active.
+            let (index_changed, bodies) = if let Ok(mut changes) = thread_pending.lock() {
+                let changed = changes.drain_into(&mut stored);
+                (changed, changes.drain_bodies())
+            } else {
+                (false, Vec::new())
+            };
+            if index_changed {
                 let _ = write_snapshot(&path, &stored);
             }
-            // One final flush on shutdown, including changes sent while a
-            // write was in progress.
-            if let Ok(mut changes) = thread_pending.lock() {
-                changes.drain_into(&mut stored);
+            let mut final_writes = 0;
+            for (mailbox, validity, body) in bodies {
+                if writer_body_store.write(&mailbox, validity, &body).is_ok() {
+                    final_writes += 1;
+                }
             }
-            let _ = write_snapshot(&path, &stored);
+            if body_writes + final_writes > 0 {
+                let _ = writer_body_store.prune();
+            }
         });
     match join {
         Ok(join) => (
@@ -241,6 +340,7 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
                 wake: Some(wake),
                 pending,
                 join: Some(join),
+                body_store,
             }),
         ),
         Err(_) => (snapshot, None),
@@ -288,7 +388,318 @@ fn apply(snapshot: &mut Snapshot, change: Change) {
         Change::RemoveFolder(name) => {
             snapshot.folders.remove(&name);
         }
+        Change::Body(..) => {} // Persisted separately; never grows startup JSON.
+        Change::DeferredSeen(entries) => {
+            snapshot.deferred_seen = entries
+                .into_iter()
+                .filter(DeferredSeen::has_valid_identity)
+                .take(MAX_DEFERRED_SEEN)
+                .collect();
+        }
     }
+}
+
+/// Lazy, bounded body store. Only the selected message is read at the UI
+/// boundary; the writer persists fetched bodies off the terminal thread.
+/// Folder+UIDVALIDITY+UID are part of the file identity, so a UID reset
+/// cannot resurrect the content of a different email.
+#[derive(Clone)]
+pub(crate) struct BodyStore {
+    dir: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct BodyFile {
+    version: u8,
+    mailbox: String,
+    validity: u32,
+    body: MessageBody,
+}
+
+#[derive(Serialize)]
+struct BodyFileRef<'a> {
+    version: u8,
+    mailbox: &'a str,
+    validity: u32,
+    body: &'a MessageBody,
+}
+
+impl BodyStore {
+    fn body_path(&self, mailbox: &str, validity: u32, id: &MessageId) -> PathBuf {
+        use ring::digest::{SHA256, digest};
+        let key = format!("{mailbox}\0{validity}\0{}", id.0);
+        let hash = digest(&SHA256, key.as_bytes());
+        let hex = hash.as_ref()[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        self.dir.join(format!("{hex}.json"))
+    }
+
+    /// Cheap existence probe for prefetch filtering. The reader validates the
+    /// complete record on actual use, falling back to IMAP if it is corrupt.
+    pub(crate) fn has_candidate(&self, mailbox: &str, validity: u32, id: &MessageId) -> bool {
+        if !id.0.starts_with(&format!("imap-uid:{validity}:")) {
+            return false;
+        }
+        fs::symlink_metadata(self.body_path(mailbox, validity, id)).is_ok_and(|metadata| {
+            metadata.file_type().is_file() && metadata.len() <= MAX_BODY_FILE_BYTES
+        })
+    }
+
+    pub(crate) fn read(&self, mailbox: &str, validity: u32, id: &MessageId) -> Option<MessageBody> {
+        if !id.0.starts_with(&format!("imap-uid:{validity}:")) {
+            return None;
+        }
+        let path = self.body_path(mailbox, validity, id);
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_BODY_FILE_BYTES {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        File::open(path)
+            .ok()?
+            .take(MAX_BODY_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_BODY_FILE_BYTES {
+            return None;
+        }
+        let record: BodyFile = serde_json::from_slice(&bytes).ok()?;
+        (record.version == VERSION
+            && record.mailbox == mailbox
+            && record.validity == validity
+            && record.body.id == *id)
+            .then_some(record.body)
+    }
+
+    fn write(&self, mailbox: &str, validity: u32, body: &MessageBody) -> std::io::Result<()> {
+        if !body.id.0.starts_with(&format!("imap-uid:{validity}:")) {
+            return Err(std::io::Error::other("body UIDVALIDITY mismatch"));
+        }
+        fs::create_dir_all(&self.dir)?;
+        secure_private_dir(&self.dir)?;
+        let path = self.body_path(mailbox, validity, &body.id);
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        serde_json::to_writer(
+            &mut tmp,
+            &BodyFileRef {
+                version: VERSION,
+                mailbox,
+                validity,
+                body,
+            },
+        )
+        .map_err(std::io::Error::other)?;
+        tmp.flush()?;
+        if tmp.as_file().metadata()?.len() > MAX_BODY_FILE_BYTES {
+            return Err(std::io::Error::other("body exceeds offline cache limit"));
+        }
+        tmp.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    fn prune(&self) -> std::io::Result<()> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut files = Vec::new();
+        let mut total = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension() != Some(std::ffi::OsStr::new("json")) {
+                continue;
+            }
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            total = total.saturating_add(metadata.len());
+            files.push((
+                path,
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                metadata.len(),
+            ));
+        }
+        if total <= MAX_BODY_STORE_BYTES {
+            return Ok(());
+        }
+        files.sort_by_key(|(_, modified, _)| *modified);
+        for (path, _, size) in files {
+            if total <= MAX_BODY_STORE_BYTES {
+                break;
+            }
+            if fs::remove_file(path).is_ok() {
+                total = total.saturating_sub(size);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A small, private raw-MIME cache for previously opened attachments.
+/// Only UIDVALIDITY-scoped IMAP messages are eligible. The reader never scans
+/// this directory at startup; access and pruning happen on the mail worker.
+#[derive(Debug, Clone)]
+pub(crate) struct RawStore {
+    pub(crate) dir: PathBuf,
+}
+
+const MAX_RAW_CACHE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RAW_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+
+impl RawStore {
+    fn raw_path(&self, mailbox: &str, validity: u32, id: &MessageId) -> PathBuf {
+        use ring::digest::{SHA256, digest};
+        let key = format!("{mailbox}\0{validity}\0{}", id.0);
+        let hash = digest(&SHA256, key.as_bytes());
+        let hex = hash.as_ref()[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        self.dir.join(format!("{hex}.eml"))
+    }
+
+    fn valid_id(validity: u32, id: &MessageId) -> bool {
+        id.0.starts_with(&format!("imap-uid:{validity}:"))
+    }
+
+    /// Disk reads happen on a worker, never in the terminal render loop.
+    pub(crate) fn read(&self, mailbox: &str, validity: u32, id: &MessageId) -> Option<Vec<u8>> {
+        if !Self::valid_id(validity, id) {
+            return None;
+        }
+        let path = self.raw_path(mailbox, validity, id);
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_RAW_CACHE_FILE_BYTES {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        File::open(path)
+            .ok()?
+            .take(MAX_RAW_CACHE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (!bytes.is_empty() && bytes.len() as u64 <= MAX_RAW_CACHE_FILE_BYTES).then_some(bytes)
+    }
+
+    /// Large messages remain available through IMAP but aren't stored twice.
+    /// Atomic replacement prevents partial/corrupt cache entries on crashes.
+    pub(crate) fn write(
+        &self,
+        mailbox: &str,
+        validity: u32,
+        id: &MessageId,
+        raw: &[u8],
+    ) -> std::io::Result<()> {
+        if !Self::valid_id(validity, id) {
+            return Err(std::io::Error::other("raw MIME UIDVALIDITY mismatch"));
+        }
+        if raw.is_empty() || raw.len() as u64 > MAX_RAW_CACHE_FILE_BYTES {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.dir)?;
+        secure_private_dir(&self.dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        tmp.write_all(raw)?;
+        tmp.flush()?;
+        tmp.persist(self.raw_path(mailbox, validity, id))
+            .map_err(|error| error.error)?;
+        self.prune()
+    }
+
+    fn prune(&self) -> std::io::Result<()> {
+        let mut files = Vec::new();
+        let mut total = 0u64;
+        for entry in fs::read_dir(&self.dir)? {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension() != Some(std::ffi::OsStr::new("eml")) {
+                continue;
+            }
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            total = total.saturating_add(metadata.len());
+            files.push((
+                path,
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                metadata.len(),
+            ));
+        }
+        if total > MAX_RAW_CACHE_BYTES {
+            files.sort_by_key(|(_, modified, _)| *modified);
+            for (path, _, size) in files {
+                if total <= MAX_RAW_CACHE_BYTES {
+                    break;
+                }
+                if fs::remove_file(path).is_ok() {
+                    total = total.saturating_sub(size);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn secure_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Strip derived, potentially large layout rows before copying a message to
+/// the async writer. HTML is reflowed at the current width when reopened.
+pub(crate) fn compact_body(body: &MessageBody) -> Option<MessageBody> {
+    let size = [
+        body.plain_text.as_ref(),
+        body.plain_fallback.as_ref(),
+        body.html_source.as_ref(),
+        body.html_text.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::len)
+    .sum::<usize>();
+    if size > MAX_BODY_FILE_BYTES as usize / 2 {
+        return None;
+    }
+    Some(MessageBody {
+        id: body.id.clone(),
+        plain_text: body.plain_text.clone(),
+        plain_fallback: body.plain_fallback.clone(),
+        html_source: body.html_source.clone(),
+        html_text: body.html_text.clone(),
+        html_lines: None,
+        html_renderer: None,
+        html_render_width: 0,
+        attachment_count: body.attachment_count,
+        attachment_names: body.attachment_names.clone(),
+    })
 }
 
 fn stable_key(value: &str) -> u64 {
@@ -318,6 +729,10 @@ fn read_snapshot(path: &PathBuf) -> Option<Snapshot> {
     }
     // Discard any legacy or invalid records lacking UIDVALIDITY.
     let mut snapshot = file.snapshot;
+    snapshot
+        .deferred_seen
+        .retain(DeferredSeen::has_valid_identity);
+    snapshot.deferred_seen.truncate(MAX_DEFERRED_SEEN);
     snapshot.folders.retain(|_, folder| {
         folder.uid_validity.is_some_and(|validity| {
             let prefix = format!("imap-uid:{validity}:");
@@ -337,11 +752,7 @@ fn write_snapshot(path: &PathBuf, snapshot: &Snapshot) -> std::io::Result<()> {
         return Err(std::io::Error::other("no cache parent directory"));
     };
     fs::create_dir_all(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
+    secure_private_dir(parent)?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     #[cfg(unix)]
     {
@@ -370,6 +781,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_mime_store_is_private_uid_scoped_and_persistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RawStore {
+            dir: dir.path().join("raw"),
+        };
+        let id = MessageId("imap-uid:42:7".into());
+        let raw = b"From: sender@example.org\r\nSubject: Patch\r\n\r\nHello";
+        store.write("INBOX", 42, &id, raw).unwrap();
+        assert_eq!(store.read("INBOX", 42, &id), Some(raw.to_vec()));
+        assert_eq!(store.read("INBOX", 43, &id), None);
+        assert_eq!(store.read("Sent", 42, &id), None);
+        assert_eq!(
+            store.read("INBOX", 42, &MessageId("imap-uid:42:8".into())),
+            None
+        );
+        assert_eq!(
+            store.read("INBOX", 42, &MessageId("imap-uid:7".into())),
+            None
+        );
+        assert!(store.write("INBOX", 43, &id, raw).is_err());
+        // A later instance must find the same bytes without an IMAP session.
+        let reopened = RawStore {
+            dir: store.dir.clone(),
+        };
+        assert_eq!(reopened.read("INBOX", 42, &id), Some(raw.to_vec()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&store.dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(store.raw_path("INBOX", 42, &id))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_mime_store_does_not_follow_cache_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RawStore {
+            dir: dir.path().join("raw"),
+        };
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let id = MessageId("imap-uid:12:9".into());
+        std::os::unix::fs::symlink(&victim, store.raw_path("INBOX", 12, &id)).unwrap();
+        assert!(store.read("INBOX", 12, &id).is_none());
+        store.write("INBOX", 12, &id, b"safe").unwrap();
+        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+        assert_eq!(store.read("INBOX", 12, &id), Some(b"safe".to_vec()));
+    }
+
+    #[test]
     fn pending_writer_coalesces_latest_folder_and_removal() {
         let mut pending = super::PendingChanges::default();
         pending.insert(super::Change::Mailboxes(Vec::new()));
@@ -379,6 +852,64 @@ mod tests {
         let mut stored = super::Snapshot::default();
         pending.drain_into(&mut stored);
         assert!(pending.folders.is_empty());
+    }
+
+    #[test]
+    fn deferred_seen_journal_roundtrip_and_coalescing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let id = MessageId("imap-uid:17:4".into());
+        let entry = DeferredSeen {
+            mailbox: "INBOX".into(),
+            validity: 17,
+            id: id.clone(),
+            seen: true,
+        };
+        let mut pending = PendingChanges::default();
+        pending.insert(Change::DeferredSeen(vec![entry.clone()]));
+        pending.insert(Change::DeferredSeen(vec![DeferredSeen {
+            seen: false,
+            ..entry
+        }]));
+        let mut snapshot = Snapshot::default();
+        assert!(pending.drain_into(&mut snapshot));
+        assert_eq!(snapshot.deferred_seen.len(), 1);
+        assert!(!snapshot.deferred_seen[0].seen);
+        write_snapshot(&path, &snapshot).unwrap();
+        assert_eq!(
+            read_snapshot(&path).unwrap().deferred_seen,
+            snapshot.deferred_seen
+        );
+        pending.insert(Change::DeferredSeen(vec![]));
+        assert!(pending.drain_into(&mut snapshot));
+        assert!(snapshot.deferred_seen.is_empty());
+    }
+
+    #[test]
+    fn invalid_deferred_uid_is_rejected_from_the_index() {
+        let mut snapshot = Snapshot::default();
+        snapshot.deferred_seen.push(DeferredSeen {
+            mailbox: "INBOX".into(),
+            validity: 10,
+            id: MessageId("imap-uid:11:3".into()),
+            seen: true,
+        });
+        let invalid = snapshot.deferred_seen.clone();
+        apply(&mut snapshot, Change::DeferredSeen(invalid));
+        assert!(snapshot.deferred_seen.is_empty());
+    }
+
+    #[test]
+    fn body_only_changes_do_not_rewrite_mailbox_index() {
+        let mut pending = PendingChanges::default();
+        let id = MessageId("imap-uid:10:4".into());
+        pending.insert(Change::Body("INBOX".into(), 10, body(id.clone(), "hello")));
+        let mut snapshot = Snapshot::default();
+        assert!(!pending.drain_into(&mut snapshot));
+        assert!(snapshot.folders.is_empty());
+        let bodies = pending.drain_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].2.id, id);
     }
 
     #[test]
@@ -399,6 +930,7 @@ mod tests {
         let data = Snapshot {
             mailboxes: vec![Mailbox::new("INBOX", crate::model::MailboxRole::Inbox)],
             folders: HashMap::new(),
+            deferred_seen: Vec::new(),
         };
         write_snapshot(&path, &data).unwrap();
         let loaded = read_snapshot(&path).unwrap();
@@ -702,6 +1234,73 @@ mod tests {
         let file = File::create(&path).unwrap();
         file.set_len(MAX_CACHE_BYTES + 1).unwrap();
         assert!(read_snapshot(&path).is_none());
+    }
+
+    #[test]
+    fn body_store_roundtrip_is_lazy_and_scoped_to_uid_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let id = MessageId("imap-uid:17:42".into());
+        let mut message = body(id.clone(), "Offline message");
+        message.html_lines = Some(vec![crate::model::HtmlLine::default()]);
+        let compact = compact_body(&message).unwrap();
+        assert!(compact.html_lines.is_none());
+        store.write("INBOX", 17, &compact).unwrap();
+        assert!(store.has_candidate("INBOX", 17, &id));
+        assert!(!store.has_candidate("INBOX", 18, &id));
+        assert_eq!(
+            store.read("INBOX", 17, &id).unwrap().plain_text.as_deref(),
+            Some("Offline message")
+        );
+        assert!(store.read("INBOX", 18, &id).is_none());
+        assert!(store.read("Archive", 17, &id).is_none());
+        assert!(
+            store
+                .read("INBOX", 17, &MessageId("imap-uid:17:43".into()))
+                .is_none()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = store.body_path("INBOX", 17, &id);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_body_and_corrupt_file_are_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let id = MessageId("imap-uid:4:9".into());
+        assert!(
+            compact_body(&body(id.clone(), &"a".repeat(MAX_BODY_FILE_BYTES as usize))).is_none()
+        );
+        store.write("INBOX", 4, &body(id.clone(), "okay")).unwrap();
+        std::fs::write(store.body_path("INBOX", 4, &id), b"not json").unwrap();
+        assert!(store.read("INBOX", 4, &id).is_none());
+    }
+
+    #[test]
+    fn store_prunes_to_disk_budget_without_reading_body_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        std::fs::create_dir_all(&store.dir).unwrap();
+        for index in 0..2 {
+            let file = File::create(store.dir.join(format!("{index}.json"))).unwrap();
+            file.set_len(MAX_BODY_STORE_BYTES / 2 + 1).unwrap();
+        }
+        store.prune().unwrap();
+        let remaining = std::fs::read_dir(&store.dir).unwrap().count();
+        assert_eq!(remaining, 1);
     }
 
     #[test]

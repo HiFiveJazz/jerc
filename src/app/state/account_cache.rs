@@ -62,6 +62,28 @@ impl AccountState {
         }
     }
 
+    /// Store a compact readable body without rewriting the startup index.
+    /// The asynchronous writer owns all filesystem work.
+    pub(super) fn persist_body(&self, body: &MessageBody) {
+        let Some(mailbox) = self.current_mailbox.as_deref() else {
+            return;
+        };
+        if self.unverified_mailboxes.contains(mailbox)
+            || !self.messages.iter().any(|message| message.id == body.id)
+        {
+            return;
+        }
+        let (Some(writer), Some(validity)) = (
+            self.cache_writer.as_ref(),
+            self.uid_validities.get(mailbox).copied(),
+        ) else {
+            return;
+        };
+        if let Some(compact) = cache::compact_body(body) {
+            writer.send(cache::Change::Body(mailbox.to_owned(), validity, compact));
+        }
+    }
+
     pub(super) fn persist_mailboxes(&self) {
         if let Some(writer) = &self.cache_writer {
             writer.send(cache::Change::Mailboxes(self.mailboxes.clone()));
@@ -141,6 +163,7 @@ impl AccountState {
         self.search_query.clear();
         self.search_editing = false;
         self.clamp_selection();
+        self.overlay_deferred_seen();
         // This precedes the network refresh. It identifies the moment cached
         // rows become available to the UI, not the terminal's paint latency.
         crate::perf::record("ui_cache_restore", None, Duration::ZERO, true);

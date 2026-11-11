@@ -27,6 +27,9 @@ impl App {
             .zip(workers)
             .map(|(config, worker)| {
                 let (snapshot, cache_writer) = cache::open(config);
+                let body_store = cache_writer.as_ref().map(cache::Writer::body_store);
+                let raw_store = cache_writer.as_ref().map(cache::Writer::raw_store);
+                let deferred_seen = snapshot.deferred_seen.clone();
                 let uid_validities = snapshot
                     .folders
                     .iter()
@@ -99,6 +102,8 @@ impl App {
                     mailbox_cache: warm_folders,
                     warm_folder_order,
                     cache_writer,
+                    body_store,
+                    raw_store,
                     uid_validities,
                     uid_nexts,
                     unverified_mailboxes,
@@ -108,6 +113,8 @@ impl App {
                     bodies: HashMap::new(),
                     pending_bodies: HashSet::new(),
                     pending_seen: HashMap::new(),
+                    deferred_seen,
+                    inflight_deferred_seen: HashMap::new(),
                     status_requests: MailboxStatusQueue::default(),
                     pending_inbox_refresh: false,
                     pending_mutation_labels: HashMap::new(),
@@ -156,6 +163,7 @@ impl App {
             account_index: 0,
             focus: Focus::Messages,
             status: StatusLine::info("starting workers…"),
+            sync_spinner_frame: 0,
             startup_warnings: contacts_warning.into_iter().collect(),
             show_startup_warnings: false,
             should_quit: false,
