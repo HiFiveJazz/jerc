@@ -17,7 +17,7 @@ REPOSITORY = "https://github.com/HiFiveJazz/jerc"
 TARGET = "x86_64-pc-windows-msvc"
 DESCRIPTION = "Keyboard-driven terminal email client written in Rust"
 TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
-MANIFEST_VERSION = "1.9.0"
+MANIFEST_VERSION = "1.12.0"
 
 
 def validate_tag(tag: str) -> str:
@@ -87,16 +87,27 @@ def scoop_manifest(tag: str, digest: str) -> dict:
     }
 
 
+def winget_schema_header(manifest_type: str) -> str:
+    # Required by the WinGet community manifest repository. A missing schema
+    # header makes `winget validate` return a warning (nonzero) exit code.
+    return (
+        "# yaml-language-server: $schema=https://aka.ms/"
+        f"winget-manifest.{manifest_type}.{MANIFEST_VERSION}.schema.json\n"
+    )
+
+
 def winget_manifests(tag: str, digest: str) -> dict[str, str]:
     version = validate_tag(tag)
     common = f"PackageIdentifier: HiFiveJazz.Jerc\nPackageVersion: {version}\n"
     return {
         "HiFiveJazz.Jerc.yaml": (
-            common + "DefaultLocale: en-US\nManifestType: version\n"
+            winget_schema_header("version")
+            + common + "DefaultLocale: en-US\nManifestType: version\n"
             f"ManifestVersion: {MANIFEST_VERSION}\n"
         ),
         "HiFiveJazz.Jerc.installer.yaml": (
-            common + "InstallerType: zip\nNestedInstallerType: portable\n"
+            winget_schema_header("installer")
+            + common + "InstallerType: zip\nNestedInstallerType: portable\n"
             "Installers:\n"
             "- Architecture: x64\n"
             f"  InstallerUrl: {release_url(tag)}\n"
@@ -108,7 +119,8 @@ def winget_manifests(tag: str, digest: str) -> dict[str, str]:
             f"ManifestVersion: {MANIFEST_VERSION}\n"
         ),
         "HiFiveJazz.Jerc.locale.en-US.yaml": (
-            common + "PackageLocale: en-US\nPublisher: HiFiveJazz\n"
+            winget_schema_header("defaultLocale")
+            + common + "PackageLocale: en-US\nPublisher: HiFiveJazz\n"
             "PackageName: Jerc\nLicense: GPL-3.0-only\n"
             f"ShortDescription: {DESCRIPTION}\n"
             f"PackageUrl: {REPOSITORY}\n"

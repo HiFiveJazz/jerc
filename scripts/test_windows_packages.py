@@ -45,6 +45,22 @@ class WindowsPackageTests(unittest.TestCase):
         self.assertIn("v$version", manifest["autoupdate"]["architecture"]["64bit"]["url"])
         winget = self.root / "meta/winget/manifests/h/HiFiveJazz/Jerc/0.6.2"
         self.assertEqual(3, len(list(winget.glob("*.yaml"))))
+        for filename, manifest_type in (
+            ("HiFiveJazz.Jerc.yaml", "version"),
+            ("HiFiveJazz.Jerc.installer.yaml", "installer"),
+            ("HiFiveJazz.Jerc.locale.en-US.yaml", "defaultLocale"),
+        ):
+            with self.subTest(filename=filename):
+                contents = (winget / filename).read_text(encoding="utf-8")
+                self.assertTrue(
+                    contents.startswith(
+                        f"# yaml-language-server: $schema=https://aka.ms/"
+                        f"winget-manifest.{manifest_type}.{module.MANIFEST_VERSION}.schema.json\n"
+                    ),
+                    "WinGet manifest must begin with its matching schema header",
+                )
+                self.assertIn(f"ManifestType: {manifest_type}\n", contents)
+                self.assertIn(f"ManifestVersion: {module.MANIFEST_VERSION}\n", contents)
         installer = (winget / "HiFiveJazz.Jerc.installer.yaml").read_text()
         self.assertIn(module.release_url(self.tag), installer)
         self.assertIn(self.hash.upper(), installer)
