@@ -59,6 +59,25 @@ prefer a GNU/glibc build can compile from source with
 `cargo build --release --target x86_64-unknown-linux-gnu`.
 macOS release binaries are not code-signed or notarized.
 
+### Install through Cargo
+
+After the first crates.io publication, install from source with:
+
+```sh
+cargo install jerc --locked
+```
+
+For faster installation, [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall)
+can download Jerc's existing GitHub release binary instead of compiling Rust:
+
+```sh
+cargo binstall jerc
+```
+
+Prebuilt downloads are available for x86-64 Linux (static musl), macOS Intel /
+Apple Silicon, and x86-64 Windows. Other targets may fall back to compiling
+from source. `cargo-binstall` is a separate Cargo subcommand to install first.
+
 ### Build from source
 
 **Requirements:** Rust 1.98 or newer and a terminal with modern Unicode support. Optional terminal graphics require a compatible terminal; PDF thumbnails use `pdftoppm` when installed.

@@ -59,9 +59,46 @@ published at <https://github.com/HiFiveJazz/jerc/releases>.
 Archives are built on GitHub-hosted runners. The Linux release uses static musl
 and does not require glibc. It still relies on host CA certificates and optional
 programs such as `pdftoppm` and a browser. macOS artifacts are unsigned and
-unnotarized. No crate is published to crates.io (`publish = false` in
-`Cargo.toml`). GNU/glibc builds remain available by building from source with
+unnotarized. crates.io publication follows a successful GitHub Release
+using Trusted Publishing after the first manual upload. GNU/glibc builds
+remain available by building from source with
 `cargo build --release --target x86_64-unknown-linux-gnu`.
+
+## One-time crates.io setup
+
+The first version of Jerc must be published manually before crates.io can
+register a GitHub Trusted Publisher. First, commit the manifest changes on
+`main`, confirm the `jerc` crate name is available, then run:
+
+```sh
+python scripts/test_binstall_metadata.py
+cargo package --list
+cargo publish --dry-run --locked
+cargo login
+cargo publish --locked
+```
+
+Use a crates.io API token for `cargo login`; never put it in the repository.
+For 0.6.1 this is an initial, packaging-only publication from `main` after the
+original GitHub tag was created. If exact tag-to-crate source identity is
+required, instead bootstrap a new version with its own release tag.
+
+In GitHub Actions, create an environment named `crates-io`. In the Jerc crate's
+crates.io Settings > Trusted Publishing, register:
+
+- Provider: GitHub Actions
+- Owner: `HiFiveJazz`
+- Repository: `jerc`
+- Workflow filename: `release.yml`
+- Environment: `crates-io`
+
+The `publish_crate` job in `release.yml` runs **after** successful GitHub
+Release creation on future version-tag pushes. It uses short-lived OIDC
+credentials rather than a permanent token and skips versions already in the
+registry. AUR publishing remains a separate workflow.
+
+The `cargo-binstall` metadata reuses our GitHub Release binaries. Validate
+its target-to-asset names with `python scripts/test_binstall_metadata.py`.
 
 ## If the workflow fails
 

@@ -29,6 +29,8 @@ jobs:
           python-version: '3.12'
       - name: Reject tags that don't match Cargo.toml
         run: python scripts/package_release.py --tag "$GITHUB_REF_NAME" --check-only
+      - name: Verify cargo-binstall metadata matches release artifacts
+        run: python scripts/test_binstall_metadata.py
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
@@ -153,3 +155,59 @@ jobs:
           gh api -X POST "repos/$GITHUB_REPOSITORY/dispatches" \
             -f event_type=jerc_release_ready \
             -f "client_payload[tag]=$GITHUB_REF_NAME"
+
+  publish_crate:
+    name: Publish Jerc to crates.io
+    needs: publish
+    runs-on: ubuntu-24.04
+    # Configure the matching trusted publisher on crates.io after the first
+    # manual publication. A tag push is an accepted trusted-publishing event.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify tag and binary-release manifest
+        run: |
+          python scripts/package_release.py --tag "$GITHUB_REF_NAME" --check-only
+          python scripts/test_binstall_metadata.py
+      - name: Skip versions already on crates.io
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          status="$(curl --retry 3 --retry-all-errors -sS -o /dev/null -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/jerc/$version")"
+          case "$status" in
+            200)
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "jerc $version already exists on crates.io; no-op"
+              ;;
+            404)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected crates.io API status: $status" >&2
+              exit 1
+              ;;
+          esac
+      - name: Validate publishable crate from the tagged source
+        if: steps.registry.outputs.publish == 'true'
+        run: cargo publish --dry-run --locked
+      - name: Authenticate using crates.io Trusted Publishing
+        if: steps.registry.outputs.publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish crate
+        if: steps.registry.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
