@@ -165,3 +165,22 @@ with a different rustup toolchain.
 
 The release workflow intentionally publishes only the musl Linux build.
 The optional comparison workflow is retained for development and debugging.
+
+## Additional Linux distributions
+
+The release pipeline also generates and smoke-tests an Alpine x86-64 `.apk`,
+Void x86-64 glibc and musl `.xbps` packages, and a versioned Gentoo `jerc-bin`
+local overlay tarball. All reuse the same verified static musl Linux release.
+Alpine and Void are installed through their native package managers in CI.
+The Gentoo job validates the ebuild layout and Manifest, and executes the
+binary on Gentoo stage3; a real `emerge` install is not yet covered.
+
+To test these formats with existing v0.6.2 release assets without re-tagging:
+
+```sh
+gh workflow run test-linux-packages.yml -f tag=v0.6.2
+```
+
+None of these downloads are an entry in the distributions' official package
+repositories, and downloaded packages/overlay do not provide unattended
+updates. See `packaging/linux/README.md` for installation and submission paths.

@@ -246,9 +246,108 @@ jobs:
             -e JERC_PACKAGE_MANAGER=zypper \
             opensuse/tumbleweed:latest bash /usr/local/bin/jerc-package-smoke
 
+  extra_packages:
+    name: Package Alpine, Void and Gentoo formats
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: dist
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Install pinned nFPM
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Package Alpine APK
+        run: ./scripts/package-linux-apk.sh "$GITHUB_REF_NAME"
+      - name: Package Void XBPS for glibc and musl
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            -e JERC_TAG="$GITHUB_REF_NAME" \
+            ghcr.io/void-linux/void-musl-full:latest \
+            bash -euo pipefail -c './scripts/package-linux-xbps.sh "$JERC_TAG"'
+      - name: Build and verify Gentoo Portage overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-linux-gentoo.py "$GITHUB_REF_NAME"
+          python3 scripts/verify-gentoo-overlay.py "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extra-linux-formats
+          path: |
+            dist/jerc-*.apk
+            dist/jerc-*.xbps
+            dist/jerc-gentoo-overlay-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  extra_smoke:
+    name: Test ${{ matrix.name }} package/runtime
+    needs: extra_packages
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Alpine Linux
+            image: alpine:3.22
+            manager: apk
+            xbps_arch: none
+          - name: Void Linux glibc
+            image: ghcr.io/void-linux/void-glibc-full:latest
+            manager: xbps
+            xbps_arch: x86_64
+          - name: Void Linux musl
+            image: ghcr.io/void-linux/void-musl-full:latest
+            manager: xbps
+            xbps_arch: x86_64-musl
+          - name: Gentoo stage3 (overlay metadata and runtime)
+            image: gentoo/stage3:latest
+            manager: gentoo
+            xbps_arch: none
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: extra-linux-formats
+          path: dist
+      - uses: actions/download-artifact@v4
+        if: matrix.manager == 'gentoo'
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: dist
+      - name: Install or execute package in target distribution
+        env:
+          DISTRO_IMAGE: ${{ matrix.image }}
+          PKG_MANAGER: ${{ matrix.manager }}
+          XBPS_ARCH: ${{ matrix.xbps_arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/dist:/packages:ro" \
+            -v "$PWD/scripts/smoke-extra-linux-package.sh:/usr/local/bin/jerc-extra-smoke:ro" \
+            -e JERC_VERSION="${GITHUB_REF_NAME#v}" \
+            -e JERC_PACKAGE_MANAGER="$PKG_MANAGER" \
+            -e JERC_XBPS_ARCH="$XBPS_ARCH" \
+            "$DISTRO_IMAGE" sh /usr/local/bin/jerc-extra-smoke
+
   publish:
     name: Publish GitHub Release
-    needs: [build, rpm, deb, deb_smoke, opensuse_smoke]
+    needs: [build, rpm, deb, deb_smoke, opensuse_smoke, extra_packages, extra_smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -258,7 +357,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          # Download four binary archives, the tested RPM, and tested DEB.
+          # Download four archives plus tested RPM, DEB, APK, XBPS and Gentoo overlay.
           path: dist
           merge-multiple: true
       - name: Create SHA-256 checksums
@@ -267,7 +366,7 @@ jobs:
           set -euo pipefail
           cd dist
           sha256sum jerc-* jerc_*.deb > SHA256SUMS
-          test "$(find . -maxdepth 1 -type f \( -name 'jerc-*' -o -name 'jerc_*.deb' \) | wc -l)" -eq 6
+          test "$(find . -maxdepth 1 -type f \( -name 'jerc-*' -o -name 'jerc_*.deb' \) | wc -l)" -eq 10
       - name: Publish tagged release with generated notes
         env:
           GH_TOKEN: ${{ github.token }}

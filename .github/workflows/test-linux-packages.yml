@@ -1,6 +1,6 @@
 name: Test Linux distribution packages
 
-# Test all four distros with an EXISTING published Linux release archive.
+# Test package formats across Fedora, SUSE, Debian, Ubuntu, Alpine, Void and Gentoo.
 # This does not create a GitHub Release or publish AUR/crates.io packages.
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   package:
-    name: Build DEB and RPM from release asset
+    name: Build DEB, RPM, APK, XBPS and Gentoo overlay
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +53,7 @@ jobs:
             cd dist
             grep -F "  jerc-${JERC_TAG}-x86_64-unknown-linux-musl.tar.gz" SHA256SUMS | sha256sum -c -
           )
-      - name: Package RPM and DEB
+      - name: Package DEB, RPM, APK, XBPS and Gentoo overlay
         env:
           JERC_TAG: ${{ inputs.tag }}
         shell: bash
@@ -61,12 +61,23 @@ jobs:
           set -euo pipefail
           ./scripts/package-linux-rpm.sh "$JERC_TAG"
           ./scripts/package-linux-deb.sh "$JERC_TAG"
+          ./scripts/package-linux-apk.sh "$JERC_TAG"
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            -e JERC_TAG="$JERC_TAG" \
+            ghcr.io/void-linux/void-musl-full:latest \
+            bash -euo pipefail -c './scripts/package-linux-xbps.sh "$JERC_TAG"'
+          python3 scripts/package-linux-gentoo.py "$JERC_TAG"
+          python3 scripts/verify-gentoo-overlay.py "$JERC_TAG"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installers
           path: |
             dist/jerc-*.rpm
             dist/jerc_*.deb
+            dist/jerc-*.apk
+            dist/jerc-*.xbps
+            dist/jerc-gentoo-overlay-*.tar.gz
+            dist/jerc-v*-x86_64-unknown-linux-musl.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -94,6 +105,26 @@ jobs:
             image: ubuntu:24.04
             format: deb
             manager: apt
+          - name: Alpine 3.22
+            image: alpine:3.22
+            format: apk
+            manager: apk
+            xbps_arch: none
+          - name: Void Linux glibc
+            image: ghcr.io/void-linux/void-glibc-full:latest
+            format: xbps
+            manager: xbps
+            xbps_arch: x86_64
+          - name: Void Linux musl
+            image: ghcr.io/void-linux/void-musl-full:latest
+            format: xbps
+            manager: xbps
+            xbps_arch: x86_64-musl
+          - name: Gentoo (overlay metadata and runtime)
+            image: gentoo/stage3:latest
+            format: overlay
+            manager: gentoo
+            xbps_arch: none
     steps:
       - uses: actions/checkout@v4
         with:
@@ -108,13 +139,24 @@ jobs:
           DISTRO_IMAGE: ${{ matrix.image }}
           PACKAGE_FORMAT: ${{ matrix.format }}
           PACKAGE_MANAGER: ${{ matrix.manager }}
+          XBPS_ARCH: ${{ matrix.xbps_arch }}
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm \
-            -v "$PWD/dist:/packages:ro" \
-            -v "$PWD/scripts/smoke-linux-package.sh:/usr/local/bin/jerc-package-smoke:ro" \
-            -e JERC_VERSION="${JERC_TAG#v}" \
-            -e JERC_PACKAGE_FORMAT="$PACKAGE_FORMAT" \
-            -e JERC_PACKAGE_MANAGER="$PACKAGE_MANAGER" \
-            "$DISTRO_IMAGE" bash /usr/local/bin/jerc-package-smoke
+          if [[ "$PACKAGE_MANAGER" == apk || "$PACKAGE_MANAGER" == xbps || "$PACKAGE_MANAGER" == gentoo ]]; then
+            docker run --rm \
+              -v "$PWD/dist:/packages:ro" \
+              -v "$PWD/scripts/smoke-extra-linux-package.sh:/usr/local/bin/jerc-extra-smoke:ro" \
+              -e JERC_VERSION="${JERC_TAG#v}" \
+              -e JERC_PACKAGE_MANAGER="$PACKAGE_MANAGER" \
+              -e JERC_XBPS_ARCH="$XBPS_ARCH" \
+              "$DISTRO_IMAGE" sh /usr/local/bin/jerc-extra-smoke
+          else
+            docker run --rm \
+              -v "$PWD/dist:/packages:ro" \
+              -v "$PWD/scripts/smoke-linux-package.sh:/usr/local/bin/jerc-package-smoke:ro" \
+              -e JERC_VERSION="${JERC_TAG#v}" \
+              -e JERC_PACKAGE_FORMAT="$PACKAGE_FORMAT" \
+              -e JERC_PACKAGE_MANAGER="$PACKAGE_MANAGER" \
+              "$DISTRO_IMAGE" bash /usr/local/bin/jerc-package-smoke
+          fi

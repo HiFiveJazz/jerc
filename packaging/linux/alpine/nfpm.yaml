@@ -1,0 +1,29 @@
+# Alpine Linux APK built from the release's static x86-64 musl executable.
+name: jerc
+arch: amd64
+platform: linux
+version: ${JERC_VERSION}
+release: 0
+maintainer: HiFiveJazz
+homepage: https://github.com/HiFiveJazz/jerc
+license: GPL-3.0-only
+description: Keyboard-driven terminal email client written in Rust
+depends:
+  - ca-certificates
+contents:
+  - src: dist/apk-stage/jerc
+    dst: /usr/bin/jerc
+    file_info:
+      mode: 0755
+  - src: dist/apk-stage/LICENSE
+    dst: /usr/share/licenses/jerc/LICENSE
+    file_info:
+      mode: 0644
+  - src: dist/apk-stage/README.md
+    dst: /usr/share/doc/jerc/README.md
+    file_info:
+      mode: 0644
+  - src: dist/apk-stage/config.example.toml
+    dst: /usr/share/doc/jerc/config.example.toml
+    file_info:
+      mode: 0644
