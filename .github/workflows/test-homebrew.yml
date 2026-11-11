@@ -1,0 +1,86 @@
+name: Test Homebrew packages
+
+# Test both published macOS archives using native Homebrew installations.
+# This never publishes releases, taps, or crates.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release tag (for example v0.6.2)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  homebrew:
+    name: Homebrew install (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel
+            runner: macos-15-intel
+            arch: x86_64
+          - name: macOS Apple Silicon
+            runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      JERC_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_ANALYTICS: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Confirm runner architecture and release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$JERC_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          brew --version
+      - name: Download both macOS archives and published checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$JERC_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "jerc-${JERC_TAG}-*-apple-darwin.tar.gz" \
+            --dir dist
+          gh release download "$JERC_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS \
+            --dir dist
+          (
+            cd dist
+            for target in aarch64-apple-darwin x86_64-apple-darwin; do
+              archive="jerc-${JERC_TAG}-${target}.tar.gz"
+              test -f "$archive"
+              grep -F "  $archive" SHA256SUMS | shasum -a 256 -c -
+            done
+          )
+      - name: Generate and install locally sourced Homebrew formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test_homebrew_formula.py
+          python3 scripts/generate-homebrew-formula.py \
+            --tag "$JERC_TAG" --archives dist \
+            --output "$RUNNER_TEMP/public/Formula/jerc.rb"
+          python3 scripts/generate-homebrew-formula.py \
+            --tag "$JERC_TAG" --archives dist --local-assets \
+            --output "$RUNNER_TEMP/local/Formula/jerc.rb"
+          ruby -c "$RUNNER_TEMP/public/Formula/jerc.rb"
+          ruby -c "$RUNNER_TEMP/local/Formula/jerc.rb"
+          brew install --formula "$RUNNER_TEMP/local/Formula/jerc.rb"
+          brew test "$RUNNER_TEMP/local/Formula/jerc.rb"
+          "$(brew --prefix jerc)/bin/jerc" --version | grep -F "${JERC_TAG#v}"

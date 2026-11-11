@@ -58,7 +58,11 @@ When a version tag is pushed, the workflow:
    source and binary ebuilds. It also archives the tagged Rust source and
    locked vendor crates for offline builds, then generates checksummed Alpine
    and Void source recipes.
-6. Produces `SHA256SUMS` for all twelve release assets and publishes them
+6. Generates a checksum-pinned Homebrew tap formula for native macOS Intel and
+   Apple Silicon archives, then installs and tests it with Homebrew on both
+   architectures before publishing. The formula ships in
+   `jerc-homebrew-vVERSION.tar.gz` for later addition to a separate tap.
+7. Produces `SHA256SUMS` for all thirteen release assets and publishes them
    **only if the package and runtime checks succeed**.
 
 To test packaging of an **existing** release without a new tag or publication,
@@ -191,3 +195,22 @@ gh workflow run test-linux-packages.yml -f tag=v0.6.2
 None of these downloads are an entry in the distributions' official package
 repositories, and downloaded packages/overlay do not provide unattended
 updates. See `packaging/linux/README.md` for installation and submission paths.
+
+## Homebrew macOS CI
+
+The release workflow builds and tests Jerc natively on Intel and Apple Silicon
+macOS, then runs a *second* check: Homebrew must install the release archives
+on both native runner architectures and pass `brew test`. The generated formula
+uses real GitHub Release URLs and the exact archives' SHA-256 digests; CI uses
+a local `file://` URL variant because release assets are not public yet.
+
+Test previously published macOS binaries without tagging again:
+
+```sh
+gh workflow run test-homebrew.yml -f tag=v0.6.2
+gh run list --workflow test-homebrew.yml --limit 3
+```
+
+The generated formula does **not** create or publish a Homebrew tap. Refer to
+`packaging/macos/homebrew/README.md` for creating a separate `homebrew-jerc` tap
+and eventually submitting a separate source-build formula to Homebrew/core.

@@ -31,6 +31,8 @@ jobs:
         run: python scripts/package_release.py --tag "$GITHUB_REF_NAME" --check-only
       - name: Verify cargo-binstall metadata matches release artifacts
         run: python scripts/test_binstall_metadata.py
+      - name: Test Homebrew formula generation
+        run: python scripts/test_homebrew_formula.py
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
@@ -110,6 +112,94 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+
+  homebrew_formula:
+    name: Generate checksum-pinned Homebrew formula
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*-apple-darwin
+          path: dist
+          merge-multiple: true
+      - name: Render formula for both native macOS release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/generate-homebrew-formula.py \
+            --tag "$GITHUB_REF_NAME" --archives dist \
+            --output dist/homebrew/Formula/jerc.rb
+          ruby -c dist/homebrew/Formula/jerc.rb
+          tar -czf "dist/jerc-homebrew-${GITHUB_REF_NAME}.tar.gz" \
+            -C dist/homebrew Formula
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: dist/jerc-homebrew-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  homebrew_smoke:
+    name: Homebrew install (${{ matrix.name }})
+    needs: [build, homebrew_formula]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel
+            runner: macos-15-intel
+            arch: x86_64
+          - name: macOS Apple Silicon
+            runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_ANALYTICS: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*-apple-darwin
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: homebrew-formula
+          path: dist
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify formula and install with Homebrew
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          brew --version
+          mkdir -p "$RUNNER_TEMP/published"
+          tar -xzf "dist/jerc-homebrew-${GITHUB_REF_NAME}.tar.gz" \
+            -C "$RUNNER_TEMP/published"
+          # The packaged formula MUST match the candidate release archives.
+          python3 scripts/generate-homebrew-formula.py \
+            --tag "$GITHUB_REF_NAME" --archives dist \
+            --output "$RUNNER_TEMP/expected/Formula/jerc.rb"
+          cmp "$RUNNER_TEMP/published/Formula/jerc.rb" "$RUNNER_TEMP/expected/Formula/jerc.rb"
+          # GitHub Release URLs do not exist yet; install the exact archives
+          # via a file:// URL while retaining identical SHA256 checksums.
+          python3 scripts/generate-homebrew-formula.py \
+            --tag "$GITHUB_REF_NAME" --archives dist --local-assets \
+            --output "$RUNNER_TEMP/local/Formula/jerc.rb"
+          ruby -c "$RUNNER_TEMP/local/Formula/jerc.rb"
+          brew install --formula "$RUNNER_TEMP/local/Formula/jerc.rb"
+          brew test "$RUNNER_TEMP/local/Formula/jerc.rb"
+          "$(brew --prefix jerc)/bin/jerc" --version | grep -F "${GITHUB_REF_NAME#v}"
 
   deb:
     name: Package Debian/Ubuntu DEB
@@ -353,7 +443,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [build, rpm, deb, deb_smoke, opensuse_smoke, extra_packages, extra_smoke]
+    needs: [build, rpm, deb, deb_smoke, opensuse_smoke, extra_packages, extra_smoke, homebrew_formula, homebrew_smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -363,7 +453,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          # Four platform archives, five packages, Gentoo overlay and two source assets.
+          # Four platform archives, five packages, Gentoo overlay, two source assets, and Homebrew formula.
           path: dist
           merge-multiple: true
       - name: Create SHA-256 checksums
@@ -372,7 +462,7 @@ jobs:
           set -euo pipefail
           cd dist
           sha256sum jerc-* jerc_*.deb > SHA256SUMS
-          test "$(find . -maxdepth 1 -type f \( -name 'jerc-*' -o -name 'jerc_*.deb' \) | wc -l)" -eq 12
+          test "$(find . -maxdepth 1 -type f \( -name 'jerc-*' -o -name 'jerc_*.deb' \) | wc -l)" -eq 13
       - name: Publish tagged release with generated notes
         env:
           GH_TOKEN: ${{ github.token }}
