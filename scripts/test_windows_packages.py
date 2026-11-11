@@ -45,6 +45,7 @@ class WindowsPackageTests(unittest.TestCase):
         self.assertIn("v$version", manifest["autoupdate"]["architecture"]["64bit"]["url"])
         winget = self.root / "meta/winget/manifests/h/HiFiveJazz/Jerc/0.6.2"
         self.assertEqual(3, len(list(winget.glob("*.yaml"))))
+        self.assertEqual("1.10.0", module.MANIFEST_VERSION)
         for filename, manifest_type in (
             ("HiFiveJazz.Jerc.yaml", "version"),
             ("HiFiveJazz.Jerc.installer.yaml", "installer"),

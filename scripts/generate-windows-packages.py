@@ -17,7 +17,9 @@ REPOSITORY = "https://github.com/HiFiveJazz/jerc"
 TARGET = "x86_64-pc-windows-msvc"
 DESCRIPTION = "Keyboard-driven terminal email client written in Rust"
 TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
-MANIFEST_VERSION = "1.12.0"
+# Use a schema version accepted by older WinGet clients on GitHub hosted runners.
+# Upgrade after the CI runner is verified to support newer manifest schemas.
+MANIFEST_VERSION = "1.10.0"
 
 
 def validate_tag(tag: str) -> str:

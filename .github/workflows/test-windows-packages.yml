@@ -81,8 +81,15 @@ jobs:
             '### WinGet: native validation/install unavailable on this runner' >> $env:GITHUB_STEP_SUMMARY
             exit 0
           }
+          Write-Host 'WinGet executable and version:'
+          (Get-Command winget).Source
+          winget --version
+          Write-Host 'Generated manifest schema headers:'
+          Get-ChildItem $manifest -Filter '*.yaml' | ForEach-Object {
+            Write-Host "$($_.Name): $((Get-Content $_.FullName -TotalCount 1))"
+          }
           winget validate --manifest $manifest
-          if ($LASTEXITCODE -ne 0) { throw 'WinGet manifest validation failed' }
+          if ($LASTEXITCODE -ne 0) { throw "WinGet manifest validation failed (exit code: $LASTEXITCODE)" }
           winget settings --enable LocalManifestFiles
           if ($LASTEXITCODE -ne 0) { throw 'Could not enable WinGet local manifests' }
           try {
