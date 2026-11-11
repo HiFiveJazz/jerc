@@ -111,9 +111,57 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  rpm:
+    name: Package and test Fedora 44 RPM
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: dist
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Install pinned nFPM
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build RPM from the verified Linux release archive
+        run: ./scripts/package-linux-rpm.sh "$GITHUB_REF_NAME"
+      - name: Install and smoke-test RPM on Fedora 44
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/dist:/packages:ro" \
+            -e JERC_VERSION="${GITHUB_REF_NAME#v}" \
+            quay.io/fedora/fedora:44 bash -euo pipefail -c '
+              package="/packages/jerc-${JERC_VERSION}-1.x86_64.rpm"
+              rpm -qp --qf "%{NAME} %{VERSION}-%{RELEASE} %{ARCH} %{LICENSE}\n" "$package"
+              test "$(rpm -qp --qf "%{NAME}" "$package")" = jerc
+              test "$(rpm -qp --qf "%{VERSION}-%{RELEASE}" "$package")" = "${JERC_VERSION}-1"
+              test "$(rpm -qp --qf "%{ARCH}" "$package")" = x86_64
+              test "$(rpm -qp --qf "%{LICENSE}" "$package")" = GPL-3.0-only
+              rpm -qlp "$package" | grep -Fx /usr/bin/jerc
+              rpm -qlp "$package" | grep -Fx /usr/share/licenses/jerc/LICENSE
+              dnf install -y "$package"
+              jerc --version | grep -F "$JERC_VERSION"
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-x86_64
+          path: dist/jerc-*.rpm
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, rpm]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -123,7 +171,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          pattern: binary-*
+          # Download the four binary archives and the tested RPM from this run.
           path: dist
           merge-multiple: true
       - name: Create SHA-256 checksums
@@ -132,7 +180,7 @@ jobs:
           set -euo pipefail
           cd dist
           sha256sum jerc-* > SHA256SUMS
-          test "$(find . -maxdepth 1 -type f -name 'jerc-*' | wc -l)" -eq 4
+          test "$(find . -maxdepth 1 -type f -name 'jerc-*' | wc -l)" -eq 5
       - name: Publish tagged release with generated notes
         env:
           GH_TOKEN: ${{ github.token }}

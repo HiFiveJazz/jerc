@@ -27,7 +27,7 @@ trap 'rm -rf -- "$TMP"' EXIT
 # A missing or incomplete release must not leave half-updated PKGBUILDs.
 packages=()
 for name in jerc-bin jerc; do
-  pkgdir="$ROOT/packaging/aur/$name"
+  pkgdir="$ROOT/packaging/linux/aur/$name"
   [[ -f "$pkgdir/PKGBUILD" ]] || continue
 
   mkdir -p "$TMP/$name"
@@ -103,8 +103,8 @@ if (( ${#packages[@]} == 0 )); then
 fi
 
 for name in "${packages[@]}"; do
-  cp -- "$TMP/$name/PKGBUILD" "$ROOT/packaging/aur/$name/PKGBUILD"
-  cp -- "$TMP/$name/.SRCINFO" "$ROOT/packaging/aur/$name/.SRCINFO"
+  cp -- "$TMP/$name/PKGBUILD" "$ROOT/packaging/linux/aur/$name/PKGBUILD"
+  cp -- "$TMP/$name/.SRCINFO" "$ROOT/packaging/linux/aur/$name/.SRCINFO"
 done
 
 echo 'AUR metadata updated. Review changes before publishing.'

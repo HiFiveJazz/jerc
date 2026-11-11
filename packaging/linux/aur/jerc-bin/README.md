@@ -6,9 +6,8 @@ It is independent of Cargo's default target and does not change Jerc's runtime.
 
 ## Before submitting
 
-1. Verify the upstream release asset and its checksum. The SHA-256 pinned in
-   `PKGBUILD` matches the digest shown on the [v0.6.0 GitHub release](https://github.com/HiFiveJazz/jerc/releases/tag/v0.6.0)
-   for `jerc-v0.6.0-x86_64-unknown-linux-musl.tar.gz`.
+1. Verify that the upstream release asset exists and that `PKGBUILD` has the
+   matching SHA-256 checksum (updated automatically by GitHub Actions).
 2. Add your AUR maintainer name/contact to the `PKGBUILD` comment.
 3. On Arch Linux, from this directory, regenerate metadata and test:
 
@@ -34,7 +33,7 @@ Then publish the two metadata files to the separate AUR Git repository:
 mkdir -p ~/aur && cd ~/aur
 git clone ssh://aur@aur.archlinux.org/jerc-bin.git
 cd jerc-bin
-cp ~/GitHub/jerc/packaging/aur/jerc-bin/PKGBUILD .
+cp ~/GitHub/jerc/packaging/linux/aur/jerc-bin/PKGBUILD .
 makepkg --printsrcinfo > .SRCINFO
 git add PKGBUILD .SRCINFO
 git commit -m 'Initial import: jerc-bin 0.6.0-1'
@@ -49,7 +48,8 @@ the AUR repository and running `makepkg -si`.
 
 ## Future Jerc releases
 
-Bump `pkgver`, reset `pkgrel=1`, update the upstream archive's SHA-256 (e.g.
-with `updpkgsums` from `pacman-contrib`, after verifying the release), then
-regenerate `.SRCINFO` and push a commit to the AUR repository. AUR package
-updates are not automatically published by GitHub Releases.
+The `publish-aur.yml` GitHub Actions workflow automates release updates:
+`scripts/update-aur-release.sh` refreshes versions and checksums, computes
+`pkgrel` against the published AUR package, and regenerates `.SRCINFO`.
+`scripts/publish-aur.sh` pushes the two metadata files to AUR. Packaging-only
+changes pushed to `main` trigger this workflow without a new GitHub release.

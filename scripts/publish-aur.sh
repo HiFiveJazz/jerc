@@ -12,7 +12,7 @@ case "$PKG_NAME" in
     ;;
 esac
 
-PKG="$ROOT/packaging/aur/$PKG_NAME"
+PKG="$ROOT/packaging/linux/aur/$PKG_NAME"
 
 for file in PKGBUILD .SRCINFO; do
   if [[ ! -f "$PKG/$file" ]]; then

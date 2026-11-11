@@ -11,7 +11,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'packaging/aur/*/PKGBUILD'
+      - 'packaging/linux/aur/*/PKGBUILD'
   workflow_dispatch:
     inputs:
       tag:
@@ -121,7 +121,7 @@ jobs:
           set -euo pipefail
           # makepkg refuses to run as root, even when printing metadata.
           useradd --create-home aur-builder
-          chown -R aur-builder:aur-builder packaging/aur
+          chown -R aur-builder:aur-builder packaging/linux/aur
           runuser -u aur-builder -- ./scripts/update-aur-release.sh "$RELEASE_TAG"
 
       - name: Commit packaging metadata to GitHub
@@ -133,9 +133,9 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           for name in jerc-bin jerc; do
-            if [[ -f "packaging/aur/$name/PKGBUILD" ]]; then
-              git add "packaging/aur/$name/PKGBUILD"
-              git add -f "packaging/aur/$name/.SRCINFO"
+            if [[ -f "packaging/linux/aur/$name/PKGBUILD" ]]; then
+              git add "packaging/linux/aur/$name/PKGBUILD"
+              git add -f "packaging/linux/aur/$name/.SRCINFO"
             fi
           done
           if ! git diff --cached --quiet; then
@@ -159,10 +159,10 @@ jobs:
           set -euo pipefail
           pacman -S --noconfirm --needed rust cargo ca-certificates
           # makepkg refuses root; the metadata step created this user and
-          # gave it ownership of packaging/aur.
+          # gave it ownership of packaging/linux/aur.
           runuser -u aur-builder -- bash -c '
             set -euo pipefail
-            cd packaging/aur/jerc
+            cd packaging/linux/aur/jerc
             makepkg --cleanbuild --noconfirm
           '
 

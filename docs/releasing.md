@@ -50,8 +50,11 @@ When a version tag is pushed, the workflow:
    `.tar.gz` archives, and a Windows `.zip`, each with a binary, `LICENSE`,
    `README.md`, and `config.example.toml`. The workflow rejects a musl binary
    with an ELF interpreter or required shared libraries.
-4. Produces `SHA256SUMS` and publishes all four binaries in a GitHub Release
-   with automatically generated notes **only if all jobs succeed**.
+4. Creates an x86-64 RPM from the verified Linux musl archive and tests
+   installation and execution in a Fedora 44 container. The RPM is an unsigned
+   GitHub Release download, not a Copr or official Fedora repository package.
+5. Produces `SHA256SUMS` and publishes the four archives plus the RPM in a
+   GitHub Release with automatically generated notes **only if all jobs succeed**.
 
 Watch the workflow under **GitHub → Actions → Release**. Its artifacts are
 published at <https://github.com/HiFiveJazz/jerc/releases>.
