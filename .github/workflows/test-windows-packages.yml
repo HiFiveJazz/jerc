@@ -92,14 +92,53 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "WinGet manifest validation failed (exit code: $LASTEXITCODE)" }
           winget settings --enable LocalManifestFiles
           if ($LASTEXITCODE -ne 0) { throw 'Could not enable WinGet local manifests' }
+          # The local manifest isn't yet published to the community source, so
+          # an ID-based `winget list` lookup is not a reliable installation test.
+          # WinGet portable installs create a per-user Apps & Features entry.
+          $installed = $false
           try {
-            winget install --manifest $manifest --accept-package-agreements --accept-source-agreements --disable-interactivity
+            winget install --manifest $manifest --scope user --accept-package-agreements --accept-source-agreements --disable-interactivity
             if ($LASTEXITCODE -ne 0) { throw 'WinGet installation failed' }
-            winget list --id HiFiveJazz.Jerc --exact --accept-source-agreements
-            if ($LASTEXITCODE -ne 0) { throw 'WinGet cannot find the installed Jerc package' }
+            $installed = $true
+
+            $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+            $entries = @(Get-ChildItem $uninstallKey | ForEach-Object {
+              Get-ItemProperty $_.PSPath
+            } | Where-Object { $_.WinGetPackageIdentifier -eq 'HiFiveJazz.Jerc' })
+            if ($entries.Count -ne 1) {
+              throw "Expected exactly one Jerc portable registration; found $($entries.Count)"
+            }
+            if ($entries[0].DisplayVersion -ne $version) {
+              throw "Incorrect WinGet registered version: $($entries[0].DisplayVersion)"
+            }
+
+            # WinGet updates the persistent PATH, not this existing PowerShell
+            # process. Run the installed executable by its known location.
+            $exe = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\jerc.exe'
+            if (-not (Test-Path $exe)) {
+              $packageRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+              $found = @(Get-ChildItem $packageRoot -Filter jerc.exe -File -Recurse -ErrorAction Stop)
+              if ($found.Count -ne 1) {
+                throw "Expected exactly one installed Jerc executable; found $($found.Count)"
+              }
+              $exe = $found[0].FullName
+            }
+            $reported = & $exe --version
+            if ($LASTEXITCODE -ne 0 -or $reported -notlike "*$version*") {
+              throw "Installed Jerc failed its version check: $reported"
+            }
+            Write-Host "Verified WinGet installed Jerc $version at $exe"
           } finally {
-            winget uninstall --id HiFiveJazz.Jerc --exact --disable-interactivity
+            $cleanupError = $null
+            if ($installed) {
+              # `uninstall --manifest` supports packages tested from local YAML,
+              # even before their ID exists in the public WinGet catalog.
+              winget uninstall --manifest $manifest --accept-source-agreements --disable-interactivity
+              if ($LASTEXITCODE -ne 0) { $cleanupError = 'WinGet manifest uninstall failed' }
+            }
             winget settings --disable LocalManifestFiles
+            if ($LASTEXITCODE -ne 0) { $cleanupError = 'Could not disable WinGet local manifests' }
+            if ($cleanupError) { throw $cleanupError }
           }
       - name: Install with Chocolatey, verify version and uninstall
         if: matrix.manager == 'chocolatey'
