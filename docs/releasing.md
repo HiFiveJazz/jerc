@@ -50,11 +50,18 @@ When a version tag is pushed, the workflow:
    `.tar.gz` archives, and a Windows `.zip`, each with a binary, `LICENSE`,
    `README.md`, and `config.example.toml`. The workflow rejects a musl binary
    with an ELF interpreter or required shared libraries.
-4. Creates an x86-64 RPM from the verified Linux musl archive and tests
-   installation and execution in a Fedora 44 container. The RPM is an unsigned
-   GitHub Release download, not a Copr or official Fedora repository package.
-5. Produces `SHA256SUMS` and publishes the four archives plus the RPM in a
-   GitHub Release with automatically generated notes **only if all jobs succeed**.
+4. Creates one x86-64 RPM and one amd64 DEB from the verified Linux musl
+   archive. RPM installation is checked on Fedora 44 and openSUSE Tumbleweed;
+   DEB installation is checked on Debian 13 and Ubuntu 24.04 LTS. Distro smoke
+   tests run concurrently where their package artifacts are ready.
+5. Produces `SHA256SUMS` and publishes the four archives plus RPM and DEB
+   in a GitHub Release with generated notes **only if all checks succeed**.
+
+To test packaging of an **existing** release without a new tag or publication,
+run `gh workflow run test-linux-packages.yml -f tag=v0.6.2`. The manual
+workflow builds RPM and DEB from that release archive, then runs four Linux
+installation tests in parallel. It does not modify GitHub Releases, AUR,
+or crates.io.
 
 Watch the workflow under **GitHub → Actions → Release**. Its artifacts are
 published at <https://github.com/HiFiveJazz/jerc/releases>.

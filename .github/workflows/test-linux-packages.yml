@@ -1,0 +1,120 @@
+name: Test Linux distribution packages
+
+# Test all four distros with an EXISTING published Linux release archive.
+# This does not create a GitHub Release or publish AUR/crates.io packages.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release tag (for example v0.6.2)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build DEB and RPM from release asset
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Install pinned nFPM
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Fetch verified release binary archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JERC_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$JERC_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid release tag: $JERC_TAG" >&2
+            exit 1
+          }
+          mkdir -p dist
+          gh release download "$JERC_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "jerc-${JERC_TAG}-x86_64-unknown-linux-musl.tar.gz" \
+            --dir dist
+          gh release download "$JERC_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS \
+            --dir dist
+          (
+            cd dist
+            grep -F "  jerc-${JERC_TAG}-x86_64-unknown-linux-musl.tar.gz" SHA256SUMS | sha256sum -c -
+          )
+      - name: Package RPM and DEB
+        env:
+          JERC_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/package-linux-rpm.sh "$JERC_TAG"
+          ./scripts/package-linux-deb.sh "$JERC_TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-installers
+          path: |
+            dist/jerc-*.rpm
+            dist/jerc_*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: Test ${{ matrix.name }} install
+    needs: package
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Fedora 44
+            image: quay.io/fedora/fedora:44
+            format: rpm
+            manager: dnf
+          - name: openSUSE Tumbleweed
+            image: opensuse/tumbleweed:latest
+            format: rpm
+            manager: zypper
+          - name: Debian 13
+            image: debian:trixie
+            format: deb
+            manager: apt
+          - name: Ubuntu 24.04 LTS
+            image: ubuntu:24.04
+            format: deb
+            manager: apt
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-installers
+          path: dist
+      - name: Install and verify Jerc
+        env:
+          JERC_TAG: ${{ inputs.tag }}
+          DISTRO_IMAGE: ${{ matrix.image }}
+          PACKAGE_FORMAT: ${{ matrix.format }}
+          PACKAGE_MANAGER: ${{ matrix.manager }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/dist:/packages:ro" \
+            -v "$PWD/scripts/smoke-linux-package.sh:/usr/local/bin/jerc-package-smoke:ro" \
+            -e JERC_VERSION="${JERC_TAG#v}" \
+            -e JERC_PACKAGE_FORMAT="$PACKAGE_FORMAT" \
+            -e JERC_PACKAGE_MANAGER="$PACKAGE_MANAGER" \
+            "$DISTRO_IMAGE" bash /usr/local/bin/jerc-package-smoke

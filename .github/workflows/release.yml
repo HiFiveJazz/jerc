@@ -111,6 +111,69 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  deb:
+    name: Package Debian/Ubuntu DEB
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: dist
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Install pinned nFPM
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build DEB from the verified Linux release archive
+        run: ./scripts/package-linux-deb.sh "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-amd64
+          path: dist/jerc_*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  deb_smoke:
+    name: Test DEB on ${{ matrix.name }}
+    needs: deb
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian 13
+            image: debian:trixie
+          - name: Ubuntu 24.04 LTS
+            image: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-amd64
+          path: dist
+      - name: Install package and verify executable
+        env:
+          DISTRO_IMAGE: ${{ matrix.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/dist:/packages:ro" \
+            -v "$PWD/scripts/smoke-linux-package.sh:/usr/local/bin/jerc-package-smoke:ro" \
+            -e JERC_VERSION="${GITHUB_REF_NAME#v}" \
+            -e JERC_PACKAGE_FORMAT=deb \
+            -e JERC_PACKAGE_MANAGER=apt \
+            "$DISTRO_IMAGE" bash /usr/local/bin/jerc-package-smoke
+
   rpm:
     name: Package and test Fedora 44 RPM
     needs: build
@@ -159,9 +222,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  opensuse_smoke:
+    name: Test RPM on openSUSE Tumbleweed
+    needs: rpm
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-x86_64
+          path: dist
+      - name: Install package and verify executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/dist:/packages:ro" \
+            -v "$PWD/scripts/smoke-linux-package.sh:/usr/local/bin/jerc-package-smoke:ro" \
+            -e JERC_VERSION="${GITHUB_REF_NAME#v}" \
+            -e JERC_PACKAGE_FORMAT=rpm \
+            -e JERC_PACKAGE_MANAGER=zypper \
+            opensuse/tumbleweed:latest bash /usr/local/bin/jerc-package-smoke
+
   publish:
     name: Publish GitHub Release
-    needs: [build, rpm]
+    needs: [build, rpm, deb, deb_smoke, opensuse_smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -171,7 +258,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          # Download the four binary archives and the tested RPM from this run.
+          # Download four binary archives, the tested RPM, and tested DEB.
           path: dist
           merge-multiple: true
       - name: Create SHA-256 checksums
@@ -179,8 +266,8 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum jerc-* > SHA256SUMS
-          test "$(find . -maxdepth 1 -type f -name 'jerc-*' | wc -l)" -eq 5
+          sha256sum jerc-* jerc_*.deb > SHA256SUMS
+          test "$(find . -maxdepth 1 -type f \( -name 'jerc-*' -o -name 'jerc_*.deb' \) | wc -l)" -eq 6
       - name: Publish tagged release with generated notes
         env:
           GH_TOKEN: ${{ github.token }}
