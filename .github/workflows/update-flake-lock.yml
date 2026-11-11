@@ -1,0 +1,36 @@
+name: Update Nix flake lock
+
+# Keep ordinary Nix builds pinned; propose dependency updates for review.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 5 * * 1' # Weekly, Monday 05:17 UTC
+  push:
+    branches: [main]
+    paths:
+      - flake.nix
+      - .github/workflows/update-flake-lock.yml
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+concurrency:
+  group: update-flake-lock
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Propose flake.lock update
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out Jerc
+        uses: actions/checkout@v6
+      - name: Install Nix with flakes support
+        uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Generate or update flake.lock and open PR
+        uses: DeterminateSystems/update-flake-lock@main
+        with:
+          pr-title: 'chore(nix): generate or update flake.lock'
