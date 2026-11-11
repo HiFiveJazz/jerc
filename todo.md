@@ -1,5 +1,5 @@
 Package Manager Release Todos!
-[ ] Cargo: crates.io and binstall
+[*] Cargo: crates.io and binstall
 [ ] Linux: Debian / Ubuntu — .deb (High)
 [ ] Linux: Fedora — .rpm and Copr (High)
 [ ] Linux: openSUSE — RPM / OBS (Medium)

@@ -1,0 +1,85 @@
+name: Retry crates.io publication
+
+# Recovery path for a GitHub Release whose original publishing job failed.
+# The normal, automatic publisher remains in release.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing published release tag (e.g. v0.6.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  retry_crate:
+    name: Publish existing release to crates.io
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Validate release tag input
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo 'Expected a release tag like v0.6.2' >&2
+            exit 1
+          }
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: ci
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+          path: source
+          # Publish the source at the release tag, never the current main branch.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify tagged source matches an existing GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          python scripts/package_release.py --tag "$RELEASE_TAG" --check-only
+          python scripts/test_binstall_metadata.py
+          [[ "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq '.isDraft')" == 'false' ]] || {
+            echo 'GitHub Release does not exist or is still a draft' >&2
+            exit 1
+          }
+      - name: Skip versions already on crates.io
+        id: registry
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ci/scripts/check_crates_io_version.py --version "${RELEASE_TAG#v}"
+      - name: Validate Cargo package
+        if: steps.registry.outputs.publish == 'true'
+        working-directory: source
+        run: cargo publish --dry-run --locked
+      - name: Authenticate with crates.io Trusted Publishing
+        if: steps.registry.outputs.publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish missing crate version
+        if: steps.registry.outputs.publish == 'true'
+        working-directory: source
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked

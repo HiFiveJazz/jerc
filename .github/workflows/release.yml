@@ -183,22 +183,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          status="$(curl --retry 3 --retry-all-errors -sS -o /dev/null -w '%{http_code}' \
-            "https://crates.io/api/v1/crates/jerc/$version")"
-          case "$status" in
-            200)
-              echo "publish=false" >> "$GITHUB_OUTPUT"
-              echo "jerc $version already exists on crates.io; no-op"
-              ;;
-            404)
-              echo "publish=true" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "Unexpected crates.io API status: $status" >&2
-              exit 1
-              ;;
-          esac
+          python3 scripts/check_crates_io_version.py --version "${GITHUB_REF_NAME#v}"
       - name: Validate publishable crate from the tagged source
         if: steps.registry.outputs.publish == 'true'
         run: cargo publish --dry-run --locked
