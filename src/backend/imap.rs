@@ -814,6 +814,10 @@ impl MailBackend for ImapBackend {
             self.source.host, self.source.port
         ))
         .context("building IMAP connection URL")?;
+        // Emit a start marker too. When TCP/TLS/greeting stalls, the matching
+        // completion cannot be recorded until connect() returns. This changes
+        // logging only; the working io-imap transport remains untouched.
+        crate::perf::record("imap_tls_connect_begin", None, Duration::ZERO, true);
         let started = Instant::now();
         let client_result =
             ImapClientStd::connect(&connect_url, ImapClientStdConnectOptions::default())
@@ -830,6 +834,7 @@ impl MailBackend for ImapBackend {
             .set_read_timeout(Some(IO_TIMEOUT))
             .context("setting IMAP read timeout")?;
 
+        crate::perf::record("imap_auth_begin", None, Duration::ZERO, true);
         let started = Instant::now();
         let auth_result = (|| -> Result<()> {
             match self.source.auth {
@@ -1530,6 +1535,49 @@ mod tests {
         assert!(!debug.contains("refresh-secret"));
         assert!(!debug.contains("client-secret"));
         assert!(!debug.contains("oauth.example.com"));
+    }
+
+    #[test]
+    fn tls_connection_closed_before_imap_greeting_fails_without_oauth() {
+        // Local-only regression test for the actual IMAP transport. Keep
+        // ImapClientStd::connect unchanged, and never depend on Microsoft,
+        // Google, DNS, or OAuth availability in CI.
+        use super::ImapBackend;
+        use crate::backend::MailBackend;
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream); // TLS peer closes before the IMAP greeting
+                        break;
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("loopback test server did not accept: {error}"),
+                }
+            }
+        });
+        let source = ImapSource::parse(&format!(
+            "imaps://user%40example.test:dummy@127.0.0.1:{port}"
+        ))
+        .unwrap();
+        let mut backend = ImapBackend::new(source, None, 10);
+        let started = Instant::now();
+        let err = backend.connect().expect_err("closed TLS peer must fail");
+        assert!(err.to_string().contains("connecting to IMAP server"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        server.join().unwrap();
     }
 
     #[test]

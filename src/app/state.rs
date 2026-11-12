@@ -764,8 +764,16 @@ pub struct AccountState {
     // be automatically retried after an ambiguous IMAP response.
     deferred_mutations: Vec<cache::DeferredMutation>,
     inflight_deferred_mutations: HashMap<u64, cache::DeferredMutation>,
+    // Only offline/restored operations should produce queue notices. The
+    // normal online queue -> in-flight transition is NOT an alert.
+    offline_notice_mutations: HashSet<String>,
     outbox_store: Option<crate::outgoing::outbox::Store>,
     outbox: Vec<crate::outgoing::outbox::QueuedSend>,
+    offline_notice_sends: HashSet<String>,
+    // A failure is a notice only after an actual connection problem, never
+    // merely because a newly opened account is still connecting.
+    offline_incident_active: bool,
+    offline_incident_number: u64,
     inflight_outbox: HashMap<u64, String>,
     // Correlates Seen ACKs with the original mailbox, including navigation.
     inflight_deferred_seen: HashMap<u64, cache::DeferredSeen>,
@@ -786,6 +794,27 @@ pub struct AccountState {
     pub restore_message_index: Option<usize>,
     pub worker: WorkerHandle,
     foreground_generation: u64,
+}
+
+// Ignore journal state: Queued -> NeedsReview is a normal in-flight
+// transition, so the notice must retain its identity until the server ACK.
+fn mutation_notice_key(entry: &cache::DeferredMutation) -> String {
+    format!(
+        "{}:{}:{:?}:{:?}",
+        entry.mailbox, entry.validity, entry.kind, entry.ids
+    )
+}
+
+fn notice_count(count: usize, noun: &str) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+}
+
+// A single displayed notice can represent several queued actions. Track
+// acknowledgment per action, not per aggregate count: completing one of three
+// already-acknowledged emails must not resurrect the banner for the other two.
+struct WarningNotice {
+    identities: Vec<String>,
+    message: String,
 }
 
 impl AccountState {
@@ -850,6 +879,23 @@ impl AccountState {
     /// durable Outbox/mutation journals and their in-flight IDs are retained:
     /// an ambiguous SMTP/IMAP write must never be silently retried.
     fn mark_disconnected(&mut self) {
+        if !self.offline_incident_active {
+            self.offline_incident_number = self.offline_incident_number.wrapping_add(1);
+            self.offline_incident_active = true;
+        }
+        // Preserve the offline identity of any work that was already queued
+        // when a live connection failed; keep its notice through replay.
+        for entry in &self.deferred_mutations {
+            if entry.state == cache::DeferredMutationState::Queued {
+                self.offline_notice_mutations
+                    .insert(mutation_notice_key(entry));
+            }
+        }
+        for entry in &self.outbox {
+            if entry.state == crate::outgoing::outbox::SendState::Queued {
+                self.offline_notice_sends.insert(entry.id.clone());
+            }
+        }
         self.capabilities = None;
         self.sync_progress_at = None;
         self.abandon_mailbox_list();
@@ -1550,6 +1596,8 @@ pub struct App {
     sync_spinner_frame: usize,
     pub startup_warnings: Vec<String>,
     pub show_startup_warnings: bool,
+    // UI acknowledgment only; never alters durable Outbox/mutation state.
+    pub acknowledged_warning_keys: HashSet<String>,
     pub should_quit: bool,
     /// In-app first-run or add-account setup, modal over normal mail UI.
     pub setup: Option<SetupWizard>,
@@ -1835,66 +1883,249 @@ impl App {
         }
     }
 
-    /// Derived warnings never become stale after Outbox replay succeeds.
-    /// A NeedsReview warning stays visible because retrying may duplicate mail.
-    #[must_use]
-    pub fn visible_warnings(&self) -> Vec<String> {
-        let mut warnings = self.startup_warnings.clone();
+    /// Build notices from durable operation state without modifying the journals.
+    /// An online delete temporarily enters Queued and then NeedsReview while
+    /// its IMAP ACK is outstanding; neither state should flash a warning.
+    fn warning_entries(&self) -> Vec<WarningNotice> {
+        let mut notices = self
+            .startup_warnings
+            .iter()
+            .map(|message| WarningNotice {
+                identities: vec![format!("configuration:{message}")],
+                message: message.clone(),
+            })
+            .collect::<Vec<_>>();
+
         for account in &self.accounts {
-            let queued_mutations = account
-                .deferred_mutations
-                .iter()
-                .filter(|entry| entry.state == cache::DeferredMutationState::Queued)
-                .count();
-            let queued_sends = account
-                .outbox
-                .iter()
-                .filter(|entry| entry.state == crate::outgoing::outbox::SendState::Queued)
-                .count();
-            if queued_mutations > 0 || queued_sends > 0 {
-                warnings.push(format!(
-                    "{}: {queued_mutations} mailbox change(s) and {queued_sends} outgoing email(s) queued for reconnect",
-                    account.name
-                ));
+            if account.offline_incident_active {
+                notices.push(WarningNotice {
+                    identities: vec![format!("connection:{}:{}", account.name, account.offline_incident_number)],
+                    message: format!("{}: connection unavailable; cached mail remains readable. Jerc will retry automatically.", account.name),
+                });
             }
+            let mut queued_keys = Vec::new();
+            let mut queued_deletes = 0usize;
+            let mut queued_changes = 0usize;
+            let mut sending_now = 0usize;
+            let mut changing_now = 0usize;
+            let in_flight_mutations = account
+                .inflight_deferred_mutations
+                .values()
+                .map(mutation_notice_key)
+                .collect::<HashSet<_>>();
+            let in_flight_sends = account
+                .inflight_outbox
+                .values()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            for entry in &account.deferred_mutations {
+                let key = mutation_notice_key(entry);
+                let was_offline = account.offline_notice_mutations.contains(&key);
+                if !(was_offline || account.capabilities.is_none()) {
+                    continue;
+                }
+                let in_flight = in_flight_mutations.contains(&key);
+                if entry.state == cache::DeferredMutationState::Queued || in_flight {
+                    queued_keys.push(format!("queue-mutation:{}:{key}", account.name));
+                    if in_flight {
+                        changing_now += entry.ids.len();
+                    } else {
+                        match &entry.kind {
+                            cache::DeferredMutationKind::Delete => {
+                                queued_deletes += entry.ids.len()
+                            }
+                            _ => queued_changes += entry.ids.len(),
+                        }
+                    }
+                }
+            }
+            let mut queued_sends = 0usize;
+            for entry in &account.outbox {
+                let was_offline = account.offline_notice_sends.contains(&entry.id);
+                if !(was_offline || account.capabilities.is_none()) {
+                    continue;
+                }
+                let in_flight = in_flight_sends.contains(entry.id.as_str());
+                if entry.state == crate::outgoing::outbox::SendState::Queued || in_flight {
+                    queued_keys.push(format!("queue-send:{}:{}", account.name, entry.id));
+                    if in_flight {
+                        sending_now += 1;
+                    } else {
+                        queued_sends += 1;
+                    }
+                }
+            }
+            if !queued_keys.is_empty() {
+                queued_keys.sort();
+                // Each action keeps its identity until its ACK, including
+                // while in flight. Aggregate size shrinking is not a new alert.
+                let mut parts = Vec::new();
+                let when = if account.capabilities.is_none() {
+                    "when the connection resumes"
+                } else {
+                    "for synchronization"
+                };
+                if queued_sends > 0 {
+                    parts.push(format!(
+                        "{} queued for sending {when}",
+                        notice_count(queued_sends, "email")
+                    ));
+                }
+                if queued_deletes > 0 {
+                    parts.push(format!(
+                        "{} queued for deletion {when}",
+                        notice_count(queued_deletes, "email")
+                    ));
+                }
+                if queued_changes > 0 {
+                    parts.push(format!(
+                        "{} queued {when}",
+                        notice_count(queued_changes, "mailbox change")
+                    ));
+                }
+                if sending_now > 0 {
+                    parts.push(format!(
+                        "{} submitted from the offline queue; awaiting server confirmation",
+                        notice_count(sending_now, "email")
+                    ));
+                }
+                if changing_now > 0 {
+                    parts.push(format!(
+                        "{} submitted from the offline queue; awaiting server confirmation",
+                        notice_count(changing_now, "mailbox change")
+                    ));
+                }
+                notices.push(WarningNotice {
+                    identities: queued_keys,
+                    message: format!("{}: {}.", account.name, parts.join("; ")),
+                });
+            }
+
             let review_mutations = account
                 .deferred_mutations
                 .iter()
-                .filter(|entry| entry.state == cache::DeferredMutationState::NeedsReview)
-                .count();
+                .filter(|entry| {
+                    entry.state == cache::DeferredMutationState::NeedsReview
+                        && !in_flight_mutations.contains(&mutation_notice_key(entry))
+                })
+                .collect::<Vec<_>>();
+            if !review_mutations.is_empty() {
+                let mut keys = review_mutations
+                    .iter()
+                    .map(|entry| mutation_notice_key(entry))
+                    .collect::<Vec<_>>();
+                keys.sort();
+                let count = review_mutations
+                    .iter()
+                    .map(|entry| entry.ids.len())
+                    .sum::<usize>();
+                let verb = if count == 1 { "requires" } else { "require" };
+                notices.push(WarningNotice {
+                    identities: keys.into_iter().map(|key| format!("review-mutation:{}:{key}", account.name)).collect(),
+                    message: format!("{}: {} {verb} manual review; the IMAP result is uncertain, so Jerc will NOT retry automatically.", account.name, notice_count(count, "mailbox change")),
+                });
+            }
             let review_sends = account
                 .outbox
                 .iter()
-                .filter(|entry| entry.state == crate::outgoing::outbox::SendState::NeedsReview)
-                .count();
-            if review_mutations > 0 || review_sends > 0 {
-                warnings.push(format!(
-                    "{}: {review_mutations} mailbox change(s) and {review_sends} Outbox send(s) require manual review; no uncertain operation will be automatically retried",
-                    account.name
-                ));
+                .filter(|entry| {
+                    entry.state == crate::outgoing::outbox::SendState::NeedsReview
+                        && !in_flight_sends.contains(entry.id.as_str())
+                })
+                .collect::<Vec<_>>();
+            if !review_sends.is_empty() {
+                let mut ids = review_sends
+                    .iter()
+                    .map(|entry| entry.id.as_str())
+                    .collect::<Vec<_>>();
+                ids.sort();
+                let verb = if review_sends.len() == 1 {
+                    "requires"
+                } else {
+                    "require"
+                };
+                notices.push(WarningNotice {
+                    identities: ids.into_iter().map(|id| format!("review-outbox:{}:{id}", account.name)).collect(),
+                    message: format!("{}: {} {verb} manual review. Check Sent before retrying: SMTP may have accepted the email. Jerc will NOT resend automatically.", account.name, notice_count(review_sends.len(), "Outbox email")),
+                });
             }
             if account
                 .cache_writer
                 .as_ref()
                 .is_some_and(|writer| !writer.mutations_available())
             {
-                warnings.push(format!(
-                    "{}: offline mutation journal is unreadable; it has not been overwritten",
-                    account.name
-                ));
+                notices.push(WarningNotice {
+                    identities: vec![format!("mutation-storage:{}", account.name)],
+                    message: format!(
+                        "{}: offline mutation journal is unreadable; it has not been overwritten",
+                        account.name
+                    ),
+                });
             }
             if account
                 .outbox_store
                 .as_ref()
                 .is_some_and(|store| !store.is_readable())
             {
-                warnings.push(format!(
-                    "{}: offline Outbox is unreadable; it has not been overwritten",
-                    account.name
-                ));
+                notices.push(WarningNotice {
+                    identities: vec![format!("outbox-storage:{}", account.name)],
+                    message: format!(
+                        "{}: offline Outbox is unreadable; it has not been overwritten",
+                        account.name
+                    ),
+                });
             }
         }
-        warnings
+        notices
+    }
+
+    /// Full details remain available via ! even after acknowledging the banner.
+    #[must_use]
+    pub fn all_warnings(&self) -> Vec<String> {
+        self.warning_entries()
+            .into_iter()
+            .map(|notice| notice.message)
+            .collect()
+    }
+
+    /// Only notices not yet inspected appear in the top banner.
+    #[must_use]
+    pub fn visible_warnings(&self) -> Vec<String> {
+        self.warning_entries()
+            .into_iter()
+            .filter(|notice| {
+                notice
+                    .identities
+                    .iter()
+                    .any(|key| !self.acknowledged_warning_keys.contains(key))
+            })
+            .map(|notice| notice.message)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn warning_banner_label(&self) -> Option<String> {
+        let count = self.visible_warnings().len();
+        (count > 0).then(|| {
+            format!(
+                "  ! {count} notice{} [! to inspect]",
+                if count == 1 { "" } else { "s" }
+            )
+        })
+    }
+
+    /// Acknowledges the current set in memory immediately, with no restart.
+    /// New work gets a different identity and will produce another notice.
+    pub fn inspect_warnings(&mut self) {
+        let entries = self.warning_entries();
+        let current = entries
+            .iter()
+            .flat_map(|notice| notice.identities.iter().cloned())
+            .collect::<HashSet<_>>();
+        self.acknowledged_warning_keys
+            .retain(|key| current.contains(key));
+        self.acknowledged_warning_keys.extend(current);
+        self.show_startup_warnings = true;
     }
 
     /// The runtime uses this deadline to repaint even without another keypress.

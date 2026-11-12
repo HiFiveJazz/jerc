@@ -55,7 +55,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry {
         category: "General",
         key: "!",
-        description: "show account configuration warnings",
+        description: "inspect notices",
     },
     HelpEntry {
         category: "General",

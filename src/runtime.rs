@@ -1,5 +1,7 @@
 use std::io::{self, Stdout, Write};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,7 +27,9 @@ use crate::worker::{RuntimeEvent, WorkerHandle};
 pub fn run_tui(config: Config) -> Result<()> {
     let (config, configuration_warnings) = validate_account_configuration(config)?;
     let (runtime_tx, runtime_rx) = sync_channel::<RuntimeEvent>(4096);
-    let workers = create_workers(&config, runtime_tx.clone())?;
+    let active_epoch = Arc::new(AtomicU64::new(0));
+    let worker_tx = scoped_worker_sender(runtime_tx.clone(), Arc::clone(&active_epoch), 0);
+    let workers = create_workers(&config, worker_tx)?;
     let mut app = App::new(&config, workers);
     app.bootstrap();
     app.attach_setup_sender(runtime_tx.clone());
@@ -63,7 +67,13 @@ pub fn run_tui(config: Config) -> Result<()> {
     // Quit must not wait for a busy IMAP SELECT/FETCH or for a full worker
     // queue. Keep the normal graceful worker shutdown for account reloads,
     // but detach network workers on final process exit (including UI errors).
-    let result = event_loop(&mut terminal, &mut app, runtime_rx, runtime_tx);
+    let result = event_loop(
+        &mut terminal,
+        &mut app,
+        runtime_rx,
+        runtime_tx,
+        active_epoch,
+    );
     app.detach_network_workers_for_exit();
     result
 }
@@ -136,40 +146,99 @@ fn safe_scheme(uri: &str) -> &str {
     }
 }
 
+/// Each configuration has an independent worker-output channel. Results that
+/// arrive late from a removed account keep their epoch and cannot be mistaken
+/// for results from a new account reusing the same numeric index.
+fn scoped_worker_sender(
+    runtime_tx: SyncSender<RuntimeEvent>,
+    active_epoch: Arc<AtomicU64>,
+    epoch: u64,
+) -> SyncSender<RuntimeEvent> {
+    let (sender, receiver) = sync_channel::<RuntimeEvent>(4096);
+    thread::Builder::new()
+        .name("mail-event-relay".to_owned())
+        .spawn(move || {
+            while let Ok(event) = receiver.recv() {
+                if active_epoch.load(Ordering::Acquire) != epoch {
+                    continue;
+                }
+                if runtime_tx
+                    .send(RuntimeEvent::ScopedWorker {
+                        epoch,
+                        event: Box::new(event),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .expect("failed to start account event relay");
+    sender
+}
+
+/// Worker events are scoped to their account configuration, not only to the
+/// worker generation. Leave terminal input, setup, and image events unchanged.
+fn unwrap_current_worker_event(event: RuntimeEvent, epoch: u64) -> Option<RuntimeEvent> {
+    match event {
+        RuntimeEvent::ScopedWorker {
+            epoch: source,
+            event,
+        } if source == epoch => Some(*event),
+        RuntimeEvent::ScopedWorker { .. } => None,
+        other => Some(other),
+    }
+}
+
+fn create_worker(
+    index: usize,
+    account: &crate::config::AccountConfig,
+    runtime_tx: &SyncSender<RuntimeEvent>,
+) -> Result<WorkerHandle> {
+    let backend = backend::from_account(account)?;
+    // STATUS and preview preloading share a lazy background session.
+    // Maildir uses a separate inexpensive local worker as well, so
+    // disk reads cannot stall interactive navigation.
+    let status_backend = Some(backend::from_account(account)?);
+    let idle_backend = if backend::ImapSource::supports(&account.source) {
+        Some(backend::from_account(account)?)
+    } else {
+        None
+    };
+    let sender = outgoing::from_account(account)?;
+    let mut worker = WorkerHandle::spawn_with_idle(
+        index,
+        backend,
+        status_backend,
+        idle_backend,
+        sender,
+        runtime_tx.clone(),
+    );
+    if backend::ImapSource::supports(&account.source) {
+        worker.enable_foreground_recovery(index, account.clone(), runtime_tx.clone());
+    }
+    Ok(worker)
+}
+
 fn create_workers(
     config: &Config,
     runtime_tx: SyncSender<RuntimeEvent>,
 ) -> Result<Vec<WorkerHandle>> {
-    config
-        .accounts
-        .iter()
-        .enumerate()
-        .map(|(index, account)| {
-            let backend = backend::from_account(account)?;
-            // STATUS and preview preloading share a lazy background session.
-            // Maildir uses a separate inexpensive local worker as well, so
-            // disk reads cannot stall interactive navigation.
-            let status_backend = Some(backend::from_account(account)?);
-            let idle_backend = if backend::ImapSource::supports(&account.source) {
-                Some(backend::from_account(account)?)
-            } else {
-                None
-            };
-            let sender = outgoing::from_account(account)?;
-            let mut worker = WorkerHandle::spawn_with_idle(
-                index,
-                backend,
-                status_backend,
-                idle_backend,
-                sender,
-                runtime_tx.clone(),
-            );
-            if backend::ImapSource::supports(&account.source) {
-                worker.enable_foreground_recovery(index, account.clone(), runtime_tx.clone());
+    let mut workers = Vec::with_capacity(config.accounts.len());
+    for (index, account) in config.accounts.iter().enumerate() {
+        match create_worker(index, account, &runtime_tx) {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                // A late configuration error must not synchronously drop
+                // previously spawned workers on the UI thread either.
+                for worker in &mut workers {
+                    worker.retire_for_reload();
+                }
+                return Err(error);
             }
-            Ok(worker)
-        })
-        .collect()
+        }
+    }
+    Ok(workers)
 }
 
 fn spawn_input_thread(runtime_tx: SyncSender<RuntimeEvent>) {
@@ -198,6 +267,7 @@ fn event_loop(
     app: &mut App,
     runtime_rx: Receiver<RuntimeEvent>,
     runtime_tx: SyncSender<RuntimeEvent>,
+    active_epoch: Arc<AtomicU64>,
 ) -> Result<()> {
     // Animation is deadline-driven instead of timeout-driven.  The old loop only
     // advanced smooth scrolling when recv_timeout() *timed out*, so a steady
@@ -301,6 +371,10 @@ fn event_loop(
             // from postponing a due frame.
             continue;
         };
+        let Some(event) = unwrap_current_worker_event(event, active_epoch.load(Ordering::Acquire))
+        else {
+            continue;
+        };
 
         let background_update = matches!(
             &event,
@@ -324,6 +398,7 @@ fn event_loop(
             }
             RuntimeEvent::Input(_) => continue,
             RuntimeEvent::Worker(event) => app.handle_worker_event(event),
+            RuntimeEvent::ScopedWorker { .. } => unreachable!("nested worker epoch"),
             RuntimeEvent::ForegroundWorker { generation, event } => {
                 app.handle_foreground_worker_event(generation, event);
             }
@@ -334,25 +409,48 @@ fn event_loop(
         }
 
         if std::mem::take(&mut app.setup_reload_requested) {
+            // A write may have reached the remote server even if its ACK is
+            // still queued. Keep processing events until every write is
+            // acknowledged; never re-run or silently discard it on reload.
+            if app
+                .accounts
+                .iter()
+                .any(|account| account.worker.has_unacknowledged_writes())
+            {
+                app.setup_reload_requested = true;
+                continue;
+            }
+            let next_epoch = active_epoch.load(Ordering::Acquire) + 1;
+            let worker_tx =
+                scoped_worker_sender(runtime_tx.clone(), Arc::clone(&active_epoch), next_epoch);
             let result = Config::load_or_empty(Some(&app.setup_config_path))
                 .and_then(validate_account_configuration)
                 .and_then(|(config, warnings)| {
-                    let workers = create_workers(&config, runtime_tx.clone())?;
+                    let workers = create_workers(&config, worker_tx)?;
                     Ok((config, workers, warnings))
                 });
             match result {
                 Ok((config, workers, warnings)) => {
-                    // Old mail workers finish before we accept events from new
-                    // account indices, preventing stale updates after reload.
+                    // Turn on the new epoch before disposing of the old App.
+                    // Old results already queued are also filtered by epoch.
+                    active_epoch.store(next_epoch, Ordering::Release);
                     app.flush_contacts(true);
                     let mut fresh = App::new(&config, workers);
                     fresh.attach_setup_sender(runtime_tx.clone());
                     fresh.account_index = fresh.accounts.len().saturating_sub(1);
                     fresh.startup_warnings.extend(warnings);
+                    // Account reload must not require acknowledging the same
+                    // queue notice a second time within this session.
+                    fresh.acknowledged_warning_keys = app.acknowledged_warning_keys.clone();
                     let mut old = std::mem::replace(app, fresh);
                     app.inherit_image_runtime(&mut old);
+                    for account in &mut old.accounts {
+                        account.worker.retire_for_reload();
+                    }
                     drop(old);
-                    while runtime_rx.try_recv().is_ok() {}
+                    // Do not drain the global runtime queue: it contains
+                    // input and *new* worker events too. Stale worker events
+                    // are rejected by unwrap_current_worker_event instead.
                     app.bootstrap();
                     render(terminal, app)?;
                     continue;
@@ -618,6 +716,51 @@ mod multi_account_tests {
         assert!(!error.contains("secret"));
         assert_eq!(safe_scheme("imaps://username:secret@host"), "imaps");
         assert_eq!(safe_scheme("username:secret@host"), "<invalid>");
+    }
+}
+
+#[cfg(test)]
+mod account_worker_epoch_tests {
+    use super::{scoped_worker_sender, unwrap_current_worker_event};
+    use crate::worker::{RuntimeEvent, WorkerEvent, WorkerEventKind};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, mpsc::sync_channel};
+    use std::time::Duration;
+
+    #[test]
+    fn queued_old_account_results_cannot_update_reused_account_index() {
+        let (tx, rx) = sync_channel(8);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let old = scoped_worker_sender(tx.clone(), Arc::clone(&epoch), 0);
+        old.send(RuntimeEvent::Worker(WorkerEvent {
+            account: 0,
+            request_id: 1,
+            kind: WorkerEventKind::Stopped,
+        }))
+        .unwrap();
+        let queued_old = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Same index now points at a different account.
+        epoch.store(1, Ordering::Release);
+        assert!(unwrap_current_worker_event(queued_old, 1).is_none());
+        old.send(RuntimeEvent::Worker(WorkerEvent {
+            account: 0,
+            request_id: 2,
+            kind: WorkerEventKind::Stopped,
+        }))
+        .unwrap();
+        let current = scoped_worker_sender(tx, Arc::clone(&epoch), 1);
+        current
+            .send(RuntimeEvent::Worker(WorkerEvent {
+                account: 0,
+                request_id: 3,
+                kind: WorkerEventKind::Stopped,
+            }))
+            .unwrap();
+        let received = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let Some(RuntimeEvent::Worker(event)) = unwrap_current_worker_event(received, 1) else {
+            panic!("new-epoch worker event should be delivered");
+        };
+        assert_eq!(event.request_id, 3);
     }
 }
 

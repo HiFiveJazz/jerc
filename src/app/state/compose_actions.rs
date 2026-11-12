@@ -12,8 +12,12 @@ impl AccountState {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("offline outbox storage unavailable"))?;
         let mut next = self.outbox.clone();
+        let offline_id = self.capabilities.is_none().then(|| message.id.clone());
         next.push(message);
         store.save(&next)?;
+        if let Some(id) = offline_id {
+            self.offline_notice_sends.insert(id);
+        }
         self.outbox = next;
         Ok(())
     }
@@ -97,6 +101,7 @@ impl AccountState {
             return false;
         }
         self.outbox = next;
+        self.offline_notice_sends.insert(id);
         true
     }
 
@@ -115,6 +120,7 @@ impl AccountState {
         let id = self.inflight_outbox.remove(&request_id)?;
         let index = self.outbox.iter().position(|message| message.id == id)?;
         if accepted {
+            self.offline_notice_sends.remove(&id);
             let sent = self.outbox.remove(index);
             let _ = self.save_outbox();
             Some(sent)

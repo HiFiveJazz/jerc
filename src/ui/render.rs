@@ -162,11 +162,12 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         };
         spans.push(Span::styled(format!(" {} ", account.name), style));
     }
-    let warnings = app.visible_warnings();
-    if !warnings.is_empty() {
+    if let Some(label) = app.warning_banner_label() {
         spans.push(Span::styled(
-            format!("  ! {} warning(s) [! to inspect]", warnings.len()),
-            theme.error(),
+            label,
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.text()), area);

@@ -32,6 +32,18 @@ impl App {
                 let deferred_seen = snapshot.deferred_seen.clone();
                 let deferred_mutations = snapshot.deferred_mutations.clone();
                 let (outbox_store, outbox) = crate::outgoing::outbox::Store::open(config);
+                // A restored offline queue keeps its notice until the remote
+                // operation is acknowledged. Fresh online actions aren't alerts.
+                let offline_notice_mutations = deferred_mutations
+                    .iter()
+                    .filter(|entry| entry.state == cache::DeferredMutationState::Queued)
+                    .map(mutation_notice_key)
+                    .collect();
+                let offline_notice_sends = outbox
+                    .iter()
+                    .filter(|entry| entry.state == crate::outgoing::outbox::SendState::Queued)
+                    .map(|entry| entry.id.clone())
+                    .collect();
                 let uid_validities = snapshot
                     .folders
                     .iter()
@@ -118,8 +130,12 @@ impl App {
                     deferred_seen,
                     deferred_mutations,
                     inflight_deferred_mutations: HashMap::new(),
+                    offline_notice_mutations,
                     outbox_store,
                     outbox,
+                    offline_notice_sends,
+                    offline_incident_active: false,
+                    offline_incident_number: 0,
                     inflight_outbox: HashMap::new(),
                     inflight_deferred_seen: HashMap::new(),
                     status_requests: MailboxStatusQueue::default(),
@@ -181,6 +197,7 @@ impl App {
             sync_spinner_frame: 0,
             startup_warnings,
             show_startup_warnings: false,
+            acknowledged_warning_keys: HashSet::new(),
             should_quit: false,
             setup: config.accounts.is_empty().then(|| SetupWizard::new(true)),
             remove_account_confirmation: None,

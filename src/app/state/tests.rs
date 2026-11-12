@@ -2936,22 +2936,251 @@ fn offline_warning_banner_tracks_live_queue_instead_of_startup_snapshot() {
     assert!(
         app.visible_warnings()
             .iter()
-            .any(|warning| warning.contains("queued for reconnect"))
+            .any(|warning| warning.contains("queued for deletion"))
     );
     app.accounts[0].deferred_mutations[0].state = DeferredMutationState::NeedsReview;
     let warnings = app.visible_warnings();
     assert!(
         !warnings
             .iter()
-            .any(|warning| warning.contains("queued for reconnect"))
+            .any(|warning| warning.contains("queued for deletion"))
     );
     assert!(
         warnings
             .iter()
-            .any(|warning| warning.contains("require manual review"))
+            .any(|warning| warning.contains("manual review"))
     );
     app.accounts[0].deferred_mutations.clear();
     assert_eq!(app.visible_warnings(), baseline);
+}
+
+#[test]
+fn online_delete_and_inflight_journal_never_flash_a_notice() {
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState};
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    app.accounts[0].capabilities = Some(crate::model::Capabilities::MAILDIR);
+    let entry = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 12,
+        ids: vec![MessageId("imap-uid:12:34".into())],
+        kind: DeferredMutationKind::Delete,
+        state: DeferredMutationState::Queued,
+    };
+    app.accounts[0].deferred_mutations.push(entry.clone());
+    assert!(
+        app.visible_warnings().is_empty(),
+        "online Queued is not offline"
+    );
+    app.accounts[0].deferred_mutations[0].state = DeferredMutationState::NeedsReview;
+    app.accounts[0]
+        .inflight_deferred_mutations
+        .insert(45, entry);
+    assert!(
+        app.visible_warnings().is_empty(),
+        "inflight is not uncertain"
+    );
+    app.accounts[0].inflight_deferred_mutations.clear();
+    assert!(
+        app.visible_warnings()
+            .iter()
+            .any(|line| line.contains("manual review"))
+    );
+    app.inspect_warnings();
+    assert!(app.visible_warnings().is_empty());
+    assert!(
+        app.all_warnings()
+            .iter()
+            .any(|line| line.contains("NOT retry"))
+    );
+    app.accounts[0].deferred_mutations.clear();
+    assert!(app.visible_warnings().is_empty());
+}
+
+#[test]
+fn offline_delete_notice_is_amber_acknowledgeable_and_reappears_for_new_work() {
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState};
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let entry = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 12,
+        ids: vec![MessageId("imap-uid:12:34".into())],
+        kind: DeferredMutationKind::Delete,
+        state: DeferredMutationState::Queued,
+    };
+    app.accounts[0]
+        .offline_notice_mutations
+        .insert(super::mutation_notice_key(&entry));
+    app.accounts[0].deferred_mutations.push(entry);
+    assert!(
+        app.visible_warnings()
+            .iter()
+            .any(|line| line.contains("1 email queued for deletion"))
+    );
+    assert!(
+        app.warning_banner_label()
+            .is_some_and(|label| label.contains("notice"))
+    );
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('!'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.show_startup_warnings);
+    assert!(
+        app.visible_warnings().is_empty(),
+        "ack clears the banner immediately"
+    );
+    assert!(
+        app.all_warnings()
+            .iter()
+            .any(|line| line.contains("queued for deletion"))
+    );
+    app.show_startup_warnings = false;
+    app.accounts[0].capabilities = Some(crate::model::Capabilities::MAILDIR);
+    assert!(app.visible_warnings().is_empty(), "ack survives reconnect");
+    let next = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 12,
+        ids: vec![MessageId("imap-uid:12:35".into())],
+        kind: DeferredMutationKind::Delete,
+        state: DeferredMutationState::Queued,
+    };
+    app.accounts[0]
+        .offline_notice_mutations
+        .insert(super::mutation_notice_key(&next));
+    app.accounts[0].deferred_mutations.push(next);
+    assert!(
+        !app.visible_warnings().is_empty(),
+        "new offline work deserves a new notice"
+    );
+    app.inspect_warnings();
+    app.show_startup_warnings = false;
+    app.accounts[0].deferred_mutations.remove(0);
+    assert!(
+        app.visible_warnings().is_empty(),
+        "shrinking an acknowledged queue is not a new notice"
+    );
+    app.accounts[0].deferred_mutations.clear();
+    assert!(
+        app.visible_warnings().is_empty(),
+        "completed queue clears the banner"
+    );
+}
+
+#[test]
+fn offline_outbox_notice_clears_only_after_confirmed_send() {
+    use crate::outgoing::outbox::{QueuedSend, SendState};
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let message = crate::model::OutgoingMessage {
+        from: "sender@example.org".into(),
+        to: "friend@example.net".into(),
+        cc: String::new(),
+        bcc: String::new(),
+        subject: "Offline".into(),
+        body: "Body".into(),
+        html_body: None,
+        attachments: vec![],
+        custom_headers: vec![],
+        in_reply_to: None,
+        references: vec![],
+        forwarded_raw: None,
+    };
+    let entry = QueuedSend::new(message, None, None, None).unwrap();
+    let id = entry.id.clone();
+    app.accounts[0].offline_notice_sends.insert(id.clone());
+    app.accounts[0].outbox.push(entry);
+    assert!(
+        app.visible_warnings()
+            .iter()
+            .any(|line| line.contains("queued for sending"))
+    );
+    app.accounts[0].capabilities = Some(crate::model::Capabilities::MAILDIR);
+    app.accounts[0].outbox[0].state = SendState::NeedsReview;
+    app.accounts[0].inflight_outbox.insert(55, id);
+    assert!(
+        app.visible_warnings()
+            .iter()
+            .any(|line| line.contains("awaiting server confirmation"))
+    );
+    let _ = app.accounts[0].finish_outbox(55, true);
+    assert!(
+        app.visible_warnings().is_empty(),
+        "SMTP ACK clears the notice"
+    );
+}
+
+#[test]
+fn connection_failure_notices_do_not_flash_during_initial_login() {
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    assert!(app.visible_warnings().is_empty());
+    app.accounts[0].mark_disconnected();
+    assert!(
+        app.visible_warnings()
+            .iter()
+            .any(|line| line.contains("connection unavailable"))
+    );
+    app.inspect_warnings();
+    assert!(app.visible_warnings().is_empty());
+    app.accounts[0].mark_disconnected();
+    assert!(
+        app.visible_warnings().is_empty(),
+        "retry must not re-notify same outage"
+    );
+    app.accounts[0].offline_incident_active = false;
+    app.accounts[0].capabilities = Some(crate::model::Capabilities::MAILDIR);
+    assert!(app.visible_warnings().is_empty());
+    app.accounts[0].mark_disconnected();
+    assert!(
+        !app.visible_warnings().is_empty(),
+        "new outage should be visible"
+    );
 }
 
 #[test]

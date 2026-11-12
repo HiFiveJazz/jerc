@@ -75,6 +75,222 @@ impl MailBackend for FakeBackend {
     }
 }
 
+// A deterministic stand-in for TCP/TLS/IMAP-greeting stalls. No internet,
+// OAuth credentials, or slow sleeps are required to reproduce the original UI
+// freeze. The worker is stuck in connect() until the test releases it.
+struct PausedConnect {
+    started: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl MailBackend for PausedConnect {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::IMAP_BASIC
+    }
+    fn connect(&mut self) -> Result<()> {
+        let _ = self.started.send(());
+        let _ = self.release.recv();
+        Ok(())
+    }
+    fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>> {
+        Ok(vec![])
+    }
+    fn mailbox_status(&mut self, _: &str) -> Result<(usize, usize)> {
+        Ok((0, 0))
+    }
+    fn open_mailbox(&mut self, _: &str, offset: usize, _: usize) -> Result<MessagePage> {
+        Ok(MessagePage {
+            messages: vec![],
+            offset,
+            next_offset: offset,
+            has_more: false,
+        })
+    }
+    fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody> {
+        FakeBackend.fetch_body(mailbox, id)
+    }
+    fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
+        FakeBackend.fetch_raw(mailbox, id)
+    }
+    fn set_seen(&mut self, _: &str, _: &MessageId, _: bool) -> Result<()> {
+        Ok(())
+    }
+    fn delete(&mut self, _: &str, _: &MessageId) -> Result<()> {
+        Ok(())
+    }
+    fn move_to(&mut self, _: &str, _: &str, _: &MessageId) -> Result<()> {
+        Ok(())
+    }
+}
+
+// Run the reload on an isolated surrogate UI thread so a regression in
+// shutdown cannot hang the entire test suite forever. Always unblock IMAP
+// before reporting a failed assertion.
+fn assert_reload_is_nonblocking(worker: WorkerHandle, release: std::sync::mpsc::SyncSender<()>) {
+    let (done_tx, done_rx) = sync_channel(1);
+    let reload = std::thread::spawn(move || {
+        let mut worker = worker;
+        let started = std::time::Instant::now();
+        worker.retire_for_reload();
+        drop(worker);
+        let _ = done_tx.send(started.elapsed());
+    });
+    let elapsed = done_rx.recv_timeout(Duration::from_millis(750));
+    release.send(()).unwrap();
+    reload.join().unwrap();
+    assert!(
+        elapsed.is_ok_and(|elapsed| elapsed < Duration::from_millis(750)),
+        "account reload waited for a blocked network worker",
+    );
+}
+
+#[test]
+fn reload_retirement_does_not_join_a_blocked_initial_imap_connect() {
+    let (started_tx, started_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let (events_tx, _events_rx) = sync_channel(8);
+    let backend = PausedConnect {
+        started: started_tx,
+        release: release_rx,
+    };
+    let worker = WorkerHandle::spawn(0, Box::new(backend), None, None, events_tx);
+    worker.post(ActionKind::Connect).unwrap();
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("connect was entered");
+    assert_reload_is_nonblocking(worker, release_tx);
+}
+
+#[test]
+fn reload_retirement_does_not_join_a_stalled_status_connection() {
+    let (started_tx, started_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let (events_tx, _events_rx) = sync_channel(8);
+    let backend = PausedConnect {
+        started: started_tx,
+        release: release_rx,
+    };
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(FakeBackend),
+        Some(Box::new(backend)),
+        None,
+        events_tx,
+    );
+    worker
+        .post(ActionKind::MailboxStatus("INBOX".into()))
+        .unwrap();
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("STATUS connected");
+    assert_reload_is_nonblocking(worker, release_tx);
+}
+
+#[test]
+fn reload_retirement_does_not_wait_for_full_action_queue() {
+    let (started_tx, started_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let (events_tx, _events_rx) = sync_channel(128);
+    let backend = PausedConnect {
+        started: started_tx,
+        release: release_rx,
+    };
+    let worker = WorkerHandle::spawn(0, Box::new(backend), None, None, events_tx);
+    worker.post(ActionKind::Connect).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    for _ in 0..64 {
+        worker.post(ActionKind::ListMailboxes).unwrap();
+    }
+    assert_reload_is_nonblocking(worker, release_tx);
+}
+
+#[test]
+fn account_reload_waits_for_write_ack_not_merely_backend_completion() {
+    let (events_tx, events_rx) = sync_channel(8);
+    let mut worker = WorkerHandle::spawn(0, Box::new(FakeBackend), None, None, events_tx);
+    let id = worker
+        .post(ActionKind::Delete {
+            mailbox: "INBOX".into(),
+            id: MessageId("old-message".into()),
+        })
+        .unwrap();
+    assert!(worker.has_unacknowledged_writes());
+    let event = recv_initial_foreground(&events_rx);
+    assert_eq!(event.request_id, id);
+    assert!(
+        worker.has_unacknowledged_writes(),
+        "queued ACK is not yet applied"
+    );
+    worker.acknowledge_foreground_event(id);
+    assert!(!worker.has_unacknowledged_writes());
+    worker.retire_for_reload();
+}
+
+#[test]
+fn a_failed_connect_can_be_retried_without_rebuilding_the_worker() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct FlakyConnect(Arc<AtomicUsize>);
+    impl MailBackend for FlakyConnect {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::IMAP_BASIC
+        }
+        fn connect(&mut self) -> Result<()> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("simulated TCP failure")
+            }
+            Ok(())
+        }
+        fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>> {
+            Ok(vec![])
+        }
+        fn mailbox_status(&mut self, _: &str) -> Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+        fn open_mailbox(&mut self, _: &str, offset: usize, _: usize) -> Result<MessagePage> {
+            Ok(MessagePage {
+                messages: vec![],
+                offset,
+                next_offset: offset,
+                has_more: false,
+            })
+        }
+        fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody> {
+            FakeBackend.fetch_body(mailbox, id)
+        }
+        fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
+            FakeBackend.fetch_raw(mailbox, id)
+        }
+        fn set_seen(&mut self, _: &str, _: &MessageId, _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn delete(&mut self, _: &str, _: &MessageId) -> Result<()> {
+            Ok(())
+        }
+        fn move_to(&mut self, _: &str, _: &str, _: &MessageId) -> Result<()> {
+            Ok(())
+        }
+    }
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = sync_channel(8);
+    let mut worker = WorkerHandle::spawn(
+        0,
+        Box::new(FlakyConnect(Arc::clone(&attempts))),
+        None,
+        None,
+        tx,
+    );
+    let first = worker.post(ActionKind::Connect).unwrap();
+    let error = recv_initial_foreground(&rx);
+    assert_eq!(first, error.request_id);
+    assert!(matches!(error.kind, WorkerEventKind::Error(_)));
+    let second = worker.post(ActionKind::Connect).unwrap();
+    let connected = recv_initial_foreground(&rx);
+    assert_eq!(second, connected.request_id);
+    assert!(matches!(connected.kind, WorkerEventKind::Connected { .. }));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    worker.shutdown();
+}
+
 #[test]
 fn worker_preserves_request_correlation() {
     let (tx, rx) = sync_channel(8);

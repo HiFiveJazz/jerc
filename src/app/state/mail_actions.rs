@@ -49,11 +49,17 @@ impl AccountState {
             ));
         }
         let mut next = self.deferred_mutations.clone();
+        let offline_key = (self.capabilities.is_none()
+            || self.unverified_mailboxes.contains(&entry.mailbox))
+        .then(|| mutation_notice_key(&entry));
         next.push(entry);
         let writer = self.cache_writer.as_ref().ok_or_else(|| {
             std::io::Error::other("offline mutation queue is unavailable for this account")
         })?;
         writer.save_mutations(&next)?;
+        if let Some(key) = offline_key {
+            self.offline_notice_mutations.insert(key);
+        }
         self.deferred_mutations = next;
         Ok(())
     }
@@ -193,6 +199,8 @@ impl AccountState {
             return false;
         };
         if succeeded {
+            self.offline_notice_mutations
+                .remove(&mutation_notice_key(&entry));
             self.deferred_mutations
                 .retain(|record| !(record.mailbox == entry.mailbox && record.ids == entry.ids));
             let destination = match &entry.kind {

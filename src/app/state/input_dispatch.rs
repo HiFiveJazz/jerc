@@ -68,7 +68,7 @@ impl App {
             }
             return;
         }
-        if !self.visible_warnings().is_empty()
+        if !self.all_warnings().is_empty()
             && key.code == KeyCode::Char('!')
             && self.composer.is_none()
             && !self.attachment_picker_visible
@@ -76,7 +76,7 @@ impl App {
             && !self.theme_picker_visible
             && self.confirmation.is_none()
         {
-            self.show_startup_warnings = true;
+            self.inspect_warnings();
             return;
         }
         if self.attachment_picker_visible {

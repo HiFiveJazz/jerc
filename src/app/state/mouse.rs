@@ -127,12 +127,10 @@ impl App {
                     left += 2;
                 }
             }
-            let warnings = self.visible_warnings();
-            if !warnings.is_empty() {
-                let label = format!("  ! {} warning(s) [! to inspect]", warnings.len());
+            if let Some(label) = self.warning_banner_label() {
                 let len = unicode_width::UnicodeWidthStr::width(label.as_str());
                 if (left..left + len).contains(&usize::from(mouse.column)) {
-                    self.show_startup_warnings = true;
+                    self.inspect_warnings();
                     return;
                 }
             }
