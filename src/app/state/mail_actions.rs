@@ -29,6 +29,191 @@ impl AccountState {
     }
 }
 
+impl AccountState {
+    /// Commit before changing any visible state. If the journal cannot be
+    /// written, the UI action must fail without removing cached mail.
+    fn enqueue_mutation(&mut self, entry: cache::DeferredMutation) -> std::io::Result<()> {
+        if !entry.has_valid_identity()
+            || self.deferred_mutations.len() >= cache::MAX_DEFERRED_MUTATIONS
+        {
+            return Err(std::io::Error::other(
+                "invalid mailbox generation or offline queue full",
+            ));
+        }
+        if self.deferred_mutations.iter().any(|existing| {
+            existing.mailbox == entry.mailbox
+                && existing.ids.iter().any(|id| entry.ids.contains(id))
+        }) {
+            return Err(std::io::Error::other(
+                "a mailbox change is already queued for this message",
+            ));
+        }
+        let mut next = self.deferred_mutations.clone();
+        next.push(entry);
+        let writer = self.cache_writer.as_ref().ok_or_else(|| {
+            std::io::Error::other("offline mutation queue is unavailable for this account")
+        })?;
+        writer.save_mutations(&next)?;
+        self.deferred_mutations = next;
+        Ok(())
+    }
+
+    fn save_deferred_mutations(&self) -> std::io::Result<()> {
+        self.cache_writer
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("offline journal is unavailable"))?
+            .save_mutations(&self.deferred_mutations)
+    }
+
+    /// Hide locally queued moves/deletes on both cached restoration and a
+    /// later server-page refresh, until we receive a definite IMAP ACK.
+    pub(super) fn overlay_deferred_mutations(&mut self) {
+        let Some(mailbox) = self.current_mailbox.as_deref() else {
+            return;
+        };
+        let Some(validity) = self.uid_validities.get(mailbox).copied() else {
+            return;
+        };
+        let hidden = self
+            .deferred_mutations
+            .iter()
+            .filter(|entry| entry.mailbox == mailbox && entry.validity == validity)
+            .filter(|entry| {
+                !matches!(&entry.kind, cache::DeferredMutationKind::Unarchive { .. })
+                    || !(mailbox.to_ascii_lowercase().starts_with("[gmail]/")
+                        || mailbox.to_ascii_lowercase().starts_with("[googlemail]/"))
+            })
+            .flat_map(|entry| entry.ids.iter())
+            .collect::<HashSet<_>>();
+        if hidden.is_empty() {
+            return;
+        }
+        self.messages
+            .retain(|message| !hidden.contains(&message.id));
+        for id in hidden {
+            self.bodies.remove(id);
+            self.pending_bodies.remove(id);
+            self.pending_seen.remove(id);
+        }
+        self.message_index = self
+            .message_index
+            .min(self.messages.len().saturating_sub(1));
+        self.keep_message_cursor_visible();
+    }
+
+    /// The IMAP backend SELECTs the named source and checks every embedded
+    /// UIDVALIDITY *again*, immediately before executing each mutation. This
+    /// permits replay for unopened mailboxes without trusting a cached UID.
+    /// Persist NeedsReview before posting: a crash after SMTP-like ambiguous
+    /// network success must not cause an unsafe automatic duplicate move.
+    pub(super) fn pump_deferred_mutations(&mut self) {
+        if self.capabilities.is_none() {
+            return;
+        }
+        if !self.inflight_deferred_mutations.is_empty() {
+            return;
+        }
+        let ready = self
+            .deferred_mutations
+            .iter()
+            .filter(|entry| entry.state == cache::DeferredMutationState::Queued)
+            .take(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in ready {
+            if !entry.has_valid_identity() {
+                continue;
+            }
+            if let Some(record) = self
+                .deferred_mutations
+                .iter_mut()
+                .find(|record| record.mailbox == entry.mailbox && record.ids == entry.ids)
+            {
+                record.state = cache::DeferredMutationState::NeedsReview;
+            } else {
+                continue;
+            }
+            if self.save_deferred_mutations().is_err() {
+                if let Some(record) = self
+                    .deferred_mutations
+                    .iter_mut()
+                    .find(|record| record.mailbox == entry.mailbox && record.ids == entry.ids)
+                {
+                    record.state = cache::DeferredMutationState::Queued;
+                }
+                break;
+            }
+            let action = match &entry.kind {
+                cache::DeferredMutationKind::Delete => ActionKind::DeleteMany {
+                    mailbox: entry.mailbox.clone(),
+                    ids: entry.ids.clone(),
+                },
+                cache::DeferredMutationKind::Move { destination } => ActionKind::MoveMany {
+                    source: entry.mailbox.clone(),
+                    destination: destination.clone(),
+                    ids: entry.ids.clone(),
+                },
+                cache::DeferredMutationKind::Archive { destination } => ActionKind::ArchiveMany {
+                    source: entry.mailbox.clone(),
+                    destination: destination.clone(),
+                    ids: entry.ids.clone(),
+                },
+                cache::DeferredMutationKind::Unarchive { destination } => {
+                    ActionKind::UnarchiveMany {
+                        source: entry.mailbox.clone(),
+                        destination: destination.clone(),
+                        ids: entry.ids.clone(),
+                    }
+                }
+            };
+            match self.worker.post(action) {
+                Ok(request_id) => {
+                    self.inflight_deferred_mutations.insert(request_id, entry);
+                    self.pending_mutation_labels
+                        .insert(request_id, "offline mailbox action synchronized");
+                }
+                Err(_) => {
+                    if let Some(record) = self
+                        .deferred_mutations
+                        .iter_mut()
+                        .find(|record| record.mailbox == entry.mailbox && record.ids == entry.ids)
+                    {
+                        record.state = cache::DeferredMutationState::Queued;
+                    }
+                    // Not submitted to a worker, so definitely safe to retry.
+                    let _ = self.save_deferred_mutations();
+                    break;
+                }
+            }
+        }
+    }
+
+    pub(super) fn finish_deferred_mutation(&mut self, request_id: u64, succeeded: bool) -> bool {
+        let Some(entry) = self.inflight_deferred_mutations.remove(&request_id) else {
+            return false;
+        };
+        if succeeded {
+            self.deferred_mutations
+                .retain(|record| !(record.mailbox == entry.mailbox && record.ids == entry.ids));
+            let destination = match &entry.kind {
+                cache::DeferredMutationKind::Delete => None,
+                cache::DeferredMutationKind::Move { destination }
+                | cache::DeferredMutationKind::Archive { destination }
+                | cache::DeferredMutationKind::Unarchive { destination } => {
+                    Some(destination.as_str())
+                }
+            };
+            if let Some(destination) = destination {
+                self.invalidate_remote_folder(destination);
+            }
+        }
+        // On failure NeedsReview stays on disk. Failure may be a timeout
+        // after a successful COPY, and automatic retries could duplicate mail.
+        let _ = self.save_deferred_mutations();
+        true
+    }
+}
+
 impl App {
     pub(super) fn toggle_seen(&mut self) {
         let Some(account) = self.account_mut() else {
@@ -633,16 +818,62 @@ impl App {
         if ids.is_empty() {
             return;
         }
-        // Moving/deleting a cached row before SELECT could mutate a different
-        // email if the server recycled UIDs. These actions are intentionally
-        // unavailable offline until we have a validated operation journal.
-        if self
+        // Store an IMAP mutation in a private, crash-durable journal BEFORE
+        // optimistic removal. Replay validates the UID generation on SELECT.
+        // Maildir and uncached accounts retain their direct worker path.
+        let is_unverified = self
             .account()
-            .is_some_and(|account| account.unverified_mailboxes.contains(&source))
-        {
-            self.status = StatusLine::error(
-                "cached mailbox is still syncing; delete/archive requires server verification",
-            );
+            .is_some_and(|account| account.unverified_mailboxes.contains(&source));
+        let validity = self.account().and_then(|account| {
+            account.cache_writer.as_ref()?;
+            account.uid_validities.get(&source).copied()
+        });
+        if let Some(validity) = validity {
+            let journal_kind = match &kind {
+                MutationKind::Delete => cache::DeferredMutationKind::Delete,
+                MutationKind::Move { destination } => cache::DeferredMutationKind::Move {
+                    destination: destination.clone(),
+                },
+                MutationKind::Archive { destination } => cache::DeferredMutationKind::Archive {
+                    destination: destination.clone(),
+                },
+                MutationKind::Unarchive { destination } => cache::DeferredMutationKind::Unarchive {
+                    destination: destination.clone(),
+                },
+            };
+            let entry = cache::DeferredMutation {
+                mailbox: source.clone(),
+                validity,
+                ids: ids.clone(),
+                kind: journal_kind,
+                state: cache::DeferredMutationState::Queued,
+            };
+            let result = self
+                .account_mut()
+                .expect("account exists")
+                .enqueue_mutation(entry);
+            if let Err(error) = result {
+                self.status = StatusLine::error(format!("mailbox change not queued: {error}"));
+                return;
+            }
+            self.remove_messages_locally(&source, &ids, &kind);
+            self.visual_anchor = None;
+            self.message_marked.clear();
+            if self.message_open {
+                self.close_message();
+            }
+            if let Some(account) = self.account_mut() {
+                account.pump_deferred_mutations();
+            }
+            self.status = if is_unverified {
+                StatusLine::info("mailbox action saved offline; will sync on reconnect")
+            } else {
+                StatusLine::info("mailbox action saved; syncing with server")
+            };
+            return;
+        }
+        if is_unverified {
+            self.status = StatusLine::error("offline action requires a cached IMAP UIDVALIDITY");
             return;
         }
         let action = match &kind {
@@ -736,7 +967,9 @@ impl App {
             && (source.to_ascii_lowercase().starts_with("[gmail]/")
                 || source.to_ascii_lowercase().starts_with("[googlemail]/"))
         {
-            account.forget_cached_folder(destination);
+            if !account.unverified_mailboxes.contains(source) {
+                account.forget_cached_folder(destination);
+            }
             if let Some(mailbox) = account
                 .mailboxes
                 .iter_mut()
@@ -778,7 +1011,9 @@ impl App {
             // A destination cache cannot know about the moved messages without
             // a server response containing their destination UIDs. Drop only
             // that cache; the active source list stays updated locally.
-            account.forget_cached_folder(destination);
+            if !account.unverified_mailboxes.contains(source) {
+                account.forget_cached_folder(destination);
+            }
             if let Some(mailbox) = account
                 .mailboxes
                 .iter_mut()

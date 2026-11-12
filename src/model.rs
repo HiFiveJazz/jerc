@@ -604,14 +604,14 @@ fn looks_like_tracking_image(source: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutgoingAttachment {
     pub filename: String,
     pub content_type: String,
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutgoingMessage {
     pub from: String,
     pub to: String,

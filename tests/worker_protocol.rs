@@ -1,4 +1,4 @@
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,7 +6,23 @@ use anyhow::Result;
 use jerc::backend::MailBackend;
 use jerc::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingMessage};
 use jerc::outgoing::{MailSender, SendReceipt};
-use jerc::worker::{ActionKind, RuntimeEvent, WorkerEventKind, WorkerHandle};
+use jerc::worker::{ActionKind, RuntimeEvent, WorkerEvent, WorkerEventKind, WorkerHandle};
+
+// Foreground actions carry a worker generation so the runtime can reject
+// results from a replaced, stalled IMAP session. A freshly spawned worker
+// always starts at generation zero.
+fn recv_initial_foreground(rx: &Receiver<RuntimeEvent>) -> WorkerEvent {
+    match rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker event")
+    {
+        RuntimeEvent::ForegroundWorker {
+            generation: 0,
+            event,
+        } => event,
+        other => panic!("expected generation-0 foreground event, got {other:?}"),
+    }
+}
 
 struct FakeBackend;
 
@@ -64,9 +80,7 @@ fn worker_preserves_request_correlation() {
     let (tx, rx) = sync_channel(8);
     let mut worker = WorkerHandle::spawn(3, Box::new(FakeBackend), None, None, tx);
     let request_id = worker.post(ActionKind::Connect).unwrap();
-    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
-        panic!("expected worker event");
-    };
+    let event = recv_initial_foreground(&rx);
     assert_eq!(event.account, 3);
     assert_eq!(event.request_id, request_id);
     assert!(matches!(event.kind, WorkerEventKind::Connected { .. }));
@@ -85,9 +99,7 @@ fn worker_preserves_pagination_metadata() {
             hint: None,
         })
         .unwrap();
-    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
-        panic!("expected worker event");
-    };
+    let event = recv_initial_foreground(&rx);
     assert_eq!(event.request_id, request_id);
     let WorkerEventKind::MailboxOpened { name, page, .. } = event.kind else {
         panic!("expected mailbox page");
@@ -210,9 +222,7 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
         })
         .unwrap();
 
-    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
-        panic!("expected worker event");
-    };
+    let event = recv_initial_foreground(&rx);
     let WorkerEventKind::MessageSent {
         smtp_status,
         sent_mailbox,
@@ -267,9 +277,7 @@ fn sent_append_failure_is_reported_and_not_retried_as_smtp_send() {
             copy_to: None,
         })
         .unwrap();
-    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
-        panic!("worker event expected");
-    };
+    let event = recv_initial_foreground(&rx);
     let WorkerEventKind::MessageSent {
         sent_copy_saved,
         sent_copy_warning,
@@ -314,9 +322,7 @@ fn sent_copy_can_be_disabled_without_appending_to_server() {
             copy_to: Some(Vec::new()),
         })
         .unwrap();
-    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
-        panic!("worker event expected");
-    };
+    let event = recv_initial_foreground(&rx);
     let WorkerEventKind::MessageSent {
         sent_copy_saved,
         sent_copy_disabled,
@@ -361,9 +367,7 @@ fn sent_copy_explicit_multiple_folders_appends_both() {
             copy_to: Some(vec!["Sent".into(), "Project Archive".into()]),
         })
         .unwrap();
-    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
-        panic!("worker event expected");
-    };
+    let event = recv_initial_foreground(&rx);
     let WorkerEventKind::MessageSent {
         sent_copy_saved,
         sent_copy_warning,

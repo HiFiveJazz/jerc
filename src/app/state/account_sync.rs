@@ -87,7 +87,7 @@ impl MailboxStatusQueue {
         None
     }
 
-    fn start(&mut self, request_id: u64, request: StatusRequest) {
+    pub(super) fn start(&mut self, request_id: u64, request: StatusRequest) {
         debug_assert!(self.in_flight.is_none());
         self.in_flight = Some(StatusInFlight {
             request_id,
@@ -103,7 +103,16 @@ impl MailboxStatusQueue {
         self.in_flight.take().map(|in_flight| in_flight.request)
     }
 
-    fn busy(&self) -> bool {
+    /// A background STATUS request may never finish when its connection dies.
+    /// Clear only that request's correlation, and retry it after reconnection.
+    /// Late replies must not be applied to the new connection's counts.
+    pub(super) fn reset_connection(&mut self) {
+        if let Some(in_flight) = self.in_flight.take() {
+            self.enqueue(in_flight.request.name, StatusReason::Refresh);
+        }
+    }
+
+    pub(super) fn busy(&self) -> bool {
         self.in_flight.is_some()
     }
 }
@@ -136,6 +145,7 @@ impl App {
     pub fn poll_inboxes(&mut self) {
         for account in &mut self.accounts {
             if account.capabilities.is_none()
+                || account.connecting
                 || account.mailboxes_loading
                 || account.status_requests.busy()
                 || !account.pending_mutation_labels.is_empty()
@@ -156,7 +166,9 @@ impl App {
     }
 
     pub(super) fn pump_mailbox_status(account: &mut AccountState) {
-        if account.status_requests.busy()
+        if account.capabilities.is_none()
+            || account.connecting
+            || account.status_requests.busy()
             || account.messages_loading
             || !account.pending_bodies.is_empty()
             || !account.pending_mutation_labels.is_empty()
@@ -243,5 +255,78 @@ mod tests {
             queue.pop_ready(&[known("INBOX", true)]).unwrap().reason,
             StatusReason::Refresh
         );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn reset_cancels_inflight_and_preserves_refresh_for_later() {
+        let mut queue = MailboxStatusQueue::default();
+        queue.start(
+            100,
+            StatusRequest {
+                name: "INBOX".into(),
+                reason: StatusReason::Initial,
+            },
+        );
+        queue.reset_connection();
+        assert!(!queue.busy());
+        assert!(queue.finish(100).is_none());
+        let recovered = queue
+            .pop_ready(&[Mailbox {
+                name: "INBOX".into(),
+                role: MailboxRole::Inbox,
+                total: 1,
+                unread: 0,
+                counts_known: true,
+            }])
+            .unwrap();
+        assert_eq!(recovered.reason, StatusReason::Refresh);
+    }
+
+    #[test]
+    fn reset_is_idempotent_and_does_not_duplicate_pending_refresh() {
+        let mut queue = MailboxStatusQueue::default();
+        queue.enqueue("INBOX".into(), StatusReason::Refresh);
+        queue.start(
+            101,
+            StatusRequest {
+                name: "INBOX".into(),
+                reason: StatusReason::Initial,
+            },
+        );
+        queue.reset_connection();
+        queue.reset_connection();
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(queue.pending[0].reason, StatusReason::Refresh);
+    }
+
+    #[test]
+    fn late_completion_after_reset_does_not_evict_new_inflight_request() {
+        let mut queue = MailboxStatusQueue::default();
+        queue.start(
+            102,
+            StatusRequest {
+                name: "INBOX".into(),
+                reason: StatusReason::Refresh,
+            },
+        );
+        queue.reset_connection();
+        let request = queue
+            .pop_ready(&[Mailbox {
+                name: "INBOX".into(),
+                role: MailboxRole::Inbox,
+                total: 1,
+                unread: 0,
+                counts_known: true,
+            }])
+            .unwrap();
+        queue.start(103, request);
+        assert!(queue.finish(102).is_none());
+        assert!(queue.busy());
+        assert!(queue.finish(103).is_some());
     }
 }

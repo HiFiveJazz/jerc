@@ -21,7 +21,7 @@ Jerc is a light-weight terminal mail app, acting as a successor to **[aerc](http
 
 | Feature| Highlights |
 | --- | --- |
-| **Mail** | IMAP and Maildir accounts, multiple mailboxes, background refresh, and cached message lists. |
+| **Mail** | IMAP and Maildir accounts, multiple mailboxes, background refresh, and local-first cached reading. |
 | **Attachment Previews** | Preview attachments like PDFs, images, and more! |
 | **Keyboard-First** | Vim motions and relative line numbers, smooth scrolling, searchable `?` help, and mouse support. |
 | **Effecient Actions** | Visual selection, persistent marks, bulk actions, archive, spam handling, and in-mailbox filtering. |
@@ -139,6 +139,7 @@ The full reference lives in **[Keybindings](docs/keybindings.md)**. Press `?` in
 
 - **[Keybindings](docs/keybindings.md)** — mail, reader, Compose, Contacts, attachments, and picker.
 - **[Configuration](docs/configuration.md)** — accounts, privacy defaults, themes, layouts, and storage paths.
+- **[Offline cache](docs/offline-cache.md)** — local-first reading, disk limits, and IMAP reconciliation.
 - **[OAuth & account discovery](docs/oauth.md)** — Google, Microsoft, and sign-in troubleshooting.
 - **[Contacts](docs/contacts.md)** — contacts management and recipient autocomplete.
 - **[Architecture](ARCHITECTURE.md)** — rendering, backend workers, state, and performance invariants.

@@ -68,7 +68,7 @@ impl App {
             }
             return;
         }
-        if !self.startup_warnings.is_empty()
+        if !self.visible_warnings().is_empty()
             && key.code == KeyCode::Char('!')
             && self.composer.is_none()
             && !self.attachment_picker_visible

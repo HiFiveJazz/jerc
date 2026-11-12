@@ -1,4 +1,5 @@
 pub mod drafts;
+pub(crate) mod outbox;
 mod sendmail;
 mod smtp;
 mod wire;

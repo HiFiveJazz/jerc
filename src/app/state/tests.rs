@@ -429,6 +429,9 @@ fn unrelated_worker_failure_cannot_unlock_or_discard_an_inflight_send() {
         "[[accounts]]\nname = \"Local\"\nsource = \"maildir:///tmp/mail\"\noutgoing = \"sendmail:///usr/sbin/sendmail\"\nfrom = \"sender@example.org\""
     ).unwrap();
     let mut app = super::App::new(&config, vec![worker]);
+    // The test exercises an active SMTP send, not the disconnected Outbox path.
+    // Account capabilities are ordinarily set by the Connected worker event.
+    app.accounts[0].capabilities = Some(crate::model::Capabilities::MAILDIR);
     let mut composer = Composer::new();
     composer.to = "friend@example.net".into();
     composer.subject = "Don't lose this".into();
@@ -448,7 +451,9 @@ fn unrelated_worker_failure_cannot_unlock_or_discard_an_inflight_send() {
         "unrelated error cannot end a send"
     );
     assert_eq!(app.pending_send, Some((account_id, send_id)));
-    let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+    let RuntimeEvent::ForegroundWorker { event, .. } =
+        rx.recv_timeout(Duration::from_secs(2)).unwrap()
+    else {
         panic!("expected worker response");
     };
     assert_eq!(event.request_id, send_id);
@@ -2750,4 +2755,350 @@ fn cached_rows_keep_normal_colors_and_sync_is_footer_only() {
     let before = app.sync_spinner().to_owned();
     app.advance_sync_spinner();
     assert_ne!(app.sync_spinner(), before);
+}
+
+#[test]
+fn deferred_offline_delete_hides_only_original_uid_generation() {
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState};
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let account = app.account_mut().unwrap();
+    let raw = b"From: User <a@example.org>\r\nSubject: Offline\r\n\r\nHello";
+    let id_old = MessageId("imap-uid:81:3".into());
+    let id_new = MessageId("imap-uid:82:3".into());
+    account.current_mailbox = Some("INBOX".into());
+    account.uid_validities.insert("INBOX".into(), 81);
+    account.messages = vec![
+        crate::mail::parse_summary(id_old.clone(), raw, raw.len() as u64, MessageFlags::empty())
+            .unwrap(),
+        crate::mail::parse_summary(id_new.clone(), raw, raw.len() as u64, MessageFlags::empty())
+            .unwrap(),
+    ];
+    account.deferred_mutations.push(DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 81,
+        ids: vec![id_old.clone()],
+        kind: DeferredMutationKind::Delete,
+        state: DeferredMutationState::Queued,
+    });
+    account.overlay_deferred_mutations();
+    assert_eq!(account.messages.len(), 1);
+    assert_eq!(account.messages[0].id, id_new);
+    // On a new UIDVALIDITY the pending old UID must not hide new-generation mail.
+    account.uid_validities.insert("INBOX".into(), 82);
+    account.overlay_deferred_mutations();
+    assert_eq!(account.messages.len(), 1);
+}
+
+#[test]
+fn offline_reconnect_is_deduplicated_and_refresh_preserves_cached_mail() {
+    use crate::worker::{RuntimeEvent, WorkerEventKind, WorkerHandle};
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+    let root = tempfile::tempdir().unwrap();
+    // MaildirBackend::connect requires all three standard Maildir folders.
+    // A bare temporary directory is not a valid online Maildir fixture.
+    for folder in ["cur", "new", "tmp"] {
+        std::fs::create_dir(root.path().join(folder)).unwrap();
+    }
+    let (tx, rx) = sync_channel(16);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(
+            root.path().to_path_buf(),
+        )),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
+    let mut app = super::App::new(&config, vec![worker]);
+    app.accounts[0].current_mailbox = Some("INBOX".into());
+    let raw = b"From: a@example.org\r\nSubject: Cached\r\n\r\nbody";
+    let id = MessageId("cached-uid".into());
+    app.accounts[0].messages.push(
+        crate::mail::parse_summary(id, raw, raw.len() as u64, MessageFlags::empty()).unwrap(),
+    );
+    app.refresh();
+    assert!(app.accounts[0].connecting);
+    assert_eq!(
+        app.accounts[0].messages.len(),
+        1,
+        "refresh cannot erase offline mail"
+    );
+    let pending = app.accounts[0].connect_request_id;
+    app.reconnect_offline_accounts();
+    assert_eq!(app.accounts[0].connect_request_id, pending);
+    let RuntimeEvent::ForegroundWorker { event, .. } =
+        rx.recv_timeout(Duration::from_secs(2)).unwrap()
+    else {
+        panic!("expected connect result");
+    };
+    assert_eq!(Some(event.request_id), pending);
+    assert!(
+        matches!(&event.kind, WorkerEventKind::Connected { .. }),
+        "expected a successful Maildir connection, got {:?}",
+        event.kind
+    );
+    app.handle_worker_event(event);
+    assert!(app.accounts[0].capabilities.is_some());
+    assert!(!app.accounts[0].connecting);
+}
+
+#[test]
+fn transport_error_marks_account_offline_but_unrelated_error_does_not() {
+    use crate::worker::{WorkerEvent, WorkerEventKind, WorkerHandle};
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(
+            root.path().to_path_buf(),
+        )),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
+    let mut app = super::App::new(&config, vec![worker]);
+    app.accounts[0].capabilities = Some(crate::model::Capabilities::MAILDIR);
+    assert!(super::worker_events::is_connection_failure(
+        "IMAP account is not connected"
+    ));
+    assert!(super::worker_events::is_connection_failure(
+        "connection reset by peer"
+    ));
+    assert!(!super::worker_events::is_connection_failure(
+        "permission denied"
+    ));
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 900,
+        kind: WorkerEventKind::Error("permission denied".into()),
+    });
+    assert!(
+        app.accounts[0].capabilities.is_some(),
+        "unrelated errors leave connection intact"
+    );
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 901,
+        kind: WorkerEventKind::Error("broken pipe".into()),
+    });
+    assert!(
+        app.accounts[0].capabilities.is_none(),
+        "broken transport requires reconnect"
+    );
+    let transient = super::StatusLine::temporary_error("offline", Duration::from_millis(0));
+    assert!(transient.is_error && transient.expired());
+}
+
+#[test]
+fn offline_warning_banner_tracks_live_queue_instead_of_startup_snapshot() {
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState};
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(
+            root.path().to_path_buf(),
+        )),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().to_path_buf());
+    let mut app = super::App::new(&config, vec![worker]);
+    let baseline = app.visible_warnings();
+    let entry = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 12,
+        ids: vec![MessageId("imap-uid:12:34".into())],
+        kind: DeferredMutationKind::Delete,
+        state: DeferredMutationState::Queued,
+    };
+    app.accounts[0].deferred_mutations.push(entry);
+    assert!(
+        app.visible_warnings()
+            .iter()
+            .any(|warning| warning.contains("queued for reconnect"))
+    );
+    app.accounts[0].deferred_mutations[0].state = DeferredMutationState::NeedsReview;
+    let warnings = app.visible_warnings();
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("queued for reconnect"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("require manual review"))
+    );
+    app.accounts[0].deferred_mutations.clear();
+    assert_eq!(app.visible_warnings(), baseline);
+}
+
+#[test]
+fn oauth_network_failure_before_smtp_automatically_queues_current_composer() {
+    use crate::outgoing::outbox::{SendState, Store};
+    use crate::worker::{WorkerEvent, WorkerEventKind, WorkerHandle};
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config: crate::config::Config = toml::from_str(
+        "[[accounts]]\nname = \"OfflineOAuth\"\nsource = \"maildir:///tmp/oauth-offline-test\"\noutgoing = \"sendmail:///usr/sbin/sendmail\"\nfrom = \"sender@example.org\"",
+    )
+    .unwrap();
+    let mut app = super::App::new(&config, vec![worker]);
+    let path = root.path().join("outbox.json");
+    app.accounts[0].outbox_store = Some(Store::for_test(path.clone()));
+    app.accounts[0].outbox.clear();
+    app.accounts[0].capabilities = Some(crate::model::Capabilities::MAILDIR);
+    let mut composer = Composer::new();
+    composer.to = "friend@example.net".into();
+    composer.subject = "Offline reconnect".into();
+    composer.body = "Message retained safely".into();
+    composer.sending = true;
+    app.composer = Some(composer);
+    app.pending_send = Some((0, 814));
+
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 814,
+        kind: WorkerEventKind::Error("OAuth token request failed (network/TLS error)".into()),
+    });
+    assert!(app.pending_send.is_none());
+    assert!(app.accounts[0].capabilities.is_none());
+    assert!(
+        app.composer.is_none(),
+        "queued composer closes only after saving"
+    );
+    assert_eq!(app.accounts[0].outbox.len(), 1);
+    assert_eq!(app.accounts[0].outbox[0].state, SendState::Queued);
+    assert_eq!(
+        app.accounts[0].outbox[0].message.body,
+        "Message retained safely"
+    );
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        stored["messages"][0]["message"]["subject"].as_str(),
+        Some("Offline reconnect")
+    );
+    assert_eq!(stored["messages"][0]["state"].as_str(), Some("Queued"));
+}
+
+#[test]
+fn oauth_pre_smtp_failure_can_requeue_outbox_but_ambiguous_smtp_failure_cannot() {
+    use crate::outgoing::outbox::{QueuedSend, SendState, Store};
+    use crate::worker::{WorkerEvent, WorkerEventKind, WorkerHandle};
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let path = root.path().join("outbox.json");
+    app.accounts[0].outbox_store = Some(Store::for_test(path.clone()));
+    app.accounts[0].outbox.clear();
+    let email = crate::model::OutgoingMessage {
+        from: "sender@example.org".into(),
+        to: "friend@example.net".into(),
+        cc: String::new(),
+        bcc: String::new(),
+        subject: "Recovery".into(),
+        body: "Body".into(),
+        html_body: None,
+        attachments: Vec::new(),
+        custom_headers: Vec::new(),
+        in_reply_to: None,
+        references: Vec::new(),
+        forwarded_raw: None,
+    };
+    let mut safe = QueuedSend::new(email.clone(), None, None, None).unwrap();
+    safe.state = SendState::NeedsReview;
+    let mut uncertain = QueuedSend::new(email, None, None, None).unwrap();
+    uncertain.state = SendState::NeedsReview;
+    let account = &mut app.accounts[0];
+    account.inflight_outbox.insert(815, safe.id.clone());
+    account.inflight_outbox.insert(816, uncertain.id.clone());
+    account.outbox = vec![safe, uncertain];
+    account
+        .outbox_store
+        .as_ref()
+        .unwrap()
+        .save(&account.outbox)
+        .unwrap();
+
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 815,
+        kind: WorkerEventKind::Error("OAuth token request failed (network/TLS error)".into()),
+    });
+    assert_eq!(app.accounts[0].outbox[0].state, SendState::Queued);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(persisted["messages"][0]["state"].as_str(), Some("Queued"));
+
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 816,
+        kind: WorkerEventKind::Error("connection reset by peer after DATA".into()),
+    });
+    assert_eq!(app.accounts[0].outbox[1].state, SendState::NeedsReview);
+    assert!(
+        app.visible_warnings()
+            .iter()
+            .any(|warning| warning.contains("manual review"))
+    );
+}
+
+#[test]
+fn oauth_pre_smtp_classification_is_narrow_and_does_not_suppress_ambiguous_send_warning() {
+    use super::worker_events::{is_connection_failure, is_pre_smtp_oauth_network_failure};
+    assert!(is_pre_smtp_oauth_network_failure(
+        "OAuth token request failed (network/TLS error)"
+    ));
+    assert!(is_connection_failure(
+        "OAuth token request failed (network/TLS error)"
+    ));
+    for unsafe_error in [
+        "connection reset by peer",
+        "SMTP timed out after DATA",
+        "OAuth token endpoint rejected request (HTTP 401)",
+        "SMTP relay returned: OAuth token request failed (network/TLS error)",
+    ] {
+        assert!(
+            !is_pre_smtp_oauth_network_failure(unsafe_error),
+            "{unsafe_error}"
+        );
+    }
 }

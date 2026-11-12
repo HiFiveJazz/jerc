@@ -390,20 +390,20 @@ pub(super) fn draw_startup_warnings(frame: &mut Frame<'_>, app: &App) {
     let area = centered_rect(frame.area(), 85, 55);
     frame.render_widget(Clear, area);
     let block = Block::default()
-        .title(" Account configuration warnings ")
+        .title(" Startup warnings ")
         .borders(Borders::ALL)
         .border_type(theme.border_type)
         .border_style(theme.error());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let details = app
-        .startup_warnings
-        .iter()
+        .visible_warnings()
+        .into_iter()
         .enumerate()
         .map(|(i, issue)| format!("{}. {}\n", i + 1, issue))
         .collect::<Vec<_>>()
         .join("\n");
     frame.render_widget(Paragraph::new(format!(
-        "Other usable accounts remain active. Fix config.toml and restart to re-enable affected accounts or sending.\n\n{details}\nEsc / q / ! to close"
+        "Review the following issues before continuing. Uncertain offline actions will not be retried automatically.\n\n{details}\nEsc / q / ! to close"
     )).style(theme.text()).wrap(Wrap { trim: false }), inner);
 }

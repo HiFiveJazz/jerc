@@ -30,6 +30,173 @@ const MAX_BODY_STORE_BYTES: u64 = 64 * 1024 * 1024;
 const PRUNE_AFTER_WRITES: usize = 8;
 /// Bounded pending flag changes, scoped to the server's mailbox generation.
 pub(crate) const MAX_DEFERRED_SEEN: usize = 512;
+/// Queue is bounded independently of mailbox index and MIME storage.
+pub(crate) const MAX_DEFERRED_MUTATIONS: usize = 256;
+const MAX_MUTATION_IDS: usize = 512;
+const MAX_MUTATION_JOURNAL_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DeferredMutationKind {
+    Delete,
+    Move { destination: String },
+    Archive { destination: String },
+    Unarchive { destination: String },
+}
+
+/// Once submitted to IMAP, a non-idempotent COPY/MOVE may have partially
+/// succeeded even if the worker reported an error. Never blindly retry it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DeferredMutationState {
+    #[default]
+    Queued,
+    NeedsReview,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DeferredMutation {
+    pub mailbox: String,
+    pub validity: u32,
+    pub ids: Vec<MessageId>,
+    pub kind: DeferredMutationKind,
+    #[serde(default)]
+    pub state: DeferredMutationState,
+}
+
+impl DeferredMutation {
+    pub(crate) fn has_valid_identity(&self) -> bool {
+        !self.mailbox.is_empty()
+            && self.mailbox.len() <= 512
+            && !self.ids.is_empty()
+            && self.ids.len() <= MAX_MUTATION_IDS
+            && self.ids.iter().all(|id| {
+                id.0.len() <= 128 && id.0.starts_with(&format!("imap-uid:{}:", self.validity))
+            })
+            && match &self.kind {
+                DeferredMutationKind::Delete => true,
+                DeferredMutationKind::Move { destination }
+                | DeferredMutationKind::Archive { destination }
+                | DeferredMutationKind::Unarchive { destination } => {
+                    !destination.is_empty()
+                        && destination.len() <= 512
+                        && destination != &self.mailbox
+                }
+            }
+    }
+}
+
+/// Separate, synchronously committed WAL for destructive operations. The
+/// coalescing mailbox cache writer must not race with this journal, and an
+/// abrupt process exit must not lose an acknowledged user action.
+#[derive(Debug, Clone)]
+pub(crate) struct MutationStore {
+    path: PathBuf,
+    readable: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MutationFile {
+    version: u8,
+    entries: Vec<DeferredMutation>,
+}
+
+// Serialize the existing slice directly; avoid cloning the operation journal.
+#[derive(Serialize)]
+struct MutationFileRef<'a> {
+    version: u8,
+    entries: &'a [DeferredMutation],
+}
+
+impl MutationStore {
+    fn read(&self) -> std::io::Result<Vec<DeferredMutation>> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() || metadata.len() > MAX_MUTATION_JOURNAL_BYTES {
+            return Err(std::io::Error::other(
+                "invalid offline operation journal file",
+            ));
+        }
+        let file = File::open(&self.path)?;
+        if file.metadata()?.len() > MAX_MUTATION_JOURNAL_BYTES {
+            return Err(std::io::Error::other(
+                "offline operation journal exceeds size limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_MUTATION_JOURNAL_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_MUTATION_JOURNAL_BYTES {
+            return Err(std::io::Error::other(
+                "offline operation journal exceeds size limit",
+            ));
+        }
+        let journal: MutationFile =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        if journal.version != VERSION
+            || journal.entries.len() > MAX_DEFERRED_MUTATIONS
+            || !journal
+                .entries
+                .iter()
+                .all(DeferredMutation::has_valid_identity)
+        {
+            return Err(std::io::Error::other("invalid offline operation journal"));
+        }
+        Ok(journal.entries)
+    }
+
+    pub(crate) fn save(&self, entries: &[DeferredMutation]) -> std::io::Result<()> {
+        if !self.readable {
+            return Err(std::io::Error::other(
+                "offline operation journal needs manual recovery (not overwritten)",
+            ));
+        }
+        if entries.len() > MAX_DEFERRED_MUTATIONS
+            || !entries.iter().all(DeferredMutation::has_valid_identity)
+        {
+            return Err(std::io::Error::other(
+                "invalid offline operation identity or queue full",
+            ));
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no journal directory"))?;
+        fs::create_dir_all(parent)?;
+        secure_private_dir(parent)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        serde_json::to_writer(
+            &mut tmp,
+            &MutationFileRef {
+                version: VERSION,
+                entries,
+            },
+        )
+        .map_err(std::io::Error::other)?;
+        tmp.flush()?;
+        if tmp.as_file().metadata()?.len() > MAX_MUTATION_JOURNAL_BYTES {
+            return Err(std::io::Error::other(
+                "offline operation journal exceeds size limit",
+            ));
+        }
+        tmp.as_file().sync_all()?;
+        tmp.persist(&self.path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        {
+            // Some filesystems cannot fsync directories; once rename succeeds
+            // do not falsely report a failed operation (which the UI might retry).
+            let _ = File::open(parent).and_then(|dir| dir.sync_all());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DeferredSeen {
@@ -75,6 +242,9 @@ pub(crate) struct Snapshot {
     /// Pending idempotent read/unread changes (not offline deletes or moves).
     #[serde(default)]
     pub deferred_seen: Vec<DeferredSeen>,
+    /// Lives in an independent crash-durable file, not the display snapshot.
+    #[serde(skip)]
+    pub deferred_mutations: Vec<DeferredMutation>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -213,9 +383,18 @@ pub(crate) struct Writer {
     pending: Arc<Mutex<PendingChanges>>,
     join: Option<JoinHandle<()>>,
     body_store: BodyStore,
+    mutation_store: MutationStore,
 }
 
 impl Writer {
+    pub(crate) fn save_mutations(&self, entries: &[DeferredMutation]) -> std::io::Result<()> {
+        self.mutation_store.save(entries)
+    }
+
+    pub(crate) fn mutations_available(&self) -> bool {
+        self.mutation_store.readable
+    }
+
     pub(crate) fn body_store(&self) -> BodyStore {
         self.body_store.clone()
     }
@@ -263,6 +442,19 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
     let identity = crate::backend::redact_source(&account.source);
     let hash = stable_key(&format!("{}\0{identity}", account.name));
     let path = dir.join(format!("{hash:016x}.json"));
+    let mut mutation_store = MutationStore {
+        path: dir.join(format!("{hash:016x}.mutations.json")),
+        readable: true,
+    };
+    let mutations = match mutation_store.read() {
+        Ok(entries) => entries,
+        Err(_) => {
+            // Refuse to overwrite an unreadable journal. The user must
+            // inspect/recover it, rather than silently losing operations.
+            mutation_store.readable = false;
+            Vec::new()
+        }
+    };
     let body_store = BodyStore {
         dir: dir.join(format!("{hash:016x}.bodies")),
     };
@@ -278,7 +470,8 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
             .as_ref()
             .is_some_and(|snapshot| !snapshot.folders.is_empty()),
     );
-    let snapshot = loaded.unwrap_or_default();
+    let mut snapshot = loaded.unwrap_or_default();
+    snapshot.deferred_mutations = mutations;
     let (wake, rx) = mpsc::sync_channel::<()>(1);
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let thread_pending = Arc::clone(&pending);
@@ -341,6 +534,7 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
                 pending,
                 join: Some(join),
                 body_store,
+                mutation_store,
             }),
         ),
         Err(_) => (snapshot, None),
@@ -931,6 +1125,7 @@ mod tests {
             mailboxes: vec![Mailbox::new("INBOX", crate::model::MailboxRole::Inbox)],
             folders: HashMap::new(),
             deferred_seen: Vec::new(),
+            deferred_mutations: Vec::new(),
         };
         write_snapshot(&path, &data).unwrap();
         let loaded = read_snapshot(&path).unwrap();
@@ -1308,5 +1503,72 @@ mod tests {
         assert_eq!(stable_key("account\0imap-a"), stable_key("account\0imap-a"));
         assert_ne!(stable_key("account\0imap-a"), stable_key("account\0imap-b"));
         assert_ne!(stable_key("account\0imap-a"), stable_key("other\0imap-a"));
+    }
+}
+
+#[cfg(test)]
+mod offline_mutation_journal_tests {
+    use super::*;
+
+    fn queued() -> DeferredMutation {
+        DeferredMutation {
+            mailbox: "INBOX".into(),
+            validity: 81,
+            ids: vec![MessageId("imap-uid:81:77".into())],
+            kind: DeferredMutationKind::Archive {
+                destination: "Archive".into(),
+            },
+            state: DeferredMutationState::Queued,
+        }
+    }
+
+    #[test]
+    fn offline_mutations_are_crash_durable_uid_scoped_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MutationStore {
+            path: dir.path().join("index.mutations.json"),
+            readable: true,
+        };
+        let pending = queued();
+        assert!(pending.has_valid_identity());
+        store.save(std::slice::from_ref(&pending)).unwrap();
+        assert_eq!(store.read().unwrap(), vec![pending.clone()]);
+        let mut uncertain = pending;
+        uncertain.state = DeferredMutationState::NeedsReview;
+        store.save(std::slice::from_ref(&uncertain)).unwrap();
+        let restarted = MutationStore {
+            path: store.path.clone(),
+            readable: true,
+        };
+        assert_eq!(restarted.read().unwrap(), vec![uncertain]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&store.path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_uid_or_corrupt_journal_is_rejected_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MutationStore {
+            path: dir.path().join("mutations.json"),
+            readable: true,
+        };
+        let mut record = queued();
+        record.validity = 82;
+        assert!(!record.has_valid_identity());
+        assert!(store.save(&[record]).is_err());
+        fs::write(&store.path, b"{invalid").unwrap();
+        assert!(store.read().is_err());
+        let locked = MutationStore {
+            path: store.path.clone(),
+            readable: false,
+        };
+        assert!(locked.save(&[queued()]).is_err());
+        assert_eq!(fs::read(store.path).unwrap(), b"{invalid");
     }
 }

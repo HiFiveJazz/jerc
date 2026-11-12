@@ -58,11 +58,13 @@ impl App {
                 }
             }
             WorkerEventKind::MutationComplete => {
+                account.finish_deferred_mutation(event.request_id, true);
                 // Only a tracked, completed mutation may resolve the pending
                 // state. A background server-draft cleanup isn't a user action.
                 if let Some(message) = account.pending_mutation_labels.remove(&event.request_id) {
                     self.status = StatusLine::temporary(message, Duration::from_secs(2));
                 }
+                account.pump_deferred_mutations();
                 Self::pump_mailbox_status(account);
             }
             WorkerEventKind::DraftSaveFailed { mailbox, error } => {
@@ -111,6 +113,17 @@ impl App {
                 sent_copy_warning,
                 sent_copy_disabled,
             } => {
+                let queued_outbox = account.finish_outbox(event.request_id, true);
+                if let Some(queued) = queued_outbox.as_ref()
+                    && let Some((mailbox, id)) = &queued.draft_source
+                {
+                    // Only after SMTP acceptance, and backend still checks
+                    // the UID generation before deleting the draft.
+                    let _ = account.worker.post(ActionKind::Delete {
+                        mailbox: mailbox.clone(),
+                        id: id.clone(),
+                    });
+                }
                 let completed_current_send =
                     self.pending_send == Some((event.account, event.request_id));
                 if completed_current_send {
@@ -193,6 +206,7 @@ impl App {
                 if completed_current_send && event.account == self.account_index {
                     self.composer = None;
                 }
+                account.pump_outbox();
                 self.status = if let Some(warning) = sent_copy_warning {
                     StatusLine::temporary(
                         format!("SMTP accepted ({smtp_status}); {warning}"),

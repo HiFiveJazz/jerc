@@ -156,14 +156,18 @@ fn create_workers(
                 None
             };
             let sender = outgoing::from_account(account)?;
-            Ok(WorkerHandle::spawn_with_idle(
+            let mut worker = WorkerHandle::spawn_with_idle(
                 index,
                 backend,
                 status_backend,
                 idle_backend,
                 sender,
                 runtime_tx.clone(),
-            ))
+            );
+            if backend::ImapSource::supports(&account.source) {
+                worker.enable_foreground_recovery(index, account.clone(), runtime_tx.clone());
+            }
+            Ok(worker)
         })
         .collect()
 }
@@ -202,10 +206,23 @@ fn event_loop(
     let mut next_animation_frame = Instant::now();
     let mut next_spinner_frame = Instant::now();
     let mut next_inbox_poll = Instant::now() + app.inbox_poll_interval();
+    let mut next_reconnect = Instant::now() + Duration::from_secs(10);
+    let mut next_recovery_check = Instant::now() + Duration::from_secs(2);
 
     while !app.should_quit {
         app.flush_contacts(false);
         let now = Instant::now();
+        if app.expire_status() {
+            render(terminal, app)?;
+        }
+        if now >= next_recovery_check {
+            app.recover_stalled_foreground_accounts();
+            next_recovery_check = now + Duration::from_secs(2);
+        }
+        if now >= next_reconnect {
+            app.reconnect_offline_accounts();
+            next_reconnect = now + Duration::from_secs(10);
+        }
         if now >= next_inbox_poll {
             app.poll_inboxes();
             next_inbox_poll = now + app.inbox_poll_interval();
@@ -251,17 +268,23 @@ fn event_loop(
         }
 
         let deadline = if app.animation_active() {
-            next_animation_frame.min(next_inbox_poll)
+            next_animation_frame
+                .min(next_inbox_poll)
+                .min(next_reconnect)
         } else {
-            next_inbox_poll
+            next_inbox_poll.min(next_reconnect)
         };
         let deadline = if setup_busy || mail_sync_busy {
             deadline.min(next_spinner_frame)
         } else {
             deadline
         };
+        let deadline = deadline.min(next_recovery_check);
         let deadline = app
             .contact_save_deadline()
+            .map_or(deadline, |due| deadline.min(due));
+        let deadline = app
+            .status_expiration_deadline()
             .map_or(deadline, |due| deadline.min(due));
         let received =
             match runtime_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -279,8 +302,12 @@ fn event_loop(
             continue;
         };
 
-        let background_update =
-            matches!(&event, RuntimeEvent::Worker(_) | RuntimeEvent::MailImage(_));
+        let background_update = matches!(
+            &event,
+            RuntimeEvent::Worker(_)
+                | RuntimeEvent::ForegroundWorker { .. }
+                | RuntimeEvent::MailImage(_)
+        );
         match event {
             RuntimeEvent::Input(event::Event::Key(key))
                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -297,6 +324,9 @@ fn event_loop(
             }
             RuntimeEvent::Input(_) => continue,
             RuntimeEvent::Worker(event) => app.handle_worker_event(event),
+            RuntimeEvent::ForegroundWorker { generation, event } => {
+                app.handle_foreground_worker_event(generation, event);
+            }
             RuntimeEvent::MailImage(event) => app.handle_mail_image_event(event),
             RuntimeEvent::SetupDiscovered { email, result } => app.setup_discovered(email, result),
             RuntimeEvent::SetupLoginFinished(result) => app.setup_login_finished(result),

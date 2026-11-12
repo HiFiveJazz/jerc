@@ -19,15 +19,36 @@ impl App {
         };
         match event.kind {
             WorkerEventKind::Connected { capabilities } => {
+                // A delayed response from an abandoned connection must not
+                // overwrite the new session's state.
+                if account.connect_request_id != Some(event.request_id) {
+                    return;
+                }
                 account.connecting = false;
+                account.connect_request_id = None;
                 account.capabilities = Some(capabilities);
-                if account.worker.post(ActionKind::ListMailboxes).is_ok() {
-                    account.mailboxes_loading = true;
+                // Get the mailbox list before replaying offline work. If the
+                // worker queue cannot accept LIST, retry via reconnect later.
+                if !account.request_mailbox_list() {
+                    account.mark_disconnected();
+                    self.status = StatusLine::temporary_error(
+                        format!("{}: could not schedule mailbox discovery", account.name),
+                        Duration::from_secs(6),
+                    );
+                    return;
                 }
                 self.status = StatusLine::info(format!("{} connected", account.name));
             }
             WorkerEventKind::Mailboxes(mailboxes) => {
+                // LIST may complete after a newer reconnect/refresh. Never let
+                // an old snapshot replace mailbox names or counts.
+                if account.mailbox_list_request_id != Some(event.request_id) {
+                    account.is_abandoned_list_request(event.request_id);
+                    return;
+                }
+                account.mailbox_list_request_id = None;
                 account.mailboxes_loading = false;
+                account.sync_progress_at = None;
                 let wanted = account
                     .current_mailbox
                     .clone()
@@ -82,6 +103,8 @@ impl App {
                     }
                 }
                 Self::pump_mailbox_status(account);
+                account.pump_deferred_mutations();
+                account.pump_outbox();
             }
             WorkerEventKind::MailboxChanged { name } => {
                 if account.current_mailbox.as_deref() == Some(name.as_str()) {
@@ -187,6 +210,8 @@ impl App {
                     }
                 }
                 account.persist_mailboxes();
+                account.pump_deferred_mutations();
+                account.pump_outbox();
                 Self::pump_mailbox_status(account);
             }
             WorkerEventKind::NewMailPreview {
@@ -225,6 +250,7 @@ impl App {
                     return;
                 }
                 account.page_request_id = None;
+                account.sync_progress_at = None;
                 let first_page = page.offset == 0;
                 let previous_validity = account.uid_validities.get(&name).copied();
                 let generation_changed =
@@ -338,6 +364,7 @@ impl App {
                 }
                 account.next_page_offset = page.next_offset;
                 account.has_more = page.has_more;
+                account.overlay_deferred_mutations();
                 if first_page {
                     // Don't tear down an open offline reader when its cached
                     // mailbox finishes background reconciliation.
@@ -488,6 +515,8 @@ impl App {
                     .selected_mailbox()
                     .map(|mailbox| mailbox.name.clone());
                 account.queue_unknown_mailbox_statuses(selected_mailbox.as_deref());
+                account.pump_deferred_mutations();
+                account.pump_outbox();
                 Self::pump_mailbox_status(account);
             }
             WorkerEventKind::MailboxOpenFailed { name, error } => {
@@ -504,9 +533,15 @@ impl App {
                 account.page_request_id = None;
                 account.page_inflight = None;
                 account.messages_loading = false;
+                account.sync_progress_at = None;
+                if super::is_connection_failure(&error) {
+                    account.mark_disconnected();
+                }
                 Self::pump_mailbox_status(account);
-                self.status =
-                    StatusLine::error(format!("{}: could not open {name}: {error}", account.name));
+                self.status = StatusLine::temporary_error(
+                    format!("{}: could not open {name}: {error}", account.name),
+                    Duration::from_secs(8),
+                );
             }
             _ => unreachable!("worker event routed to wrong handler"),
         }

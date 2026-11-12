@@ -2,6 +2,130 @@
 
 use super::*;
 
+impl AccountState {
+    fn queue_outgoing(
+        &mut self,
+        message: crate::outgoing::outbox::QueuedSend,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .outbox_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("offline outbox storage unavailable"))?;
+        let mut next = self.outbox.clone();
+        next.push(message);
+        store.save(&next)?;
+        self.outbox = next;
+        Ok(())
+    }
+
+    pub(super) fn pump_outbox(&mut self) {
+        if self.capabilities.is_none() {
+            return;
+        }
+        if !self.inflight_outbox.is_empty() {
+            return;
+        }
+        let ready = self
+            .outbox
+            .iter()
+            .filter(|message| message.state == crate::outgoing::outbox::SendState::Queued)
+            .take(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        for message in ready {
+            if let Some(stored) = self
+                .outbox
+                .iter_mut()
+                .find(|stored| stored.id == message.id)
+            {
+                stored.state = crate::outgoing::outbox::SendState::NeedsReview;
+            }
+            // Durable marker before possible SMTP submission. If sending
+            // succeeds but the app crashes before the ACK, do not resend.
+            if self.save_outbox().is_err() {
+                if let Some(stored) = self
+                    .outbox
+                    .iter_mut()
+                    .find(|stored| stored.id == message.id)
+                {
+                    stored.state = crate::outgoing::outbox::SendState::Queued;
+                }
+                break;
+            }
+            match self.worker.post(ActionKind::Send {
+                message: message.message,
+                sent_mailbox: message.sent_mailbox,
+                copy_to: message.copy_to,
+            }) {
+                Ok(request_id) => {
+                    self.inflight_outbox.insert(request_id, message.id);
+                }
+                Err(_) => {
+                    if let Some(stored) = self
+                        .outbox
+                        .iter_mut()
+                        .find(|stored| stored.id == message.id)
+                    {
+                        stored.state = crate::outgoing::outbox::SendState::Queued;
+                    }
+                    let _ = self.save_outbox();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// An OAuth HTTP/TLS failure occurred before SMTP was contacted.
+    /// Restore a submitted Outbox entry to Queued, persisting the change
+    /// BEFORE allowing a future automatic replay. Other failures remain
+    /// NeedsReview because SMTP may already have accepted DATA.
+    pub(super) fn requeue_outbox_before_smtp(&mut self, request_id: u64) -> bool {
+        let Some(id) = self.inflight_outbox.remove(&request_id) else {
+            return false;
+        };
+        let Some(index) = self.outbox.iter().position(|message| message.id == id) else {
+            return false;
+        };
+        let mut next = self.outbox.clone();
+        next[index].state = crate::outgoing::outbox::SendState::Queued;
+        let Some(store) = self.outbox_store.as_ref() else {
+            return false;
+        };
+        if store.save(&next).is_err() {
+            // The durable state is still NeedsReview; don't risk an automatic
+            // duplicate send after a failed journal write.
+            return false;
+        }
+        self.outbox = next;
+        true
+    }
+
+    fn save_outbox(&self) -> anyhow::Result<()> {
+        self.outbox_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("outbox storage unavailable"))?
+            .save(&self.outbox)
+    }
+
+    pub(super) fn finish_outbox(
+        &mut self,
+        request_id: u64,
+        accepted: bool,
+    ) -> Option<crate::outgoing::outbox::QueuedSend> {
+        let id = self.inflight_outbox.remove(&request_id)?;
+        let index = self.outbox.iter().position(|message| message.id == id)?;
+        if accepted {
+            let sent = self.outbox.remove(index);
+            let _ = self.save_outbox();
+            Some(sent)
+        } else {
+            // NeedsReview was persisted BEFORE submission. Keep it until
+            // manually resolved because the relay's ACK may have been lost.
+            None
+        }
+    }
+}
+
 impl App {
     pub(super) fn prepare_draft_resume(&mut self) {
         let Some(account) = self.account() else {
@@ -138,18 +262,19 @@ impl App {
         }) else {
             return;
         };
-        let queued = self.account().is_some_and(|account| {
+        let request_id = self.account().and_then(|account| {
             account
                 .worker
                 .post(ActionKind::FetchRawForCompose {
                     mailbox,
                     id: message_id.clone(),
                 })
-                .is_ok()
+                .ok()
         });
-        if queued {
+        if let Some(request_id) = request_id {
             self.pending_compose = Some(PendingCompose {
                 account: account_index,
+                request_id,
                 message_id,
                 intent,
             });
@@ -1065,6 +1190,37 @@ impl App {
         // Invalid mail remains editable and is never submitted to the relay.
         if let Err(error) = crate::outgoing::build_outgoing(&message, &account.from) {
             self.status = StatusLine::error(format!("cannot prepare outgoing email: {error:#}"));
+            return;
+        }
+        if account.capabilities.is_none() {
+            let draft_source = composer
+                .draft_source
+                .as_ref()
+                .map(|source| (source.mailbox.clone(), source.id.clone()));
+            let queued = match crate::outgoing::outbox::QueuedSend::new(
+                message,
+                sent_mailbox,
+                copy_to,
+                draft_source,
+            ) {
+                Ok(queued) => queued,
+                Err(error) => {
+                    self.status =
+                        StatusLine::error(format!("cannot queue offline email: {error:#}"));
+                    return;
+                }
+            };
+            if let Err(error) = self
+                .account_mut()
+                .expect("account exists")
+                .queue_outgoing(queued)
+            {
+                self.status = StatusLine::error(format!("cannot queue offline email: {error:#}"));
+                return;
+            }
+            self.composer = None;
+            self.resumed_draft_account = None;
+            self.status = StatusLine::info("message saved in offline Outbox; sends on reconnect");
             return;
         }
         match account.worker.post(ActionKind::Send {

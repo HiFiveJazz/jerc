@@ -162,12 +162,10 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         };
         spans.push(Span::styled(format!(" {} ", account.name), style));
     }
-    if !app.startup_warnings.is_empty() {
+    let warnings = app.visible_warnings();
+    if !warnings.is_empty() {
         spans.push(Span::styled(
-            format!(
-                "  ! {} config issue(s) [! to inspect]",
-                app.startup_warnings.len()
-            ),
+            format!("  ! {} warning(s) [! to inspect]", warnings.len()),
             theme.error(),
         ));
     }

@@ -127,11 +127,9 @@ impl App {
                     left += 2;
                 }
             }
-            if !self.startup_warnings.is_empty() {
-                let label = format!(
-                    "  ! {} config issue(s) [! to inspect]",
-                    self.startup_warnings.len()
-                );
+            let warnings = self.visible_warnings();
+            if !warnings.is_empty() {
+                let label = format!("  ! {} warning(s) [! to inspect]", warnings.len());
                 let len = unicode_width::UnicodeWidthStr::width(label.as_str());
                 if (left..left + len).contains(&usize::from(mouse.column)) {
                     self.show_startup_warnings = true;

@@ -164,6 +164,7 @@ impl AccountState {
         self.search_editing = false;
         self.clamp_selection();
         self.overlay_deferred_seen();
+        self.overlay_deferred_mutations();
         // This precedes the network refresh. It identifies the moment cached
         // rows become available to the UI, not the terminal's paint latency.
         crate::perf::record("ui_cache_restore", None, Duration::ZERO, true);

@@ -24,9 +24,14 @@ impl App {
                 }
                 account.body_request_id = None;
                 account.pending_bodies.clear();
+                // Selected-body fetches normally use the independent priority
+                // IMAP session. Its failure does not prove the foreground
+                // mailbox connection is dead; preserve live LIST/SELECT work.
                 Self::pump_mailbox_status(account);
-                self.status =
-                    StatusLine::error(format!("{}: could not load email: {error}", account.name));
+                self.status = StatusLine::temporary_error(
+                    format!("{}: could not load email: {error}", account.name),
+                    Duration::from_secs(8),
+                );
             }
             WorkerEventKind::BodyLoaded(body) => {
                 if account.body_request_id != Some(event.request_id) {
@@ -182,10 +187,11 @@ impl App {
                     }
                     return;
                 }
-                let pending = self
-                    .pending_compose
-                    .as_ref()
-                    .filter(|pending| pending.account == event.account && pending.message_id == id);
+                let pending = self.pending_compose.as_ref().filter(|pending| {
+                    pending.account == event.account
+                        && pending.request_id == event.request_id
+                        && pending.message_id == id
+                });
                 let result = pending.and_then(|pending| {
                     let message = account
                         .messages

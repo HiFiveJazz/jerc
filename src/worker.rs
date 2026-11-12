@@ -1,10 +1,10 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -213,6 +213,12 @@ pub struct WorkerEvent {
 pub enum RuntimeEvent {
     Input(crossterm::event::Event),
     Worker(WorkerEvent),
+    /// Foreground events carry the worker generation so results from a retired
+    /// blocked IMAP session can never update a recovered account.
+    ForegroundWorker {
+        generation: u64,
+        event: WorkerEvent,
+    },
     MailImage(MailImageEvent),
     SetupDiscovered {
         email: String,
@@ -234,6 +240,35 @@ pub struct WorkerHandle {
     status_join: Option<JoinHandle<()>>,
     idle_stop: Arc<AtomicBool>,
     idle_join: Option<JoinHandle<()>>,
+    foreground_generation: Arc<AtomicU64>,
+    unacknowledged_writes: Mutex<HashSet<u64>>,
+    recovery: Option<ForegroundRecovery>,
+    retired_foregrounds: Vec<JoinHandle<()>>,
+    last_foreground_recovery: Option<Instant>,
+}
+
+struct ForegroundRecovery {
+    account: usize,
+    config: crate::config::AccountConfig,
+    events: SyncSender<RuntimeEvent>,
+}
+
+/// Never retire a worker that may have submitted an IMAP/SMTP write. A
+/// completion can be lost, but it must not become a duplicated operation.
+fn is_foreground_write(kind: &ActionKind) -> bool {
+    matches!(
+        kind,
+        ActionKind::SetSeen { .. }
+            | ActionKind::Delete { .. }
+            | ActionKind::DeleteMany { .. }
+            | ActionKind::Move { .. }
+            | ActionKind::MoveMany { .. }
+            | ActionKind::ArchiveMany { .. }
+            | ActionKind::UnarchiveMany { .. }
+            | ActionKind::Send { .. }
+            | ActionKind::SaveDraft { .. }
+            | ActionKind::ExportRaw { .. }
+    )
 }
 
 impl WorkerHandle {
@@ -258,11 +293,22 @@ impl WorkerHandle {
         runtime_tx: SyncSender<RuntimeEvent>,
     ) -> Self {
         let (sender, receiver) = sync_channel::<Action>(64);
+        let foreground_generation = Arc::new(AtomicU64::new(0));
+        let unacknowledged_writes = Mutex::new(HashSet::new());
         let status_events = runtime_tx.clone();
+        let active = Arc::clone(&foreground_generation);
         let join = thread::Builder::new()
             .name(format!("mail-worker-{account}"))
             .spawn(move || {
-                run_worker(account, &mut *backend, &mut outgoing, receiver, runtime_tx);
+                run_worker(
+                    account,
+                    0,
+                    active,
+                    &mut *backend,
+                    &mut outgoing,
+                    receiver,
+                    runtime_tx,
+                );
             })
             .expect("failed to spawn mail worker");
         let (status_sender, priority_sender, status_join) =
@@ -296,7 +342,98 @@ impl WorkerHandle {
             status_join,
             idle_stop,
             idle_join,
+            foreground_generation,
+            unacknowledged_writes,
+            recovery: None,
+            retired_foregrounds: Vec::new(),
+            last_foreground_recovery: None,
         }
+    }
+
+    /// Opt in only for configured IMAP accounts. Maildir and custom test
+    /// backends keep their original lifetime unless configured explicitly.
+    pub fn enable_foreground_recovery(
+        &mut self,
+        account: usize,
+        config: crate::config::AccountConfig,
+        events: SyncSender<RuntimeEvent>,
+    ) {
+        self.recovery = Some(ForegroundRecovery {
+            account,
+            config,
+            events,
+        });
+    }
+
+    pub fn foreground_generation(&self) -> u64 {
+        self.foreground_generation.load(Ordering::Acquire)
+    }
+
+    /// A submitted write remains unsafe to abandon even after its worker
+    /// finishes: the ACK may still be sitting in the UI event channel.
+    /// Release this guard only when the matching event reaches the UI.
+    pub fn acknowledge_foreground_event(&self, request_id: u64) {
+        self.unacknowledged_writes
+            .lock()
+            .expect("write journal lock")
+            .remove(&request_id);
+    }
+
+    /// Replace ONLY the stuck foreground session. Other sessions and the
+    /// locally durable Outbox/mutation journals are left alone. Limit the
+    /// detached old sessions and enforce backoff during prolonged outages.
+    pub fn recover_stalled_foreground(&mut self) -> anyhow::Result<bool> {
+        let Some(recovery) = &self.recovery else {
+            return Ok(false);
+        };
+        if !self
+            .unacknowledged_writes
+            .lock()
+            .expect("write journal lock")
+            .is_empty()
+            || self
+                .last_foreground_recovery
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(20))
+        {
+            return Ok(false);
+        }
+        // Completed retired workers can be reaped without blocking the UI.
+        self.retired_foregrounds.retain(|join| !join.is_finished());
+        if self.retired_foregrounds.len() >= 2 {
+            return Ok(false);
+        }
+        // Constructing transports is local; actual network activity starts in
+        // the new worker. If setup fails, leave the existing worker untouched.
+        let mut backend = crate::backend::from_account(&recovery.config)?;
+        let mut outgoing = crate::outgoing::from_account(&recovery.config)?;
+        let (sender, receiver) = sync_channel::<Action>(64);
+        let account = recovery.account;
+        let events = recovery.events.clone();
+        let generation = self.foreground_generation.load(Ordering::Acquire) + 1;
+        let active = Arc::clone(&self.foreground_generation);
+        let join = thread::Builder::new()
+            .name(format!("mail-worker-{account}-gen-{generation}"))
+            .spawn(move || {
+                run_worker(
+                    account,
+                    generation,
+                    active,
+                    &mut *backend,
+                    &mut outgoing,
+                    receiver,
+                    events,
+                );
+            })?;
+        self.foreground_generation
+            .store(generation, Ordering::Release);
+        let old_sender = std::mem::replace(&mut self.sender, sender);
+        drop(old_sender);
+        if let Some(old) = self.join.replace(join) {
+            self.retired_foregrounds.push(old);
+        }
+        self.last_foreground_recovery = Some(Instant::now());
+        crate::perf::record("worker_foreground_replaced", None, Duration::ZERO, true);
+        Ok(true)
     }
 
     // The caller may retry an unsent action on another worker queue, so preserve
@@ -353,7 +490,22 @@ impl WorkerHandle {
                 .unwrap_or(&self.sender)
                 .try_send(action)?;
         } else {
-            self.sender.try_send(action)?;
+            let write = is_foreground_write(&action.kind);
+            if write {
+                self.unacknowledged_writes
+                    .lock()
+                    .expect("write journal lock")
+                    .insert(id);
+            }
+            if let Err(error) = self.sender.try_send(action) {
+                if write {
+                    self.unacknowledged_writes
+                        .lock()
+                        .expect("write journal lock")
+                        .remove(&id);
+                }
+                return Err(error);
+            }
         }
         Ok(id)
     }
@@ -373,6 +525,7 @@ impl WorkerHandle {
         drop(self.join.take());
         drop(self.status_join.take());
         drop(self.idle_join.take());
+        self.retired_foregrounds.clear();
         // Disconnect the background queue when possible. The IDLE watcher may
         // still hold a clone until it observes the stop flag.
         drop(self.status_sender.take());
@@ -400,6 +553,7 @@ impl WorkerHandle {
         // Connection establishment can outlive the UI. Its send channel is
         // disconnected on shutdown, so an old watcher cannot update a reloaded
         // account. Never block quit on a stuck server handshake.
+        self.retired_foregrounds.clear();
         if let Some(idle_join) = self.idle_join.take()
             && idle_join.is_finished()
         {
@@ -458,6 +612,8 @@ fn run_idle_worker(
 
 fn run_worker(
     account: usize,
+    generation: u64,
+    active_generation: Arc<AtomicU64>,
     backend: &mut dyn MailBackend,
     outgoing: &mut Option<Box<dyn MailSender>>,
     receiver: Receiver<Action>,
@@ -479,6 +635,11 @@ fn run_worker(
             pending.push_back(action);
         }
         compact_navigation_queue(&mut pending);
+        // The old socket may return long after a replacement was started.
+        // Drop its queued read-only work rather than issuing stale requests.
+        if active_generation.load(Ordering::Acquire) != generation {
+            break;
+        }
         let Some(action) = pending.pop_front() else {
             continue;
         };
@@ -670,13 +831,21 @@ fn run_worker(
                 ),
             );
         }
-        if runtime_tx
-            .send(RuntimeEvent::Worker(WorkerEvent {
-                account,
-                request_id,
-                kind: event,
-            }))
-            .is_err()
+        // Retired generations never publish stale mailbox results/errors.
+        // Every production foreground event remains tagged through the UI
+        // event queue, including results sent immediately before rotation.
+        let should_publish = active_generation.load(Ordering::Acquire) == generation;
+        if should_publish
+            && runtime_tx
+                .send(RuntimeEvent::ForegroundWorker {
+                    generation,
+                    event: WorkerEvent {
+                        account,
+                        request_id,
+                        kind: event,
+                    },
+                })
+                .is_err()
         {
             break;
         }
@@ -1416,7 +1585,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .expect("interactive open must not wait for STATUS");
         match event {
-            RuntimeEvent::Worker(ev) => {
+            RuntimeEvent::ForegroundWorker { event: ev, .. } => {
                 assert_eq!(ev.request_id, requested);
                 assert!(matches!(ev.kind, WorkerEventKind::MailboxOpened { .. }));
             }
@@ -1690,7 +1859,7 @@ mod tests {
                 hint: None,
             })
             .unwrap();
-        let RuntimeEvent::Worker(event) = rx
+        let RuntimeEvent::ForegroundWorker { event, .. } = rx
             .recv_timeout(Duration::from_millis(500))
             .expect("interactive mailbox open must not await prefetch")
         else {
@@ -1761,5 +1930,178 @@ mod tests {
                 0o600
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod foreground_recovery_tests {
+    use super::*;
+    use crate::backend::MailBackend;
+    use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage};
+    use std::sync::mpsc::{self, Receiver, SyncSender};
+
+    struct StalledList {
+        started: SyncSender<()>,
+        release: Receiver<()>,
+    }
+
+    impl MailBackend for StalledList {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::IMAP_BASIC
+        }
+        fn connect(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_mailboxes(&mut self) -> anyhow::Result<Vec<Mailbox>> {
+            let _ = self.started.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(3));
+            Ok(Vec::new())
+        }
+        fn mailbox_status(&mut self, _: &str) -> anyhow::Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+        fn open_mailbox(&mut self, _: &str, _: usize, _: usize) -> anyhow::Result<MessagePage> {
+            Ok(MessagePage {
+                messages: Vec::new(),
+                offset: 0,
+                next_offset: 0,
+                has_more: false,
+            })
+        }
+        fn fetch_body(&mut self, _: &str, _: &MessageId) -> anyhow::Result<MessageBody> {
+            anyhow::bail!("not used")
+        }
+        fn fetch_raw(&mut self, _: &str, _: &MessageId) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("not used")
+        }
+        fn set_seen(&mut self, _: &str, _: &MessageId, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn delete(&mut self, _: &str, _: &MessageId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn move_to(&mut self, _: &str, _: &str, _: &MessageId) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        WorkerHandle,
+        Receiver<RuntimeEvent>,
+        Receiver<()>,
+        SyncSender<()>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        for folder in ["cur", "new", "tmp"] {
+            std::fs::create_dir(dir.path().join(folder)).unwrap();
+        }
+        let (started, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release) = mpsc::sync_channel(1);
+        let (events, rx) = mpsc::sync_channel(32);
+        let mut worker = WorkerHandle::spawn(
+            0,
+            Box::new(StalledList { started, release }),
+            None,
+            None,
+            events.clone(),
+        );
+        let config = crate::config::Config::single_maildir("Test".into(), dir.path().into());
+        worker.enable_foreground_recovery(0, config.accounts[0].clone(), events);
+        (dir, worker, rx, started_rx, release_tx)
+    }
+
+    #[test]
+    fn a_stalled_list_does_not_hold_the_replacement_connect_in_its_queue() {
+        let (_dir, mut worker, rx, started, release) = fixture();
+        worker.post(ActionKind::ListMailboxes).unwrap();
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let before = Instant::now();
+        assert!(worker.recover_stalled_foreground().unwrap());
+        let request = worker.post(ActionKind::Connect).unwrap();
+        let RuntimeEvent::ForegroundWorker { generation, event } = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement must run during old LIST")
+        else {
+            panic!("expected foreground worker event")
+        };
+        assert_eq!(generation, 1);
+        assert_eq!(event.request_id, request);
+        assert!(matches!(event.kind, WorkerEventKind::Connected { .. }));
+        assert!(before.elapsed() < Duration::from_secs(2));
+        release.send(()).unwrap();
+        // Even once the original request finishes, it cannot report an old
+        // LIST snapshot or an old socket error into the recovered session.
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        worker.shutdown();
+    }
+
+    #[test]
+    fn write_queued_behind_list_prevents_worker_retirement() {
+        let (_dir, mut worker, _rx, started, release) = fixture();
+        worker.post(ActionKind::ListMailboxes).unwrap();
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker
+            .post(ActionKind::Delete {
+                mailbox: "INBOX".into(),
+                id: MessageId("x".into()),
+            })
+            .unwrap();
+        assert!(!worker.recover_stalled_foreground().unwrap());
+        assert_eq!(worker.foreground_generation(), 0);
+        release.send(()).unwrap();
+        worker.shutdown();
+    }
+
+    #[test]
+    fn recovery_has_backoff_even_if_its_new_connection_is_stalled() {
+        let (_dir, mut worker, _rx, started, release) = fixture();
+        worker.post(ActionKind::ListMailboxes).unwrap();
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(worker.recover_stalled_foreground().unwrap());
+        assert!(!worker.recover_stalled_foreground().unwrap());
+        assert_eq!(worker.foreground_generation(), 1);
+        release.send(()).unwrap();
+        worker.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod foreground_ack_safety_tests {
+    use super::*;
+    #[test]
+    fn a_completed_write_must_be_acknowledged_before_a_worker_can_be_retired() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["cur", "new", "tmp"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        let (tx, rx) = sync_channel(16);
+        let mut worker = WorkerHandle::spawn(
+            0,
+            Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+            None,
+            None,
+            tx.clone(),
+        );
+        let config = crate::config::Config::single_maildir("Local".into(), root.path().into());
+        worker.enable_foreground_recovery(0, config.accounts[0].clone(), tx);
+        // A delete may have reached the server even if its acknowledgment has
+        // not yet been consumed from the UI event queue.
+        let request_id = worker
+            .post(ActionKind::Delete {
+                mailbox: "INBOX".into(),
+                id: MessageId("missing".into()),
+            })
+            .unwrap();
+        let RuntimeEvent::ForegroundWorker { event, .. } =
+            rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected foreground delete result")
+        };
+        assert_eq!(event.request_id, request_id);
+        assert!(!worker.recover_stalled_foreground().unwrap());
+        worker.acknowledge_foreground_event(request_id);
+        assert!(worker.recover_stalled_foreground().unwrap());
+        worker.shutdown();
     }
 }

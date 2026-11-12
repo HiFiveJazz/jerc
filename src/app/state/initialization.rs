@@ -21,7 +21,7 @@ impl App {
                 .spawn(cleanup_stale_attachment_files);
         });
         let app_search_mode = config.ui.search_mode;
-        let accounts = config
+        let accounts: Vec<AccountState> = config
             .accounts
             .iter()
             .zip(workers)
@@ -30,6 +30,8 @@ impl App {
                 let body_store = cache_writer.as_ref().map(cache::Writer::body_store);
                 let raw_store = cache_writer.as_ref().map(cache::Writer::raw_store);
                 let deferred_seen = snapshot.deferred_seen.clone();
+                let deferred_mutations = snapshot.deferred_mutations.clone();
+                let (outbox_store, outbox) = crate::outgoing::outbox::Store::open(config);
                 let uid_validities = snapshot
                     .folders
                     .iter()
@@ -114,15 +116,25 @@ impl App {
                     pending_bodies: HashSet::new(),
                     pending_seen: HashMap::new(),
                     deferred_seen,
+                    deferred_mutations,
+                    inflight_deferred_mutations: HashMap::new(),
+                    outbox_store,
+                    outbox,
+                    inflight_outbox: HashMap::new(),
                     inflight_deferred_seen: HashMap::new(),
                     status_requests: MailboxStatusQueue::default(),
                     pending_inbox_refresh: false,
                     pending_mutation_labels: HashMap::new(),
                     connecting: false,
+                    connect_request_id: None,
+                    mailbox_list_request_id: None,
+                    abandoned_list_requests: VecDeque::new(),
+                    sync_progress_at: None,
                     mailboxes_loading: false,
                     messages_loading: false,
                     last_scan_micros: None,
                     restore_message_index: None,
+                    foreground_generation: worker.foreground_generation(),
                     worker,
                 };
                 if let Some(index) = account
@@ -158,13 +170,16 @@ impl App {
         });
         let mut contacts = loaded_contacts.unwrap_or_default();
         contacts.include_account_identities(&config.accounts);
+        // Durable queue warnings are derived from live state by App::visible_warnings.
+        // Keeping a startup-only snapshot left stale banners after reconnect.
+        let startup_warnings = contacts_warning.into_iter().collect::<Vec<_>>();
         Self {
             accounts,
             account_index: 0,
             focus: Focus::Messages,
             status: StatusLine::info("starting workers…"),
             sync_spinner_frame: 0,
-            startup_warnings: contacts_warning.into_iter().collect(),
+            startup_warnings,
             show_startup_warnings: false,
             should_quit: false,
             setup: config.accounts.is_empty().then(|| SetupWizard::new(true)),
