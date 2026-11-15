@@ -86,24 +86,24 @@ fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<Str
     let mut warnings = Vec::new();
     config.accounts.retain_mut(|account| {
         if backend::from_account(account).is_err() {
-            if account.source.trim().is_empty() || matches!(account.source.as_str(), "imap" | "imaps") {
+            if account.source.trim().is_empty() || matches!(account.source.as_str(), "imap" | "imaps" | "imap+starttls") {
                 warnings.push(format!(
                     "{}: incoming IMAP shorthand could not be configured. Set email and, \
-                     for a custom provider, imap_host; or use a full imaps:// URI. Account skipped.",
+                     for a custom provider, imap_host; or use a full imaps:// or imap+starttls:// URI. Account skipped.",
                     account.name,
                 ));
             } else {
                 let scheme = safe_scheme(&account.source);
                 warnings.push(format!(
                     "{}: incoming source uses invalid or unsupported scheme '{scheme}'. \
-                     Use maildir://, imaps://, imaps+login://, imaps+oauthbearer://, or imaps+xoauth2://. Account skipped.",
+                     Use maildir://, imaps://, imaps+login://, imaps+oauthbearer://, or imaps+xoauth2://, or imap+starttls://. Account skipped.",
                     account.name,
                 ));
             }
             return false;
         }
         if outgoing::from_account(account).is_err() {
-            if account.outgoing.as_deref().is_some_and(|outgoing| matches!(outgoing, "smtp" | "smtps" | "starttls")) {
+            if account.outgoing.as_deref().is_some_and(|outgoing| matches!(outgoing, "smtp" | "smtps" | "starttls" | "smtp+none" | "smtps+none" | "smtp+plain" | "smtps+plain" | "smtp+login" | "smtps+login")) {
                 warnings.push(format!(
                     "{}: outgoing SMTP shorthand could not be configured. Set email and, \
                      for a custom provider, smtp_host; or use a full smtps:// or smtp:// URI. Receiving works; sending disabled until fixed.",
@@ -113,7 +113,7 @@ fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<Str
                 let scheme = account.outgoing.as_deref().map(safe_scheme).unwrap_or("<missing>");
                 warnings.push(format!(
                     "{}: outgoing transport '{scheme}' is invalid. Use smtp:// or smtps:// \
-                     (optional +login, +plain, +xoauth2 or +oauthbearer), or an absolute sendmail path. Receiving works; sending disabled until fixed.",
+                     (optional +login, +plain, +none, +xoauth2 or +oauthbearer), or an absolute sendmail path. Receiving works; sending disabled until fixed.",
                     account.name,
                 ));
             }
@@ -319,7 +319,7 @@ fn event_loop(
         let setup_busy = app
             .setup
             .as_ref()
-            .is_some_and(|wizard| wizard.authenticating || wizard.discovering);
+            .is_some_and(|wizard| wizard.authenticating || wizard.discovering || wizard.testing);
         let mail_sync_busy = app.syncing_with_server();
         if setup_busy || mail_sync_busy {
             if Instant::now() >= next_spinner_frame {
@@ -404,7 +404,14 @@ fn event_loop(
             }
             RuntimeEvent::MailImage(event) => app.handle_mail_image_event(event),
             RuntimeEvent::SetupDiscovered { email, result } => app.setup_discovered(email, result),
-            RuntimeEvent::SetupLoginFinished(result) => app.setup_login_finished(result),
+            RuntimeEvent::SetupLoginFinished { request_id, result } => {
+                app.setup_login_finished(request_id, result);
+            }
+            RuntimeEvent::SetupTestFinished { request_id, report } => {
+                if let Some(wizard) = app.setup.as_mut() {
+                    wizard.finish_connection_test(request_id, report);
+                }
+            }
             RuntimeEvent::InputStopped => break,
         }
 

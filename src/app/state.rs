@@ -2186,20 +2186,27 @@ impl App {
         }
     }
 
-    pub fn setup_login_finished(&mut self, result: Result<Option<String>, String>) {
-        if let Some(wizard) = self.setup.as_mut() {
-            match result {
-                Ok(login) => wizard.suggest_login(login),
-                Err(error) => {
-                    wizard.authenticating = false;
-                    wizard.step = crate::setup::SetupStep::Settings;
-                    wizard.selected = crate::setup::PROVIDER;
-                    wizard.login_failed = true;
+    pub fn setup_login_finished(
+        &mut self,
+        request_id: u64,
+        result: Result<Option<String>, String>,
+    ) {
+        let Some(wizard) = self.setup.as_mut() else {
+            return;
+        };
+        if !wizard.accepts_oauth_result(request_id) {
+            return; // A cancelled or superseded browser attempt completed late.
+        }
+        match result {
+            Ok(login) => {
+                if let Err(error) = wizard.complete_authentication(login, &self.setup_config_path) {
                     wizard.error = true;
-                    wizard.message =
-                        format!("OAuth failed: {error}. Ctrl-S/F6 retry; F7 saves offline.");
+                    wizard.message = format!(
+                        "Signed in, but saving failed: {error:#}. Review settings and save again."
+                    );
                 }
             }
+            Err(error) => wizard.authentication_failed(&error),
         }
     }
 
@@ -2210,7 +2217,7 @@ impl App {
         let Some(wizard) = self.setup.as_mut() else {
             return;
         };
-        if wizard.authenticating || wizard.authenticated {
+        if wizard.authenticating || wizard.authenticated || !wizard.uses_oauth() {
             return;
         }
         match wizard.preview_account() {
@@ -2242,22 +2249,25 @@ impl App {
                     wizard.message = "OAuth runtime unavailable".into();
                     return;
                 };
-                wizard.begin_authentication();
+                let (request_id, cancel) = wizard.begin_authentication();
                 std::thread::spawn(move || {
                     let name = account.name.clone();
-                    let result =
-                        crate::oauth::login_account_quiet(std::slice::from_ref(&account), &name)
-                            .and_then(|()| {
-                                let settings = crate::oauth::OAuthSettings::for_account(&account)?
-                                    .ok_or_else(|| anyhow::anyhow!("OAuth is not configured"))?;
-                                if settings.provider == "microsoft" {
-                                    settings.suggested_login_username()
-                                } else {
-                                    Ok(None)
-                                }
-                            })
-                            .map_err(|error| format!("{}", error.root_cause()));
-                    let _ = sender.send(RuntimeEvent::SetupLoginFinished(result));
+                    let result = crate::oauth::login_account_quiet_cancellable(
+                        std::slice::from_ref(&account),
+                        &name,
+                        &cancel,
+                    )
+                    .and_then(|()| {
+                        let settings = crate::oauth::OAuthSettings::for_account(&account)?
+                            .ok_or_else(|| anyhow::anyhow!("OAuth is not configured"))?;
+                        if settings.provider == "microsoft" {
+                            settings.suggested_login_username()
+                        } else {
+                            Ok(None)
+                        }
+                    })
+                    .map_err(|error| format!("{}", error.root_cause()));
+                    let _ = sender.send(RuntimeEvent::SetupLoginFinished { request_id, result });
                 });
             }
             Err(error) => {
@@ -2316,6 +2326,37 @@ impl App {
                     let _ = sender.send(RuntimeEvent::SetupDiscovered { email, result });
                 });
             }
+            WizardAction::TestConfiguration => {
+                let Some(sender) = self.setup_sender.clone() else {
+                    return;
+                };
+                let Some(wizard) = self.setup.as_mut() else {
+                    return;
+                };
+                if wizard.uses_oauth() && !wizard.authenticated {
+                    wizard.error = true;
+                    wizard.message =
+                        "Sign in with OAuth first (Ctrl-S), then press F5 to test IMAP and SMTP."
+                            .into();
+                    return;
+                }
+                match wizard.preview_account() {
+                    Ok(account) => {
+                        let password = (!wizard.uses_oauth())
+                            .then(|| wizard.fields[crate::setup::PASSWORD].clone());
+                        let request_id = wizard.begin_connection_test();
+                        std::thread::spawn(move || {
+                            let report = crate::setup::probe::test_account(account, password);
+                            let _ =
+                                sender.send(RuntimeEvent::SetupTestFinished { request_id, report });
+                        });
+                    }
+                    Err(error) => {
+                        wizard.error = true;
+                        wizard.message = format!("Check settings before testing: {error}");
+                    }
+                }
+            }
             WizardAction::SaveOffline => {
                 let Some(wizard) = self.setup.as_mut() else {
                     return;
@@ -2340,7 +2381,7 @@ impl App {
                 if self
                     .setup
                     .as_ref()
-                    .is_some_and(|wizard| !wizard.authenticated)
+                    .is_some_and(|wizard| wizard.uses_oauth() && !wizard.authenticated)
                 {
                     self.start_setup_oauth();
                     return;

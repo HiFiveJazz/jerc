@@ -1,11 +1,13 @@
 //! Native desktop OAuth authorization-code + PKCE sign-in for IMAP/SMTP.
-//! The application publisher must register public-client IDs with providers;
-//! end users authorize in a browser and never handle refresh tokens manually.
+//! Google/Microsoft use publisher-registered IDs; open-public-client servers
+//! use standards-based discovery and (when available) dynamic registration.
+//! Users authenticate in their system browser; Jerc never handles their 2FA.
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::config::{AccountConfig, OAuthConfig};
+
+mod open;
+pub use open::validate_open_issuer;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
@@ -113,6 +118,8 @@ pub struct OAuthSettings {
     prompt: Option<String>,
     login_hint: Option<String>,
     credential_namespace: Option<String>,
+    issuer: Option<String>,
+    require_issuer_response: bool,
 }
 
 impl std::fmt::Debug for OAuthSettings {
@@ -129,6 +136,8 @@ struct SavedToken {
     provider: String,
     client_id: String,
     refresh_token: String,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 // Avoid depending on the access token's internal format: Microsoft service
@@ -318,11 +327,22 @@ impl OAuthSettings {
 
     fn from_config(name: &str, oauth: &OAuthConfig) -> Result<Self> {
         let provider = oauth.provider.trim().to_ascii_lowercase();
-        let client_id = account_or_embedded(
-            oauth.client_id.as_deref(), embedded_client_id(&provider),
-        ).ok_or_else(|| anyhow!(
-            "OAuth account {name:?} needs oauth.client_id or an app-publisher client ID at build time"
-        ))?.to_owned();
+        let client_id = if provider == "open" {
+            oauth
+                .client_id
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        } else {
+            account_or_embedded(oauth.client_id.as_deref(), embedded_client_id(&provider))
+                .ok_or_else(|| anyhow!(
+                    "OAuth account {name:?} needs oauth.client_id or an app-publisher client ID at build time"
+                ))?.to_owned()
+        };
+        if provider == "open" && !client_id.is_empty() && !open::valid_client_id(&client_id) {
+            bail!("Open OAuth client ID contains invalid characters");
+        }
         let client_secret = account_or_embedded(
             oauth.client_secret.as_deref(),
             if provider == "google" {
@@ -332,6 +352,9 @@ impl OAuthSettings {
             },
         )
         .map(str::to_owned);
+        if provider == "open" && client_secret.is_some() {
+            bail!("Open OAuth public clients must not configure client_secret");
+        }
         let (auth_endpoint, token_endpoint, scope) = match provider.as_str() {
             "google" => (
                 "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
@@ -351,14 +374,21 @@ impl OAuthSettings {
                  format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"),
                  "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send".to_owned())
             }
-            _ => bail!("unsupported OAuth provider; use google or microsoft"),
+            "open" => (String::new(), String::new(), open::MAIL_SCOPE.to_owned()),
+            _ => bail!("unsupported OAuth provider; use google, microsoft or open"),
         };
         let flow = LoginFlow::parse(oauth.flow.as_deref(), &provider)?;
         let callback_host = oauth.callback_host.as_deref().unwrap_or("127.0.0.1").trim();
         if !matches!(callback_host, "127.0.0.1" | "localhost") {
             bail!("OAuth callback_host must be localhost or 127.0.0.1");
         }
+        if provider == "open" && callback_host != "127.0.0.1" {
+            bail!("public-client OAuth registration requires callback_host = \"127.0.0.1\"");
+        }
         let callback_path = oauth.callback_path.as_deref().unwrap_or("/oauth/callback");
+        if provider == "open" && callback_path != "/oauth/callback" {
+            bail!("public-client OAuth requires callback_path = \"/oauth/callback\"");
+        }
         if !valid_callback_path(callback_path) {
             bail!(
                 "OAuth callback_path must begin with / and contain only letters, digits, /, _ or -"
@@ -394,6 +424,18 @@ impl OAuthSettings {
         {
             bail!("OAuth credential_namespace must contain 1-48 ASCII letters, digits, _ or -");
         }
+        let issuer = if provider == "open" {
+            let value = oauth.issuer.as_deref().ok_or_else(|| anyhow!(
+                "Open OAuth provider needs [accounts.oauth].issuer (HTTPS mail server or authorization server)"
+            ))?;
+            validate_open_issuer(value)?;
+            Some(value.to_owned())
+        } else {
+            if oauth.issuer.is_some() {
+                bail!("OAuth issuer override applies only to provider = \"open\"");
+            }
+            None
+        };
         let scope = if let Some(custom) = oauth.scope.as_deref() {
             if custom.trim().is_empty()
                 || custom.len() > 2048
@@ -405,7 +447,7 @@ impl OAuthSettings {
         } else {
             scope
         };
-        Ok(Self {
+        let settings = Self {
             provider,
             client_id,
             client_secret,
@@ -419,7 +461,14 @@ impl OAuthSettings {
             prompt: prompt.map(str::to_owned),
             login_hint: oauth.login_hint.clone(),
             credential_namespace: oauth.credential_namespace.clone(),
-        })
+            issuer,
+            require_issuer_response: false,
+        };
+        if settings.provider == "open" {
+            open::load_cached(settings)
+        } else {
+            Ok(settings)
+        }
     }
 
     fn token_file(&self) -> Result<PathBuf> {
@@ -464,6 +513,7 @@ impl OAuthSettings {
         if data.provider != self.provider
             || data.client_id != self.client_id
             || data.refresh_token.is_empty()
+            || (self.provider == "open" && data.scope.as_deref() != Some(self.scope.as_str()))
         {
             bail!("OAuth credentials do not match the configured account/client; sign in again");
         }
@@ -496,6 +546,11 @@ impl OAuthSettings {
             provider: self.provider.clone(),
             client_id: self.client_id.clone(),
             refresh_token: token.to_owned(),
+            scope: if self.provider == "open" {
+                Some(self.scope.clone())
+            } else {
+                None
+            },
         };
         serde_json::to_writer(&mut staging, &data)?;
         staging.flush()?;
@@ -506,6 +561,11 @@ impl OAuthSettings {
     }
 
     pub fn access_token(&self) -> Result<String> {
+        if self.provider == "open" && self.client_id.is_empty() {
+            bail!(
+                "Open OAuth client is not registered; sign in through Jerc's browser OAuth flow first"
+            );
+        }
         Ok(self.refresh_access_token()?.access_token)
     }
 
@@ -556,6 +616,10 @@ impl OAuthSettings {
     }
 
     fn request_token(&self, form: &[(&str, &str)]) -> Result<TokenReply> {
+        if self.provider == "open" && (self.token_endpoint.is_empty() || self.client_id.is_empty())
+        {
+            bail!("Open OAuth sign-in is incomplete; sign in through the browser first");
+        }
         let agent = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .timeout_global(Some(HTTP_TIMEOUT))
@@ -680,20 +744,39 @@ impl OAuthSettings {
 
     /// TUI wizard uses a browser-only flow and renders its own feedback.
     /// Never print sensitive authorization URLs into the alternate screen.
-    fn wizard_login(&self) -> Result<()> {
+    fn wizard_login(&self, cancel: Option<&AtomicBool>) -> Result<()> {
         if self.flow != LoginFlow::Browser {
             bail!("the account wizard currently requires browser OAuth");
         }
-        self.browser_login_inner(true)
+        self.browser_login_inner_with_cancel(true, cancel)
     }
 
     fn browser_login_inner(&self, quiet: bool) -> Result<()> {
+        self.browser_login_inner_with_cancel(quiet, None)
+    }
+
+    fn browser_login_inner_with_cancel(
+        &self,
+        quiet: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        ensure_not_cancelled(cancel)?;
+        if self.provider == "open"
+            && (self.client_id.is_empty()
+                || self.auth_endpoint.is_empty()
+                || self.token_endpoint.is_empty())
+        {
+            let resolved = open::resolve_for_login(self)?;
+            ensure_not_cancelled(cancel)?;
+            return resolved.browser_login_inner_with_cancel(quiet, cancel);
+        }
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).context("binding OAuth callback to loopback")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let redirect_uri = format!("http://{}:{port}{}", self.callback_host, self.callback_path);
         let (authorization, verifier, state) = self.authorization_url(&redirect_uri)?;
+        ensure_not_cancelled(cancel)?;
         if open_browser(authorization.as_str()) {
             if !quiet {
                 println!(
@@ -713,6 +796,7 @@ impl OAuthSettings {
         }
         let started = Instant::now();
         let code = loop {
+            ensure_not_cancelled(cancel)?;
             if started.elapsed() >= CALLBACK_TIMEOUT {
                 bail!(
                     "OAuth sign-in timed out. If the browser reports a redirect URI mismatch, run --oauth-inspect for this account and register the exact redirect host/path for your application"
@@ -742,7 +826,14 @@ impl OAuthSettings {
                         .query_pairs()
                         .map(|(k, v)| (k.into_owned(), v.into_owned()))
                         .collect();
-                    let matching_state = params.get("state").is_some_and(|value| value == &state);
+                    let matching_state = params.get("state").is_some_and(|value| value == &state)
+                        && (self.provider != "open"
+                            || match params.get("iss") {
+                                Some(reported) => self.issuer.as_deref().is_some_and(|issuer| {
+                                    issuer.trim_end_matches('/') == reported.trim_end_matches('/')
+                                }),
+                                None => !self.require_issuer_response,
+                            });
                     let code = if matching_state {
                         params.get("code").cloned()
                     } else {
@@ -772,6 +863,7 @@ impl OAuthSettings {
                 Err(error) => return Err(error.into()),
             }
         };
+        ensure_not_cancelled(cancel)?;
         self.exchange_code(&code, &redirect_uri, &verifier, quiet)
     }
 
@@ -973,8 +1065,18 @@ pub fn inspect_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("account {name:?} has no [accounts.oauth] configuration"))?;
     println!("OAuth configuration for {:?}:", account.name);
     println!("  Provider: {}", settings.provider);
-    println!("  Client ID: configured (value intentionally not printed)");
-    println!("  Authorization endpoint: {}", settings.auth_endpoint);
+    if !settings.client_id.is_empty() {
+        println!("  Client ID: configured (value intentionally not printed)");
+    }
+    if let Some(issuer) = settings.issuer.as_deref() {
+        println!("  OAuth issuer: {issuer}");
+    }
+    if settings.provider == "open" && settings.client_id.is_empty() {
+        println!("  Client ID: will be registered dynamically on first browser sign-in");
+    }
+    if !settings.auth_endpoint.is_empty() {
+        println!("  Authorization endpoint: {}", settings.auth_endpoint);
+    }
     match settings.flow {
         LoginFlow::Browser => println!(
             "  Redirect to register: http://{}:<ephemeral-port>{}",
@@ -1008,9 +1110,13 @@ pub fn inspect_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
             .unwrap_or("default")
     );
     if settings.flow == LoginFlow::Browser {
-        println!(
-            "  Register the callback host and path; the loopback port is selected at runtime."
-        );
+        if settings.provider == "open" {
+            println!("  A compatible server will register this loopback redirect automatically.");
+        } else {
+            println!(
+                "  Register the callback host and path; the loopback port is selected at runtime."
+            );
+        }
     }
     println!("  Note: this does not verify which redirects, delegated scopes, or consent policies");
     println!(
@@ -1021,14 +1127,28 @@ pub fn inspect_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
 
 /// Browser-only login for the editable account wizard. This never exposes
 /// OAuth URL state, codes, or tokens in the TUI's terminal output.
-pub fn login_account_quiet(accounts: &[AccountConfig], name: &str) -> Result<()> {
+/// Esc sets this flag, aborting the loopback wait. Closing the external
+/// browser cannot be observed by Jerc, so cancellation is user-controlled.
+pub fn login_account_quiet_cancellable(
+    accounts: &[AccountConfig],
+    name: &str,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    ensure_not_cancelled(Some(cancel))?;
     let account = accounts
         .iter()
         .find(|account| account.name == name)
         .ok_or_else(|| anyhow!("no account named {name:?} in config"))?;
     let settings = OAuthSettings::for_account(account)?
         .ok_or_else(|| anyhow!("account {name:?} has no OAuth settings"))?;
-    settings.wizard_login()
+    settings.wizard_login(Some(cancel))
+}
+
+fn ensure_not_cancelled(cancel: Option<&AtomicBool>) -> Result<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        bail!("OAuth sign-in cancelled");
+    }
+    Ok(())
 }
 
 pub fn login_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
@@ -1044,6 +1164,21 @@ pub fn login_account(accounts: &[AccountConfig], name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_token_is_checked_without_network_access() {
+        let cancelled = AtomicBool::new(false);
+        assert!(ensure_not_cancelled(Some(&cancelled)).is_ok());
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(ensure_not_cancelled(Some(&cancelled)).is_err());
+        assert!(ensure_not_cancelled(None).is_ok());
+        assert!(
+            login_account_quiet_cancellable(&[], "unused", &cancelled)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+    }
 
     #[test]
     fn oauth_publisher_defaults_respect_explicit_nonempty_overrides() {
@@ -1496,5 +1631,67 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn open_oauth_settings_are_offline_until_browser_login() {
+        let settings = OAuthSettings::from_config(
+            "FiveJazz isolated test account",
+            &OAuthConfig {
+                provider: "open".into(),
+                issuer: Some("https://mail.fivejazz.com".into()),
+                credential_namespace: Some("stalwart-test-only".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(settings.provider, "open");
+        assert_eq!(settings.scope, open::MAIL_SCOPE);
+        assert_eq!(settings.callback_host, "127.0.0.1");
+        assert!(settings.client_secret.is_none());
+        assert_eq!(settings.flow, LoginFlow::Browser);
+        assert!(!format!("{settings:?}").contains("mail.fivejazz.com"));
+    }
+
+    #[test]
+    fn open_oauth_cannot_use_google_secret_or_an_unsafe_redirect() {
+        let base = OAuthConfig {
+            provider: "open".into(),
+            issuer: Some("https://mail.example.org".into()),
+            client_secret: Some("should-not-be-here".into()),
+            ..Default::default()
+        };
+        assert!(OAuthSettings::from_config("Open", &base).is_err());
+        let mut bad = base.clone();
+        bad.client_secret = None;
+        bad.callback_host = Some("localhost".into());
+        assert!(OAuthSettings::from_config("Open", &bad).is_err());
+        bad.callback_host = Some("127.0.0.1".into());
+        bad.callback_path = Some("/".into());
+        assert!(OAuthSettings::from_config("Open", &bad).is_err());
+    }
+
+    #[test]
+    fn issuer_override_does_not_apply_to_google_or_microsoft() {
+        for provider in ["google", "microsoft"] {
+            let config = OAuthConfig {
+                provider: provider.into(),
+                client_id: Some("owned-app-id".into()),
+                issuer: Some("https://mail.example.org".into()),
+                ..Default::default()
+            };
+            assert!(OAuthSettings::from_config("Other", &config).is_err());
+        }
+    }
+
+    #[test]
+    fn non_browser_flows_are_not_allowed_for_open_public_clients() {
+        let config = OAuthConfig {
+            provider: "open".into(),
+            issuer: Some("https://mail.example.org".into()),
+            flow: Some("devicecode".into()),
+            ..Default::default()
+        };
+        assert!(OAuthSettings::from_config("Open", &config).is_err());
     }
 }

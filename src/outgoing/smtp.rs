@@ -130,15 +130,21 @@ impl SmtpSource {
         })
     }
 
+    /// One-shot wizard probe credential; never serialized into a URI or config.
+    pub(crate) fn with_probe_password(mut self, password: &str) -> Self {
+        self.secret = Some(password.to_owned());
+        self
+    }
+
     pub fn with_account_oauth(mut self, account: &crate::config::AccountConfig) -> Result<Self> {
         if let Some(settings) = crate::oauth::OAuthSettings::for_account(account)? {
-            if matches!(
-                self.auth,
-                SmtpAuth::Plain | SmtpAuth::Login | SmtpAuth::None
-            ) {
-                bail!(
-                    "OAuth account cannot use SMTP password or no-auth scheme; use smtps:// or +xoauth2"
-                );
+            if matches!(self.auth, SmtpAuth::Plain | SmtpAuth::Login) {
+                bail!("OAuth account cannot use SMTP password authentication");
+            }
+            // A no-auth relay is valid independently of incoming OAuth.
+            // Do not obtain, forward, or unnecessarily refresh an OAuth token.
+            if self.auth == SmtpAuth::None {
+                return Ok(self);
             }
             self.account_oauth = Some(settings);
             // An unsuffixed SMTP URI must not try PLAIN/LOGIN with an OAuth
@@ -246,6 +252,74 @@ impl SmtpSender {
             source,
             credential_command,
         }
+    }
+
+    /// Verify SMTP TLS and (when configured) authenticate without MAIL FROM,
+    /// RCPT TO or DATA. Uses the same TLS/SASL mechanisms as actual sends.
+    /// No password or token is printed or placed in an error message here.
+    pub fn probe_connection(&self) -> Result<()> {
+        if matches!(self.source.auth, SmtpAuth::OAuthBearer | SmtpAuth::XOAuth2)
+            && self.source.account_oauth.is_some()
+        {
+            let mut connection = self.authenticated_oauth_connection(false, false)?;
+            let _ = connection.quit();
+            return Ok(());
+        }
+
+        let hello = ClientId::default();
+        let tls = TlsParameters::new(self.source.host.clone())
+            .context("configuring SMTP certificate verification")?;
+        let mut connection = match self.source.tls {
+            SmtpTls::Implicit => SmtpConnection::connect(
+                (self.source.host.as_str(), self.source.port),
+                Some(SMTP_TIMEOUT),
+                &hello,
+                Some(&tls),
+                None,
+            ),
+            SmtpTls::StartTls => SmtpConnection::connect(
+                (self.source.host.as_str(), self.source.port),
+                Some(SMTP_TIMEOUT),
+                &hello,
+                None,
+                None,
+            ),
+        }
+        .context("connecting to SMTP server")?;
+        if self.source.tls == SmtpTls::StartTls {
+            connection
+                .starttls(&tls, &hello)
+                .context("upgrading SMTP connection to required TLS")?;
+        }
+        if !connection.is_encrypted() {
+            bail!("SMTP connection is not encrypted; refusing authentication");
+        }
+        if self.source.auth != SmtpAuth::None {
+            let credential = self.source.credential(self.credential_command.as_deref())?;
+            let secret = if self.source.auth == SmtpAuth::XOAuth2 {
+                self.source.access_token(&credential)?
+            } else {
+                credential
+            };
+            let methods = match self.source.auth {
+                SmtpAuth::Auto => vec![Mechanism::Plain, Mechanism::Login],
+                SmtpAuth::Plain => vec![Mechanism::Plain],
+                SmtpAuth::Login => vec![Mechanism::Login],
+                SmtpAuth::XOAuth2 => vec![Mechanism::Xoauth2],
+                SmtpAuth::None | SmtpAuth::OAuthBearer => unreachable!(),
+            };
+            let response = connection
+                .auth(
+                    &methods,
+                    &Credentials::new(self.source.username.clone(), secret),
+                )
+                .context("SMTP authentication failed")?;
+            if !response.has_code(235) {
+                bail!("SMTP authentication rejected");
+            }
+        }
+        let _ = connection.quit();
+        Ok(())
     }
 
     /// Exercise SMTP OAuth using the same TLS, EHLO and SASL negotiation as
@@ -578,6 +652,9 @@ fn decode_component(raw: &str) -> Result<String> {
 }
 
 fn run_credential_command(command: &str) -> Result<String> {
+    if let Some(secret) = crate::credentials::private_file_credential(command)? {
+        return Ok(secret);
+    }
     #[cfg(unix)]
     let output = Command::new("sh").arg("-c").arg(command).output();
     #[cfg(windows)]
@@ -604,11 +681,76 @@ fn run_credential_command(command: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_backend_reads_wizard_private_credential_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "generated account password").unwrap();
+        let command = format!("@file:{}", file.path().display());
+        assert_eq!(
+            super::run_credential_command(&command).unwrap(),
+            "generated account password"
+        );
+    }
     use super::{
         SmtpAuth, SmtpSource, is_microsoft_smtp_host, oauthbearer_initial_response,
         smtp_advertises_oauthbearer, xoauth2_initial_response,
     };
     use lettre::transport::smtp::response::Response;
+
+    #[test]
+    fn unauthenticated_smtp_never_uses_oauth_tokens() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [[accounts]]
+            name = "University"
+            email = "user@example.edu"
+            source = "imap"
+            imap_host = "outlook.office365.com"
+            [accounts.oauth]
+            provider = "microsoft"
+            client_id = "test-public-client"
+        "#,
+        )
+        .unwrap();
+        let source = SmtpSource::parse("smtp+none://user%40example.edu@relay.example.edu:587")
+            .unwrap()
+            .with_account_oauth(&config.accounts[0])
+            .unwrap();
+        assert_eq!(source.auth, SmtpAuth::None);
+        assert!(source.account_oauth.is_none());
+        assert_eq!(
+            source
+                .credential(Some("nonexistent-credential-command"))
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn explicit_password_smtp_with_oauth_account_is_rejected() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [[accounts]]
+            name = "University"
+            email = "user@example.edu"
+            source = "imap"
+            imap_host = "outlook.office365.com"
+            [accounts.oauth]
+            provider = "microsoft"
+            client_id = "test-public-client"
+        "#,
+        )
+        .unwrap();
+        for scheme in ["smtps+login", "smtp+plain"] {
+            let uri = format!("{scheme}://user%40example.edu@relay.example.edu");
+            assert!(
+                SmtpSource::parse(&uri)
+                    .unwrap()
+                    .with_account_oauth(&config.accounts[0])
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn parses_secure_password_smtp() {

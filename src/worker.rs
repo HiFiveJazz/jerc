@@ -231,7 +231,14 @@ pub enum RuntimeEvent {
         email: String,
         result: Result<crate::discovery::MailConfiguration, String>,
     },
-    SetupLoginFinished(Result<Option<String>, String>),
+    SetupLoginFinished {
+        request_id: u64,
+        result: Result<Option<String>, String>,
+    },
+    SetupTestFinished {
+        request_id: u64,
+        report: crate::setup::probe::ProbeReport,
+    },
     InputStopped,
 }
 

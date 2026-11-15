@@ -3,6 +3,7 @@ pub mod backend;
 mod cache;
 pub mod config;
 pub mod contacts;
+mod credentials;
 pub mod discovery;
 pub mod mail;
 pub mod mail_image;

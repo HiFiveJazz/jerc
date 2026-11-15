@@ -8,13 +8,15 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use base64::Engine as _;
 use roxmltree::{Document, Node};
 use url::Url;
 
 const MAX_XML_BYTES: u64 = 128 * 1024;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(7);
 const MAX_DNS_BYTES: u64 = 64 * 1024;
+const MAX_PACC_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketType {
@@ -36,11 +38,22 @@ pub struct MailConfiguration {
     pub email: String,
     pub provider: String,
     pub source: &'static str,
+    /// OAuth issuer was explicitly advertised and its server metadata validated.
+    pub oauth_issuer: Option<String>,
     pub imap: MailServer,
     pub smtp: MailServer,
 }
 
 impl MailConfiguration {
+    /// Transport security comes from XML socketType, not a port-number guess.
+    pub fn imap_implicit_tls(&self) -> bool {
+        self.imap.socket == SocketType::Ssl
+    }
+
+    pub fn smtp_implicit_tls(&self) -> bool {
+        self.smtp.socket == SocketType::Ssl
+    }
+
     /// Suggest a login identity separately from the visible email address.
     /// This never persists account settings, and the caller must obtain the
     /// user's confirmation before using an OAuth claim as the login name.
@@ -74,7 +87,7 @@ impl MailConfiguration {
         }
         let mut out = format!(
             "# Suggested by {} ({})\n# Review usernames, OAuth registration, and sending identity before use.\n\
-             [[accounts]]\nname = {}\nemail = {}\nsource = \"imap\"\n\
+             [[accounts]]\nname = {}\nemail = {}\nsource = {}\n\
              outgoing = {}\nimap_host = {}\nimap_port = {}\n\
              smtp_host = {}\nsmtp_port = {}\n",
             self.source,
@@ -85,11 +98,22 @@ impl MailConfiguration {
                 .collect::<String>(),
             quoted("Discovered"),
             quoted(&self.email),
-            quoted(if self.smtp.socket == SocketType::Ssl {
-                "smtps"
+            quoted(if self.imap.socket == SocketType::Ssl {
+                "imap"
             } else {
-                "starttls"
+                "imap+starttls"
             }),
+            quoted(
+                match (
+                    self.smtp.socket,
+                    self.smtp.auth.eq_ignore_ascii_case("none")
+                ) {
+                    (SocketType::Ssl, true) => "smtps+none",
+                    (SocketType::StartTls, true) => "smtp+none",
+                    (SocketType::Ssl, false) => "smtps",
+                    (SocketType::StartTls, false) => "starttls",
+                }
+            ),
             quoted(&self.imap.host),
             self.imap.port,
             quoted(&self.smtp.host),
@@ -123,6 +147,12 @@ impl MailConfiguration {
             } else if self.imap.host.eq_ignore_ascii_case("imap.gmail.com") {
                 out.push_str("# For Google: provider = \"google\" (under [accounts.oauth]).\n");
             }
+        }
+        if let Some(issuer) = &self.oauth_issuer {
+            out.push_str(&format!(
+                "[accounts.oauth]\nprovider = \"open\"\nflow = \"browser\"\ncallback_host = \"127.0.0.1\"\ncallback_path = \"/oauth/callback\"\nissuer = {}\n",
+                quoted(issuer),
+            ));
         }
         out
     }
@@ -201,15 +231,19 @@ fn parse_server(
             }
             let socket = match field(node, "socketType")?.to_ascii_uppercase().as_str() {
                 "SSL" => SocketType::Ssl,
-                "STARTTLS" if ty == "smtp" => SocketType::StartTls,
-                // IMAP backend currently only supports implicit TLS.
+                "STARTTLS" => SocketType::StartTls,
                 _ => return None,
             };
             let auth = field(node, "authentication").unwrap_or_default();
             if !matches!(
                 auth.to_ascii_lowercase().as_str(),
-                "oauth2" | "password-cleartext"
+                "oauth2" | "password-cleartext" | "none"
             ) {
+                return None;
+            }
+            // IMAP requires a login; unauthenticated SMTP is a separate
+            // encrypted submission mode and must not imply plaintext transport.
+            if ty == "imap" && auth.eq_ignore_ascii_case("none") {
                 return None;
             }
             let username = expand(
@@ -234,7 +268,13 @@ fn parse_server(
     // multiple configurations. Never select plaintext or STARTTLS-optional.
     candidates.sort_by_key(|server| {
         (
-            !server.auth.eq_ignore_ascii_case("OAuth2"),
+            if server.auth.eq_ignore_ascii_case("OAuth2") {
+                0
+            } else if server.auth.eq_ignore_ascii_case("none") {
+                2
+            } else {
+                1
+            },
             if ty == "imap" {
                 server.port != 993
             } else {
@@ -290,6 +330,7 @@ fn parse_autoconfig_with_domain(
         email: email.to_owned(),
         provider: provider_name,
         source,
+        oauth_issuer: None,
         imap,
         smtp,
     })
@@ -339,6 +380,7 @@ fn known_provider(email: &str, provider: &str, source: &'static str) -> Result<M
         email: email.to_owned(),
         provider: name.to_owned(),
         source,
+        oauth_issuer: None,
         imap: MailServer {
             host: imap.to_owned(),
             port: 993,
@@ -363,8 +405,41 @@ fn known_provider(email: &str, provider: &str, source: &'static str) -> Result<M
 /// DNS-over-HTTPS is intentionally optional and invoked only for an explicit
 /// discovery command. It sends domain names, never email addresses, to the
 /// resolver. No externally supplied hostname is used as an auth endpoint.
+fn valid_dns_query_name(name: &str, record_type: u16) -> bool {
+    // DNS discovery is for externally resolvable domains, not single-label
+    // hosts such as "localhost". Keep this restriction local to discovery:
+    // an explicitly configured mail server may legitimately use localhost.
+    let valid_discovery_domain = |domain: &str| {
+        domain.contains('.')
+            && valid_domain(domain)
+            && !domain
+                .rsplit('.')
+                .next()
+                .is_some_and(|tld| tld.eq_ignore_ascii_case("localhost"))
+    };
+    match record_type {
+        // Plain domain lookups are only needed for autodiscover CNAME and MX.
+        5 | 15 => valid_discovery_domain(name),
+        16 => name
+            .strip_prefix("_ua-auto-config.")
+            .is_some_and(valid_discovery_domain),
+        33 => [
+            "_imaps._tcp.",
+            "_imap._tcp.",
+            "_submissions._tcp.",
+            "_submission._tcp.",
+        ]
+        .iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix)
+                .is_some_and(valid_discovery_domain)
+        }),
+        _ => false,
+    }
+}
+
 fn dns_answers(agent: &ureq::Agent, domain: &str, record_type: u16) -> Result<Vec<String>> {
-    if !valid_domain(domain) {
+    if !valid_dns_query_name(domain, record_type) {
         bail!("invalid domain for DNS discovery");
     }
     let mut url = Url::parse("https://cloudflare-dns.com/dns-query")?;
@@ -401,6 +476,260 @@ fn parse_dns_answers(json: &str, record_type: u16) -> Result<Vec<String>> {
         .filter_map(|entry| entry.get("data").and_then(serde_json::Value::as_str))
         .map(str::to_owned)
         .collect())
+}
+
+/// PACC (draft-ietf-mailmaint-pacc) announces OAuth independently of
+/// Thunderbird's XML, which normally advertises password authentication only.
+/// Never treat an advertised issuer as proof that an individual IMAP or SMTP
+/// service supports a bearer SASL mechanism: F5 probes still verify the login.
+pub(crate) fn parse_pacc(email: &str, json: &str) -> Result<MailConfiguration> {
+    let (_, domain) = address_parts(email)?;
+    let value: serde_json::Value = serde_json::from_str(json).context("invalid PACC JSON")?;
+    let protocols = value
+        .get("protocols")
+        .ok_or_else(|| anyhow!("PACC has no protocols"))?;
+    let imap = protocols
+        .pointer("/imap/host")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("PACC has no IMAP host"))?;
+    let smtp = protocols
+        .pointer("/submit/host")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("PACC has no SMTP submission host"))?;
+    ensure!(
+        valid_domain(imap) && valid_domain(smtp),
+        "invalid PACC mail host"
+    );
+
+    let auth = value.get("authentication");
+    let password = auth
+        .and_then(|a| a.get("password"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let oauth_issuer = auth
+        .and_then(|a| a.pointer("/oauth-public/issuer"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    if let Some(issuer) = oauth_issuer.as_deref() {
+        crate::oauth::validate_open_issuer(issuer)?;
+    }
+    ensure!(
+        password || oauth_issuer.is_some() || auth.is_none(),
+        "PACC advertises no supported mail authentication"
+    );
+    let oauth = oauth_issuer.is_some();
+    let provider = value
+        .pointer("/info/provider/name")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty() && v.len() <= 60 && !v.chars().any(char::is_control))
+        .unwrap_or(domain);
+    Ok(MailConfiguration {
+        email: email.into(),
+        provider: provider.into(),
+        source: "PACC (domain HTTPS with DNS digest)",
+        oauth_issuer,
+        imap: MailServer {
+            host: imap.into(),
+            port: 993,
+            username: email.into(),
+            auth: if oauth {
+                "OAuth2"
+            } else {
+                "password-cleartext"
+            }
+            .into(),
+            socket: SocketType::Ssl,
+        },
+        smtp: MailServer {
+            host: smtp.into(),
+            port: 465,
+            username: email.into(),
+            auth: if oauth {
+                "OAuth2"
+            } else {
+                "password-cleartext"
+            }
+            .into(),
+            socket: SocketType::Ssl,
+        },
+    })
+}
+
+/// DNS-over-HTTPS uses JSON-escaped TXT strings. Each TXT resource record
+/// must be parsed separately; adjacent character-string segments within a
+/// single record are concatenated without separators.
+fn pacc_digest_matches(contents: &[u8], txt_records: &[String]) -> bool {
+    use ring::digest::{SHA256, digest};
+    let actual = digest(&SHA256, contents);
+    txt_records.iter().any(|raw| {
+        let record = raw.trim();
+        let record = record.strip_prefix('"').unwrap_or(record);
+        let record = record.strip_suffix('"').unwrap_or(record);
+        let record = record.replace("\" \"", "");
+        let mut version = None;
+        let mut algorithm = None;
+        let mut expected = None;
+        for tag in record.split(';') {
+            if let Some((key, value)) = tag.trim().split_once('=') {
+                match key.trim() {
+                    "v" => version = Some(value.trim()),
+                    "a" => algorithm = Some(value.trim()),
+                    "d" => expected = Some(value.trim()),
+                    _ => {}
+                }
+            }
+        }
+        if version != Some("UAAC1") || algorithm != Some("sha256") {
+            return false;
+        }
+        expected
+            .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+            .is_some_and(|digest| digest.as_slice() == actual.as_ref())
+    })
+}
+
+/// Validate the issuer before recommending OAuth. Never register a client or
+/// send credentials during discovery. Invalid metadata means use password.
+fn validate_public_oauth_metadata(json: &str, issuer: &str) -> Result<()> {
+    crate::oauth::validate_open_issuer(issuer)?;
+    let value: serde_json::Value = serde_json::from_str(json).context("invalid OAuth metadata")?;
+    ensure!(
+        value.get("issuer").and_then(|v| v.as_str()) == Some(issuer),
+        "OAuth issuer mismatch"
+    );
+    for key in [
+        "authorization_endpoint",
+        "token_endpoint",
+        "registration_endpoint",
+    ] {
+        let endpoint = value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("OAuth metadata missing {key}"))?;
+        crate::oauth::validate_open_issuer(endpoint)?;
+    }
+    let includes = |key: &str, wanted: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|xs| xs.iter().any(|x| x.as_str() == Some(wanted)))
+    };
+    ensure!(
+        includes("code_challenge_methods_supported", "S256"),
+        "OAuth provider does not advertise PKCE S256"
+    );
+    ensure!(
+        includes("grant_types_supported", "authorization_code")
+            && includes("grant_types_supported", "refresh_token"),
+        "OAuth provider does not advertise refreshable authorization codes"
+    );
+    ensure!(
+        includes("scopes_supported", "urn:ietf:params:oauth:scope:mail"),
+        "OAuth provider does not advertise mail scope"
+    );
+    Ok(())
+}
+
+fn check_oauth_issuer(agent: &ureq::Agent, issuer: &str) -> Result<()> {
+    crate::oauth::validate_open_issuer(issuer)?;
+    let parsed = Url::parse(issuer)?;
+    let origin = parsed.origin().ascii_serialization();
+    let path = parsed.path().trim_end_matches('/');
+    let url = format!("{origin}/.well-known/oauth-authorization-server{path}");
+    let mut reply = agent.get(&url).call().context("fetching OAuth metadata")?;
+    ensure!(
+        reply.status() == 200,
+        "OAuth metadata HTTP {}",
+        reply.status()
+    );
+    let json = reply
+        .body_mut()
+        .with_config()
+        .limit(MAX_PACC_BYTES)
+        .read_to_string()?;
+    validate_public_oauth_metadata(&json, issuer)
+}
+
+fn discover_pacc(agent: &ureq::Agent, email: &str) -> Result<MailConfiguration> {
+    let (_, domain) = address_parts(email)?;
+    let url = format!("https://ua-auto-config.{domain}/.well-known/user-agent-configuration.json");
+    let mut reply = agent
+        .get(&url)
+        .header("accept", "application/json")
+        .call()
+        .context("fetching domain PACC document")?;
+    ensure!(reply.status() == 200, "PACC HTTP {}", reply.status());
+    let mime = reply
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    ensure!(
+        mime.split(';')
+            .next()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json")),
+        "PACC content type is not application/json"
+    );
+    let bytes = reply
+        .body_mut()
+        .with_config()
+        .limit(MAX_PACC_BYTES)
+        .read_to_vec()?;
+    // We have a trusted HTTPS DNS channel, so reject absent or mismatched
+    // TXT digests instead of allowing an unverified OAuth issuer override.
+    let txt = dns_answers(agent, &format!("_ua-auto-config.{domain}"), 16)?;
+    ensure!(
+        pacc_digest_matches(&bytes, &txt),
+        "PACC DNS digest is missing or mismatched"
+    );
+    let json = std::str::from_utf8(&bytes)?;
+    let mut config = parse_pacc(email, json)?;
+    let password_supported = serde_json::from_str::<serde_json::Value>(json)?
+        .pointer("/authentication/password")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(issuer) = config.oauth_issuer.clone()
+        && check_oauth_issuer(agent, &issuer).is_err()
+    {
+        // Keep the verified server settings only if password really is
+        // supported; never silently recommend credentials for OAuth-only mail.
+        ensure!(
+            password_supported,
+            "OAuth metadata invalid and PACC disables passwords"
+        );
+        config.oauth_issuer = None;
+        config.imap.auth = "password-cleartext".into();
+        config.smtp.auth = "password-cleartext".into();
+    }
+    Ok(config)
+}
+
+/// Non-PACC fallback only for the exact first-party mail.<email-domain>
+/// host shared by IMAP and SMTP. Avoid guessing OAuth for hosted MX providers,
+/// and require validated RFC 8414 metadata rather than relying on a banner.
+fn first_party_oauth_candidate(config: &MailConfiguration) -> Option<String> {
+    let (_, domain) = address_parts(&config.email).ok()?;
+    let hostname = format!("mail.{domain}");
+    if config.oauth_issuer.is_some()
+        || !config.imap.host.eq_ignore_ascii_case(&hostname)
+        || !config.smtp.host.eq_ignore_ascii_case(&hostname)
+        || config.smtp.auth.eq_ignore_ascii_case("none")
+    {
+        return None;
+    }
+    Some(format!("https://{hostname}"))
+}
+
+fn try_first_party_oauth(agent: &ureq::Agent, mut config: MailConfiguration) -> MailConfiguration {
+    let Some(issuer) = first_party_oauth_candidate(&config) else {
+        return config;
+    };
+    if check_oauth_issuer(agent, &issuer).is_ok() {
+        config.oauth_issuer = Some(issuer);
+        config.imap.auth = "OAuth2".into();
+        config.smtp.auth = "OAuth2".into();
+    }
+    config
 }
 
 fn mx_hosts(records: &[String]) -> Vec<String> {
@@ -470,6 +799,85 @@ fn mx_base_domain(mx: &str) -> Option<String> {
     Some(labels[labels.len() - 2..].join("."))
 }
 
+/// DNS SRV records are untrusted *suggestions*: Jerc always validates TLS
+/// certificates when it actually connects, and no credentials are sent during
+/// discovery. Parse only the secure IMAPS and SMTP submission variants.
+fn srv_endpoint(records: &[String]) -> Option<(String, u16)> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let parts: Vec<_> = record.split_whitespace().collect();
+            if parts.len() != 4 {
+                return None;
+            }
+            let priority = parts[0].parse::<u16>().ok()?;
+            let _weight = parts[1].parse::<u16>().ok()?;
+            let port = parts[2].parse::<u16>().ok()?;
+            let host = parts[3].trim_end_matches('.').to_ascii_lowercase();
+            (port != 0 && valid_domain(&host)).then_some((priority, host, port))
+        })
+        .min_by_key(|(priority, _, _)| *priority)
+        .map(|(_, host, port)| (host, port))
+}
+
+/// Never infer a password, port, or server from an unrelated third-party MX.
+fn self_hosted_mx_suggestion(email: &str, mxes: &[String]) -> Option<MailConfiguration> {
+    let (_, domain) = address_parts(email).ok()?;
+    let host = format!("mail.{domain}");
+    if !mxes.iter().any(|mx| mx.eq_ignore_ascii_case(&host)) {
+        return None;
+    }
+    Some(MailConfiguration {
+        email: email.to_owned(),
+        provider: "Self-hosted IMAP/SMTP (review suggested settings)".into(),
+        source: "same-domain MX hostname hint (not a TLS connectivity test)",
+        oauth_issuer: None,
+        imap: MailServer {
+            host: host.clone(),
+            port: 993,
+            username: email.into(),
+            auth: "password-cleartext".into(),
+            socket: SocketType::Ssl,
+        },
+        smtp: MailServer {
+            host,
+            port: 465,
+            username: email.into(),
+            auth: "password-cleartext".into(),
+            socket: SocketType::Ssl,
+        },
+    })
+}
+
+fn srv_suggestion(
+    email: &str,
+    imap: (String, u16),
+    imap_tls: SocketType,
+    smtp: (String, u16),
+    smtp_tls: SocketType,
+) -> MailConfiguration {
+    MailConfiguration {
+        email: email.to_owned(),
+        provider: "IMAP/SMTP via DNS SRV (review suggested settings)".into(),
+        source: "DNS SRV (TLS endpoints not independently verified)",
+        oauth_issuer: None,
+        imap: MailServer {
+            host: imap.0,
+            port: imap.1,
+            username: email.into(),
+            auth: "password-cleartext".into(),
+            socket: imap_tls,
+        },
+        smtp: MailServer {
+            host: smtp.0,
+            port: smtp.1,
+            username: email.into(),
+            auth: "password-cleartext".into(),
+            socket: smtp_tls,
+        },
+    }
+}
+
 /// Read-only discovery. Domain-owner HTTPS autoconfig outranks ISPDB; after a
 /// miss, use MX-based provider discovery and Exchange's autodiscover CNAME.
 /// For universities with mixed mail systems, specify a provider explicitly.
@@ -490,6 +898,10 @@ pub fn discover_with_provider(email: &str, provider: &str) -> Result<MailConfigu
             .build(),
     );
     let mut failures = Vec::new();
+    match discover_pacc(&agent, email) {
+        Ok(configuration) => return Ok(configuration),
+        Err(error) => failures.push(format!("PACC: {error:#}")),
+    }
     for (url, source) in candidates {
         let attempt = (|| -> Result<MailConfiguration> {
             let mut response = agent
@@ -508,7 +920,7 @@ pub fn discover_with_provider(email: &str, provider: &str) -> Result<MailConfigu
             parse_autoconfig(email, &xml, source)
         })();
         match attempt {
-            Ok(config) => return Ok(config),
+            Ok(config) => return Ok(try_first_party_oauth(&agent, config)),
             Err(error) => failures.push(format!("{source}: {error:#}")),
         }
     }
@@ -560,7 +972,7 @@ pub fn discover_with_provider(email: &str, provider: &str) -> Result<MailConfigu
             parse_autoconfig_with_domain(email, &xml, source, Some(&base))
         })();
         match attempt {
-            Ok(config) => return Ok(config),
+            Ok(config) => return Ok(try_first_party_oauth(&agent, config)),
             Err(error) => failures.push(format!("MX-derived ISPDB ({base}): {error:#}")),
         }
     }
@@ -570,6 +982,48 @@ pub fn discover_with_provider(email: &str, provider: &str) -> Result<MailConfigu
             kind,
             "DNS provider hint (verify mailbox/account identity)",
         );
+    }
+    // RFC 8314 _imaps and _submissions identify TLS-wrapped endpoints;
+    // RFC 6186 _submission uses STARTTLS. All results remain editable hints.
+    let imaps = dns_answers(&agent, &format!("_imaps._tcp.{domain}"), 33)
+        .ok()
+        .and_then(|answers| srv_endpoint(&answers));
+    let imap_starttls = if imaps.is_none() {
+        dns_answers(&agent, &format!("_imap._tcp.{domain}"), 33)
+            .ok()
+            .and_then(|answers| srv_endpoint(&answers))
+    } else {
+        None
+    };
+    let submissions = dns_answers(&agent, &format!("_submissions._tcp.{domain}"), 33)
+        .ok()
+        .and_then(|answers| srv_endpoint(&answers));
+    let submission = if submissions.is_none() {
+        dns_answers(&agent, &format!("_submission._tcp.{domain}"), 33)
+            .ok()
+            .and_then(|answers| srv_endpoint(&answers))
+    } else {
+        None
+    };
+    if let Some((imap, imap_tls)) = imaps
+        .map(|endpoint| (endpoint, SocketType::Ssl))
+        .or_else(|| imap_starttls.map(|endpoint| (endpoint, SocketType::StartTls)))
+    {
+        if let Some(smtp) = submissions {
+            return Ok(try_first_party_oauth(
+                &agent,
+                srv_suggestion(email, imap, imap_tls, smtp, SocketType::Ssl),
+            ));
+        }
+        if let Some(smtp) = submission {
+            return Ok(try_first_party_oauth(
+                &agent,
+                srv_suggestion(email, imap, imap_tls, smtp, SocketType::StartTls),
+            ));
+        }
+    }
+    if let Some(suggested) = self_hosted_mx_suggestion(email, &mxes) {
+        return Ok(try_first_party_oauth(&agent, suggested));
     }
     bail!(
         "No supported secure IMAP/SMTP autoconfig found for {domain}. \
@@ -586,6 +1040,326 @@ mod tests {
         known_provider, lookup_urls, mx_base_domain, mx_hosts, parse_autoconfig,
         parse_autoconfig_with_domain, parse_dns_answers, provider_from_dns,
     };
+
+    const PACC_OAUTH: &str = r#"{
+        "protocols": {
+          "imap": {"host": "mail.fivejazz.com"},
+          "submit": {"host": "mail.fivejazz.com"},
+          "jmap": {"url": "https://mail.fivejazz.com/jmap/session"}
+        },
+        "authentication": {"oauth-public": {"issuer": "https://mail.fivejazz.com"}, "password": true},
+        "info": {"provider": {"name": "FiveJazz Mail"}}
+    }"#;
+
+    const VALID_OAUTH_METADATA: &str = r#"{
+        "issuer": "https://mail.fivejazz.com",
+        "authorization_endpoint": "https://mail.fivejazz.com/auth/authorize",
+        "token_endpoint": "https://mail.fivejazz.com/auth/token",
+        "registration_endpoint": "https://mail.fivejazz.com/auth/register",
+        "code_challenge_methods_supported": ["S256"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "scopes_supported": ["urn:ietf:params:oauth:scope:mail", "openid"]
+    }"#;
+
+    #[test]
+    fn pacc_selects_oauth_and_preserves_non_google_issuer() {
+        let config = super::parse_pacc("hi@fivejazz.com", PACC_OAUTH).unwrap();
+        assert_eq!(config.imap.auth, "OAuth2");
+        assert_eq!(config.smtp.auth, "OAuth2");
+        assert_eq!(config.imap.port, 993);
+        assert_eq!(config.smtp.port, 465);
+        assert_eq!(config.provider, "FiveJazz Mail");
+        assert_eq!(
+            config.oauth_issuer.as_deref(),
+            Some("https://mail.fivejazz.com")
+        );
+        assert!(config.to_toml().contains("provider = \"open\""));
+        assert!(
+            config
+                .to_toml()
+                .contains("issuer = \"https://mail.fivejazz.com\"")
+        );
+        let parsed: crate::config::Config = toml::from_str(&config.to_toml()).unwrap();
+        assert_eq!(parsed.accounts[0].oauth.as_ref().unwrap().provider, "open");
+    }
+
+    #[test]
+    fn pacc_allows_password_only_servers() {
+        let input = PACC_OAUTH.replace(
+            r#""oauth-public": {"issuer": "https://mail.fivejazz.com"}, "password": true"#,
+            r#""password": true"#,
+        );
+        let config = super::parse_pacc("hi@fivejazz.com", &input).unwrap();
+        assert_eq!(config.oauth_issuer, None);
+        assert_eq!(config.imap.auth, "password-cleartext");
+        assert!(!config.to_toml().contains("[accounts.oauth]"));
+    }
+
+    #[test]
+    fn pacc_rejects_no_supported_auth_and_missing_hosts() {
+        let no_auth = PACC_OAUTH.replace(
+            r#""oauth-public": {"issuer": "https://mail.fivejazz.com"}, "password": true"#,
+            r#""password": false"#,
+        );
+        assert!(super::parse_pacc("hi@fivejazz.com", &no_auth).is_err());
+        let no_smtp = PACC_OAUTH.replace(
+            r#""submit": {"host": "mail.fivejazz.com"}"#,
+            r#""submit": {}"#,
+        );
+        assert!(super::parse_pacc("hi@fivejazz.com", &no_smtp).is_err());
+        let invalid_host = PACC_OAUTH.replace("mail.fivejazz.com\"},", "evil.test:25\"},");
+        assert!(super::parse_pacc("hi@fivejazz.com", &invalid_host).is_err());
+    }
+
+    #[test]
+    fn pacc_rejects_unencrypted_or_malformed_issuer() {
+        let unencrypted = PACC_OAUTH.replace(
+            "https://mail.fivejazz.com\"}, \"password",
+            "http://mail.fivejazz.com\"}, \"password",
+        );
+        assert!(super::parse_pacc("hi@fivejazz.com", &unencrypted).is_err());
+        assert!(super::parse_pacc("missing-at", PACC_OAUTH).is_err());
+        assert!(super::parse_pacc("hi@fivejazz.com", "not json").is_err());
+    }
+
+    #[test]
+    fn dns_allows_only_expected_srv_and_pacc_labels() {
+        assert!(super::valid_dns_query_name(
+            "_ua-auto-config.fivejazz.com",
+            16
+        ));
+        assert!(super::valid_dns_query_name("_imaps._tcp.fivejazz.com", 33));
+        assert!(super::valid_dns_query_name(
+            "_submissions._tcp.fivejazz.com",
+            33
+        ));
+        assert!(super::valid_dns_query_name("_imap._tcp.fivejazz.com", 33));
+        assert!(super::valid_dns_query_name(
+            "_submission._tcp.fivejazz.com",
+            33
+        ));
+        assert!(super::valid_dns_query_name("fivejazz.com", 15));
+        assert!(super::valid_dns_query_name("autodiscover.fivejazz.com", 5));
+
+        // Restrict the allowed record types and service labels.
+        assert!(!super::valid_dns_query_name(
+            "_ua-auto-config.fivejazz.com",
+            15
+        ));
+        assert!(!super::valid_dns_query_name("fivejazz.com", 16));
+        assert!(!super::valid_dns_query_name("fivejazz.com", 33));
+        assert!(!super::valid_dns_query_name(
+            "_something._tcp.fivejazz.com",
+            33
+        ));
+        assert!(!super::valid_dns_query_name("_imaps._tcp.fivejazz.com", 15));
+        assert!(!super::valid_dns_query_name("_imaps._tcp.fivejazz.com", 99));
+
+        // Do not ask the public DNS resolver to discover single-label hosts.
+        assert!(!super::valid_dns_query_name("_imaps._tcp.localhost", 33));
+        assert!(!super::valid_dns_query_name(
+            "_ua-auto-config.localhost",
+            16
+        ));
+        assert!(!super::valid_dns_query_name("localhost", 15));
+        assert!(!super::valid_dns_query_name("autodiscover.localhost", 5));
+        assert!(!super::valid_dns_query_name("_imaps._tcp.bad..example", 33));
+    }
+
+    #[test]
+    fn pacc_digest_uses_decoded_bytes_and_requires_valid_txt() {
+        use base64::Engine as _;
+        let expected = base64::engine::general_purpose::STANDARD
+            .encode(ring::digest::digest(&ring::digest::SHA256, PACC_OAUTH.as_bytes()).as_ref());
+        let correct = format!("\"v=UAAC1; a=sha256; d={expected}\"");
+        assert!(super::pacc_digest_matches(
+            PACC_OAUTH.as_bytes(),
+            std::slice::from_ref(&correct)
+        ));
+        assert!(!super::pacc_digest_matches(
+            b"changed",
+            std::slice::from_ref(&correct)
+        ));
+        assert!(!super::pacc_digest_matches(PACC_OAUTH.as_bytes(), &[]));
+        assert!(!super::pacc_digest_matches(
+            PACC_OAUTH.as_bytes(),
+            &[correct.replace("UAAC1", "UAAC2")]
+        ));
+        assert!(!super::pacc_digest_matches(
+            PACC_OAUTH.as_bytes(),
+            &[correct.replace("sha256", "sha1")]
+        ));
+    }
+
+    #[test]
+    fn oauth_metadata_requires_exact_issuer_and_registration() {
+        assert!(
+            super::validate_public_oauth_metadata(
+                VALID_OAUTH_METADATA,
+                "https://mail.fivejazz.com"
+            )
+            .is_ok()
+        );
+        assert!(
+            super::validate_public_oauth_metadata(
+                VALID_OAUTH_METADATA,
+                "https://other.example.com"
+            )
+            .is_err()
+        );
+        assert!(super::validate_public_oauth_metadata("{}", "https://mail.fivejazz.com").is_err());
+        assert!(
+            super::validate_public_oauth_metadata(
+                &VALID_OAUTH_METADATA.replace(
+                    "https://mail.fivejazz.com/auth/register",
+                    "http://mail.fivejazz.com/auth/register"
+                ),
+                "https://mail.fivejazz.com"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn oauth_metadata_rejects_missing_pkce_mail_scope_or_refresh() {
+        for changed in [
+            VALID_OAUTH_METADATA.replace("\"S256\"", "\"plain\""),
+            VALID_OAUTH_METADATA.replace("urn:ietf:params:oauth:scope:mail", "openid"),
+            VALID_OAUTH_METADATA.replace("\"refresh_token\"", "\"client_credentials\""),
+        ] {
+            assert!(
+                super::validate_public_oauth_metadata(&changed, "https://mail.fivejazz.com")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn first_party_oauth_is_only_probed_for_matching_mail_hosts() {
+        let mut config = super::parse_pacc("hi@fivejazz.com", PACC_OAUTH).unwrap();
+        config.oauth_issuer = None;
+        assert_eq!(
+            super::first_party_oauth_candidate(&config).as_deref(),
+            Some("https://mail.fivejazz.com")
+        );
+        config.smtp.host = "smtp.other.com".into();
+        assert_eq!(super::first_party_oauth_candidate(&config), None);
+        config.smtp.host = "mail.fivejazz.com".into();
+        config.smtp.auth = "none".into();
+        assert_eq!(super::first_party_oauth_candidate(&config), None);
+    }
+
+    #[test]
+    fn legacy_mozilla_xml_does_not_advertise_oauth_without_extra_evidence() {
+        let xml = r#"<clientConfig><emailProvider id="fivejazz.com"><domain>fivejazz.com</domain>
+            <incomingServer type="imap"><hostname>mail.fivejazz.com</hostname><port>993</port>
+              <socketType>SSL</socketType><authentication>password-cleartext</authentication></incomingServer>
+            <outgoingServer type="smtp"><hostname>mail.fivejazz.com</hostname><port>465</port>
+              <socketType>SSL</socketType><authentication>password-cleartext</authentication></outgoingServer>
+            </emailProvider></clientConfig>"#;
+        let config = super::parse_autoconfig("hi@fivejazz.com", xml, "test").unwrap();
+        assert_eq!(config.imap.auth, "password-cleartext");
+        assert!(config.oauth_issuer.is_none());
+    }
+
+    #[test]
+    fn imap_starttls_only_xml_is_now_accepted() {
+        let xml = r#"<clientConfig version="1.1"><emailProvider id="example.com">
+            <domain>example.com</domain>
+            <incomingServer type="imap"><hostname>imap.example.com</hostname>
+                <port>143</port><socketType>STARTTLS</socketType>
+                <authentication>password-cleartext</authentication><username>%EMAILADDRESS%</username></incomingServer>
+            <outgoingServer type="smtp"><hostname>smtp.example.com</hostname>
+                <port>587</port><socketType>STARTTLS</socketType>
+                <authentication>none</authentication><username>%EMAILADDRESS%</username></outgoingServer>
+            </emailProvider></clientConfig>"#;
+        let proposal = parse_autoconfig("user@example.com", xml, "fixture").unwrap();
+        assert!(!proposal.imap_implicit_tls());
+        assert!(!proposal.smtp_implicit_tls());
+        assert_eq!(proposal.smtp.auth, "none");
+        let text = proposal.to_toml();
+        assert!(text.contains("source = \"imap+starttls\""));
+        assert!(text.contains("outgoing = \"smtp+none\""));
+    }
+
+    #[test]
+    fn noauth_imap_is_not_accepted_as_normal_mailbox() {
+        let xml = r#"<clientConfig version="1.1"><emailProvider id="example.com">
+            <domain>example.com</domain>
+            <incomingServer type="imap"><hostname>imap.example.com</hostname>
+                <port>143</port><socketType>STARTTLS</socketType>
+                <authentication>none</authentication></incomingServer>
+            <outgoingServer type="smtp"><hostname>smtp.example.com</hostname>
+                <port>587</port><socketType>STARTTLS</socketType>
+                <authentication>none</authentication></outgoingServer>
+            </emailProvider></clientConfig>"#;
+        assert!(parse_autoconfig("user@example.com", xml, "fixture").is_err());
+    }
+
+    #[test]
+    fn unencrypted_xml_endpoints_remain_rejected() {
+        let xml = r#"<clientConfig version="1.1"><emailProvider id="example.com">
+            <domain>example.com</domain>
+            <incomingServer type="imap"><hostname>imap.example.com</hostname>
+                <port>143</port><socketType>plain</socketType>
+                <authentication>password-cleartext</authentication></incomingServer>
+            <outgoingServer type="smtp"><hostname>smtp.example.com</hostname>
+                <port>25</port><socketType>plain</socketType>
+                <authentication>none</authentication></outgoingServer>
+            </emailProvider></clientConfig>"#;
+        assert!(parse_autoconfig("user@example.com", xml, "fixture").is_err());
+    }
+    #[test]
+    fn srv_parsing_ignores_invalid_and_prioritizes_valid_endpoints() {
+        use super::srv_endpoint;
+        let rows = vec![
+            "x y 993 mail.example.org.".to_string(),
+            "0 0 0 bad.example.org.".to_string(),
+            "20 0 993 second.example.org.".to_string(),
+            "10 0 1993 imap.example.org.".to_string(),
+            "1 0 993 hostile@example.org.".to_string(),
+        ];
+        assert_eq!(srv_endpoint(&rows), Some(("imap.example.org".into(), 1993)));
+        assert_eq!(srv_endpoint(&["0 0 0 .".into()]), None);
+    }
+
+    #[test]
+    fn mx_suggestion_requires_same_domain_mail_hostname() {
+        use super::self_hosted_mx_suggestion;
+        let ok =
+            self_hosted_mx_suggestion("hi@fivejazz.com", &["mail.fivejazz.com".into()]).unwrap();
+        assert_eq!(ok.imap.port, 993);
+        assert_eq!(ok.smtp.port, 465);
+        assert_eq!(ok.smtp.auth, "password-cleartext");
+        assert!(ok.to_toml().contains("imap_host = \"mail.fivejazz.com\""));
+        assert!(self_hosted_mx_suggestion("hi@fivejazz.com", &["evil.com".into()]).is_none());
+        assert!(self_hosted_mx_suggestion("invalid", &["mail.fivejazz.com".into()]).is_none());
+    }
+
+    #[test]
+    fn dns_srv_suggestion_supports_submission_starttls_and_implicit() {
+        use super::{SocketType, srv_suggestion};
+        let input = ("imap.example.org".to_owned(), 993);
+        let smtp = ("smtp.example.org".to_owned(), 587);
+        let starttls = srv_suggestion(
+            "hi@example.org",
+            input.clone(),
+            SocketType::Ssl,
+            smtp.clone(),
+            SocketType::StartTls,
+        );
+        assert!(!starttls.smtp_implicit_tls());
+        assert!(starttls.to_toml().contains("outgoing = \"starttls\""));
+        let tls = srv_suggestion(
+            "hi@example.org",
+            input,
+            SocketType::Ssl,
+            smtp,
+            SocketType::Ssl,
+        );
+        assert!(tls.smtp_implicit_tls());
+        assert!(tls.to_toml().contains("outgoing = \"smtps\""));
+    }
 
     const SAMPLE: &str = r#"<?xml version="1.0"?>
     <clientConfig version="1.1"><emailProvider id="example.edu">

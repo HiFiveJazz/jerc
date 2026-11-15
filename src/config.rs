@@ -149,6 +149,10 @@ pub struct OAuthConfig {
     /// refresh tokens for an account with the same name.
     #[serde(default)]
     pub credential_namespace: Option<String>,
+    /// HTTPS OAuth issuer for self-hosted/open-public-client providers.
+    /// Required when provider = "open"; independent of the mail host.
+    #[serde(default)]
+    pub issuer: Option<String>,
 }
 
 impl std::fmt::Debug for AccountConfig {
@@ -492,7 +496,7 @@ impl MailPreset {
 impl AccountConfig {
     /// Expand user-friendly shorthand at load time. Everything downstream still
     /// receives the same fully qualified URIs and OAuth settings as before.
-    fn normalize_shorthand(&mut self) -> Result<()> {
+    pub(crate) fn normalize_shorthand(&mut self) -> Result<()> {
         let email = self
             .email
             .as_deref()
@@ -535,7 +539,15 @@ impl AccountConfig {
         };
         if matches!(
             incoming,
-            "imap" | "imaps" | "imaps+login" | "imaps+xoauth2" | "imaps+oauthbearer"
+            "imap"
+                | "imaps"
+                | "imaps+login"
+                | "imaps+xoauth2"
+                | "imaps+oauthbearer"
+                | "imap+starttls"
+                | "imap+starttls+login"
+                | "imap+starttls+xoauth2"
+                | "imap+starttls+oauthbearer"
         ) {
             let email = email.ok_or_else(|| anyhow!("email is required when source = 'imap'"))?;
             let host = self
@@ -543,7 +555,13 @@ impl AccountConfig {
                 .as_deref()
                 .or_else(|| preset.map(MailPreset::imap_host))
                 .ok_or_else(|| anyhow!("unknown mail provider: set imap_host for this account"))?;
-            let port = self.imap_port.unwrap_or(993);
+            let port = self
+                .imap_port
+                .unwrap_or(if incoming.starts_with("imap+starttls") {
+                    143
+                } else {
+                    993
+                });
             let scheme = match incoming {
                 "imap" => "imaps",
                 other => other,
@@ -563,7 +581,8 @@ impl AccountConfig {
         {
             match outgoing.as_str() {
                 "none" => self.outgoing = None,
-                "smtp" | "smtps" | "starttls" => {
+                "smtp" | "smtps" | "starttls" | "smtp+none" | "smtps+none" | "smtp+plain"
+                | "smtps+plain" | "smtp+login" | "smtps+login" => {
                     let email =
                         email.ok_or_else(|| anyhow!("email is required for outgoing = 'smtp'"))?;
                     let host = self
@@ -576,12 +595,23 @@ impl AccountConfig {
                     let starttls = match outgoing.as_str() {
                         "smtps" => false,
                         "starttls" => true,
+                        value if value.starts_with("smtps+") => false,
+                        value if value.starts_with("smtp+") => true,
                         _ => self.smtp_port.map_or_else(
                             || preset.is_none_or(MailPreset::smtp_starttls),
                             |port| port != 465,
                         ),
                     };
-                    let scheme = if starttls { "smtp" } else { "smtps" };
+                    let scheme = match outgoing.as_str() {
+                        "smtp" | "starttls" | "smtps" => {
+                            if starttls {
+                                "smtp"
+                            } else {
+                                "smtps"
+                            }
+                        }
+                        other => other,
+                    };
                     let port = self.smtp_port.unwrap_or(if starttls { 587 } else { 465 });
                     let username = self.smtp_username.as_deref().unwrap_or(email);
                     self.outgoing = Some(build_mail_uri(scheme, username, host, port)?);
@@ -1289,5 +1319,81 @@ mod tests {
             crate::outgoing::SmtpSource::parse(config.accounts[0].outgoing.as_deref().unwrap())
                 .unwrap();
         assert_eq!(smtp.username, "explicit@example.com");
+    }
+    #[test]
+    fn imap_starttls_shorthand_is_secure_and_defaults_to_143() {
+        let config: Config = toml::from_str(
+            r#"
+            [[accounts]]
+            name = "Personal"
+            email = "user@example.com"
+            source = "imap+starttls"
+            imap_host = "mail.example.com"
+        "#,
+        )
+        .unwrap();
+        let mut account = config.accounts[0].clone();
+        account.normalize_shorthand().unwrap();
+        let parsed = crate::backend::ImapSource::parse(&account.source).unwrap();
+        assert!(parsed.requires_starttls());
+        assert_eq!(parsed.port, 143);
+    }
+
+    #[test]
+    fn imap_starttls_explicit_port_keeps_custom_value() {
+        let config: Config = toml::from_str(
+            r#"
+            [[accounts]]
+            name = "Private"
+            email = "user@example.com"
+            source = "imap+starttls"
+            imap_host = "mail.example.com"
+            imap_port = 8143
+        "#,
+        )
+        .unwrap();
+        let mut account = config.accounts[0].clone();
+        account.normalize_shorthand().unwrap();
+        let parsed = crate::backend::ImapSource::parse(&account.source).unwrap();
+        assert_eq!(parsed.port, 8143);
+        assert!(parsed.requires_starttls());
+    }
+
+    #[test]
+    fn smtp_noauth_shorthands_expand_with_tls_and_no_password() {
+        for (shorthand, scheme, port) in [
+            ("smtps+none", "smtps+none", 465),
+            ("smtp+none", "smtp+none", 587),
+        ] {
+            let raw = format!(
+                "[[accounts]]\nname = \"NoAuth\"\nemail = \"user@example.com\"\nsource = \"imap\"\nimap_host = \"mail.example.com\"\noutgoing = \"{shorthand}\"\nsmtp_host = \"smtp.example.com\"\n"
+            );
+            let config: Config = toml::from_str(&raw).unwrap();
+            let mut account = config.accounts[0].clone();
+            account.normalize_shorthand().unwrap();
+            let parsed =
+                crate::outgoing::SmtpSource::parse(account.outgoing.as_ref().unwrap()).unwrap();
+            assert_eq!(parsed.auth, crate::outgoing::SmtpAuth::None);
+            assert_eq!(parsed.scheme, scheme);
+            assert_eq!(parsed.port, port);
+        }
+    }
+
+    #[test]
+    fn explicit_smtp_password_sasl_schemes_are_preserved() {
+        for shorthand in ["smtps+plain", "smtp+plain", "smtps+login", "smtp+login"] {
+            let raw = format!(
+                "[[accounts]]\nname=\"SASL\"\nemail=\"user@example.com\"\nsource=\"imap\"\nimap_host=\"imap.example.com\"\noutgoing=\"{shorthand}\"\nsmtp_host=\"smtp.example.com\"\n"
+            );
+            let config: Config = toml::from_str(&raw).unwrap();
+            let mut account = config.accounts[0].clone();
+            account.normalize_shorthand().unwrap();
+            assert_eq!(
+                crate::outgoing::SmtpSource::parse(account.outgoing.as_ref().unwrap())
+                    .unwrap()
+                    .scheme,
+                shorthand
+            );
+        }
     }
 }

@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use io_imap::client::{
-    ImapClient, ImapClientStd, ImapClientStdConnectOptions, ImapMailboxWatchStreamOptions,
+    ImapClient, ImapClientError, ImapClientStd, ImapClientStdConnectOptions,
+    ImapMailboxWatchStreamOptions,
 };
 use io_imap::rfc3501::{
     append::ImapMessageAppendOptions, copy::ImapMessageCopyOptions, fetch::ImapMessageFetchOptions,
@@ -18,6 +19,7 @@ use io_imap::rfc3501::{
 use io_imap::rfc6851::r#move::ImapMessageMoveOptions;
 use io_imap::rfc7628::auth_oauthbearer::ImapAuthOauthbearerOptions;
 use io_imap::sasl::auth_xoauth2::ImapAuthXoauth2Options;
+use io_imap::send::ImapOutput;
 use io_imap::types::{
     body::{BodyStructure, SpecificFields},
     fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
@@ -27,6 +29,7 @@ use io_imap::types::{
     sequence::SequenceSet,
     status::{StatusDataItem, StatusDataItemName},
 };
+use io_imap::watch::{ImapMailboxWatchError, ImapMailboxWatchState};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use url::Url;
@@ -39,6 +42,52 @@ use crate::model::{
 
 const IO_TIMEOUT: Duration = Duration::from_secs(90);
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_IDLE_SHADOW_MESSAGES: usize = 3_000;
+const IDLE_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// io-imap 0.11 can recover individual FETCH fields while reporting the rest
+/// in `partial` / `skipped`. A message page is atomic from Jerc's point of
+/// view: accepting only the decoded subset can silently drop cached mail or
+/// advance pagination past messages the user has never seen.
+fn complete_imap_output<T>(output: ImapOutput<T>, operation: &str) -> Result<T> {
+    if !output.partial.is_empty() || !output.skipped.is_empty() {
+        let missing_items: usize = output.partial.iter().map(|part| part.failed.len()).sum();
+        bail!(
+            "incomplete IMAP {operation}: {} partially decoded responses ({} missing items), {} undecodable responses; refresh to retry",
+            output.partial.len(),
+            missing_items,
+            output.skipped.len()
+        );
+    }
+    // ALERT response text is intentionally not copied to terminal diagnostics:
+    // servers can include untrusted content, and the TUI currently has no
+    // dedicated sanitized alert surface.
+    Ok(output.data)
+}
+
+/// A previous IDLE watch can be resumed only for the identical mailbox.
+/// Its 3,000-message cap is enforced again before handing it to io-imap.
+fn take_idle_checkpoint(
+    checkpoint: &mut Option<(String, ImapMailboxWatchState)>,
+    mailbox: &str,
+) -> Option<ImapMailboxWatchState> {
+    checkpoint.take().and_then(|(name, state)| {
+        (name == mailbox && state.flags.len() <= MAX_IDLE_SHADOW_MESSAGES).then_some(state)
+    })
+}
+
+fn watch_error_label(error: &ImapClientError) -> &'static str {
+    if matches!(
+        error,
+        ImapClientError::MailboxWatch(ImapMailboxWatchError::UidValidityChanged { .. })
+    ) {
+        "mailbox UIDVALIDITY changed"
+    } else if error.is_connection_lost() {
+        "connection lost"
+    } else {
+        "IMAP watcher command failed"
+    }
+}
 
 /// Reject data at the IMAP stream boundary, before a malicious literal can
 /// allocate an arbitrary-sized Vec. The writer is not a disk cache.
@@ -102,7 +151,14 @@ impl ImapSource {
         source.split_once("://").is_some_and(|(scheme, _)| {
             matches!(
                 scheme,
-                "imaps" | "imaps+login" | "imaps+oauthbearer" | "imaps+xoauth2"
+                "imaps"
+                    | "imaps+login"
+                    | "imaps+oauthbearer"
+                    | "imaps+xoauth2"
+                    | "imap+starttls"
+                    | "imap+starttls+login"
+                    | "imap+starttls+oauthbearer"
+                    | "imap+starttls+xoauth2"
             )
         })
     }
@@ -110,10 +166,10 @@ impl ImapSource {
     pub fn parse(source: &str) -> Result<Self> {
         let url = Url::parse(source).context("parsing IMAP source URI")?;
         let auth = match url.scheme() {
-            "imaps" => ImapAuth::Password,
-            "imaps+login" => ImapAuth::Login,
-            "imaps+oauthbearer" => ImapAuth::OAuthBearer,
-            "imaps+xoauth2" => ImapAuth::XOAuth2,
+            "imaps" | "imap+starttls" => ImapAuth::Password,
+            "imaps+login" | "imap+starttls+login" => ImapAuth::Login,
+            "imaps+oauthbearer" | "imap+starttls+oauthbearer" => ImapAuth::OAuthBearer,
+            "imaps+xoauth2" | "imap+starttls+xoauth2" => ImapAuth::XOAuth2,
             _ => bail!("unsupported IMAP source scheme"),
         };
 
@@ -154,7 +210,13 @@ impl ImapSource {
         Ok(Self {
             scheme: url.scheme().to_owned(),
             host,
-            port: url.port().unwrap_or(993),
+            port: url
+                .port()
+                .unwrap_or(if url.scheme().starts_with("imap+starttls") {
+                    143
+                } else {
+                    993
+                }),
             username,
             secret,
             auth,
@@ -164,6 +226,34 @@ impl ImapSource {
             scope,
             account_oauth: None,
         })
+    }
+
+    /// Supply an in-memory credential for a one-shot setup probe. This never
+    /// changes the saved account or inserts passwords into a URI or log.
+    pub(crate) fn with_probe_password(mut self, password: &str) -> Self {
+        self.secret = Some(password.to_owned());
+        self
+    }
+
+    /// The `imap+starttls` schemes require the STARTTLS upgrade before any
+    /// authentication. No plain `imap://` credential scheme is accepted.
+    pub fn requires_starttls(&self) -> bool {
+        self.scheme.starts_with("imap+starttls")
+    }
+
+    /// Separate the transport options from the connection so tests can verify
+    /// the mandatory TLS upgrade without depending on a public mail provider.
+    fn connection_settings(&self) -> Result<(Url, ImapClientStdConnectOptions)> {
+        let transport_scheme = if self.requires_starttls() {
+            "imap"
+        } else {
+            "imaps"
+        };
+        let url = Url::parse(&format!("{transport_scheme}://{}:{}", self.host, self.port))
+            .context("building IMAP connection URL")?;
+        let mut options = ImapClientStdConnectOptions::default();
+        options.session.starttls = self.requires_starttls();
+        Ok((url, options))
     }
 
     pub fn with_account_oauth(mut self, account: &crate::config::AccountConfig) -> Result<Self> {
@@ -281,6 +371,9 @@ pub struct ImapBackend {
     selected_exists: Option<u32>,
     selected_uid_validity: Option<u32>,
     selected_uid_next: Option<u32>,
+    // Kept only by the dedicated IDLE backend between reconnect attempts.
+    // Never persisted, shared with the UI, or reused for another mailbox.
+    idle_checkpoint: Option<(String, ImapMailboxWatchState)>,
 }
 
 impl std::fmt::Debug for ImapBackend {
@@ -315,6 +408,7 @@ impl ImapBackend {
             selected_exists: None,
             selected_uid_validity: None,
             selected_uid_next: None,
+            idle_checkpoint: None,
         }
     }
 
@@ -337,7 +431,9 @@ impl ImapBackend {
             started.elapsed(),
             selected_result.is_ok(),
         );
-        let selected = selected_result?;
+        // io-imap 0.11 returns both command data and ancillary responses.
+        // Keep the existing selection state based on the typed command data.
+        let selected = complete_imap_output(selected_result?, "SELECT")?;
         self.selected_mailbox = Some(mailbox.to_owned());
         self.selected_exists = Some(selected.exists.unwrap_or(0));
         self.selected_uid_validity = selected.uid_validity.map(|uid| uid.get());
@@ -460,7 +556,7 @@ impl ImapBackend {
             started.elapsed(),
             fetched.is_ok(),
         );
-        let fetched = fetched?;
+        let fetched = complete_imap_output(fetched?, "FETCH")?;
         if fetched.len() != width as usize {
             return Ok(None);
         }
@@ -472,7 +568,7 @@ impl ImapBackend {
             for item in items.as_ref() {
                 match item {
                     MessageDataItem::Uid(value) => uid = Some(value.get()),
-                    MessageDataItem::Flags(value) => flags = Some(flags_from_imap(value)),
+                    MessageDataItem::Flags(value) => flags = Some(flags_from_imap(value.as_ref())),
                     _ => {}
                 }
             }
@@ -524,7 +620,7 @@ impl ImapBackend {
                 started.elapsed(),
                 fetched.is_ok(),
             );
-            let fetched = fetched?;
+            let fetched = complete_imap_output(fetched?, "FETCH")?;
             for data in fetched.values() {
                 if let Some(summary) = summary_from_fetch(data.as_ref(), self.selected_uid_validity)
                     && let Ok((_, uid)) = Self::decode_uid(&summary.id)
@@ -653,12 +749,23 @@ impl ImapBackend {
             started.elapsed(),
             fetched_result.is_ok(),
         );
-        let fetched = fetched_result?;
+        let fetched = complete_imap_output(fetched_result?, "header FETCH")?;
 
+        let requested = usize::try_from(end - start + 1).unwrap_or(usize::MAX);
+        if fetched.len() != requested {
+            bail!(
+                "incomplete IMAP header FETCH: expected {requested} messages, received {}; refresh to retry",
+                fetched.len()
+            );
+        }
         let mut messages = fetched
             .values()
-            .filter_map(|items| summary_from_fetch(items.as_ref(), self.selected_uid_validity))
-            .collect::<Vec<_>>();
+            .map(|items| {
+                summary_from_fetch(items.as_ref(), self.selected_uid_validity).ok_or_else(|| {
+                    anyhow!("incomplete IMAP FETCH: missing required summary fields")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
         let consumed =
             usize::try_from(end.saturating_sub(start).saturating_add(1)).unwrap_or(usize::MAX);
@@ -809,19 +916,14 @@ impl MailBackend for ImapBackend {
             credential_result.is_ok(),
         );
         let credential = credential_result?;
-        let connect_url = Url::parse(&format!(
-            "imaps://{}:{}",
-            self.source.host, self.source.port
-        ))
-        .context("building IMAP connection URL")?;
+        let (connect_url, connect_options) = self.source.connection_settings()?;
         // Emit a start marker too. When TCP/TLS/greeting stalls, the matching
         // completion cannot be recorded until connect() returns. This changes
         // logging only; the working io-imap transport remains untouched.
         crate::perf::record("imap_tls_connect_begin", None, Duration::ZERO, true);
         let started = Instant::now();
-        let client_result =
-            ImapClientStd::connect(&connect_url, ImapClientStdConnectOptions::default())
-                .context("connecting to IMAP server");
+        let client_result = ImapClientStd::connect(&connect_url, connect_options)
+            .context("connecting to IMAP server");
         crate::perf::record(
             "imap_tls_connect",
             None,
@@ -913,12 +1015,11 @@ impl MailBackend for ImapBackend {
         cancel: &AtomicBool,
         changed: &mut dyn FnMut(),
     ) -> Result<()> {
-        // io-imap's watcher stores a UID+FLAGS shadow for the entire folder.
-        // Do not start it for a giant Inbox: STATUS polling stays available
-        // and has constant retained memory regardless of mailbox size.
-        const MAX_IDLE_SHADOW_MESSAGES: usize = 3_000;
+        // io-imap retains a UID+FLAGS shadow for the whole folder. Cap it,
+        // and use ordinary STATUS polling for unusually large mailboxes.
         let (total, _) = self.mailbox_status(name)?;
         if total > MAX_IDLE_SHADOW_MESSAGES || cancel.load(Ordering::Relaxed) {
+            self.idle_checkpoint = None;
             return Ok(());
         }
         let mailbox = mailbox_from_name(name)?;
@@ -926,29 +1027,101 @@ impl MailBackend for ImapBackend {
             .session
             .take()
             .ok_or_else(|| anyhow!("IMAP not connected"))?;
-        // Only use IDLE when the server explicitly advertises RFC 2177.
         let capability = session.capability().context("reading IMAP capabilities")?;
         if !capability.contains(&Capability::Idle) {
+            self.idle_checkpoint = None;
             return Ok(());
         }
-        let opts = ImapMailboxWatchStreamOptions {
-            shutdown_poll: Duration::from_secs(1),
-            // Reissue IDLE periodically to survive quiet middleboxes.
-            idle_timeout: Some(Duration::from_secs(25 * 60)),
-            poll: None,
-        };
+        let resume_from = take_idle_checkpoint(&mut self.idle_checkpoint, name);
+        let started_with_checkpoint = resume_from.is_some();
         let watch = session
-            .watch_mailbox(mailbox, &capability, opts)
+            .watch_mailbox(
+                mailbox,
+                &capability,
+                ImapMailboxWatchStreamOptions {
+                    shutdown_poll: Duration::from_secs(1),
+                    idle_timeout: Some(Duration::from_secs(25 * 60)),
+                    poll: None,
+                    resume_from,
+                },
+            )
             .context("starting IMAP IDLE mailbox watcher")?;
-        // The watcher owns the connection, leaving all foreground navigation
-        // and the independent STATUS/prefetch worker unaffected.
+
+        // A created watcher is not necessarily an opened watcher. Wait for
+        // EXAMINE to succeed so failures don't masquerade as live sync.
+        let opened_at = Instant::now();
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                watch
+                    .into_state()
+                    .context("stopping cancelled IMAP watcher")?;
+                return Ok(());
+            }
+            match watch.wait_opened(Duration::from_millis(250)) {
+                Ok(()) => break,
+                Err(RecvTimeoutError::Timeout) if opened_at.elapsed() < IDLE_OPEN_TIMEOUT => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    watch
+                        .into_state()
+                        .context("stopping unopened IMAP watcher")?;
+                    bail!("IMAP IDLE watcher did not open mailbox within 30 seconds");
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    let failure = watch.try_recv().ok().and_then(Result::err);
+                    watch.into_state().context("stopping failed IMAP watcher")?;
+                    if let Some(error) = failure {
+                        return Err(anyhow!(
+                            "IMAP watcher failed before opening ({}): {error}",
+                            watch_error_label(&error)
+                        ));
+                    }
+                    bail!("IMAP watcher ended before opening mailbox");
+                }
+            }
+        }
+
+        // Initial watch baseline doesn't produce change events. Ask the
+        // regular worker to reconcile once, ensuring the gap between its
+        // last STATUS and this new watch isn't silently missed.
+        if !started_with_checkpoint {
+            changed();
+        }
+        let mut error = None;
         while !cancel.load(Ordering::Relaxed) {
             match watch.recv_timeout(Duration::from_secs(1)) {
                 Ok(Ok(_)) => changed(),
-                Ok(Err(error)) => return Err(error.into()),
+                Ok(Err(failure)) => {
+                    error = Some(failure);
+                    break;
+                }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => bail!("IMAP IDLE stream stopped"),
+                Err(RecvTimeoutError::Disconnected) => break,
             }
+        }
+        // Always join the worker and recover its shadow, including after a
+        // broken socket. Never resume after UIDVALIDITY changed.
+        let invalid_generation = error.as_ref().is_some_and(|failure| {
+            matches!(
+                failure,
+                ImapClientError::MailboxWatch(ImapMailboxWatchError::UidValidityChanged { .. })
+            )
+        });
+        let state = watch.into_state().context("joining IMAP IDLE watcher")?;
+        self.idle_checkpoint = if invalid_generation {
+            None
+        } else {
+            state
+                .filter(|checkpoint| checkpoint.flags.len() <= MAX_IDLE_SHADOW_MESSAGES)
+                .map(|checkpoint| (name.to_owned(), checkpoint))
+        };
+        if let Some(failure) = error {
+            bail!(
+                "IMAP watcher stopped ({}): {failure}",
+                watch_error_label(&failure)
+            );
+        }
+        if !cancel.load(Ordering::Relaxed) {
+            bail!("IMAP IDLE stream disconnected");
         }
         Ok(())
     }
@@ -966,7 +1139,7 @@ impl MailBackend for ImapBackend {
             .list(reference, pattern)
             .context("listing IMAP mailboxes");
         crate::perf::record("imap_list", None, started.elapsed(), names_result.is_ok());
-        let names = names_result?;
+        let names = complete_imap_output(names_result?, "LIST")?;
 
         let mut selectable: Vec<(String, MailboxRole)> = names
             .into_iter()
@@ -1016,7 +1189,7 @@ impl MailBackend for ImapBackend {
             )
             .with_context(|| format!("reading status for {name:?}"));
         crate::perf::record("imap_status", None, started.elapsed(), items_result.is_ok());
-        let items = items_result?;
+        let items = complete_imap_output(items_result?, "STATUS")?;
         let mut total = 0usize;
         let mut unread = 0usize;
         for item in items {
@@ -1321,6 +1494,9 @@ fn mailbox_to_name(mailbox: &ImapMailbox<'_>) -> String {
 }
 
 fn run_credential_command(command: &str) -> Result<String> {
+    if let Some(secret) = crate::credentials::private_file_credential(command)? {
+        return Ok(secret);
+    }
     #[cfg(unix)]
     let output = Command::new("sh").arg("-c").arg(command).output();
     #[cfg(windows)]
@@ -1484,8 +1660,91 @@ fn mailbox_sort_key(name: &str, role: &MailboxRole) -> (u8, String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_backend_reads_wizard_private_credential_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "generated account password").unwrap();
+        let command = format!("@file:{}", file.path().display());
+        assert_eq!(
+            super::run_credential_command(&command).unwrap(),
+            "generated account password"
+        );
+    }
     use super::{ImapAuth, ImapSource, role_for_name};
 
+    #[test]
+    fn starttls_uri_builds_required_upgrade_options_before_authentication() {
+        let source =
+            ImapSource::parse("imap+starttls://me%40example.com@imap.example.com").unwrap();
+        assert_eq!(source.port, 143);
+        assert_eq!(source.auth, ImapAuth::Password);
+        let (url, options) = source.connection_settings().unwrap();
+        assert_eq!(url.scheme(), "imap");
+        assert_eq!(url.port(), Some(143));
+        assert!(options.session.starttls);
+    }
+
+    #[test]
+    fn implicit_tls_still_does_not_issue_starttls() {
+        let source = ImapSource::parse("imaps://me%40example.com@imap.example.com").unwrap();
+        let (url, options) = source.connection_settings().unwrap();
+        assert_eq!(url.scheme(), "imaps");
+        assert_eq!(url.port(), Some(993));
+        assert!(!options.session.starttls);
+    }
+
+    #[test]
+    fn all_imap_starttls_auth_variants_are_accepted_without_plaintext_uri_support() {
+        for (scheme, expected) in [
+            ("imap+starttls", ImapAuth::Password),
+            ("imap+starttls+login", ImapAuth::Login),
+            ("imap+starttls+xoauth2", ImapAuth::XOAuth2),
+            ("imap+starttls+oauthbearer", ImapAuth::OAuthBearer),
+        ] {
+            let uri = format!("{scheme}://me%40example.com@mail.example.com:1143");
+            assert!(ImapSource::supports(&uri));
+            let source = ImapSource::parse(&uri).unwrap();
+            assert_eq!(source.auth, expected);
+            assert!(source.connection_settings().unwrap().1.session.starttls);
+        }
+        assert!(!ImapSource::supports("imap://user@mail.example.com"));
+        assert!(ImapSource::parse("imap://user@mail.example.com").is_err());
+        assert!(ImapSource::parse("imap+starttls+garbage://user@mail.example.com").is_err());
+    }
+
+    #[test]
+    fn starttls_connection_failure_does_not_send_password() {
+        use crate::backend::MailBackend;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .write_all(b"* OK [CAPABILITY IMAP4rev1] Fake IMAP server\r\n")
+                .unwrap();
+            let mut buffer = [0_u8; 1024];
+            let count = stream.read(&mut buffer).unwrap_or(0);
+            let commands = String::from_utf8_lossy(&buffer[..count]);
+            assert!(!commands.to_ascii_uppercase().contains("LOGIN"));
+            assert!(!commands.contains("sensitive-password"));
+            // No STARTTLS capability; deliberately close the connection.
+        });
+        let source = ImapSource::parse(&format!(
+            "imap+starttls://user%40example.com:sensitive-password@127.0.0.1:{port}"
+        ))
+        .unwrap();
+        let mut backend = super::ImapBackend::new(source, None, 10);
+        assert!(backend.connect().is_err());
+        server.join().unwrap();
+    }
     #[test]
     fn parses_password_source() {
         let source =
@@ -1711,5 +1970,79 @@ mod tests {
         assert_eq!(writer.bytes, b"123");
         writer.write_all(b"45").unwrap();
         assert_eq!(writer.bytes, b"12345");
+    }
+
+    #[test]
+    fn io_imap_partial_fetch_is_never_treated_as_complete() {
+        use io_imap::send::{ImapFetchPartial, ImapOutput};
+        use std::num::NonZeroU32;
+        let output = ImapOutput {
+            data: vec![42],
+            partial: vec![ImapFetchPartial {
+                seq: NonZeroU32::new(1).unwrap(),
+                uid: None,
+                failed: vec![],
+            }],
+            skipped: vec![],
+            alerts: vec![],
+        };
+        let error = super::complete_imap_output(output, "FETCH").unwrap_err();
+        assert!(error.to_string().contains("incomplete IMAP FETCH"));
+        let good = ImapOutput {
+            data: vec![42],
+            partial: vec![],
+            skipped: vec![],
+            alerts: vec![],
+        };
+        assert_eq!(
+            super::complete_imap_output(good, "FETCH").unwrap(),
+            vec![42]
+        );
+    }
+
+    #[test]
+    fn idle_resume_checkpoint_is_bound_to_mailbox_and_size_limit() {
+        use io_imap::watch::ImapMailboxWatchState;
+        use std::collections::BTreeMap;
+        use std::num::NonZeroU32;
+        let checkpoint = ImapMailboxWatchState {
+            uid_validity: NonZeroU32::new(42).unwrap(),
+            highest_mod_seq: 100,
+            flags: BTreeMap::new(),
+        };
+        let mut stored = Some(("INBOX".to_owned(), checkpoint.clone()));
+        assert!(super::take_idle_checkpoint(&mut stored, "Other").is_none());
+        assert!(stored.is_none());
+        let mut stored = Some(("INBOX".to_owned(), checkpoint.clone()));
+        assert_eq!(
+            super::take_idle_checkpoint(&mut stored, "INBOX"),
+            Some(checkpoint.clone())
+        );
+        assert!(stored.is_none());
+        let mut oversized = checkpoint;
+        for uid in 1..=super::MAX_IDLE_SHADOW_MESSAGES as u32 + 1 {
+            oversized
+                .flags
+                .insert(NonZeroU32::new(uid).unwrap(), vec![]);
+        }
+        let mut stored = Some(("INBOX".to_owned(), oversized));
+        assert!(super::take_idle_checkpoint(&mut stored, "INBOX").is_none());
+    }
+
+    #[test]
+    fn io_imap_connection_error_is_distinguished_from_uid_validity_change() {
+        use io_imap::client::ImapClientError;
+        use io_imap::watch::ImapMailboxWatchError;
+        use std::num::NonZeroU32;
+        let lost = ImapClientError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(super::watch_error_label(&lost), "connection lost");
+        let changed = ImapClientError::MailboxWatch(ImapMailboxWatchError::UidValidityChanged {
+            known: NonZeroU32::new(4).unwrap(),
+            seen: NonZeroU32::new(5).unwrap(),
+        });
+        assert_eq!(
+            super::watch_error_label(&changed),
+            "mailbox UIDVALIDITY changed"
+        );
     }
 }

@@ -15,6 +15,44 @@
 ---
 ![Jerc mail browser showing Vim-style navigation and multiple mail accounts](assets/images/example.png)
 
+
+### Adding a self-hosted or password-based IMAP account
+
+The interactive account wizard supports OAuth2 (Google/Microsoft and compatible self-hosted servers) and
+standard password accounts (including Stalwart, mailcow and other private
+IMAP/SMTP servers). The review step has **All Servers**, **Incoming · IMAP**,
+and **Outgoing · SMTP** sections. Use Left/Right to change authentication and
+SMTP transport security; press F3 to reveal per-server username overrides.
+
+Jerc always requires encrypted mail connections: IMAP supports **SSL/TLS**
+(usually 993) and mandatory **STARTTLS** (usually 143). SMTP supports **SSL/TLS**
+(usually 465) and **STARTTLS** (usually 587). Incoming and outgoing transport
+security can be chosen independently; SMTP authentication offers **Automatic**,
+**PLAIN**, **LOGIN**, and **None** (still over TLS). OAuth accounts can use a
+no-auth SMTP relay, but the wizard does not yet support mixed OAuth/password
+server authentication. Nonstandard secure ports are allowed.
+
+In the review step, choose **Test Configuration** (or press **F5**) to
+verify both IMAP login and SMTP authentication over the selected TLS modes.
+Jerc checks both servers in the background and displays separate results;
+**no test email is sent**, no mailbox is read, and nothing is saved by this
+operation. Press **Esc** to dismiss an in-progress test (the network operation
+may finish in the background). Changing any field clears the previous result.
+For self-hosted OAuth, choose OAuth2 and set the HTTPS issuer under F3 advanced settings if it differs from the IMAP host. For OAuth accounts, complete browser sign-in first, then return to the review
+step and press F5. Saving remains a separate explicit action.
+
+Unencrypted IMAP and SMTP are intentionally not selectable. A proposed host
+from MX or SRV DNS is a suggestion only; verify it before entering secrets.
+
+The wizard saves standard-account passwords in an owner-only random file in the
+OS per-user data directory (`jerc/credentials/`), not in `config.toml` or a
+credential-bearing URI. Its generated `source_cred_cmd` and
+`outgoing_cred_cmd` values start with `@file:`; Jerc reads those natively,
+without invoking a shell. These files are **not encrypted at rest**: protect
+your user account, do not publish this directory, and back it up securely.
+Existing accounts that use `pass` or other credential commands remain supported.
+
+
 ## Features
 
 | Features| Highlights |

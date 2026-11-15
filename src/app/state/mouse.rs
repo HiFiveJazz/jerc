@@ -6,16 +6,13 @@ impl App {
     pub fn handle_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
         if self.setup.is_some() {
             let mut continue_clicked = false;
+            let mut test_clicked = false;
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 let wizard = self.setup.as_mut().expect("wizard exists");
                 let (popup_width, popup_height) = wizard.popup_size(width, height);
                 let popup_y = height.saturating_sub(popup_height) / 2;
                 let popup_x = width.saturating_sub(popup_width) / 2;
-                let header_height = if wizard.step == crate::setup::SetupStep::Identity {
-                    1
-                } else {
-                    3
-                };
+                let header_height = wizard.header_rows();
                 let list_y =
                     popup_y.saturating_add(1 + crate::setup::PROGRESS_ROWS + header_height);
                 let list_height = usize::from(
@@ -33,6 +30,7 @@ impl App {
                         && usize::from(mouse.row - list_y) < list_height
                         && !wizard.authenticating
                         && !wizard.discovering
+                        && !wizard.testing
                         && let Some(crate::setup::SetupDisplayRow::Field(field)) =
                             rows.get(first + usize::from(mouse.row - list_y))
                     {
@@ -50,7 +48,7 @@ impl App {
                         "Open account"
                     } else if wizard.step == crate::setup::SetupStep::Identity {
                         "Continue"
-                    } else if wizard.authenticated {
+                    } else if wizard.authenticated || !wizard.uses_oauth() {
                         "Save and open account"
                     } else if wizard.login_failed {
                         "Retry sign-in"
@@ -63,18 +61,42 @@ impl App {
                         (label.chars().count() as u16).saturating_add(6)
                     })
                     .min(popup_width.saturating_sub(2));
-                    let button_x = popup_x.saturating_add(1).saturating_add(
-                        popup_width.saturating_sub(2).saturating_sub(button_width) / 2,
-                    );
+                    let inner_width = popup_width.saturating_sub(2);
+                    let test_button_width = ("Test Configuration [F5]".chars().count() as u16) + 4;
+                    let test_width = if !wizard.saved
+                        && wizard.step == crate::setup::SetupStep::Settings
+                        && inner_width >= button_width + test_button_width + 2
+                    {
+                        test_button_width
+                    } else {
+                        0
+                    };
+                    let gap = if test_width > 0 { 2 } else { 0 };
+                    let total = test_width.saturating_add(gap).saturating_add(button_width);
+                    let start_x = popup_x
+                        .saturating_add(1)
+                        .saturating_add(inner_width.saturating_sub(total) / 2);
+                    let button_x = start_x.saturating_add(test_width + gap);
                     if mouse.row == button_y
-                        && mouse.column >= button_x
-                        && mouse.column < button_x.saturating_add(button_width)
                         && !wizard.authenticating
                         && !wizard.discovering
+                        && !wizard.testing
                     {
-                        continue_clicked = true;
+                        if test_width > 0
+                            && mouse.column >= start_x
+                            && mouse.column < start_x.saturating_add(test_width)
+                        {
+                            test_clicked = true;
+                        } else if mouse.column >= button_x
+                            && mouse.column < button_x.saturating_add(button_width)
+                        {
+                            continue_clicked = true;
+                        }
                     }
                 }
+            }
+            if test_clicked {
+                self.handle_setup_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
             }
             if continue_clicked {
                 let key = if self.setup.as_ref().is_some_and(|wizard| wizard.saved) {

@@ -6,7 +6,8 @@ use super::*;
 /// second. Each selected row paints its entire rectangle, not just the text.
 pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
     use crate::setup::{
-        CLIENT_ID, EMAIL, GOOGLE_SECRET, NAME, PROVIDER, SetupDisplayRow, SetupStep,
+        AUTH_METHOD, CLIENT_ID, EMAIL, GOOGLE_SECRET, IMAP_SECURITY, NAME, PASSWORD, PROVIDER,
+        SMTP_AUTH, SMTP_SECURITY, SetupDisplayRow, SetupStep,
     };
 
     let Some(wizard) = app.setup.as_ref() else {
@@ -22,13 +23,23 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
         height,
     );
     frame.render_widget(Clear, popup);
-    let stages = [
+    let oauth_stages = [
         "Add Email",
         "Review and Connect",
         "Browser Sign-In",
         "Confirmation",
     ];
-    let active = wizard.progress_stage();
+    let password_stages = ["Add Email", "Review and Connect", "Confirmation"];
+    let stages: &[&str] = if wizard.uses_oauth() {
+        &oauth_stages
+    } else {
+        &password_stages
+    };
+    let active = if !wizard.uses_oauth() && wizard.saved {
+        2
+    } else {
+        wizard.progress_stage()
+    };
     let mut progress = Vec::new();
     for (i, stage) in stages.iter().enumerate() {
         if i != 0 {
@@ -56,6 +67,8 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
     if wizard.saved {
         let description = if wizard.authenticated {
             "Your account is configured and signed in."
+        } else if !wizard.uses_oauth() {
+            "Account saved with a private password file. Open to connect."
         } else {
             "Your account was saved. Sign in later to access mail."
         };
@@ -98,13 +111,8 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
         return;
     }
     if wizard.step == SetupStep::Authenticating {
-        // This is a real stage for *both* Google and Microsoft, including
-        // when sign-in is launched from the editable review page.
-        let provider = if wizard.provider_hint() == "google" {
-            "Google"
-        } else {
-            "Microsoft 365"
-        };
+        // Browser sign-in works for Google, Microsoft, and custom providers.
+        let provider = wizard.oauth_sign_in_label();
         let lines = vec![
             Line::styled(format!("Sign in with {provider}"), theme.accent()),
             Line::raw(""),
@@ -116,7 +124,7 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
             ),
             Line::raw(""),
             Line::styled(
-                "This page will update when authentication finishes.",
+                "Press Esc to cancel. Browser closing is not detected; otherwise the attempt times out.",
                 theme.muted(),
             ),
         ];
@@ -125,7 +133,7 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
     }
 
     let identity_step = wizard.step == SetupStep::Identity;
-    let header_height = if identity_step { 1 } else { 3 };
+    let header_height = wizard.header_rows();
     let regions = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -149,10 +157,6 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
         } else {
             "Manual account settings"
         };
-        let source = wizard
-            .source
-            .as_deref()
-            .unwrap_or("Edit the settings below");
         let found_style = if wizard.source.is_some() {
             setup_success_style()
         } else {
@@ -169,13 +173,6 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
                 theme.text(),
             )),
             Rect::new(regions[0].x, regions[0].y + 1, regions[0].width, 1),
-        );
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                format!("{}  ·  {}", wizard.fields[PROVIDER], source),
-                theme.muted(),
-            )),
-            Rect::new(regions[0].x, regions[0].y + 2, regions[0].width, 1),
         );
     }
 
@@ -270,19 +267,24 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
                 } else {
                     value
                 };
-                let value = if *index == GOOGLE_SECRET && !wizard.fields[*index].is_empty() {
+                let value = if *index == PASSWORD && !wizard.fields[*index].is_empty() {
+                    "•".repeat(wizard.fields[*index].chars().count().min(20))
+                } else if *index == GOOGLE_SECRET && !wizard.fields[*index].is_empty() {
                     "(configured)".to_owned()
                 } else {
                     value.to_owned()
                 };
-                let value = if *index == PROVIDER {
+                let value = if matches!(
+                    *index,
+                    PROVIDER | AUTH_METHOD | SMTP_SECURITY | IMAP_SECURITY | SMTP_AUTH
+                ) {
                     format!("◀ {value} ▶")
                 } else if selected && !wizard.authenticating && !wizard.saved {
                     format!("{value}▏")
                 } else {
                     value
                 };
-                let boxed = !identity_step && *index != PROVIDER;
+                let boxed = !identity_step;
                 let maximum = width.saturating_sub(if boxed { 28 } else { 24 });
                 let visible = value.chars().take(maximum).collect::<String>();
                 let body = format!(
@@ -318,9 +320,20 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
 
     // No repeated instructions or keybinding cheat sheet in the wizard.
     // Discovery and authentication failures remain visible and actionable.
-    if wizard.error || wizard.discovering {
+    if wizard.error
+        || wizard.discovering
+        || wizard.testing
+        || wizard.mixed_auth
+        || wizard.last_test_result.is_some()
+        || (!identity_step && !wizard.message.is_empty())
+    {
         let status = if wizard.discovering {
             format!("{} Looking up secure email settings…", wizard.spinner())
+        } else if wizard.testing {
+            format!(
+                "{} Testing TLS and authentication (no email sent)…",
+                wizard.spinner()
+            )
         } else {
             wizard.message.clone()
         };
@@ -336,28 +349,45 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
     }
     let action = if identity_step {
         "Continue"
-    } else if wizard.authenticated {
+    } else if wizard.authenticated || !wizard.uses_oauth() {
         "Save and open account"
     } else if wizard.login_failed {
         "Retry sign-in"
     } else {
         "Continue to Browser Sign-In"
     };
-    if !wizard.authenticating && !wizard.discovering {
+    if !wizard.authenticating && !wizard.discovering && !wizard.testing {
         let button_width = (action.chars().count() as u16)
             .saturating_add(6)
             .min(regions[2].width);
-        let button_area = Rect::new(
-            regions[2].x + regions[2].width.saturating_sub(button_width) / 2,
-            regions[2].y + 2,
-            button_width,
-            1,
-        );
+        let test_label = "Test Configuration [F5]";
+        let required = (test_label.chars().count() as u16) + 4 + button_width + 2;
+        let test_width = if !identity_step && regions[2].width >= required {
+            (test_label.chars().count() as u16) + 4
+        } else {
+            0
+        };
+        let gap = if test_width == 0 { 0 } else { 2 };
+        let total = button_width.saturating_add(test_width).saturating_add(gap);
+        let start = regions[2].x + regions[2].width.saturating_sub(total) / 2;
+        if test_width > 0 {
+            frame.render_widget(
+                Paragraph::new(format!("  {test_label}  "))
+                    .alignment(Alignment::Center)
+                    .style(setup_button_style(&theme)),
+                Rect::new(start, regions[2].y + 2, test_width, 1),
+            );
+        }
         frame.render_widget(
             Paragraph::new(format!("  {action}  "))
                 .alignment(Alignment::Center)
                 .style(setup_button_style(&theme)),
-            button_area,
+            Rect::new(
+                start.saturating_add(test_width + gap),
+                regions[2].y + 2,
+                button_width,
+                1,
+            ),
         );
     }
 }

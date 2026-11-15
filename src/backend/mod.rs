@@ -31,7 +31,7 @@ pub fn from_account(account: &AccountConfig) -> Result<Box<dyn MailBackend>> {
     }
 
     Err(anyhow!(
-        "unsupported backend scheme; currently implemented: maildir://, imaps://, imaps+login://, imaps+oauthbearer://, imaps+xoauth2://"
+        "unsupported backend scheme; currently implemented: maildir://, imaps://, imaps+login://, imaps+oauthbearer://, imaps+xoauth2://, imap+starttls://"
     ))
 }
 
