@@ -19,6 +19,14 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
   doCheck = true;
 
+  # Account-setup tests exercise private credential storage. Nix builders do
+  # not have a writable user home, so provide an isolated XDG data directory.
+  # Precreate the private credential folder to avoid parallel-test races.
+  preCheck = ''
+    export XDG_DATA_HOME="$TMPDIR/jerc-test-data"
+    install -d -m 0700 "$XDG_DATA_HOME/jerc/credentials"
+  '';
+
   meta = {
     description = "Keyboard-driven terminal email client written in Rust";
     homepage = "https://github.com/HiFiveJazz/jerc";
