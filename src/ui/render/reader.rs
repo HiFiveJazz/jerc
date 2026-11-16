@@ -82,6 +82,23 @@ pub(super) fn compact_recipient(value: &str) -> String {
     format!("{name}{trailing}")
 }
 
+/// Shared mail/notice header treatment: accent label followed by ordinary text.
+/// Passing the style lets Notices use amber labels without changing mail colors.
+pub(super) fn reader_labeled_line(
+    label: &'static str,
+    value: impl Into<String>,
+    label_style: Style,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label, label_style),
+        Span::raw(value.into()),
+    ])
+}
+
+pub(super) fn reader_divider(theme: &Theme, width: u16) -> Line<'static> {
+    Line::styled("─".repeat(usize::from(width)), theme.border())
+}
+
 /// Only addresses and Message-ID collapse with `m`. From, To, Cc and Bcc
 /// stay visible, as do all display names, subjects and dates.
 pub(super) fn reader_header_lines(
@@ -91,13 +108,10 @@ pub(super) fn reader_header_lines(
 ) -> Vec<Line<'static>> {
     let from = sender_header_value(&message.from_name, &message.from_address, show_details);
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("From: ", theme.accent()),
-            Span::raw(from),
-        ]),
-        Line::from(vec![
-            Span::styled("Date: ", theme.accent()),
-            Span::raw(if message.timestamp > 0 {
+        reader_labeled_line("From: ", from, theme.accent()),
+        reader_labeled_line(
+            "Date: ",
+            if message.timestamp > 0 {
                 chrono::DateTime::<chrono::Utc>::from_timestamp(message.timestamp, 0)
                     .map(|date| {
                         date.with_timezone(&chrono::Local)
@@ -107,48 +121,50 @@ pub(super) fn reader_header_lines(
                     .unwrap_or_else(|| "unknown".to_owned())
             } else {
                 "unknown".to_owned()
-            }),
-        ]),
-        Line::from(vec![
-            Span::styled("To: ", theme.accent()),
-            Span::raw(if message.to.is_empty() {
+            },
+            theme.accent(),
+        ),
+        reader_labeled_line(
+            "To: ",
+            if message.to.is_empty() {
                 "(not supplied)".to_owned()
             } else if show_details {
                 message.to.clone()
             } else {
                 compact_recipient_header(&message.to)
-            }),
-        ]),
-        Line::from(vec![
-            Span::styled("Subject: ", theme.accent()),
-            Span::raw(message.subject.clone()),
-        ]),
+            },
+            theme.accent(),
+        ),
+        reader_labeled_line("Subject: ", message.subject.clone(), theme.accent()),
     ];
     if !message.cc.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Cc: ", theme.accent()),
-            Span::raw(if show_details {
+        lines.push(reader_labeled_line(
+            "Cc: ",
+            if show_details {
                 message.cc.clone()
             } else {
                 compact_recipient_header(&message.cc)
-            }),
-        ]));
+            },
+            theme.accent(),
+        ));
     }
     if !message.bcc.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Bcc: ", theme.accent()),
-            Span::raw(if show_details {
+        lines.push(reader_labeled_line(
+            "Bcc: ",
+            if show_details {
                 message.bcc.clone()
             } else {
                 compact_recipient_header(&message.bcc)
-            }),
-        ]));
+            },
+            theme.accent(),
+        ));
     }
     if show_details && let Some(message_id) = &message.message_id {
-        lines.push(Line::from(vec![
-            Span::styled("Message-ID: ", theme.accent()),
-            Span::raw(format!("<{message_id}>")),
-        ]));
+        lines.push(reader_labeled_line(
+            "Message-ID: ",
+            format!("<{message_id}>"),
+            theme.accent(),
+        ));
     }
     lines
 }
@@ -280,10 +296,7 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ),
             ]));
         }
-        lines.push(Line::styled(
-            "─".repeat(usize::from(content_area.width)),
-            theme.border(),
-        ));
+        lines.push(reader_divider(&theme, content_area.width));
         lines.push(Line::raw(""));
 
         let image_start = reader_image_size.map(|_| lines.len());

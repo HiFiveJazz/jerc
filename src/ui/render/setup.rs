@@ -415,25 +415,29 @@ pub(super) fn destructive_button_style(theme: &Theme) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-pub(super) fn draw_startup_warnings(frame: &mut Frame<'_>, app: &App) {
+/// Review is deliberately distinct from the warning acknowledgment: only an
+/// explicit, confirmed action can remove one durable uncertain operation.
+pub(super) fn draw_manual_review(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme().clone();
-    let area = centered_rect(frame.area(), 85, 55);
+    let area = centered_rect(frame.area(), 85, 60);
     frame.render_widget(Clear, area);
     let block = Block::default()
-        .title(" Connection and queue notices ")
+        .title(" Manual review: unresolved mailbox / Outbox work ")
         .borders(Borders::ALL)
         .border_type(theme.border_type)
         .border_style(Style::default().fg(theme.warning));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let details = app
-        .all_warnings()
-        .into_iter()
-        .enumerate()
-        .map(|(i, issue)| format!("{}. {}\n", i + 1, issue))
-        .collect::<Vec<_>>()
-        .join("\n");
-    frame.render_widget(Paragraph::new(format!(
-        "Queued offline work will synchronize automatically when safe. Items marked manual review will NOT be retried because the server may already have applied them.\n\n{details}\nEsc / q / ! to close (acknowledged)"
-    )).style(theme.text()).wrap(Wrap { trim: false }), inner);
+    let details = app.manual_review_details();
+    let footer = if app.manual_review_confirmation_open() {
+        "CONFIRM: I checked the server. Remove ONLY this saved record?  y = resolve, n/Esc = cancel"
+    } else {
+        "j/k = select another  |  Enter/r = mark resolved  |  Esc/q = close"
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{details}\n\n{footer}\n\nResolving does not perform any network mutation or send. It cannot be undone in Jerc."))
+            .style(theme.text())
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }

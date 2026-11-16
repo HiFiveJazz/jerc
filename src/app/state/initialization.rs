@@ -189,6 +189,8 @@ impl App {
         // Durable queue warnings are derived from live state by App::visible_warnings.
         // Keeping a startup-only snapshot left stale banners after reconnect.
         let startup_warnings = contacts_warning.into_iter().collect::<Vec<_>>();
+        let (notice_ack_store, acknowledged_warning_keys, notice_first_seen) =
+            NoticeAcknowledgments::open(config.config_path.as_deref());
         Self {
             accounts,
             account_index: 0,
@@ -197,7 +199,13 @@ impl App {
             sync_spinner_frame: 0,
             startup_warnings,
             show_startup_warnings: false,
-            acknowledged_warning_keys: HashSet::new(),
+            acknowledged_warning_keys,
+            notice_ack_store,
+            notice_first_seen,
+            notices: NoticeBrowser::default(),
+            manual_review_visible: false,
+            manual_review_selected: 0,
+            manual_review_pending: None,
             should_quit: false,
             setup: config.accounts.is_empty().then(|| SetupWizard::new(true)),
             remove_account_confirmation: None,

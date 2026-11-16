@@ -59,17 +59,15 @@ impl App {
             self.setup = Some(SetupWizard::new(false));
             return;
         }
-        if self.show_startup_warnings {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('!')
-            ) {
-                self.show_startup_warnings = false;
-            }
+        if self.manual_review_visible {
+            self.handle_manual_review_key(key);
             return;
         }
-        if !self.all_warnings().is_empty()
-            && key.code == KeyCode::Char('!')
+        if self.show_startup_warnings {
+            self.handle_notices_key(key);
+            return;
+        }
+        if key.code == KeyCode::Char('!')
             && self.composer.is_none()
             && !self.attachment_picker_visible
             && !self.help_visible

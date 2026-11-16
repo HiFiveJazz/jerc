@@ -106,7 +106,37 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // notification state. The glyph can also be clicked to toggle alerts.
     let indicator_width = crate::ui::NOTIFICATION_INDICATOR_WIDTH.min(area.width);
     let status_area = Rect::new(area.x, area.y, area.width - indicator_width, area.height);
-    if let Some(modal) = app.contacts_modal.as_ref() {
+    if app.show_startup_warnings {
+        // Notices share the application-wide footer with Contacts, mail and
+        // Compose. Editing the search query is INSERT; selection is VISUAL.
+        let mode = if app.notices.searching {
+            "INSERT"
+        } else if app.notices.detail.is_none() && app.notices.visual_anchor.is_some() {
+            "VISUAL"
+        } else {
+            "NORMAL"
+        };
+        let mut mode_spans = vec![
+            Span::styled("[Notices] ", Style::default().fg(theme.warning)),
+            Span::styled(format!(" {mode} "), mode_style(mode, &theme)),
+        ];
+        if !app.notices.marked.is_empty() {
+            mode_spans.push(Span::styled(
+                format!("  {} marked", app.notices.marked.len()),
+                theme.accent(),
+            ));
+        }
+        if app.status.is_error && !app.status.text.is_empty() {
+            mode_spans.push(Span::styled(
+                format!("  {}", app.status.text),
+                theme.error(),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(mode_spans)).style(theme.status()),
+            status_area,
+        );
+    } else if let Some(modal) = app.contacts_modal.as_ref() {
         // Contacts use the same global status row and mode slot as mail.
         // The contact count belongs inside the Contacts window, not here.
         let mut mode_spans = contact_status_spans(

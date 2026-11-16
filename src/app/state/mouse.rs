@@ -108,7 +108,10 @@ impl App {
             }
             return;
         }
-        if self.show_startup_warnings || self.remove_account_confirmation.is_some() {
+        if self.show_startup_warnings
+            || self.manual_review_visible
+            || self.remove_account_confirmation.is_some()
+        {
             return;
         }
         // The rightmost footer bell is an action as well as a status indicator.

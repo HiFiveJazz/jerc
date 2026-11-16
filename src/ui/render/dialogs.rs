@@ -4,12 +4,14 @@ use super::*;
 
 /// Shared compact two-button confirmation. The caller owns the action and
 /// this renderer only draws the same themed layout in each context.
-fn draw_short_confirmation(
+pub(super) fn draw_short_confirmation(
     frame: &mut Frame<'_>,
     theme: &Theme,
     width: u16,
     title: &str,
     message: &str,
+    border: Style,
+    destructive: bool,
 ) {
     let viewport = frame.area();
     let width = viewport.width.min(width);
@@ -20,7 +22,7 @@ fn draw_short_confirmation(
         width,
         height,
     );
-    let inner = popup_inner(frame, theme, area, title, theme.border());
+    let inner = popup_inner(frame, theme, area, title, border);
     if inner.width < 10 || inner.height < 3 {
         return;
     }
@@ -30,12 +32,18 @@ fn draw_short_confirmation(
             .style(theme.text()),
         Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
     );
+    let (yes_style, no_style) = if destructive {
+        // Same button colors as "Review mail action".
+        (destructive_button_style(theme), theme.current_line())
+    } else {
+        (setup_button_style(theme), destructive_button_style(theme))
+    };
     draw_confirmation_buttons(
         frame,
         theme,
         Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2),
-        setup_button_style(theme),
-        destructive_button_style(theme),
+        yes_style,
+        no_style,
     );
 }
 
@@ -47,6 +55,8 @@ pub(super) fn draw_compose_exit_prompt(frame: &mut Frame<'_>, theme: &Theme) {
         62,
         " Save unsent email? ",
         "Save this email to Drafts before closing?",
+        theme.border(),
+        false,
     );
 }
 
@@ -58,6 +68,8 @@ pub(super) fn draw_draft_resume_confirmation(frame: &mut Frame<'_>, theme: &Them
         68,
         " Continue saved draft? ",
         "Continue composing this saved email?",
+        theme.border(),
+        false,
     );
 }
 

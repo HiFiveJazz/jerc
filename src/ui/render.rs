@@ -11,8 +11,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     ATTACHMENT_HELP_ENTRIES, App, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, ComposeField,
-    ComposeMode, DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, PICKER_HELP_ENTRIES,
-    ReaderSelection, ranked_help_matches,
+    ComposeMode, DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, NOTICE_HELP_ENTRIES,
+    PICKER_HELP_ENTRIES, ReaderSelection, ranked_help_matches,
 };
 use crate::config::VisualSelectionStyle;
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
@@ -39,6 +39,7 @@ mod contacts;
 mod dialogs;
 mod help;
 mod mail_list;
+mod notices;
 mod quote;
 mod reader;
 mod setup;
@@ -51,6 +52,7 @@ use self::contacts::*;
 use self::dialogs::*;
 use self::help::*;
 use self::mail_list::*;
+use self::notices::*;
 use self::quote::*;
 use self::reader::*;
 use self::setup::*;
@@ -71,7 +73,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_status(frame, app, outer[2]);
 
     if app.show_startup_warnings {
-        draw_startup_warnings(frame, app);
+        draw_notices(frame, app);
+    }
+    if app.manual_review_visible {
+        draw_manual_review(frame, app);
     }
     if app.attachment_picker_visible {
         draw_attachments(frame, app);
@@ -162,6 +167,8 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         };
         spans.push(Span::styled(format!(" {} ", account.name), style));
     }
+    // Only show the amber hazard icon while at least one notice is active.
+    // Acknowledging it does not resolve uncertain mailbox or Outbox work.
     if let Some(label) = app.warning_banner_label() {
         spans.push(Span::styled(
             label,
@@ -396,6 +403,7 @@ mod tests {
         for entries in [
             crate::app::HELP_ENTRIES,
             crate::app::CONTACT_HELP_ENTRIES,
+            crate::app::NOTICE_HELP_ENTRIES,
             crate::app::ATTACHMENT_HELP_ENTRIES,
             crate::app::DESTINATION_HELP_ENTRIES,
             crate::app::PICKER_HELP_ENTRIES,

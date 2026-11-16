@@ -3042,7 +3042,7 @@ fn offline_delete_notice_is_amber_acknowledgeable_and_reappears_for_new_work() {
     );
     assert!(
         app.warning_banner_label()
-            .is_some_and(|label| label.contains("notice"))
+            .is_some_and(|label| label.trim() == crate::ui::NOTICE_HAZARD_ICON)
     );
     app.handle_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Char('!'),
@@ -3087,6 +3087,10 @@ fn offline_delete_notice_is_amber_acknowledgeable_and_reappears_for_new_work() {
     assert!(
         app.visible_warnings().is_empty(),
         "completed queue clears the banner"
+    );
+    assert!(
+        app.warning_banner_label().is_none(),
+        "no active notices means no hazard icon"
     );
 }
 
@@ -3330,4 +3334,619 @@ fn oauth_pre_smtp_classification_is_narrow_and_does_not_suppress_ambiguous_send_
             "{unsafe_error}"
         );
     }
+}
+
+#[test]
+fn warning_acknowledgment_survives_restart_without_mutating_the_journal() {
+    use crate::app::state::notice_ack::NoticeAcknowledgments;
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState};
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let journal = root.path().join("ack.json");
+    let entry = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 1,
+        ids: vec![MessageId("imap-uid:1:4225".into())],
+        kind: DeferredMutationKind::Move {
+            destination: "[Gmail]/Trash".into(),
+        },
+        state: DeferredMutationState::NeedsReview,
+    };
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let mut app = super::App::new(&config, vec![worker]);
+    app.accounts[0].deferred_mutations.push(entry.clone());
+    app.notice_ack_store = Some(NoticeAcknowledgments::for_test(journal.clone()));
+    assert!(
+        app.visible_warnings()
+            .iter()
+            .any(|line| line.contains("manual review"))
+    );
+    app.inspect_warnings();
+    assert!(app.visible_warnings().is_empty());
+    assert!(
+        app.warning_banner_label().is_some(),
+        "unresolved review stays visible even after acknowledgment"
+    );
+    assert_eq!(app.accounts[0].deferred_mutations, vec![entry.clone()]);
+
+    let restored = NoticeAcknowledgments::for_test(journal).read().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let mut restarted = super::App::new(&config, vec![worker]);
+    restarted.accounts[0].deferred_mutations.push(entry);
+    restarted.acknowledged_warning_keys = restored;
+    assert!(restarted.visible_warnings().is_empty());
+    assert_eq!(restarted.manual_review_count(), 1);
+    assert!(
+        restarted
+            .all_warnings()
+            .iter()
+            .any(|line| line.contains("manual review"))
+    );
+}
+
+#[test]
+fn dismissing_manual_review_preserves_its_durable_journal() {
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState, Writer};
+    use crate::worker::WorkerHandle;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let journal = root.path().join("mutations.json");
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let uncertain = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 1,
+        ids: vec![MessageId("imap-uid:1:4225".into())],
+        kind: DeferredMutationKind::Move {
+            destination: "[Gmail]/Trash".into(),
+        },
+        state: DeferredMutationState::NeedsReview,
+    };
+    let queued = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 1,
+        ids: vec![MessageId("imap-uid:1:4226".into())],
+        kind: DeferredMutationKind::Delete,
+        state: DeferredMutationState::Queued,
+    };
+    let writer = Writer::for_test_mutations(journal.clone());
+    writer
+        .save_mutations(&[uncertain.clone(), queued.clone()])
+        .unwrap();
+    app.accounts[0].cache_writer = Some(writer);
+    app.accounts[0].deferred_mutations = vec![uncertain.clone(), queued.clone()];
+    app.inspect_warnings();
+    let review_item = app
+        .filtered_notices()
+        .iter()
+        .find_map(|row| row.review.clone())
+        .unwrap();
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert!(app.manual_review_details().contains("[Gmail]/Trash"));
+    assert!(app.manual_review_details().contains("imap-uid:1:4225"));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.notices.detail.is_some());
+    app.handle_key(key(KeyCode::Esc));
+    app.handle_key(key(KeyCode::Char('d')));
+    assert_eq!(app.notices.confirming.len(), 1);
+    // Cancel once to prove no change is made without explicit confirmation.
+    app.handle_key(key(KeyCode::Char('n')));
+    assert_eq!(app.accounts[0].deferred_mutations.len(), 2);
+    app.handle_key(key(KeyCode::Char('d')));
+    app.handle_key(key(KeyCode::Char('y')));
+    assert_eq!(app.accounts[0].deferred_mutations, vec![uncertain, queued]);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(persisted["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        app.manual_review_count(),
+        1,
+        "dismissing is not journal resolution"
+    );
+    assert_eq!(
+        app.filtered_notices()
+            .iter()
+            .filter(|row| row.review.is_some())
+            .count(),
+        0
+    );
+
+    // The existing explicit journal-resolution path still works independently
+    // of UI-only dismissal, after a user verifies what happened on the server.
+    assert!(app.resolve_review_item(review_item));
+    assert_eq!(app.manual_review_count(), 0);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(persisted["entries"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn manual_review_refuses_to_resolve_an_inflight_mutation() {
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState};
+    use crate::worker::WorkerHandle;
+    use std::sync::mpsc::sync_channel;
+    let root = tempfile::tempdir().unwrap();
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let mut app = super::App::new(&config, vec![worker]);
+    let entry = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 1,
+        ids: vec![MessageId("imap-uid:1:4225".into())],
+        kind: DeferredMutationKind::Delete,
+        state: DeferredMutationState::NeedsReview,
+    };
+    app.accounts[0].deferred_mutations.push(entry.clone());
+    app.accounts[0]
+        .inflight_deferred_mutations
+        .insert(17, entry);
+    assert_eq!(app.manual_review_count(), 0);
+    app.handle_system_resume();
+    assert_eq!(app.accounts[0].deferred_mutations.len(), 1);
+    assert!(
+        app.accounts[0]
+            .inflight_deferred_mutations
+            .contains_key(&17)
+    );
+}
+
+#[test]
+fn dismissing_uncertain_outbox_preserves_recovery_copy() {
+    use crate::outgoing::outbox::{QueuedSend, SendState, Store};
+    use crate::worker::WorkerHandle;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let message = crate::model::OutgoingMessage {
+        from: "sender@example.org".into(),
+        to: "recipient@example.net".into(),
+        cc: String::new(),
+        bcc: String::new(),
+        subject: "Uncertain".into(),
+        body: "Body".into(),
+        html_body: None,
+        attachments: vec![],
+        custom_headers: vec![],
+        in_reply_to: None,
+        references: vec![],
+        forwarded_raw: None,
+    };
+    let mut entry = QueuedSend::new(message, None, None, None).unwrap();
+    entry.state = SendState::NeedsReview;
+    let path = root.path().join("outbox.json");
+    let store = Store::for_test(path.clone());
+    store.save(std::slice::from_ref(&entry)).unwrap();
+    app.accounts[0].outbox_store = Some(store);
+    app.accounts[0].outbox.push(entry);
+    assert!(
+        app.manual_review_details()
+            .contains("recipient@example.net")
+    );
+    app.inspect_warnings();
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    app.handle_key(key(KeyCode::Char('d')));
+    assert_eq!(app.notices.confirming.len(), 1);
+    assert_eq!(app.accounts[0].outbox.len(), 1);
+    app.handle_key(key(KeyCode::Char('y')));
+    assert_eq!(app.accounts[0].outbox.len(), 1);
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(saved["messages"].as_array().unwrap().len(), 1);
+    assert!(app.accounts[0].inflight_outbox.is_empty());
+    assert!(app.filtered_notices().is_empty());
+    assert!(app.warning_banner_label().is_none());
+}
+
+#[test]
+fn notices_newest_first_with_contacts_style_counts_and_visual_marks() {
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState};
+    use crate::worker::WorkerHandle;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    for uid in [4225, 4226, 4227, 4228] {
+        app.accounts[0].deferred_mutations.push(DeferredMutation {
+            mailbox: "INBOX".into(),
+            validity: 1,
+            ids: vec![MessageId(format!("imap-uid:1:{uid}"))],
+            kind: DeferredMutationKind::Move {
+                destination: "[Gmail]/Trash".into(),
+            },
+            state: DeferredMutationState::NeedsReview,
+        });
+    }
+    app.inspect_warnings();
+    let rows = app.filtered_notices();
+    assert_eq!(rows.len(), 4);
+    assert!(
+        rows[0].details.contains("4228"),
+        "most recently observed entry first"
+    );
+    assert!(rows[3].details.contains("4225"));
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    app.handle_key(key(KeyCode::Char('2')));
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.notices.selected, 2);
+    app.handle_key(key(KeyCode::Char('g')));
+    app.handle_key(key(KeyCode::Char('g')));
+    assert_eq!(app.notices.selected, 0);
+    app.handle_key(key(KeyCode::Char('V')));
+    app.handle_key(key(KeyCode::Char('2')));
+    app.handle_key(key(KeyCode::Char('j')));
+    assert!(app.notices.in_visual_range(1));
+    app.handle_key(key(KeyCode::Char(' ')));
+    assert_eq!(app.notices.marked.len(), 3);
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.notices.marked.is_empty());
+    assert!(app.show_startup_warnings);
+}
+
+#[test]
+fn notices_bulk_dismissal_preserves_queued_and_review_work() {
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState, Writer};
+    use crate::worker::WorkerHandle;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let journal = root.path().join("mutations.json");
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let records = [4225, 4226, 4227]
+        .into_iter()
+        .map(|uid| DeferredMutation {
+            mailbox: "INBOX".into(),
+            validity: 1,
+            ids: vec![MessageId(format!("imap-uid:1:{uid}"))],
+            kind: DeferredMutationKind::Move {
+                destination: "[Gmail]/Trash".into(),
+            },
+            state: if uid == 4227 {
+                DeferredMutationState::Queued
+            } else {
+                DeferredMutationState::NeedsReview
+            },
+        })
+        .collect::<Vec<_>>();
+    let writer = Writer::for_test_mutations(journal.clone());
+    writer.save_mutations(&records).unwrap();
+    app.accounts[0].cache_writer = Some(writer);
+    app.accounts[0].deferred_mutations = records.clone();
+    app.inspect_warnings();
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let rows = app.filtered_notices();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.iter().filter(|row| row.review.is_some()).count(), 2);
+    // Select the two review rows, not the queued row.
+    let review_indices = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.review.as_ref().map(|_| i))
+        .collect::<Vec<_>>();
+    assert_eq!(review_indices.len(), 2);
+    app.notices
+        .marked
+        .extend(review_indices.iter().map(|&i| rows[i].id.clone()));
+    app.handle_key(key(KeyCode::Char('d')));
+    assert_eq!(app.notices.confirming.len(), 2);
+    app.handle_key(key(KeyCode::Char('n')));
+    assert_eq!(app.accounts[0].deferred_mutations, records);
+    app.handle_key(key(KeyCode::Char('d')));
+    app.handle_key(key(KeyCode::Char('y')));
+    assert_eq!(app.accounts[0].deferred_mutations, records);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+    assert_eq!(persisted["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(app.filtered_notices().len(), 1);
+    assert_eq!(app.filtered_notices()[0].kind, "Queue");
+    // Informational notices can be dismissed too, without canceling queued work.
+    app.handle_key(key(KeyCode::Char('d')));
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.filtered_notices().is_empty());
+    assert!(app.warning_banner_label().is_none());
+    assert_eq!(app.accounts[0].deferred_mutations, records);
+    assert!(app.accounts[0].inflight_deferred_mutations.is_empty());
+}
+
+#[test]
+fn uppercase_d_dismisses_marked_notices_immediately_without_touching_recovery_records() {
+    use crate::app::state::notice_ack::NoticeAcknowledgments;
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState, Writer};
+    use crate::worker::WorkerHandle;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let journal = root.path().join("mutations.json");
+    let ack = root.path().join("ack.json");
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let mut app = super::App::new(&config, vec![worker]);
+    let records = [4225, 4226, 4227]
+        .into_iter()
+        .map(|uid| DeferredMutation {
+            mailbox: "INBOX".into(),
+            validity: 1,
+            ids: vec![MessageId(format!("imap-uid:1:{uid}"))],
+            kind: DeferredMutationKind::Move {
+                destination: "[Gmail]/Trash".into(),
+            },
+            state: DeferredMutationState::NeedsReview,
+        })
+        .collect::<Vec<_>>();
+    let writer = Writer::for_test_mutations(journal.clone());
+    writer.save_mutations(&records).unwrap();
+    app.accounts[0].cache_writer = Some(writer);
+    app.accounts[0].deferred_mutations = records.clone();
+    app.notice_ack_store = Some(NoticeAcknowledgments::for_test(ack.clone()));
+    app.inspect_warnings();
+
+    let rows = app.filtered_notices();
+    assert_eq!(rows.len(), 3);
+    let dismissed = rows
+        .iter()
+        .take(2)
+        .map(|row| row.id.clone())
+        .collect::<Vec<_>>();
+    app.notices.marked.extend(dismissed.iter().cloned());
+    app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+
+    // The uppercase shortcut never opens a confirmation and clears selection.
+    assert!(app.notices.confirming.is_empty());
+    assert!(app.notices.marked.is_empty());
+    assert!(app.notices.visual_anchor.is_none());
+    assert_eq!(app.filtered_notices().len(), 1);
+    assert_eq!(app.accounts[0].deferred_mutations, records);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+    assert_eq!(persisted["entries"].as_array().unwrap().len(), 3);
+
+    // Use the existing private acknowledgment store, also on the immediate path.
+    let persisted_keys = NoticeAcknowledgments::for_test(ack).read().unwrap();
+    for id in &dismissed {
+        assert!(persisted_keys.contains(&super::notices::dismissed_notice_key(id)));
+    }
+}
+
+#[test]
+fn notices_reuse_searchable_help_without_intercepting_resolution_keys() {
+    use crate::worker::WorkerHandle;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let mut app = super::App::new(&config, vec![worker]);
+    app.show_startup_warnings = true;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.notices.help);
+    app.handle_key(key(KeyCode::Char('d')));
+    // Key presses go to the reused palette, not notice actions.
+    assert_eq!(app.notices.help_query, "d");
+    assert!(
+        crate::app::ranked_help_matches(crate::app::NOTICE_HELP_ENTRIES, &app.notices.help_query,)
+            .iter()
+            .any(|&index| crate::app::NOTICE_HELP_ENTRIES[index].key == "d")
+    );
+    assert!(
+        crate::app::NOTICE_HELP_ENTRIES
+            .iter()
+            .any(|entry| entry.key == "D")
+    );
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.notices.help);
+    assert!(app.show_startup_warnings);
+
+    // Search edits are the shared footer's INSERT mode, not a separate badge.
+    app.handle_key(key(KeyCode::Char('/')));
+    assert!(app.notices.searching);
+    app.handle_key(key(KeyCode::Char('B')));
+    assert_eq!(app.notices.query, "B");
+    app.handle_key(key(KeyCode::Enter));
+    assert!(!app.notices.searching);
+}
+
+#[test]
+fn notice_detail_delete_keeps_its_identity_when_new_notices_arrive() {
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState};
+    use crate::worker::WorkerHandle;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let (tx, _rx) = sync_channel(8);
+    let worker = WorkerHandle::spawn(
+        0,
+        Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+        None,
+        None,
+        tx,
+    );
+    let mut app = super::App::new(&config, vec![worker]);
+    let mutation = |uid| DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 1,
+        ids: vec![MessageId(format!("imap-uid:1:{uid}"))],
+        kind: DeferredMutationKind::Move {
+            destination: "[Gmail]/Trash".into(),
+        },
+        state: DeferredMutationState::NeedsReview,
+    };
+    app.accounts[0].deferred_mutations.push(mutation(4225));
+    app.inspect_warnings();
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    app.handle_key(key(KeyCode::Enter));
+    let original_id = app.notices.detail.clone().unwrap();
+
+    app.accounts[0].deferred_mutations.push(mutation(4226));
+    assert!(
+        app.filtered_notices()
+            .iter()
+            .any(|row| row.id == original_id)
+    );
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.notices.help);
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.notices.help);
+    assert_eq!(app.notices.detail.as_deref(), Some(original_id.as_str()));
+    app.handle_key(key(KeyCode::Char('d')));
+    assert_eq!(app.notices.confirming.len(), 1);
+    let selected = app.notices.confirming.first().unwrap();
+    assert_eq!(selected, &original_id);
+    app.handle_key(key(KeyCode::Char('n')));
+    assert_eq!(app.accounts[0].deferred_mutations.len(), 2);
+
+    // The immediate shortcut from the reader acts on the same original ID,
+    // not the newer notice that has appeared above it.
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.notices.detail.as_deref(), Some(original_id.as_str()));
+    app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+    assert!(app.notices.confirming.is_empty());
+    assert!(app.notices.detail.is_none());
+    assert!(
+        app.filtered_notices()
+            .iter()
+            .all(|row| row.id != original_id)
+    );
+    assert_eq!(app.filtered_notices().len(), 1);
+    assert_eq!(app.accounts[0].deferred_mutations.len(), 2);
+}
+
+#[test]
+fn dismissed_notice_stays_hidden_across_acknowledgment_and_restart() {
+    use crate::app::state::notice_ack::NoticeAcknowledgments;
+    use crate::cache::{DeferredMutation, DeferredMutationKind, DeferredMutationState};
+    use crate::worker::WorkerHandle;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc::sync_channel;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = crate::config::Config::single_maildir("Burner".into(), root.path().into());
+    let ack = root.path().join("ack.json");
+    let entry = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 1,
+        ids: vec![MessageId("imap-uid:1:4225".into())],
+        kind: DeferredMutationKind::Move {
+            destination: "[Gmail]/Trash".into(),
+        },
+        state: DeferredMutationState::NeedsReview,
+    };
+    let create_app = || {
+        let (tx, _rx) = sync_channel(8);
+        let worker = WorkerHandle::spawn(
+            0,
+            Box::new(crate::backend::MaildirBackend::new(root.path().into())),
+            None,
+            None,
+            tx,
+        );
+        let mut app = super::App::new(&config, vec![worker]);
+        app.accounts[0].deferred_mutations.push(entry.clone());
+        app.notice_ack_store = Some(NoticeAcknowledgments::for_test(ack.clone()));
+        app
+    };
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let mut app = create_app();
+    app.inspect_warnings();
+    assert_eq!(app.filtered_notices().len(), 1);
+    app.handle_key(key(KeyCode::Char('d')));
+    assert_eq!(app.notices.confirming.len(), 1);
+    app.handle_key(key(KeyCode::Char('n')));
+    assert_eq!(app.filtered_notices().len(), 1);
+    app.handle_key(key(KeyCode::Char('d')));
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.filtered_notices().is_empty());
+    assert!(app.warning_banner_label().is_none());
+    assert_eq!(app.accounts[0].deferred_mutations, vec![entry.clone()]);
+    app.inspect_warnings();
+    assert!(app.filtered_notices().is_empty());
+
+    let mut restarted = create_app();
+    restarted.acknowledged_warning_keys = NoticeAcknowledgments::for_test(ack).read().unwrap();
+    restarted.inspect_warnings();
+    assert!(restarted.filtered_notices().is_empty());
+    assert_eq!(restarted.manual_review_count(), 1);
+    assert_eq!(restarted.accounts[0].deferred_mutations, vec![entry]);
 }

@@ -50,6 +50,9 @@ use crate::worker::{ActionKind, RuntimeEvent, WorkerEvent, WorkerEventKind, Work
 mod account_cache;
 mod account_sync;
 use self::account_sync::{MailboxStatusQueue, StatusReason};
+pub(crate) use self::manual_review::{ReviewItem, ReviewOperation};
+use self::notice_ack::{NoticeAcknowledgments, key_digest};
+pub(crate) use self::notices::{NoticeBrowser, NoticeRow};
 mod attachment_actions;
 mod compose_actions;
 mod composer;
@@ -58,7 +61,10 @@ mod file_picker;
 mod initialization;
 mod input_dispatch;
 mod mail_actions;
+mod manual_review;
 mod mouse;
+mod notice_ack;
+mod notices;
 mod reader_actions;
 mod reader_text;
 mod search_help_actions;
@@ -1598,6 +1604,12 @@ pub struct App {
     pub show_startup_warnings: bool,
     // UI acknowledgment only; never alters durable Outbox/mutation state.
     pub acknowledged_warning_keys: HashSet<String>,
+    notice_ack_store: Option<NoticeAcknowledgments>,
+    notice_first_seen: HashMap<String, u64>,
+    pub(crate) notices: NoticeBrowser,
+    pub manual_review_visible: bool,
+    pub manual_review_selected: usize,
+    manual_review_pending: Option<ReviewItem>,
     pub should_quit: bool,
     /// In-app first-run or add-account setup, modal over normal mail UI.
     pub setup: Option<SetupWizard>,
@@ -1856,6 +1868,69 @@ impl App {
         }
     }
 
+    /// System resume: proactively replace sockets for read-only sessions. A
+    /// possibly submitted write is NEVER detached, retried, or discarded.
+    /// Its journal remains NeedsReview until a definitive server ACK or an
+    /// explicit user resolution.
+    pub fn handle_system_resume(&mut self) {
+        let pending_send = self.pending_send;
+        let pending_compose = self.pending_compose.as_ref().map(|pending| pending.account);
+        let pending_draft = self.pending_draft.as_ref().map(|pending| pending.account);
+        let mut reconnected = 0usize;
+        for (index, account) in self.accounts.iter_mut().enumerate() {
+            let write_pending = pending_send.is_some_and(|(owner, _)| owner == index)
+                || pending_compose == Some(index)
+                || pending_draft == Some(index)
+                || !account.pending_mutation_labels.is_empty()
+                || !account.inflight_deferred_mutations.is_empty()
+                || !account.inflight_outbox.is_empty()
+                || !account.pending_seen.is_empty()
+                || !account.inflight_deferred_seen.is_empty()
+                || account.worker.has_unacknowledged_writes();
+            if write_pending {
+                // Keep waiting for the actual worker reply. On failure the
+                // normal worker error handler preserves uncertain journals.
+                continue;
+            }
+            let already_offline = account.offline_incident_active;
+            match account.worker.recover_stalled_foreground() {
+                Ok(true) => {
+                    account.foreground_generation = account.worker.foreground_generation();
+                    account.connecting = false;
+                    account.connect_request_id = None;
+                    account.mark_disconnected();
+                    // A routine resume is not itself evidence of an outage.
+                    // A real failed reconnect will create its own notice.
+                    if !already_offline {
+                        account.offline_incident_active = false;
+                    }
+                    if account.request_connect() {
+                        reconnected += 1;
+                    }
+                }
+                Ok(false) => {
+                    // A worker may be under recovery backoff, or the account
+                    // might use Maildir (no network socket to replace).
+                    if account.capabilities.is_none() && !account.connecting {
+                        let _ = account.request_connect();
+                    }
+                }
+                Err(error) => {
+                    self.status = StatusLine::temporary_error(
+                        format!("{}: resume recovery unavailable: {error:#}", account.name),
+                        Duration::from_secs(6),
+                    );
+                }
+            }
+        }
+        if reconnected > 0 {
+            self.status = StatusLine::temporary(
+                format!("resumed from sleep; reconnecting {reconnected} mail account(s)"),
+                Duration::from_secs(5),
+            );
+        }
+    }
+
     /// Auto-reconnect uses its original 10-second cadence. Stall detection
     /// runs on a separate, faster timer to avoid increasing retry traffic.
     pub fn reconnect_offline_accounts(&mut self) {
@@ -2097,34 +2172,56 @@ impl App {
                 notice
                     .identities
                     .iter()
-                    .any(|key| !self.acknowledged_warning_keys.contains(key))
+                    .any(|key| !self.acknowledged_warning_keys.contains(&key_digest(key)))
             })
             .map(|notice| notice.message)
             .collect()
     }
 
+    /// Compact mail-browser indicator for *active* notices. Acknowledgment
+    /// only silences unsolicited warnings: it must not hide unresolved work.
+    /// The same string is used by the tab renderer and its click hitbox.
     #[must_use]
     pub fn warning_banner_label(&self) -> Option<String> {
-        let count = self.visible_warnings().len();
-        (count > 0).then(|| {
-            format!(
-                "  ! {count} notice{} [! to inspect]",
-                if count == 1 { "" } else { "s" }
-            )
-        })
+        (!self.notice_rows().is_empty()).then(|| format!("  {}", crate::ui::NOTICE_HAZARD_ICON))
     }
 
-    /// Acknowledges the current set in memory immediately, with no restart.
-    /// New work gets a different identity and will produce another notice.
+    /// Store only digests of the inspected identities, never mailbox names or
+    /// message UIDs. Acknowledgment silences the banner, not the durable WAL.
     pub fn inspect_warnings(&mut self) {
-        let entries = self.warning_entries();
-        let current = entries
+        let current = self.notice_identity_digests();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let active = current.iter().cloned().collect::<HashSet<_>>();
+        self.notice_first_seen
+            .retain(|identity, _| active.contains(identity));
+        for (order, identity) in current.iter().enumerate() {
+            self.notice_first_seen
+                .entry(identity.clone())
+                .or_insert(now.saturating_add(order as u64));
+        }
+        // Keep explicit dismissals of still-active rows separate from the
+        // ordinary banner acknowledgment. Both are digests in the same private
+        // persisted store, so no new journal or persistence component is needed.
+        let active_dismissals = self
+            .all_notice_rows()
             .iter()
-            .flat_map(|notice| notice.identities.iter().cloned())
+            .map(|row| notices::dismissed_notice_key(&row.id))
             .collect::<HashSet<_>>();
         self.acknowledged_warning_keys
-            .retain(|key| current.contains(key));
+            .retain(|key| active_dismissals.contains(key));
         self.acknowledged_warning_keys.extend(current);
+        if let Some(store) = &self.notice_ack_store
+            && let Err(error) =
+                store.save_state(&self.acknowledged_warning_keys, &self.notice_first_seen)
+        {
+            self.status = StatusLine::temporary_error(
+                format!("could not persist notice acknowledgment: {error}"),
+                Duration::from_secs(6),
+            );
+        }
         self.show_startup_warnings = true;
     }
 

@@ -2,6 +2,10 @@
 /// Leave room for a three-digit capped count (99+) in either icon style.
 pub(crate) const NOTIFICATION_INDICATOR_WIDTH: u16 = 8;
 
+/// Monochrome warning indicator shared by the mail header and Notices title.
+/// A single terminal cell keeps alignment predictable without emoji fonts.
+pub(crate) const NOTICE_HAZARD_ICON: &str = "!";
+
 mod render;
 
 pub use render::draw;

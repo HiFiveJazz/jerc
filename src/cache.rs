@@ -387,6 +387,22 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
+    #[cfg(test)]
+    pub(crate) fn for_test_mutations(path: PathBuf) -> Self {
+        Self {
+            wake: None,
+            pending: Arc::new(Mutex::new(PendingChanges::default())),
+            join: None,
+            body_store: BodyStore {
+                dir: path.with_extension("bodies"),
+            },
+            mutation_store: MutationStore {
+                path,
+                readable: true,
+            },
+        }
+    }
+
     pub(crate) fn save_mutations(&self, entries: &[DeferredMutation]) -> std::io::Result<()> {
         self.mutation_store.save(entries)
     }

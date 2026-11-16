@@ -252,6 +252,76 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
 /// Contacts-specific shortcuts shown in the same searchable palette as mail.
 /// Keep all discoverability here instead of showing permanent shortcut hints
 /// across the contacts list.
+/// Context-specific shortcuts for the Notices browser, rendered by the
+/// same searchable help palette as Contacts, mail, and attachment views.
+pub const NOTICE_HELP_ENTRIES: &[HelpEntry] = &[
+    HelpEntry {
+        category: "Actions",
+        key: "d",
+        description: "dismiss notices (confirm)",
+    },
+    HelpEntry {
+        category: "Actions",
+        key: "D",
+        description: "dismiss notices immediately",
+    },
+    HelpEntry {
+        category: "Actions",
+        key: "Enter",
+        description: "open notice details",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "Ctrl-j / Ctrl-k",
+        description: "smooth scroll notices",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "gg / G",
+        description: "first / last notice",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "H / M / L",
+        description: "top / middle / bottom row",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "j / k",
+        description: "move down / up (counts allowed)",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "PageUp / PageDown",
+        description: "page through notices",
+    },
+    HelpEntry {
+        category: "Search",
+        key: "/",
+        description: "search notices",
+    },
+    HelpEntry {
+        category: "Selection",
+        key: "Space",
+        description: "toggle mark / mark visual range",
+    },
+    HelpEntry {
+        category: "Selection",
+        key: "v / V",
+        description: "select visual notice rows",
+    },
+    HelpEntry {
+        category: "Window",
+        key: "?",
+        description: "show searchable keybindings",
+    },
+    HelpEntry {
+        category: "Window",
+        key: "Esc / q",
+        description: "clear marks / back / close",
+    },
+];
+
 pub const CONTACT_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry {
         category: "Actions",
@@ -291,7 +361,7 @@ pub const CONTACT_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry {
         category: "Navigation",
         key: "H / M / L",
-        description: "top / middle / bottom visible row",
+        description: "top / middle / bottom row",
     },
     HelpEntry {
         category: "Navigation",

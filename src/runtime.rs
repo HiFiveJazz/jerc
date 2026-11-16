@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow};
 use crossterm::cursor::SetCursorStyle;
@@ -262,6 +262,32 @@ fn spawn_input_thread(runtime_tx: SyncSender<RuntimeEvent>) {
         .expect("failed to spawn terminal input thread");
 }
 
+/// Linux CLOCK_MONOTONIC does not count time suspended, whereas wall time
+/// normally does. A large wall-vs-monotonic gap is a best-effort resume hint.
+/// Also used on other hosts where these clocks have different sleep behavior.
+struct ResumeGapDetector {
+    last_wall: SystemTime,
+    last_monotonic: Instant,
+}
+
+impl ResumeGapDetector {
+    fn new() -> Self {
+        Self {
+            last_wall: SystemTime::now(),
+            last_monotonic: Instant::now(),
+        }
+    }
+
+    fn check(&mut self, wall: SystemTime, monotonic: Instant) -> bool {
+        let wall_elapsed = wall.duration_since(self.last_wall).unwrap_or_default();
+        let monotonic_elapsed = monotonic.saturating_duration_since(self.last_monotonic);
+        self.last_wall = wall;
+        self.last_monotonic = monotonic;
+        // Ignore normal scheduling jitter and modest NTP clock changes.
+        wall_elapsed.saturating_sub(monotonic_elapsed) >= Duration::from_secs(20)
+    }
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -278,9 +304,19 @@ fn event_loop(
     let mut next_inbox_poll = Instant::now() + app.inbox_poll_interval();
     let mut next_reconnect = Instant::now() + Duration::from_secs(10);
     let mut next_recovery_check = Instant::now() + Duration::from_secs(2);
+    let mut resume_detector = ResumeGapDetector::new();
 
     while !app.should_quit {
         app.flush_contacts(false);
+        if resume_detector.check(SystemTime::now(), Instant::now()) {
+            // Resume can leave IMAP sockets unusable while monotonic timers
+            // still think they have plenty of time. Reconnect read-only
+            // sessions immediately; never detach an unacknowledged write.
+            app.handle_system_resume();
+            next_recovery_check = Instant::now() + Duration::from_secs(2);
+            next_reconnect = Instant::now() + Duration::from_secs(10);
+            next_inbox_poll = Instant::now() + app.inbox_poll_interval();
+        }
         let now = Instant::now();
         if app.expire_status() {
             render(terminal, app)?;
@@ -795,5 +831,37 @@ mod new_mail_notification_tests {
     #[test]
     fn long_preview_is_bounded_by_chars() {
         assert!(notification_excerpt(&"界".repeat(240), 180).chars().count() <= 181);
+    }
+}
+
+#[cfg(test)]
+mod resume_gap_tests {
+    use super::ResumeGapDetector;
+    use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn resume_detection_requires_a_real_wall_vs_monotonic_gap() {
+        let monotonic = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut detector = ResumeGapDetector {
+            last_wall: wall,
+            last_monotonic: monotonic,
+        };
+        assert!(!detector.check(
+            wall + Duration::from_secs(10),
+            monotonic + Duration::from_secs(10),
+        ));
+        assert!(!detector.check(
+            wall + Duration::from_secs(12),
+            monotonic + Duration::from_secs(11),
+        ));
+        assert!(detector.check(
+            wall + Duration::from_secs(240),
+            monotonic + Duration::from_secs(12),
+        ));
+        assert!(!detector.check(
+            wall + Duration::from_secs(241),
+            monotonic + Duration::from_secs(13),
+        ));
     }
 }

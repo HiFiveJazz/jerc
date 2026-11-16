@@ -146,10 +146,12 @@ See [Contacts](contacts.md) for importing/learning behavior and storage details.
 | `Ctrl-r` | Refresh mailbox |
 | `B` | Toggle terminal bell |
 | `n` | Toggle desktop notifications |
-| `!` | Configuration warnings |
+| `!` | Connection, queue, and configuration notices (acknowledgments persist across restarts) |
 | `?` | Contextual help |
 | `q` / `Ctrl-c` | Quit from mail browser |
 
 Terminal key handling can vary with your terminal and modifiers. When unsure, use `?` in the relevant view.
+
+In **Notices** (`!`), use `j`/`k`, `gg`/`G`, count prefixes and relative line numbers to navigate. `Space` marks rows; `v`/`V` selects a visual range with the same checkmarks and selection colors as the mail browser and Contacts. `Enter` opens a notice; `Esc` returns to the list. Press `?` for searchable keybindings. Use `d` to **dismiss** the selected notice(s) with the standard **[Y]es** / **[N]o** confirmation, or `D` to dismiss immediately. Dismissal only hides notices from Jerc's list; it does **not** delete queued mail, remove uncertain IMAP/SMTP journal records, retry work, or change anything on the mail server. An amber `!` appears in the mail browser while any undismissed notice is active. The Notices footer displays the matching notice count on the right. Queued work still syncs only when safe, and manual-review work is never retried automatically.
 
 Saved drafts: open a message inside the **Drafts** mailbox with `Enter` to preview it; select **[Y]es** to edit or **[N]o** to keep reading. `Ctrl-N` still resumes a locally postponed draft. The original server draft is retained until a replacement is saved or the message is sent successfully.
