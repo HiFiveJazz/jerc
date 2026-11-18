@@ -4,7 +4,12 @@ set -eu
 
 case "$(uname -s)" in
     FreeBSD) target=x86_64-unknown-freebsd ;;
-    OpenBSD) target=x86_64-unknown-openbsd ;;
+    OpenBSD)
+        target=x86_64-unknown-openbsd
+        # Keep build artifacts small on OpenBSD's constrained /tmp filesystem.
+        # Its release-profile tests reuse dependencies from the release build.
+        export CARGO_INCREMENTAL=0
+        ;;
     NetBSD)
         target=x86_64-unknown-netbsd
         # NetBSD VM storage is constrained. Avoid duplicate debug/release
@@ -31,10 +36,10 @@ rustc -vV | grep -F "host: $target"
 
 cargo build --locked --release
 "$CARGO_TARGET_DIR/release/jerc" --version
-# NetBSD can compile the release binary but runs out of disk when Cargo
-# subsequently creates a second, debug-profile dependency tree for tests.
-# --release reuses the already-built release-profile dependencies.
-if [ "$target" = x86_64-unknown-netbsd ]; then
+# OpenBSD and NetBSD can run out of space when Cargo also builds an entire
+# debug-profile dependency tree. Release-profile tests reuse the dependencies
+# that cargo build --release already compiled.
+if [ "$target" = x86_64-unknown-openbsd ] || [ "$target" = x86_64-unknown-netbsd ]; then
     cargo test --locked --release --all-targets --all-features
 else
     cargo test --locked --all-targets --all-features
@@ -42,11 +47,11 @@ fi
 
 df -h "$CARGO_TARGET_DIR"
 
+# Package files directly from their existing locations: an extra copy of the
+# executable in /tmp can fail after a successful build on space-limited VMs.
 mkdir -p bsd-dist
-staging="$(mktemp -d)"
-trap 'rm -rf "$staging"' EXIT HUP INT TERM
-cp "$CARGO_TARGET_DIR/release/jerc" "$staging/jerc"
-cp LICENSE config.example.toml "$staging/"
 archive="bsd-dist/jerc-${GITHUB_SHA:-local}-$target.tar.gz"
-tar -czf "$archive" -C "$staging" jerc LICENSE config.example.toml
+tar -czf "$archive" \
+    -C "$CARGO_TARGET_DIR/release" jerc \
+    -C "$PWD" LICENSE config.example.toml
 printf 'Experimental BSD binary: %s\n' "$archive"
