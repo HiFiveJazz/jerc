@@ -174,8 +174,14 @@ fn refresh_may_persist(slot: &CredentialSlot, original_generation: u64) -> bool 
 
 fn credential_slot(path: &Path) -> Arc<CredentialSlot> {
     let slots = CREDENTIAL_SLOTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut slots = slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    Arc::clone(slots.entry(path.to_owned()).or_insert_with(|| Arc::new(CredentialSlot::default())))
+    let mut slots = slots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        slots
+            .entry(path.to_owned())
+            .or_insert_with(|| Arc::new(CredentialSlot::default())),
+    )
 }
 
 /// Nonblocking invalidation: workers already in an HTTP refresh observe it
@@ -183,15 +189,15 @@ fn credential_slot(path: &Path) -> Arc<CredentialSlot> {
 pub(crate) fn retire_account_token(account: &AccountConfig) -> Option<u64> {
     let oauth = account.oauth.as_ref()?;
     let base = dirs::config_dir()?;
-    let path = token_path_for_account(&base, &account.name, oauth.credential_namespace.as_deref()).ok()?;
+    let path =
+        token_path_for_account(&base, &account.name, oauth.credential_namespace.as_deref()).ok()?;
     let slot = credential_slot(&path);
     slot.retired.store(true, Ordering::Release);
     Some(slot.generation.fetch_add(1, Ordering::AcqRel) + 1)
 }
 
 fn retired_slot_is_current(slot: &CredentialSlot, generation: u64) -> bool {
-    slot.retired.load(Ordering::Acquire)
-        && slot.generation.load(Ordering::Acquire) == generation
+    slot.retired.load(Ordering::Acquire) && slot.generation.load(Ordering::Acquire) == generation
 }
 
 /// Run local cleanup only after any in-flight refresh has released the gate.
@@ -201,11 +207,22 @@ pub(crate) fn with_retired_account_lock<T>(
     retired_generation: Option<u64>,
     action: impl FnOnce() -> T,
 ) -> Option<T> {
-    let Some(oauth) = &account.oauth else { return Some(action()) };
-    let Some(base) = dirs::config_dir() else { return Some(action()) };
-    let Ok(path) = token_path_for_account(&base, &account.name, oauth.credential_namespace.as_deref()) else { return Some(action()) };
+    let Some(oauth) = &account.oauth else {
+        return Some(action());
+    };
+    let Some(base) = dirs::config_dir() else {
+        return Some(action());
+    };
+    let Ok(path) =
+        token_path_for_account(&base, &account.name, oauth.credential_namespace.as_deref())
+    else {
+        return Some(action());
+    };
     let slot = credential_slot(&path);
-    let mut session = slot.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut session = slot
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(generation) = retired_generation
         && !retired_slot_is_current(&slot, generation)
     {
@@ -223,7 +240,8 @@ pub(crate) fn discard_provisional_login(account: &AccountConfig) {
     let _ = with_retired_account_lock(account, generation, || {
         if let Some(oauth) = &account.oauth
             && let Some(base) = dirs::config_dir()
-            && let Ok(path) = token_path_for_account(&base, &account.name, oauth.credential_namespace.as_deref())
+            && let Ok(path) =
+                token_path_for_account(&base, &account.name, oauth.credential_namespace.as_deref())
         {
             let _ = fs::remove_file(path.with_extension("public-client.json"));
             let _ = fs::remove_file(path);
@@ -484,11 +502,17 @@ fn google_revocation_conflicts(
     let deleted_identity = google_mailbox_identity(deleted);
     // Different client IDs may still belong to the same Google project.
     remaining.iter().any(|other| {
-        let is_google = other.oauth.as_ref().is_some_and(|oauth| {
-            oauth.provider.trim().eq_ignore_ascii_case("google")
-        });
-        if !is_google { return false; }
-        match (deleted_identity.as_deref(), google_mailbox_identity(other).as_deref()) {
+        let is_google = other
+            .oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.provider.trim().eq_ignore_ascii_case("google"));
+        if !is_google {
+            return false;
+        }
+        match (
+            deleted_identity.as_deref(),
+            google_mailbox_identity(other).as_deref(),
+        ) {
             (Some(deleted), Some(other)) => deleted == other,
             _ => true,
         }
@@ -532,7 +556,9 @@ impl RevocationRequest {
         if let Some(secret) = settings.client_secret.as_deref() {
             form.push(("client_secret", secret));
         }
-        let response = agent.post(endpoint).send_form(form)
+        let response = agent
+            .post(endpoint)
+            .send_form(form)
             .map_err(|_| anyhow!("OAuth revocation unavailable"))?;
         if !response.status().is_success() {
             bail!("OAuth revocation HTTP {}", response.status());
@@ -671,8 +697,8 @@ impl OAuthSettings {
         } else {
             scope
         };
-        let revocation_endpoint = (provider == "google")
-            .then(|| "https://oauth2.googleapis.com/revoke".to_owned());
+        let revocation_endpoint =
+            (provider == "google").then(|| "https://oauth2.googleapis.com/revoke".to_owned());
         let base = dirs::config_dir().context("finding OAuth credential directory")?;
         let path = token_path_for_account(&base, name, oauth.credential_namespace.as_deref())?;
         let credential_slot = credential_slot(&path);
@@ -751,7 +777,11 @@ impl OAuthSettings {
     fn token_file(&self) -> Result<PathBuf> {
         let base = dirs::config_dir()
             .ok_or_else(|| anyhow!("cannot locate config directory for OAuth token"))?;
-        token_path_for_account(&base, &self.account_name, self.credential_namespace.as_deref())
+        token_path_for_account(
+            &base,
+            &self.account_name,
+            self.credential_namespace.as_deref(),
+        )
     }
 
     pub fn refresh_token(&self) -> Result<String> {
@@ -862,7 +892,10 @@ impl OAuthSettings {
         // Hold one per-credential gate across the network refresh, rotation and
         // persistence. A second caller receives the cached access token when
         // the server advertised a safe lifetime, or refreshes sequentially.
-        let mut session = self.credential_slot.state.lock()
+        let mut session = self
+            .credential_slot
+            .state
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.check_credential_active()?;
         if let Some(cached) = &session.cached_access
@@ -893,14 +926,19 @@ impl OAuthSettings {
         let reply = self.request_token(&form)?;
         // Invalidation is atomic and does not wait for the HTTP timeout.
         if refresh_may_persist(&self.credential_slot, self.credential_generation)
-            && let Some(rotated) = reply.refresh_token.as_deref().filter(|value| !value.is_empty())
+            && let Some(rotated) = reply
+                .refresh_token
+                .as_deref()
+                .filter(|value| !value.is_empty())
         {
             // If deletion began during HTTP, the cleanup job is waiting on
             // our gate and will revoke/purge this final rotated token.
             self.save_refresh_token(rotated)?;
         }
         self.check_credential_active()?;
-        if let Some(ttl) = reply.expires_in.map(|seconds| seconds.saturating_sub(120))
+        if let Some(ttl) = reply
+            .expires_in
+            .map(|seconds| seconds.saturating_sub(120))
             .filter(|seconds| *seconds > 0)
         {
             session.cached_access = Some(CachedAccess {
@@ -1049,7 +1087,10 @@ impl OAuthSettings {
     }
 
     fn finish_login_with_cancel(
-        &self, reply: TokenReply, quiet: bool, cancel: Option<&AtomicBool>,
+        &self,
+        reply: TokenReply,
+        quiet: bool,
+        cancel: Option<&AtomicBool>,
     ) -> Result<()> {
         if reply.access_token.is_empty() {
             bail!("OAuth server returned no access token");
@@ -1057,7 +1098,10 @@ impl OAuthSettings {
         let refresh = reply.refresh_token.ok_or_else(|| anyhow!(
             "OAuth provider did not return a refresh token; revoke authorization and retry with offline access"
         ))?;
-        let mut session = self.credential_slot.state.lock()
+        let mut session = self
+            .credential_slot
+            .state
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_not_cancelled(cancel)?;
         if self.credential_generation != self.credential_slot.generation.load(Ordering::Acquire) {
@@ -1068,11 +1112,15 @@ impl OAuthSettings {
         self.save_refresh_token(&refresh)?;
         if let Err(error) = ensure_not_cancelled(cancel) {
             self.credential_slot.retired.store(true, Ordering::Release);
-            self.credential_slot.generation.fetch_add(1, Ordering::AcqRel);
+            self.credential_slot
+                .generation
+                .fetch_add(1, Ordering::AcqRel);
             let _ = fs::remove_file(self.token_file()?);
             return Err(error);
         }
-        self.credential_slot.generation.fetch_add(1, Ordering::AcqRel);
+        self.credential_slot
+            .generation
+            .fetch_add(1, Ordering::AcqRel);
         self.credential_slot.retired.store(false, Ordering::Release);
         session.cached_access = None;
         if !quiet {
@@ -2047,12 +2095,16 @@ mod tests {
     #[test]
     fn google_revocation_allows_other_google_users_with_shared_client() {
         let mut removed = crate::config::Config::single_maildir(
-            "Burner".into(), std::path::PathBuf::from("/tmp/unused-maildir"),
-        ).accounts.remove(0);
+            "Burner".into(),
+            std::path::PathBuf::from("/tmp/unused-maildir"),
+        )
+        .accounts
+        .remove(0);
         removed.email = Some("burner@gmail.com".into());
         removed.source = "imap".into();
         removed.oauth = Some(OAuthConfig {
-            provider: "google".into(), client_id: Some("desktop-app".into()),
+            provider: "google".into(),
+            client_id: Some("desktop-app".into()),
             ..Default::default()
         });
         let mut personal = removed.clone();
@@ -2063,28 +2115,42 @@ mod tests {
             Some("burner@gmail.com")
         );
         assert!(!super::google_revocation_conflicts(
-            &removed, &[personal], "desktop-app"
+            &removed,
+            &[personal],
+            "desktop-app"
         ));
     }
 
     #[test]
     fn google_revocation_preserves_same_principal_or_unknown_identity() {
         let mut removed = crate::config::Config::single_maildir(
-            "Burner".into(), std::path::PathBuf::from("/tmp/unused-maildir"),
-        ).accounts.remove(0);
+            "Burner".into(),
+            std::path::PathBuf::from("/tmp/unused-maildir"),
+        )
+        .accounts
+        .remove(0);
         removed.email = Some("burner@gmail.com".into());
         removed.source = "imap".into();
         removed.oauth = Some(OAuthConfig {
-            provider: "google".into(), client_id: Some("desktop-app".into()),
+            provider: "google".into(),
+            client_id: Some("desktop-app".into()),
             ..Default::default()
         });
         let mut alias = removed.clone();
         alias.name = "Alias".into();
         alias.email = Some("BURNER@gmail.com".into());
-        assert!(super::google_revocation_conflicts(&removed, &[alias], "desktop-app"));
+        assert!(super::google_revocation_conflicts(
+            &removed,
+            &[alias],
+            "desktop-app"
+        ));
         let mut unknown = removed.clone();
         unknown.email = None;
-        assert!(super::google_revocation_conflicts(&removed, &[unknown], "desktop-app"));
+        assert!(super::google_revocation_conflicts(
+            &removed,
+            &[unknown],
+            "desktop-app"
+        ));
     }
 
     #[test]
@@ -2143,7 +2209,11 @@ mod tests {
             expires_in: Some(3600),
             scope: None,
         };
-        assert!(settings.finish_login_with_cancel(reply, true, Some(&cancel)).is_err());
+        assert!(
+            settings
+                .finish_login_with_cancel(reply, true, Some(&cancel))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2164,14 +2234,21 @@ mod tests {
             expires_in: Some(3600),
             scope: None,
         };
-        assert!(settings.finish_login_with_cancel(reply, true, None).is_err());
+        assert!(
+            settings
+                .finish_login_with_cancel(reply, true, None)
+                .is_err()
+        );
     }
 
     #[test]
     fn wizard_cannot_rebind_grant_to_another_client_or_account() {
         let mut account = crate::config::Config::single_maildir(
-            "original".into(), std::path::PathBuf::from("/tmp/oauth-unused-maildir"),
-        ).accounts.remove(0);
+            "original".into(),
+            std::path::PathBuf::from("/tmp/oauth-unused-maildir"),
+        )
+        .accounts
+        .remove(0);
         account.oauth = Some(OAuthConfig {
             provider: "google".into(),
             client_id: Some("first.apps.googleusercontent.com".into()),
@@ -2232,13 +2309,11 @@ mod tests {
 
     #[test]
     fn token_reply_expiry_is_optional_and_never_required_by_old_providers() {
-        let reply: TokenReply = serde_json::from_str(
-            r#"{"access_token":"test","refresh_token":null}"#,
-        ).unwrap();
+        let reply: TokenReply =
+            serde_json::from_str(r#"{"access_token":"test","refresh_token":null}"#).unwrap();
         assert_eq!(reply.expires_in, None);
-        let reply: TokenReply = serde_json::from_str(
-            r#"{"access_token":"test","expires_in":3600}"#,
-        ).unwrap();
+        let reply: TokenReply =
+            serde_json::from_str(r#"{"access_token":"test","expires_in":3600}"#).unwrap();
         assert_eq!(reply.expires_in, Some(3600));
     }
 
@@ -2250,18 +2325,25 @@ mod tests {
             ..Default::default()
         };
         let settings = OAuthSettings::from_config("revocation-test", &config).unwrap();
-        let request = RevocationRequest { settings, token: "test".into() };
+        let request = RevocationRequest {
+            settings,
+            token: "test".into(),
+        };
         assert!(request.revoke().is_err());
     }
 
     #[test]
     fn google_revocation_decodes_imap_logins_and_protects_other_clients() {
         let mut removed = crate::config::Config::single_maildir(
-            "Burner".into(), std::path::PathBuf::from("/tmp/unused-maildir"),
-        ).accounts.remove(0);
+            "Burner".into(),
+            std::path::PathBuf::from("/tmp/unused-maildir"),
+        )
+        .accounts
+        .remove(0);
         removed.source = "imaps+xoauth2://burner%40gmail.com@imap.gmail.com:993".into();
         removed.oauth = Some(OAuthConfig {
-            provider: "google".into(), client_id: Some("desktop-app".into()),
+            provider: "google".into(),
+            client_id: Some("desktop-app".into()),
             ..Default::default()
         });
         assert_eq!(
@@ -2272,7 +2354,9 @@ mod tests {
         different_client.name = "Other".into();
         different_client.oauth.as_mut().unwrap().client_id = Some("other-app".into());
         assert!(super::google_revocation_conflicts(
-            &removed, &[different_client], "desktop-app"
+            &removed,
+            &[different_client],
+            "desktop-app"
         ));
     }
 }

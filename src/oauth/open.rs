@@ -106,7 +106,13 @@ fn parse_metadata(data: &str, expected_issuer: &str, scope: &str) -> Result<Meta
     for url in [&metadata.authorization_endpoint, &metadata.token_endpoint] {
         valid_endpoint(url)?;
     }
-    for endpoint in [metadata.registration_endpoint.as_deref(), metadata.revocation_endpoint.as_deref()].into_iter().flatten() {
+    for endpoint in [
+        metadata.registration_endpoint.as_deref(),
+        metadata.revocation_endpoint.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         valid_endpoint(endpoint)?;
     }
     if let Some(methods) = metadata.code_challenge_methods_supported.as_ref() {
@@ -303,7 +309,9 @@ fn with_record(mut settings: OAuthSettings, record: &ClientRecord) -> OAuthSetti
         .auth_endpoint
         .clone_from(&record.authorization_endpoint);
     settings.token_endpoint.clone_from(&record.token_endpoint);
-    settings.revocation_endpoint.clone_from(&record.revocation_endpoint);
+    settings
+        .revocation_endpoint
+        .clone_from(&record.revocation_endpoint);
     settings.issuer = Some(record.issuer.clone());
     settings.require_issuer_response = record.require_issuer_response;
     settings
@@ -459,26 +467,43 @@ mod tests {
             "authorization_endpoint": "https://mail.example.org/auth/authorize",
             "token_endpoint": "https://mail.example.org/auth/token",
             "revocation_endpoint": "https://mail.example.org/auth/revoke"
-        }).to_string();
-        assert_eq!(parse_metadata(&metadata, "https://mail.example.org", MAIL_SCOPE)
-            .unwrap().revocation_endpoint.as_deref(),
-            Some("https://mail.example.org/auth/revoke"));
-        for bad in ["http://mail.example.org/revoke",
-                    "https://user:password@mail.example.org/revoke",
-                    "https://mail.example.org/revoke#frag"] {
-            assert!(parse_metadata(&metadata.replace(
-                "https://mail.example.org/auth/revoke", bad),
-                "https://mail.example.org", MAIL_SCOPE).is_err());
+        })
+        .to_string();
+        assert_eq!(
+            parse_metadata(&metadata, "https://mail.example.org", MAIL_SCOPE)
+                .unwrap()
+                .revocation_endpoint
+                .as_deref(),
+            Some("https://mail.example.org/auth/revoke")
+        );
+        for bad in [
+            "http://mail.example.org/revoke",
+            "https://user:password@mail.example.org/revoke",
+            "https://mail.example.org/revoke#frag",
+        ] {
+            assert!(
+                parse_metadata(
+                    &metadata.replace("https://mail.example.org/auth/revoke", bad),
+                    "https://mail.example.org",
+                    MAIL_SCOPE
+                )
+                .is_err()
+            );
         }
         // Missing optional revocation metadata remains supported.
         let legacy = serde_json::json!({
             "issuer": "https://mail.example.org",
             "authorization_endpoint": "https://mail.example.org/auth/authorize",
             "token_endpoint": "https://mail.example.org/auth/token"
-        }).to_string();
+        })
+        .to_string();
         assert!(legacy.len() < metadata.len());
-        assert!(parse_metadata(&legacy, "https://mail.example.org", MAIL_SCOPE)
-            .unwrap().revocation_endpoint.is_none());
+        assert!(
+            parse_metadata(&legacy, "https://mail.example.org", MAIL_SCOPE)
+                .unwrap()
+                .revocation_endpoint
+                .is_none()
+        );
     }
 
     #[test]

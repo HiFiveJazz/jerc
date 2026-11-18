@@ -864,8 +864,10 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
     // forwarded line as a single invisible logical line during navigation.
     // Reply prose is hard-wrapped for mailing lists; show the same 72-column
     // margin in the editor, even when the terminal is much wider.
-    composer.body_view_width =
-        composer_body_view_width(usize::from(fields[6].width.saturating_sub(4)), composer.reply_wrap);
+    composer.body_view_width = composer_body_view_width(
+        usize::from(fields[6].width.saturating_sub(4)),
+        composer.reply_wrap,
+    );
     let viewport_height = usize::from(fields[6].height).max(1);
     let rows = composer.body_rows();
     let cursor_row = rows

@@ -236,9 +236,14 @@ impl App {
                     });
                 }
             }
-            WorkerEventKind::MailboxWarmed { name, page, uid_validity, uid_next } => {
-                if account.mailbox_warm_request.as_ref()
-                    != Some(&(event.request_id, name.clone())) {
+            WorkerEventKind::MailboxWarmed {
+                name,
+                page,
+                uid_validity,
+                uid_next,
+            } => {
+                if account.mailbox_warm_request.as_ref() != Some(&(event.request_id, name.clone()))
+                {
                     return; // superseded by a mutation or newer LIST
                 }
                 account.mailbox_warm_request = None;
@@ -248,8 +253,7 @@ impl App {
                 account.pump_mailbox_warming();
             }
             WorkerEventKind::MailboxWarmFailed { name } => {
-                if account.mailbox_warm_request.as_ref()
-                    == Some(&(event.request_id, name)) {
+                if account.mailbox_warm_request.as_ref() == Some(&(event.request_id, name)) {
                     account.mailbox_warm_request = None;
                     // A failed optional preload is not an account failure.
                     // Stop the series until the next LIST/explicit refresh.

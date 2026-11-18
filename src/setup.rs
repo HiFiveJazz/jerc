@@ -784,7 +784,9 @@ impl SetupWizard {
     }
 
     fn discard_provisional_oauth(&mut self) {
-        if !self.saved && let Some(account) = self.provisional_oauth_account.take() {
+        if !self.saved
+            && let Some(account) = self.provisional_oauth_account.take()
+        {
             crate::oauth::discard_provisional_login(&account);
         }
     }
@@ -1409,9 +1411,12 @@ fn purge_local_account_data_in(
             Ok(path) => {
                 // Open-provider dynamic client registrations live alongside
                 // the refresh token and also belong to this account.
-                files.push((path.with_extension("public-client.json"), roots.config.clone()));
+                files.push((
+                    path.with_extension("public-client.json"),
+                    roots.config.clone(),
+                ));
                 files.push((path, roots.config.clone()));
-            },
+            }
             Err(error) => errors.push(format!("OAuth token: {error:#}")),
         }
     }
@@ -1448,10 +1453,13 @@ fn purge_local_account_data_in(
             continue;
         };
         let used_elsewhere = remaining.iter().any(|other| {
-            [other.source_cred_cmd.as_deref(), other.outgoing_cred_cmd.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|value| value == command)
+            [
+                other.source_cred_cmd.as_deref(),
+                other.outgoing_cred_cmd.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| value == command)
         });
         if !used_elsewhere && !files.iter().any(|(candidate, _)| candidate == &path) {
             files.push((path, roots.data.clone()));
@@ -1485,16 +1493,20 @@ fn wizard_secret_path(command: &str, data_root: &Path) -> Option<std::path::Path
         return None;
     }
     let name = path.file_name()?.to_str()?;
-    (name.starts_with("jerc-") && name.ends_with(".secret"))
-        .then(|| path.to_owned())
+    (name.starts_with("jerc-") && name.ends_with(".secret")).then(|| path.to_owned())
 }
 
 /// Refuse symbolic links in managed directories and at the artifact path.
 /// A body cache must be a real directory; everything else a regular file.
 fn remove_private_artifact(path: &Path, root: &Path, directory: bool) -> Result<()> {
-    let relative = path.strip_prefix(root).context("path outside managed root")?;
+    let relative = path
+        .strip_prefix(root)
+        .context("path outside managed root")?;
     let mut current = root.to_owned();
-    for component in relative.components().take(relative.components().count().saturating_sub(1)) {
+    for component in relative
+        .components()
+        .take(relative.components().count().saturating_sub(1))
+    {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_dir() => {
@@ -1512,7 +1524,9 @@ fn remove_private_artifact(path: &Path, root: &Path, directory: bool) -> Result<
         Ok(meta) if !directory && meta.file_type().is_file() => {
             fs::remove_file(path).context("removing local account file")
         }
-        Ok(_) => Err(anyhow!("refusing non-regular or symlinked account artifact")),
+        Ok(_) => Err(anyhow!(
+            "refusing non-regular or symlinked account artifact"
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -2757,7 +2771,12 @@ mod tests {
 mod account_cleanup_tests {
     use super::*;
 
-    fn fixture() -> (tempfile::TempDir, LocalDataRoots, AccountConfig, AccountConfig) {
+    fn fixture() -> (
+        tempfile::TempDir,
+        LocalDataRoots,
+        AccountConfig,
+        AccountConfig,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let roots = LocalDataRoots {
             config: directory.path().join("config"),
@@ -2790,23 +2809,36 @@ mod account_cleanup_tests {
             crate::oauth::token_path_for_account(
                 &roots.config,
                 &account.name,
-                account.oauth.as_ref().unwrap().credential_namespace.as_deref(),
+                account
+                    .oauth
+                    .as_ref()
+                    .unwrap()
+                    .credential_namespace
+                    .as_deref(),
             )
             .unwrap(),
             crate::oauth::token_path_for_account(
                 &roots.config,
                 &account.name,
-                account.oauth.as_ref().unwrap().credential_namespace.as_deref(),
+                account
+                    .oauth
+                    .as_ref()
+                    .unwrap()
+                    .credential_namespace
+                    .as_deref(),
             )
             .unwrap()
             .with_extension("public-client.json"),
-            roots.cache.join("jerc/mail-index").join(format!("{stem}.json")),
-            roots.cache.join("jerc/mail-index").join(format!("{stem}.mutations.json")),
+            roots
+                .cache
+                .join("jerc/mail-index")
+                .join(format!("{stem}.json")),
+            roots
+                .cache
+                .join("jerc/mail-index")
+                .join(format!("{stem}.mutations.json")),
             crate::outgoing::outbox::path_for_account(account, &roots.data),
-            crate::outgoing::drafts::path_for(
-                &roots.data.join("jerc/postponed"),
-                &account.name,
-            ),
+            crate::outgoing::drafts::path_for(&roots.data.join("jerc/postponed"), &account.name),
         ]
     }
 
@@ -2822,7 +2854,10 @@ mod account_cleanup_tests {
         let removed = remove_account(&path, "Removed").unwrap();
         assert_eq!(removed.name, "Removed");
         assert!(removed.source.starts_with("imaps://"));
-        assert_eq!(Config::load_or_empty(Some(&path)).unwrap().accounts[0].name, "Keep");
+        assert_eq!(
+            Config::load_or_empty(Some(&path)).unwrap().accounts[0].name,
+            "Keep"
+        );
     }
 
     #[test]
@@ -2850,12 +2885,20 @@ mod account_cleanup_tests {
 
         purge_local_account_data_in(&deleted, &[retained], &roots).unwrap();
         for path in deleted_paths {
-            assert!(!path.exists(), "deleted account artifact left: {}", path.display());
+            assert!(
+                !path.exists(),
+                "deleted account artifact left: {}",
+                path.display()
+            );
         }
         assert!(!deleted_bodies.exists());
         assert!(!deleted_raw.exists());
         for path in retained_paths {
-            assert!(path.exists(), "unrelated account artifact removed: {}", path.display());
+            assert!(
+                path.exists(),
+                "unrelated account artifact removed: {}",
+                path.display()
+            );
         }
         assert!(retained_bodies.join("INBOX/message.body").exists());
         assert!(retained_raw.join("message.eml").exists());
@@ -2900,7 +2943,12 @@ mod account_cleanup_tests {
         symlink(&target, &outbox).unwrap();
         assert!(purge_local_account_data_in(&deleted, &[], &roots).is_err());
         assert!(target.exists());
-        assert!(fs::symlink_metadata(outbox).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(outbox)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -2908,11 +2956,13 @@ mod account_cleanup_tests {
         let (_directory, roots, mut deleted, _retained) = fixture();
         deleted.oauth.as_mut().unwrap().credential_namespace = Some("../../escape".into());
         assert!(purge_local_account_data_in(&deleted, &[], &roots).is_err());
-        assert!(crate::oauth::token_path_for_account(
-            &roots.config,
-            &deleted.name,
-            Some("../../escape"),
-        )
-        .is_err());
+        assert!(
+            crate::oauth::token_path_for_account(
+                &roots.config,
+                &deleted.name,
+                Some("../../escape"),
+            )
+            .is_err()
+        );
     }
 }

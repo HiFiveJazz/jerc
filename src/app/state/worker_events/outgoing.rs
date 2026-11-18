@@ -58,16 +58,23 @@ impl App {
                 }
             }
             WorkerEventKind::MutationComplete => {
-                let destination = account.inflight_deferred_mutations.get(&event.request_id)
+                let destination = account
+                    .inflight_deferred_mutations
+                    .get(&event.request_id)
                     .and_then(|entry| match &entry.kind {
                         cache::DeferredMutationKind::Delete => None,
                         cache::DeferredMutationKind::Move { destination }
                         | cache::DeferredMutationKind::Archive { destination }
-                        | cache::DeferredMutationKind::Unarchive { destination } => Some(destination.clone()),
+                        | cache::DeferredMutationKind::Unarchive { destination } => {
+                            Some(destination.clone())
+                        }
                     });
                 account.finish_deferred_mutation(event.request_id, true);
-                let destination = destination
-                    .or_else(|| account.pending_destination_refresh.remove(&event.request_id));
+                let destination = destination.or_else(|| {
+                    account
+                        .pending_destination_refresh
+                        .remove(&event.request_id)
+                });
                 if let Some(destination) = destination {
                     account.invalidate_remote_folder(&destination);
                     account.rewarm_mailbox(&destination);
@@ -183,7 +190,11 @@ impl App {
                     .collect::<Vec<_>>();
                 for name in &affected {
                     account.invalidate_remote_folder(name);
-                    if account.mailboxes.iter().any(|folder| folder.name == *name && folder.role == MailboxRole::Sent) {
+                    if account
+                        .mailboxes
+                        .iter()
+                        .any(|folder| folder.name == *name && folder.role == MailboxRole::Sent)
+                    {
                         account.rewarm_mailbox(name);
                     }
                 }

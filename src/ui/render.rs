@@ -11,8 +11,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     ATTACHMENT_HELP_ENTRIES, App, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, ComposeField,
-    ComposeMode, DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, MailReviewItem, NOTICE_HELP_ENTRIES,
-    PICKER_HELP_ENTRIES, ReaderSelection, ranked_help_matches,
+    ComposeMode, DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, MailReviewItem,
+    NOTICE_HELP_ENTRIES, PICKER_HELP_ENTRIES, ReaderSelection, ranked_help_matches,
 };
 use crate::config::VisualSelectionStyle;
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};

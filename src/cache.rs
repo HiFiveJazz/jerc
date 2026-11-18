@@ -350,7 +350,11 @@ fn persistable_bodies_near_impl(
     let mut selected = HashMap::with_capacity(ids.len());
     for id in ids {
         if let Some(body) = bodies.get(&id) {
-            let copy = if compact { compact_body(body) } else { Some(body.clone()) };
+            let copy = if compact {
+                compact_body(body)
+            } else {
+                Some(body.clone())
+            };
             if let Some(copy) = copy {
                 selected.insert(id, copy);
             }
@@ -1253,10 +1257,14 @@ mod tests {
         let mut writer_index = original.clone();
         let original_row = &original.folders["INBOX"].messages[0];
         let writer_row = &writer_index.folders["INBOX"].messages[0];
-        assert!(std::sync::Arc::ptr_eq(&original_row.headers, &writer_row.headers));
+        assert!(std::sync::Arc::ptr_eq(
+            &original_row.headers,
+            &writer_row.headers
+        ));
 
         writer_index.folders.get_mut("INBOX").unwrap().messages[0]
-            .flags.set(crate::model::MessageFlags::SEEN, true);
+            .flags
+            .set(crate::model::MessageFlags::SEEN, true);
         assert!(std::sync::Arc::ptr_eq(
             &original.folders["INBOX"].messages[0].headers,
             &writer_index.folders["INBOX"].messages[0].headers,

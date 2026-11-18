@@ -182,8 +182,14 @@ impl App {
                     pending.account == event.account
                         && pending.request_id == event.request_id
                         && pending.message_id == id
-                }) { return; }
-                let intent = self.pending_compose.take().expect("correlated compose request").intent;
+                }) {
+                    return;
+                }
+                let intent = self
+                    .pending_compose
+                    .take()
+                    .expect("correlated compose request")
+                    .intent;
                 match result {
                     Ok(composer) => {
                         debug_assert_eq!(

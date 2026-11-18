@@ -263,11 +263,20 @@ fn mail_review_presentation(theme: &Theme, archive: bool) -> (&'static str, Styl
     if archive {
         (
             " Archive Emails ",
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
-            Style::default().fg(theme.popup_bg).bg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.popup_bg)
+                .bg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
-        (" Delete Emails ", theme.error(), destructive_button_style(theme))
+        (
+            " Delete Emails ",
+            theme.error(),
+            destructive_button_style(theme),
+        )
     }
 }
 
@@ -300,8 +309,11 @@ fn draw_mail_review_dialog(
     ])
     .split(inner);
     frame.render_widget(
-        Paragraph::new(truncate_display_width(explanation, usize::from(chunks[0].width)))
-            .style(theme.text()),
+        Paragraph::new(truncate_display_width(
+            explanation,
+            usize::from(chunks[0].width),
+        ))
+        .style(theme.text()),
         chunks[0],
     );
     let digits = items.len().max(1).to_string().len();
@@ -636,18 +648,33 @@ mod tests {
         let theme = load_themes().into_iter().next().unwrap();
         let width = 58;
         let one = mail_review_line(
-            Some(1), 2, "Short", "alice@example.com", width, &theme, false,
+            Some(1),
+            2,
+            "Short",
+            "alice@example.com",
+            width,
+            &theme,
+            false,
         );
         let long = mail_review_line(
-            Some(12), 2,
+            Some(12),
+            2,
             "A very long title with kanji 漢字 and more words that must not eat the sender column",
             "really.really.long.email.address@example-larger-than-normal-domain.test",
-            width, &theme, true,
+            width,
+            &theme,
+            true,
         );
         let header = mail_review_line(None, 2, "Subject", "From", width, &theme, false);
         let subject_start = UnicodeWidthStr::width(one.spans[0].content.as_ref());
-        assert_eq!(subject_start, UnicodeWidthStr::width(long.spans[0].content.as_ref()));
-        assert_eq!(subject_start, UnicodeWidthStr::width(header.spans[0].content.as_ref()));
+        assert_eq!(
+            subject_start,
+            UnicodeWidthStr::width(long.spans[0].content.as_ref())
+        );
+        assert_eq!(
+            subject_start,
+            UnicodeWidthStr::width(header.spans[0].content.as_ref())
+        );
         let address_offset = |line: &Line<'_>| {
             line.spans[..3]
                 .iter()
@@ -663,7 +690,11 @@ mod tests {
         assert_eq!(long.spans[1].style.bg, Some(theme.popup_bg));
         for row in [&one, &long, &header] {
             assert!(
-                row.spans.iter().map(|span| UnicodeWidthStr::width(span.content.as_ref())).sum::<usize>() <= width,
+                row.spans
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum::<usize>()
+                    <= width,
                 "review row exceeded {width} terminal columns: {row:?}"
             );
         }
@@ -681,13 +712,18 @@ mod tests {
             .collect::<Vec<_>>();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
-            .draw(|frame| draw_mail_review_dialog(frame, &theme, "Archive 50 emails?", &rows, 34, true))
+            .draw(|frame| {
+                draw_mail_review_dialog(frame, &theme, "Archive 50 emails?", &rows, 34, true)
+            })
             .unwrap();
         let rendered = (0u16..20)
-            .map(|y| (0u16..80)
-                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                .collect::<String>())
-            .collect::<Vec<_>>().join("\n");
+            .map(|y| {
+                (0u16..80)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rendered.contains("Archive Emails"), "{rendered}");
         assert!(rendered.contains("Subject"), "{rendered}");
         assert!(rendered.contains("From"), "{rendered}");
@@ -709,17 +745,28 @@ mod tests {
         }];
         for (width, height) in [(40u16, 15u16), (60u16, 16u16)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| {
-                draw_mail_review_dialog(frame, &theme, "Move 1 email to Trash?", &rows, 0, false);
-            }).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_mail_review_dialog(
+                        frame,
+                        &theme,
+                        "Move 1 email to Trash?",
+                        &rows,
+                        0,
+                        false,
+                    );
+                })
+                .unwrap();
             let rendered = (0..height)
-                .map(|y| (0..width)
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect::<String>())
-                .collect::<Vec<_>>().join("\n");
+                .map(|y| {
+                    (0..width)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(rendered.contains("Delete Emails"), "{rendered}");
             assert!(rendered.contains("[Y]es"), "{rendered}");
         }
     }
-
 }

@@ -218,10 +218,22 @@ mod tests {
             Mailbox::new("Sent", MailboxRole::Sent),
         ];
         assert_eq!(periodic_status_targets(&folders, None), vec!["INBOX"]);
-        assert_eq!(periodic_status_targets(&folders, Some("INBOX")), vec!["INBOX"]);
-        assert_eq!(periodic_status_targets(&folders, Some("Drafts")), vec!["INBOX", "Drafts"]);
-        assert_eq!(periodic_status_targets(&folders, Some("Deleted")), vec!["INBOX"]);
-        assert_eq!(periodic_status_targets(&folders[..1], Some("Drafts")), vec!["INBOX"]);
+        assert_eq!(
+            periodic_status_targets(&folders, Some("INBOX")),
+            vec!["INBOX"]
+        );
+        assert_eq!(
+            periodic_status_targets(&folders, Some("Drafts")),
+            vec!["INBOX", "Drafts"]
+        );
+        assert_eq!(
+            periodic_status_targets(&folders, Some("Deleted")),
+            vec!["INBOX"]
+        );
+        assert_eq!(
+            periodic_status_targets(&folders[..1], Some("Drafts")),
+            vec!["INBOX"]
+        );
     }
 
     fn known(name: &str, counts_known: bool) -> Mailbox {

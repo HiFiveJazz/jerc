@@ -94,7 +94,10 @@ pub(crate) fn path_for_account(account: &AccountConfig, data_root: &Path) -> Pat
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    data_root.join("jerc").join("outbox").join(format!("{key}.json"))
+    data_root
+        .join("jerc")
+        .join("outbox")
+        .join(format!("{key}.json"))
 }
 
 impl Store {

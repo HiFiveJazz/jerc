@@ -155,10 +155,17 @@ impl App {
             return;
         };
         let account_index = self.account_index;
-        let cache = account.uid_validities.get(&mailbox).copied()
+        let cache = account
+            .uid_validities
+            .get(&mailbox)
+            .copied()
             .filter(|validity| message_id.0.starts_with(&format!("imap-uid:{validity}:")))
-            .and_then(|validity| account.raw_store.as_ref()
-                .map(|store| (store.dir.clone(), validity)));
+            .and_then(|validity| {
+                account
+                    .raw_store
+                    .as_ref()
+                    .map(|store| (store.dir.clone(), validity))
+            });
         let queued = account
             .worker
             .post(ActionKind::FetchRawForCompose {
@@ -264,27 +271,43 @@ impl App {
         }
         // MIME bytes, recipients and attachment metadata are prepared by the
         // read-only worker. The event loop only installs the finished composer.
-        let own_addresses = self.accounts.iter()
+        let own_addresses = self
+            .accounts
+            .iter()
             .filter_map(|a| a.from.parse::<lettre::message::Mailbox>().ok())
-            .map(|a| a.email.to_string()).collect::<Vec<_>>();
+            .map(|a| a.email.to_string())
+            .collect::<Vec<_>>();
         let Some((message_id, mailbox, summary, cache)) = self.account().and_then(|account| {
             let message = account.selected_message()?.clone();
             let mailbox = account.current_mailbox.clone()?;
-            let cache = account.uid_validities.get(&mailbox).copied()
+            let cache = account
+                .uid_validities
+                .get(&mailbox)
+                .copied()
                 .filter(|validity| message.id.0.starts_with(&format!("imap-uid:{validity}:")))
-                .and_then(|validity| account.raw_store.as_ref()
-                    .map(|store| (store.dir.clone(), validity)));
+                .and_then(|validity| {
+                    account
+                        .raw_store
+                        .as_ref()
+                        .map(|store| (store.dir.clone(), validity))
+                });
             Some((message.id.clone(), mailbox, message, cache))
-        }) else { return; };
-        let request_id = self.account().and_then(|account| account.worker
-            .post(ActionKind::PrepareCompose {
-                mailbox,
-                id: message_id.clone(),
-                summary,
-                intent,
-                own_addresses,
-                cache,
-            }).ok());
+        }) else {
+            return;
+        };
+        let request_id = self.account().and_then(|account| {
+            account
+                .worker
+                .post(ActionKind::PrepareCompose {
+                    mailbox,
+                    id: message_id.clone(),
+                    summary,
+                    intent,
+                    own_addresses,
+                    cache,
+                })
+                .ok()
+        });
         if let Some(request_id) = request_id {
             self.pending_compose = Some(PendingCompose {
                 account: account_index,

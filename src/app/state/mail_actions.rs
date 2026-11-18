@@ -955,7 +955,9 @@ impl App {
                         MutationKind::Delete => None,
                     };
                     if let Some(destination) = destination {
-                        account.pending_destination_refresh.insert(request, destination);
+                        account
+                            .pending_destination_refresh
+                            .insert(request, destination);
                     }
                     true
                 }

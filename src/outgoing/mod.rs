@@ -13,8 +13,8 @@ pub use sendmail::SendmailSender;
 pub use smtp::{SmtpAuth, SmtpSender, SmtpSource};
 pub use wire::{
     FORWARD_SEPARATOR, InlineForwardParts, ReplyAudience, ReplyRecipients, build_draft,
-    build_outgoing, forward_attribution, forward_html, forward_subject, inline_forward_parts, inline_forward_body,
-    reply_recipients, reply_subject, send_warnings, validate_recipients,
+    build_outgoing, forward_attribution, forward_html, forward_subject, inline_forward_body,
+    inline_forward_parts, reply_recipients, reply_subject, send_warnings, validate_recipients,
 };
 
 #[derive(Debug, Clone)]

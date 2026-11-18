@@ -52,11 +52,7 @@ impl AccountState {
                     self.message_index,
                 )
             } else {
-                cache::persistable_bodies_near(
-                    &self.messages,
-                    &self.bodies,
-                    self.message_index,
-                )
+                cache::persistable_bodies_near(&self.messages, &self.bodies, self.message_index)
             },
             message_index: self.message_index.min(retained.saturating_sub(1)),
             message_view_offset: self.message_view_offset,
@@ -151,7 +147,8 @@ impl AccountState {
     /// One page at a time, only on the independent read-only session. The
     /// queue survives a busy worker and is retried after other UI events.
     pub(super) fn pump_mailbox_warming(&mut self) {
-        if self.capabilities.is_none() || self.connecting
+        if self.capabilities.is_none()
+            || self.connecting
             || self.mailbox_warm_request.is_some()
             || !self.pending_mutation_labels.is_empty()
         {
@@ -192,11 +189,19 @@ impl AccountState {
     ) {
         let previous = self.mailbox_cache.remove(&name);
         let same_generation = uid_validity.is_some()
-            && previous.as_ref().is_some_and(|cached| cached.uid_validity == uid_validity);
-        let live = page.messages.iter().map(|message| &message.id).collect::<HashSet<_>>();
+            && previous
+                .as_ref()
+                .is_some_and(|cached| cached.uid_validity == uid_validity);
+        let live = page
+            .messages
+            .iter()
+            .map(|message| &message.id)
+            .collect::<HashSet<_>>();
         let (bodies, message_index, message_view_offset) = match previous {
             Some(cached) if same_generation => (
-                cached.bodies.into_iter()
+                cached
+                    .bodies
+                    .into_iter()
                     .filter(|(id, _)| live.contains(id))
                     .collect(),
                 cached.message_index,
@@ -215,7 +220,10 @@ impl AccountState {
             uid_next,
         };
         if let Some(writer) = &self.cache_writer {
-            writer.send(cache::Change::Folder(name.clone(), cached.for_persistence()));
+            writer.send(cache::Change::Folder(
+                name.clone(),
+                cached.for_persistence(),
+            ));
         }
         self.remember_mailbox(name.clone(), cached);
         if let Some(validity) = uid_validity {
@@ -232,7 +240,11 @@ impl AccountState {
         if self.current_mailbox.as_deref() == Some(name) {
             return;
         }
-        if self.mailbox_warm_request.as_ref().is_some_and(|(_, pending)| pending == name) {
+        if self
+            .mailbox_warm_request
+            .as_ref()
+            .is_some_and(|(_, pending)| pending == name)
+        {
             self.mailbox_warm_request = None;
         }
         self.mailbox_warm_queue.retain(|pending| pending != name);
@@ -247,7 +259,11 @@ impl AccountState {
     /// unknown. It deliberately does not clear the active mailbox: callers
     /// may still have a valid, optimistically updated source view.
     pub(super) fn forget_cached_folder(&mut self, name: &str) {
-        if self.mailbox_warm_request.as_ref().is_some_and(|(_, pending)| pending == name) {
+        if self
+            .mailbox_warm_request
+            .as_ref()
+            .is_some_and(|(_, pending)| pending == name)
+        {
             self.mailbox_warm_request = None;
         }
         self.mailbox_warm_queue.retain(|queued| queued != name);

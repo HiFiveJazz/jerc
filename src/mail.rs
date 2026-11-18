@@ -325,10 +325,14 @@ pub(crate) fn attachment_names(raw: &[u8]) -> Result<Vec<String>> {
     if raw.len() > MAX_RAW_MESSAGE_BYTES {
         anyhow::bail!("message exceeds the 32 MiB MIME attachment limit");
     }
-    let parsed = MessageParser::new().parse(raw)
+    let parsed = MessageParser::new()
+        .parse(raw)
         .ok_or_else(|| anyhow!("unable to parse MIME attachments"))?;
-    Ok(attachment_parts(&parsed).into_iter().enumerate()
-        .map(|(index, part)| attachment_display_name(&part, index)).collect())
+    Ok(attachment_parts(&parsed)
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| attachment_display_name(&part, index))
+        .collect())
 }
 
 pub fn extract_attachments(raw: &[u8]) -> Result<Vec<OutgoingAttachment>> {

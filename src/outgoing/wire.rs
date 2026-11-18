@@ -106,7 +106,8 @@ pub struct InlineForwardParts {
 /// The untouched original MIME is kept for the actual forwarded message.
 pub fn inline_forward_body(raw: &[u8]) -> Result<InlineForwardParts> {
     use mail_parser::PartKind;
-    let message = MessageParser::new().parse(raw)
+    let message = MessageParser::new()
+        .parse(raw)
         .ok_or_else(|| anyhow!("cannot parse original message for forwarding"))?;
     let plain = message.text_body().find_map(|part| match part.kind() {
         PartKind::Text => part.text().map(|text| text.into_owned()),
@@ -116,9 +117,14 @@ pub fn inline_forward_body(raw: &[u8]) -> Result<InlineForwardParts> {
         PartKind::Html => part.text().map(|text| text.into_owned()),
         _ => None,
     });
-    let plain = plain.or_else(|| html.as_deref().map(mail_parser::html_to_text))
+    let plain = plain
+        .or_else(|| html.as_deref().map(mail_parser::html_to_text))
         .unwrap_or_default();
-    Ok(InlineForwardParts { plain, html, attachments: Vec::new() })
+    Ok(InlineForwardParts {
+        plain,
+        html,
+        attachments: Vec::new(),
+    })
 }
 
 pub fn inline_forward_parts(raw: &[u8]) -> Result<InlineForwardParts> {

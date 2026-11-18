@@ -557,27 +557,33 @@ fn event_loop(
                     // The background job waits for in-flight refreshes before
                     // reading final tokens or purging files. Never block the UI
                     // on a remote OAuth request or a refresh held by a worker.
-                    let retired_accounts: Vec<_> = removed_accounts.into_iter()
+                    let retired_accounts: Vec<_> = removed_accounts
+                        .into_iter()
                         .map(|removed| {
                             let generation = crate::oauth::retire_account_token(&removed);
                             (removed, generation)
-                        }).collect();
+                        })
+                        .collect();
                     for (removed, generation) in retired_accounts {
                         let remaining = config.accounts.clone();
                         let sender = runtime_tx.clone();
                         let join = std::thread::Builder::new()
                             .name("jerc-account-cleanup".into())
                             .spawn(move || {
-                                let result =
-                                    crate::oauth::with_retired_account_lock(&removed, generation, || {
-                                        let revoke = crate::oauth::OAuthSettings::prepare_revocation(
-                                            &removed, &remaining,
-                                        );
+                                let result = crate::oauth::with_retired_account_lock(
+                                    &removed,
+                                    generation,
+                                    || {
+                                        let revoke =
+                                            crate::oauth::OAuthSettings::prepare_revocation(
+                                                &removed, &remaining,
+                                            );
                                         let cleanup = crate::setup::purge_local_account_data(
                                             &removed, &remaining,
                                         );
                                         (revoke, cleanup)
-                                    });
+                                    },
+                                );
                                 let Some((revoke, cleanup)) = result else {
                                     return; // A new login superseded this cleanup.
                                 };
@@ -589,14 +595,20 @@ fn event_loop(
                                 }
                                 if removed.oauth.is_some() && revoke.is_none() {
                                     crate::perf::record(
-                                        "oauth_revoke_skipped", None, Duration::ZERO, false,
+                                        "oauth_revoke_skipped",
+                                        None,
+                                        Duration::ZERO,
+                                        false,
                                     );
                                 }
                                 if let Some(job) = revoke {
                                     let started = Instant::now();
                                     let result = job.revoke();
                                     crate::perf::record(
-                                        "oauth_revoke", None, started.elapsed(), result.is_ok(),
+                                        "oauth_revoke",
+                                        None,
+                                        started.elapsed(),
+                                        result.is_ok(),
                                     );
                                 }
                             });
@@ -891,11 +903,26 @@ mod selected_mailbox_idle_tests {
             Mailbox::new("INBOX", MailboxRole::Inbox),
             Mailbox::new("Drafts", MailboxRole::Drafts),
         ];
-        assert_eq!(selected_idle_mailbox(true, true, Some("Drafts"), &folders), Some("Drafts"));
-        assert_eq!(selected_idle_mailbox(false, true, Some("Drafts"), &folders), None);
-        assert_eq!(selected_idle_mailbox(true, false, Some("Drafts"), &folders), None);
-        assert_eq!(selected_idle_mailbox(true, true, Some("INBOX"), &folders), None);
-        assert_eq!(selected_idle_mailbox(true, true, Some("Missing"), &folders), None);
+        assert_eq!(
+            selected_idle_mailbox(true, true, Some("Drafts"), &folders),
+            Some("Drafts")
+        );
+        assert_eq!(
+            selected_idle_mailbox(false, true, Some("Drafts"), &folders),
+            None
+        );
+        assert_eq!(
+            selected_idle_mailbox(true, false, Some("Drafts"), &folders),
+            None
+        );
+        assert_eq!(
+            selected_idle_mailbox(true, true, Some("INBOX"), &folders),
+            None
+        );
+        assert_eq!(
+            selected_idle_mailbox(true, true, Some("Missing"), &folders),
+            None
+        );
         assert_eq!(selected_idle_mailbox(true, true, None, &folders), None);
     }
 }
@@ -913,9 +940,11 @@ mod account_worker_epoch_tests {
         // Two channels reserve slots for every enum variant, including events
         // that are normally rare. Don't let a new large inline variant bloat
         // every empty event queue again.
-        let reserved = 2 * RUNTIME_EVENT_QUEUE_CAPACITY
-            * std::mem::size_of::<RuntimeEvent>();
-        assert!(reserved <= 768 * 1024, "runtime event queues reserve {reserved} bytes");
+        let reserved = 2 * RUNTIME_EVENT_QUEUE_CAPACITY * std::mem::size_of::<RuntimeEvent>();
+        assert!(
+            reserved <= 768 * 1024,
+            "runtime event queues reserve {reserved} bytes"
+        );
     }
 
     #[test]
