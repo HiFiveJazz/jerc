@@ -102,6 +102,25 @@ pub struct InlineForwardParts {
     pub attachments: Vec<crate::model::OutgoingAttachment>,
 }
 
+/// Text/HTML alternatives without extracting potentially huge attachments.
+/// The untouched original MIME is kept for the actual forwarded message.
+pub fn inline_forward_body(raw: &[u8]) -> Result<InlineForwardParts> {
+    use mail_parser::PartKind;
+    let message = MessageParser::new().parse(raw)
+        .ok_or_else(|| anyhow!("cannot parse original message for forwarding"))?;
+    let plain = message.text_body().find_map(|part| match part.kind() {
+        PartKind::Text => part.text().map(|text| text.into_owned()),
+        _ => None,
+    });
+    let html = message.html_body().find_map(|part| match part.kind() {
+        PartKind::Html => part.text().map(|text| text.into_owned()),
+        _ => None,
+    });
+    let plain = plain.or_else(|| html.as_deref().map(mail_parser::html_to_text))
+        .unwrap_or_default();
+    Ok(InlineForwardParts { plain, html, attachments: Vec::new() })
+}
+
 pub fn inline_forward_parts(raw: &[u8]) -> Result<InlineForwardParts> {
     use mail_parser::PartKind;
     let message = MessageParser::new()
@@ -136,9 +155,9 @@ pub fn forward_attribution(raw: &[u8]) -> Result<String> {
         crate::model::MessageFlags::empty(),
     )?;
     let sender = if summary.from_name.is_empty() {
-        summary.from_address
+        std::borrow::Cow::Borrowed(summary.from_address.as_str())
     } else {
-        format!("{} <{}>", summary.from_name, summary.from_address)
+        std::borrow::Cow::Owned(format!("{} <{}>", summary.from_name, summary.from_address))
     };
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp(summary.timestamp, 0)
         .map(|date| {
@@ -395,7 +414,7 @@ pub fn build_outgoing(message: &OutgoingMessage, default_from: &str) -> Result<M
         builder = builder.in_reply_to(format!("<{}>", normalized_message_id(id)?));
     }
     let mut refs = Vec::new();
-    for id in &message.references {
+    for id in message.references.iter() {
         let normalized = normalized_message_id(id)?;
         if !refs.contains(&normalized) {
             refs.push(normalized);

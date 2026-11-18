@@ -54,6 +54,7 @@ struct Metadata {
     authorization_endpoint: String,
     token_endpoint: String,
     registration_endpoint: Option<String>,
+    revocation_endpoint: Option<String>,
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
     #[serde(default)]
@@ -70,6 +71,8 @@ struct ClientRecord {
     client_id: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    #[serde(default)]
+    revocation_endpoint: Option<String>,
     #[serde(default)]
     requested_scope: String,
     #[serde(default)]
@@ -103,8 +106,8 @@ fn parse_metadata(data: &str, expected_issuer: &str, scope: &str) -> Result<Meta
     for url in [&metadata.authorization_endpoint, &metadata.token_endpoint] {
         valid_endpoint(url)?;
     }
-    if let Some(url) = metadata.registration_endpoint.as_deref() {
-        valid_endpoint(url)?;
+    for endpoint in [metadata.registration_endpoint.as_deref(), metadata.revocation_endpoint.as_deref()].into_iter().flatten() {
+        valid_endpoint(endpoint)?;
     }
     if let Some(methods) = metadata.code_challenge_methods_supported.as_ref() {
         ensure!(
@@ -160,6 +163,10 @@ fn http_agent() -> ureq::Agent {
             .http_status_as_error(false)
             .build(),
     )
+}
+
+pub(super) fn revocation_endpoint(issuer: &str, scope: &str) -> Result<Option<String>> {
+    Ok(discover(issuer, scope)?.revocation_endpoint)
 }
 
 fn discover(issuer: &str, scope: &str) -> Result<Metadata> {
@@ -259,6 +266,9 @@ fn load_record(settings: &OAuthSettings) -> Result<Option<ClientRecord>> {
     validate_open_issuer(&record.issuer)?;
     valid_endpoint(&record.authorization_endpoint)?;
     valid_endpoint(&record.token_endpoint)?;
+    if let Some(url) = record.revocation_endpoint.as_deref() {
+        valid_endpoint(url)?;
+    }
     Ok(Some(record))
 }
 
@@ -293,6 +303,7 @@ fn with_record(mut settings: OAuthSettings, record: &ClientRecord) -> OAuthSetti
         .auth_endpoint
         .clone_from(&record.authorization_endpoint);
     settings.token_endpoint.clone_from(&record.token_endpoint);
+    settings.revocation_endpoint.clone_from(&record.revocation_endpoint);
     settings.issuer = Some(record.issuer.clone());
     settings.require_issuer_response = record.require_issuer_response;
     settings
@@ -339,6 +350,7 @@ pub(super) fn resolve_for_login(settings: &OAuthSettings) -> Result<OAuthSetting
         client_id,
         authorization_endpoint: metadata.authorization_endpoint,
         token_endpoint: metadata.token_endpoint,
+        revocation_endpoint: metadata.revocation_endpoint,
         requested_scope: settings.scope.clone(),
         require_issuer_response: metadata.authorization_response_iss_parameter_supported,
     };
@@ -440,6 +452,35 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn optional_rfc7009_endpoint_is_validated_and_preserved() {
+        let metadata = serde_json::json!({
+            "issuer": "https://mail.example.org",
+            "authorization_endpoint": "https://mail.example.org/auth/authorize",
+            "token_endpoint": "https://mail.example.org/auth/token",
+            "revocation_endpoint": "https://mail.example.org/auth/revoke"
+        }).to_string();
+        assert_eq!(parse_metadata(&metadata, "https://mail.example.org", MAIL_SCOPE)
+            .unwrap().revocation_endpoint.as_deref(),
+            Some("https://mail.example.org/auth/revoke"));
+        for bad in ["http://mail.example.org/revoke",
+                    "https://user:password@mail.example.org/revoke",
+                    "https://mail.example.org/revoke#frag"] {
+            assert!(parse_metadata(&metadata.replace(
+                "https://mail.example.org/auth/revoke", bad),
+                "https://mail.example.org", MAIL_SCOPE).is_err());
+        }
+        // Missing optional revocation metadata remains supported.
+        let legacy = serde_json::json!({
+            "issuer": "https://mail.example.org",
+            "authorization_endpoint": "https://mail.example.org/auth/authorize",
+            "token_endpoint": "https://mail.example.org/auth/token"
+        }).to_string();
+        assert!(legacy.len() < metadata.len());
+        assert!(parse_metadata(&legacy, "https://mail.example.org", MAIL_SCOPE)
+            .unwrap().revocation_endpoint.is_none());
+    }
+
     #[test]
     fn registration_response_accepts_public_and_rejects_confidential_clients() {
         let valid = r#"{"client_id":"swc1.abc-123","token_endpoint_auth_method":"none"}"#;

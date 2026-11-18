@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 #[derive(
     serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord,
@@ -112,11 +112,11 @@ impl Mailbox {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct MessageSummary {
+pub struct MessageHeaders {
     pub id: MessageId,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
-    pub references: Vec<String>,
+    pub references: Box<[String]>,
     pub from_name: String,
     pub from_address: String,
     /// Recipients actually present in the message headers. Bcc is normally
@@ -126,13 +126,38 @@ pub struct MessageSummary {
     pub bcc: String,
     pub subject: String,
     pub timestamp: i64,
-    pub date_label: String,
+    pub date_label: Box<str>,
     pub size: u64,
-    pub flags: MessageFlags,
     /// Header-only, conservative hint available before loading the MIME body.
     pub has_attachment_hint: bool,
     /// MIME filenames from IMAP BODYSTRUCTURE, available before fetching body.
-    pub attachment_names_hint: Vec<String>,
+    pub attachment_names_hint: Box<[String]>,
+}
+
+/// A lightweight message row. All RFC 5322 metadata is immutable and shared
+/// across UI, sync hints, warm folders and disk-writer snapshots. Only IMAP
+/// flags are independently mutable, so SEEN/FLAGGED changes need no copy.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct MessageSummary {
+    #[serde(flatten)]
+    pub headers: Arc<MessageHeaders>,
+    pub flags: MessageFlags,
+}
+
+impl std::ops::Deref for MessageSummary {
+    type Target = MessageHeaders;
+
+    fn deref(&self) -> &Self::Target {
+        &self.headers
+    }
+}
+
+// Metadata edits are rare (e.g. BODYSTRUCTURE adds attachment hints). Use
+// copy-on-write only for these changes; ordinary flag updates do not clone.
+impl std::ops::DerefMut for MessageSummary {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.headers)
+    }
 }
 
 impl MessageSummary {
@@ -182,22 +207,25 @@ pub struct HtmlLine {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct MessageBody {
     pub id: MessageId,
-    /// The MIME text/plain representation when one exists.
-    pub plain_text: Option<String>,
+    /// Immutable MIME text/plain shared by live and persistent cache snapshots.
+    /// Clones of this body retain a reference rather than copying the text.
+    pub plain_text: Option<Arc<str>>,
     /// A generated readable plain-text view for HTML-only messages. This keeps
     /// the rich/plain toggle useful even when the sender omitted text/plain.
-    pub plain_fallback: Option<String>,
+    pub plain_fallback: Option<Arc<str>>,
     /// Original HTML alternative. Keeping it lets the UI reflow the document
     /// to the actual reader width instead of freezing every message at the
     /// worker's fallback width.
-    pub html_source: Option<String>,
+    pub html_source: Option<Arc<str>>,
     /// Plain-string projection of the rich HTML rendering. This is also used
     /// when quoting HTML-only mail in a reply.
-    pub html_text: Option<String>,
+    pub html_text: Option<Arc<str>>,
+    /// Immutable rich rows are shared across live folder snapshots. Reflow
+    /// replaces this Arc for one body without mutating the other snapshots.
     /// Rich terminal representation produced by the worker at a fallback width
     /// and reflowed by reader mode when the actual viewport width changes. Table
     /// borders plus semantic links/emphasis survive into Ratatui.
-    pub html_lines: Option<Vec<HtmlLine>>,
+    pub html_lines: Option<Arc<Vec<HtmlLine>>>,
     /// Human-readable renderer label shown in reader mode.
     pub html_renderer: Option<String>,
     /// Width used to produce html_text/html_lines. A zero value means no rich
@@ -264,7 +292,7 @@ impl MessageBody {
     pub fn html_links(&self) -> Vec<String> {
         let mut links = Vec::new();
         if let Some(lines) = &self.html_lines {
-            for line in lines {
+            for line in lines.iter() {
                 for span in &line.spans {
                     if let Some(link) = &span.style.link
                         && !links.iter().any(|existing| existing == link)
@@ -320,7 +348,7 @@ impl MessageBody {
         // Fallback for synthetic/test bodies where only rich annotations exist.
         let mut images = Vec::new();
         if let Some(lines) = &self.html_lines {
-            for line in lines {
+            for line in lines.iter() {
                 for span in &line.spans {
                     let Some(source) = span.style.image.as_deref() else {
                         continue;
@@ -694,7 +722,7 @@ mod tests {
             plain_fallback: None,
             html_source: Some("<a href=\"https://example.com/one\">first</a> second".into()),
             html_text: Some("first second".into()),
-            html_lines: Some(vec![HtmlLine {
+            html_lines: Some(std::sync::Arc::new(vec![HtmlLine {
                 spans: vec![
                     HtmlSpan {
                         text: "first".into(),
@@ -708,7 +736,7 @@ mod tests {
                         style: HtmlSpanStyle::default(),
                     },
                 ],
-            }]),
+            }])),
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
@@ -735,14 +763,14 @@ mod tests {
             plain_fallback: None,
             html_source: Some("<img>".into()),
             html_text: Some("image".into()),
-            html_lines: Some(vec![HtmlLine {
+            html_lines: Some(std::sync::Arc::new(vec![HtmlLine {
                 spans: vec![
                     image_span("https://example.com/hero.png"),
                     image_span("https://example.com/hero.png"),
                     image_span("https://tracker.example/open/pixel.gif"),
                     image_span("cid:embedded-logo"),
                 ],
-            }]),
+            }])),
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
@@ -764,12 +792,12 @@ mod tests {
                 r#"<img src="https://example.com/avatar.png" width="45" height="45" alt="">
                     <p>message</p>
                     <img src="https://example.com/footer-badge.png" width="120" height="40" alt="App Store">"#
-                    .to_owned(),
+                    .into(),
             ),
             html_text: Some("message App Store".into()),
             // Simulate html2text exposing only the footer image because the
             // real header/avatar had empty alt text.
-            html_lines: Some(vec![HtmlLine {
+            html_lines: Some(std::sync::Arc::new(vec![HtmlLine {
                 spans: vec![HtmlSpan {
                     text: "App Store".into(),
                     style: HtmlSpanStyle {
@@ -777,7 +805,7 @@ mod tests {
                         ..HtmlSpanStyle::default()
                     },
                 }],
-            }]),
+            }])),
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
@@ -812,7 +840,7 @@ mod tests {
                     <img src="https://example.com/logo.png" width="150" alt="Walmart Plus Home page">
                     <img src="https://example.com/right.png" width="60" alt="Walmart Plus Home page">
                     <img src="https://example.com/body.png" width="300" alt="Body image">"#
-                    .to_owned(),
+                    .into(),
             ),
             html_text: Some("message".into()),
             html_lines: None,
@@ -842,7 +870,7 @@ mod tests {
             html_source: Some(
                 r#"<img src="https://example.com/avatar.png" width="45" height="45" alt="">
                     <img src="https://example.com/hero.png" width="500" height="300" alt="">"#
-                    .to_owned(),
+                    .into(),
             ),
             html_text: Some("message".into()),
             html_lines: None,
@@ -871,7 +899,7 @@ mod tests {
                 r#"<img src="https://example.com/hidden.png" style="display:none" width="90" height="60">
                     <img src="https://example.com/shim.png" width="1" height="1">
                     <img src="https://example.com/hero.png" width="90" height="60">"#
-                    .to_owned(),
+                    .into(),
             ),
             html_text: Some("hero".into()),
             html_lines: None,
@@ -896,10 +924,10 @@ mod tests {
             plain_fallback: None,
             html_source: Some(
                 r#"<img src="https://example.com/logo@2x.png?a=1&amp;b=2" width="74" height="24" style="width: 148px; height: 48px">"#
-                    .to_owned(),
+                    .into(),
             ),
             html_text: Some("logo".into()),
-            html_lines: Some(vec![HtmlLine {
+            html_lines: Some(std::sync::Arc::new(vec![HtmlLine {
                 spans: vec![HtmlSpan {
                     text: "logo".into(),
                     style: HtmlSpanStyle {
@@ -907,7 +935,7 @@ mod tests {
                         ..HtmlSpanStyle::default()
                     },
                 }],
-            }]),
+            }])),
             html_renderer: Some("test".into()),
             html_render_width: 80,
             attachment_count: 0,
@@ -940,5 +968,68 @@ mod tests {
         };
         assert_eq!(body.display_text(false), "HTML version");
         assert!(body.plain_is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shared_summary_regressions {
+    use std::sync::Arc;
+
+    use super::{MessageFlags, MessageId, MessageSummary};
+
+    fn summary() -> MessageSummary {
+        let raw = b"From: Example <example@example.org>\r\nTo: Recipient <recipient@example.net>\r\nSubject: A very long immutable subject\r\nMessage-ID: <test@example.org>\r\nDate: Wed, 18 Nov 2026 10:00:00 +0000\r\n\r\nBody";
+        crate::mail::parse_summary(
+            MessageId("imap-uid:42:7".into()),
+            raw,
+            raw.len() as u64,
+            MessageFlags::empty(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cloned_rows_share_headers_but_not_flags() {
+        let first = summary();
+        let mut second = first.clone();
+        assert!(Arc::ptr_eq(&first.headers, &second.headers));
+        second.flags.set(MessageFlags::SEEN, true);
+        assert!(Arc::ptr_eq(&first.headers, &second.headers));
+        assert!(first.unread());
+        assert!(!second.unread());
+    }
+
+    #[test]
+    fn changing_metadata_uses_copy_on_write() {
+        let first = summary();
+        let mut second = first.clone();
+        second.subject = "updated subject".into();
+        assert!(!Arc::ptr_eq(&first.headers, &second.headers));
+        assert_eq!(first.subject, "A very long immutable subject");
+        assert_eq!(second.subject, "updated subject");
+    }
+
+    #[test]
+    fn legacy_flat_json_roundtrips_without_new_nested_headers_key() {
+        let message = summary();
+        let json = serde_json::to_value(&message).unwrap();
+        assert!(json.get("headers").is_none());
+        assert_eq!(json["subject"], "A very long immutable subject");
+        assert!(json.get("flags").is_some());
+        let restored: MessageSummary = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored.id, message.id);
+        assert_eq!(restored.message_id, message.message_id);
+        assert_eq!(restored.references, message.references);
+        assert_eq!(restored.date_label, message.date_label);
+        assert_eq!(serde_json::to_value(restored).unwrap(), json);
+    }
+
+    #[test]
+    fn compact_metadata_has_no_spare_vector_capacity() {
+        let message = summary();
+        assert_eq!(message.references.len(), 0);
+        assert!(message.attachment_names_hint.is_empty());
+        assert!(std::mem::size_of_val(&message.references) < std::mem::size_of::<Vec<String>>());
+        assert!(std::mem::size_of_val(&message.date_label) < std::mem::size_of::<String>());
     }
 }

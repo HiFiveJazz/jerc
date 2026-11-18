@@ -79,12 +79,15 @@ impl App {
             | WorkerEventKind::MailboxStatus { .. }
             | WorkerEventKind::NewMailPreview { .. }
             | WorkerEventKind::MailboxOpened { .. }
-            | WorkerEventKind::MailboxOpenFailed { .. } => EventGroup::Mailbox,
+            | WorkerEventKind::MailboxOpenFailed { .. }
+            | WorkerEventKind::MailboxWarmed { .. }
+            | WorkerEventKind::MailboxWarmFailed { .. } => EventGroup::Mailbox,
             WorkerEventKind::BodyLoadFailed { .. }
             | WorkerEventKind::BodyLoaded(..)
             | WorkerEventKind::BodyPrefetched { .. }
             | WorkerEventKind::AttachmentsLoaded { .. }
             | WorkerEventKind::RawLoaded { .. }
+            | WorkerEventKind::ComposePrepared { .. }
             | WorkerEventKind::MessageExported { .. } => EventGroup::Content,
             WorkerEventKind::SeenChanged { .. }
             | WorkerEventKind::MutationComplete

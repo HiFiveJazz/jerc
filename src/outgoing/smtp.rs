@@ -171,8 +171,11 @@ impl SmtpSource {
         if let Some(secret) = &self.secret {
             return Ok(secret.clone());
         }
-        if let Some(oauth) = &self.account_oauth {
-            return oauth.refresh_token();
+        if self.account_oauth.is_some() {
+            // The OAuth token manager supplies short-lived access tokens.
+            // Never read/copy the raw refresh token into an IMAP/SMTP worker
+            // just to discard it during XOAUTH2 authentication.
+            return Ok(String::new());
         }
         let command = command.ok_or_else(|| {
             anyhow!(

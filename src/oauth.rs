@@ -2,12 +2,14 @@
 //! Google/Microsoft use publisher-registered IDs; open-public-client servers
 //! use standards-based discovery and (when available) dynamic registration.
 //! Users authenticate in their system browser; Jerc never handles their 2FA.
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -109,6 +111,7 @@ pub struct OAuthSettings {
     pub client_id: String,
     client_secret: Option<String>,
     pub token_endpoint: String,
+    revocation_endpoint: Option<String>,
     pub scope: String,
     auth_endpoint: String,
     account_name: String,
@@ -120,6 +123,8 @@ pub struct OAuthSettings {
     credential_namespace: Option<String>,
     issuer: Option<String>,
     require_issuer_response: bool,
+    credential_slot: Arc<CredentialSlot>,
+    credential_generation: u64,
 }
 
 impl std::fmt::Debug for OAuthSettings {
@@ -129,6 +134,101 @@ impl std::fmt::Debug for OAuthSettings {
             .field("account_name", &self.account_name)
             .finish_non_exhaustive()
     }
+}
+
+// One gate per credential path, shared by IMAP, SMTP, background and IDLE
+// workers. Keep retired gates for the process lifetime: an old worker must not
+// be able to acquire a fresh gate after account deletion.
+#[derive(Default)]
+struct CredentialSession {
+    cached_access: Option<CachedAccess>,
+}
+
+struct CachedAccess {
+    token: String,
+    scope: Option<String>,
+    provider: String,
+    client_id: String,
+    requested_scope: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct CredentialSlot {
+    state: Mutex<CredentialSession>,
+    generation: AtomicU64,
+    retired: AtomicBool,
+}
+
+static CREDENTIAL_SLOTS: OnceLock<Mutex<HashMap<PathBuf, Arc<CredentialSlot>>>> = OnceLock::new();
+
+// A refresh already under the gate may finish during deletion. Persist its
+// rotation before cleanup reads the final token, but never after replacement
+// by a NEW login generation.
+fn refresh_may_persist(slot: &CredentialSlot, original_generation: u64) -> bool {
+    let generation = slot.generation.load(Ordering::Acquire);
+    (generation == original_generation && !slot.retired.load(Ordering::Acquire))
+        || (generation == original_generation.wrapping_add(1)
+            && slot.retired.load(Ordering::Acquire))
+}
+
+fn credential_slot(path: &Path) -> Arc<CredentialSlot> {
+    let slots = CREDENTIAL_SLOTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut slots = slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(slots.entry(path.to_owned()).or_insert_with(|| Arc::new(CredentialSlot::default())))
+}
+
+/// Nonblocking invalidation: workers already in an HTTP refresh observe it
+/// before writing a rotated token. Cleanup subsequently waits for the gate.
+pub(crate) fn retire_account_token(account: &AccountConfig) -> Option<u64> {
+    let oauth = account.oauth.as_ref()?;
+    let base = dirs::config_dir()?;
+    let path = token_path_for_account(&base, &account.name, oauth.credential_namespace.as_deref()).ok()?;
+    let slot = credential_slot(&path);
+    slot.retired.store(true, Ordering::Release);
+    Some(slot.generation.fetch_add(1, Ordering::AcqRel) + 1)
+}
+
+fn retired_slot_is_current(slot: &CredentialSlot, generation: u64) -> bool {
+    slot.retired.load(Ordering::Acquire)
+        && slot.generation.load(Ordering::Acquire) == generation
+}
+
+/// Run local cleanup only after any in-flight refresh has released the gate.
+/// This must be called from a background thread, never on the TUI thread.
+pub(crate) fn with_retired_account_lock<T>(
+    account: &AccountConfig,
+    retired_generation: Option<u64>,
+    action: impl FnOnce() -> T,
+) -> Option<T> {
+    let Some(oauth) = &account.oauth else { return Some(action()) };
+    let Some(base) = dirs::config_dir() else { return Some(action()) };
+    let Ok(path) = token_path_for_account(&base, &account.name, oauth.credential_namespace.as_deref()) else { return Some(action()) };
+    let slot = credential_slot(&path);
+    let mut session = slot.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(generation) = retired_generation
+        && !retired_slot_is_current(&slot, generation)
+    {
+        // A newly signed-in account superseded this deletion. Never erase it.
+        return None;
+    }
+    session.cached_access = None;
+    Some(action())
+}
+
+/// The wizard is provisional until its account config is saved. Cancelled or
+/// abandoned wizard grants must not remain usable on disk.
+pub(crate) fn discard_provisional_login(account: &AccountConfig) {
+    let generation = retire_account_token(account);
+    let _ = with_retired_account_lock(account, generation, || {
+        if let Some(oauth) = &account.oauth
+            && let Some(base) = dirs::config_dir()
+            && let Ok(path) = token_path_for_account(&base, &account.name, oauth.credential_namespace.as_deref())
+        {
+            let _ = fs::remove_file(path.with_extension("public-client.json"));
+            let _ = fs::remove_file(path);
+        }
+    });
 }
 
 #[derive(Serialize, Deserialize)]
@@ -268,10 +368,12 @@ pub fn microsoft_login_username_hint(token: &str) -> Option<String> {
     None
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct TokenReply {
     access_token: String,
     refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
     /// Scopes in the token response, if the identity provider reports them.
     #[serde(default)]
     scope: Option<String>,
@@ -315,6 +417,128 @@ fn safe_oauth_failure(status: u16, failure: &OAuthFailure) -> String {
         message.push_str(&format!(" (AADSTS{code})"));
     }
     message
+}
+
+/// The same token path is used by sign-in and explicit local account purge.
+/// Reject unsafe namespaces even when the caller has only deserialized config.
+pub(crate) fn token_path_for_account(
+    base: &Path,
+    name: &str,
+    namespace: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(value) = namespace
+        && (value.is_empty()
+            || value.len() > 48
+            || !value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')))
+    {
+        bail!("invalid OAuth credential namespace");
+    }
+    let digest = digest::digest(&digest::SHA256, name.as_bytes());
+    let key: String = digest.as_ref()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let directory = base.join("jerc").join("oauth");
+    let directory = match namespace {
+        Some(value) => directory.join(value),
+        None => directory,
+    };
+    Ok(directory.join(format!("{key}.json")))
+}
+
+/// Best-effort identity of the Google mailbox attached to this OAuth grant.
+/// A login identity is more useful than the display address: Workspace mail
+/// aliases may have a different `email` field. Full IMAP URLs encode `@`.
+fn google_mailbox_identity(account: &AccountConfig) -> Option<String> {
+    let uri_identity = Url::parse(&account.source).ok().and_then(|url| {
+        if !url.scheme().starts_with("imap") || url.username().is_empty() {
+            return None;
+        }
+        percent_encoding::percent_decode_str(url.username())
+            .decode_utf8()
+            .ok()
+            .map(|username| username.into_owned())
+    });
+    let candidate = uri_identity
+        .as_deref()
+        .or(account.imap_username.as_deref())
+        .or(account.email.as_deref())?
+        .trim();
+    if !candidate.contains('@') || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(candidate.to_ascii_lowercase())
+}
+
+/// Google's revocation invalidates authorization for this Google *user* and
+/// OAuth project. Distinct Gmail users can safely share a desktop client ID.
+/// If a configured account's login identity is unknown, err on the side of
+/// not revoking a grant that might also be needed by another local account.
+fn google_revocation_conflicts(
+    deleted: &AccountConfig,
+    remaining: &[AccountConfig],
+    _client_id: &str,
+) -> bool {
+    let deleted_identity = google_mailbox_identity(deleted);
+    // Different client IDs may still belong to the same Google project.
+    remaining.iter().any(|other| {
+        let is_google = other.oauth.as_ref().is_some_and(|oauth| {
+            oauth.provider.trim().eq_ignore_ascii_case("google")
+        });
+        if !is_google { return false; }
+        match (deleted_identity.as_deref(), google_mailbox_identity(other).as_deref()) {
+            (Some(deleted), Some(other)) => deleted == other,
+            _ => true,
+        }
+    })
+}
+
+/// Network-only revocation job. The secret is never logged or serialized and
+/// is discarded when the detached worker finishes or times out.
+pub(crate) struct RevocationRequest {
+    settings: OAuthSettings,
+    token: String,
+}
+
+impl RevocationRequest {
+    pub(crate) fn revoke(self) -> Result<()> {
+        let mut settings = self.settings;
+        if settings.provider == "open" && settings.revocation_endpoint.is_none() {
+            // Older public-client registration files predate revocation URL
+            // caching. Discover it from the configured HTTPS issuer instead.
+            settings.revocation_endpoint = settings
+                .issuer
+                .as_deref()
+                .and_then(|issuer| open::revocation_endpoint(issuer, &settings.scope).ok())
+                .flatten();
+        }
+        let Some(endpoint) = settings.revocation_endpoint.as_deref() else {
+            bail!("OAuth provider did not advertise token revocation");
+        };
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(8)))
+                .https_only(true)
+                .http_status_as_error(false)
+                .build(),
+        );
+        let mut form = vec![
+            ("token", self.token.as_str()),
+            ("token_type_hint", "refresh_token"),
+            ("client_id", settings.client_id.as_str()),
+        ];
+        if let Some(secret) = settings.client_secret.as_deref() {
+            form.push(("client_secret", secret));
+        }
+        let response = agent.post(endpoint).send_form(form)
+            .map_err(|_| anyhow!("OAuth revocation unavailable"))?;
+        if !response.status().is_success() {
+            bail!("OAuth revocation HTTP {}", response.status());
+        }
+        Ok(())
+    }
 }
 
 impl OAuthSettings {
@@ -447,11 +671,18 @@ impl OAuthSettings {
         } else {
             scope
         };
+        let revocation_endpoint = (provider == "google")
+            .then(|| "https://oauth2.googleapis.com/revoke".to_owned());
+        let base = dirs::config_dir().context("finding OAuth credential directory")?;
+        let path = token_path_for_account(&base, name, oauth.credential_namespace.as_deref())?;
+        let credential_slot = credential_slot(&path);
+        let credential_generation = credential_slot.generation.load(Ordering::Acquire);
         let settings = Self {
             provider,
             client_id,
             client_secret,
             token_endpoint,
+            revocation_endpoint,
             scope,
             auth_endpoint,
             account_name: name.to_owned(),
@@ -463,6 +694,8 @@ impl OAuthSettings {
             credential_namespace: oauth.credential_namespace.clone(),
             issuer,
             require_issuer_response: false,
+            credential_slot,
+            credential_generation,
         };
         if settings.provider == "open" {
             open::load_cached(settings)
@@ -471,24 +704,62 @@ impl OAuthSettings {
         }
     }
 
+    /// The wizard may edit server or account identity after sign-in. Never
+    /// attach a provisional grant to a different name, client, or issuer.
+    pub(crate) fn same_wizard_credential_identity(
+        first: &AccountConfig,
+        second: &AccountConfig,
+    ) -> Result<bool> {
+        let a = Self::for_account(first)?;
+        let b = Self::for_account(second)?;
+        Ok(match (a, b) {
+            (Some(a), Some(b)) => {
+                a.token_file()? == b.token_file()?
+                    && a.provider == b.provider
+                    && a.client_id == b.client_id
+                    && a.token_endpoint == b.token_endpoint
+                    && a.scope == b.scope
+                    && a.issuer == b.issuer
+            }
+            _ => false,
+        })
+    }
+
+    /// Prepare a one-shot remote revocation before the account's local token
+    /// file is purged. No network I/O occurs on the terminal event thread.
+    /// Google's project-wide grants are per Google user. Do not revoke a
+    /// shared user's grant, but allow different Google users to share a client.
+    pub(crate) fn prepare_revocation(
+        account: &AccountConfig,
+        remaining: &[AccountConfig],
+    ) -> Option<RevocationRequest> {
+        let settings = Self::for_account(account).ok()??;
+        if settings.provider == "microsoft" {
+            // Microsoft does not offer per-client RFC 7009 token revocation.
+            // A tenant-wide session revocation is not equivalent.
+            return None;
+        }
+        if settings.provider == "google"
+            && google_revocation_conflicts(account, remaining, &settings.client_id)
+        {
+            return None;
+        }
+        let token = settings.read_refresh_token_unchecked().ok()?;
+        Some(RevocationRequest { settings, token })
+    }
+
     fn token_file(&self) -> Result<PathBuf> {
         let base = dirs::config_dir()
             .ok_or_else(|| anyhow!("cannot locate config directory for OAuth token"))?;
-        // Hash the name to keep a user-supplied account label out of paths.
-        let digest = digest::digest(&digest::SHA256, self.account_name.as_bytes());
-        let key: String = digest.as_ref()[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let directory = base.join("jerc").join("oauth");
-        let directory = match self.credential_namespace.as_deref() {
-            Some(namespace) => directory.join(namespace),
-            None => directory,
-        };
-        Ok(directory.join(format!("{key}.json")))
+        token_path_for_account(&base, &self.account_name, self.credential_namespace.as_deref())
     }
 
     pub fn refresh_token(&self) -> Result<String> {
+        self.check_credential_active()?;
+        self.read_refresh_token_unchecked()
+    }
+
+    fn read_refresh_token_unchecked(&self) -> Result<String> {
         let path = self.token_file()?;
         let meta = fs::symlink_metadata(&path).with_context(|| {
             format!(
@@ -588,16 +859,31 @@ impl OAuthSettings {
     }
 
     fn refresh_access_token(&self) -> Result<TokenReply> {
+        // Hold one per-credential gate across the network refresh, rotation and
+        // persistence. A second caller receives the cached access token when
+        // the server advertised a safe lifetime, or refreshes sequentially.
+        let mut session = self.credential_slot.state.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_credential_active()?;
+        if let Some(cached) = &session.cached_access
+            && cached.provider == self.provider
+            && cached.client_id == self.client_id
+            && cached.requested_scope == self.scope
+            && Instant::now() < cached.expires_at
+        {
+            return Ok(TokenReply {
+                access_token: cached.token.clone(),
+                refresh_token: None,
+                expires_in: None,
+                scope: cached.scope.clone(),
+            });
+        }
         let refresh = self.refresh_token()?;
         let mut form = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh.as_str()),
             ("client_id", self.client_id.as_str()),
         ];
-        // Microsoft permits an explicit scope on a refresh grant. Request the
-        // same configured IMAP/SMTP permissions rather than depending on the
-        // original grant's default scope selection. This cannot add scopes
-        // which the user/tenant has not consented to.
         if self.provider == "microsoft" {
             form.push(("scope", self.scope.as_str()));
         }
@@ -605,14 +891,39 @@ impl OAuthSettings {
             form.push(("client_secret", secret));
         }
         let reply = self.request_token(&form)?;
-        if let Some(rotated) = reply
-            .refresh_token
-            .as_deref()
-            .filter(|value| !value.is_empty())
+        // Invalidation is atomic and does not wait for the HTTP timeout.
+        if refresh_may_persist(&self.credential_slot, self.credential_generation)
+            && let Some(rotated) = reply.refresh_token.as_deref().filter(|value| !value.is_empty())
         {
+            // If deletion began during HTTP, the cleanup job is waiting on
+            // our gate and will revoke/purge this final rotated token.
             self.save_refresh_token(rotated)?;
         }
+        self.check_credential_active()?;
+        if let Some(ttl) = reply.expires_in.map(|seconds| seconds.saturating_sub(120))
+            .filter(|seconds| *seconds > 0)
+        {
+            session.cached_access = Some(CachedAccess {
+                token: reply.access_token.clone(),
+                scope: reply.scope.clone(),
+                provider: self.provider.clone(),
+                client_id: self.client_id.clone(),
+                requested_scope: self.scope.clone(),
+                expires_at: Instant::now() + Duration::from_secs(ttl.min(45 * 60)),
+            });
+        } else {
+            session.cached_access = None;
+        }
         Ok(reply)
+    }
+
+    fn check_credential_active(&self) -> Result<()> {
+        if self.credential_slot.retired.load(Ordering::Acquire)
+            || self.credential_slot.generation.load(Ordering::Acquire) != self.credential_generation
+        {
+            bail!("OAuth credentials were replaced or account was removed");
+        }
+        Ok(())
     }
 
     fn request_token(&self, form: &[(&str, &str)]) -> Result<TokenReply> {
@@ -707,6 +1018,17 @@ impl OAuthSettings {
         verifier: &str,
         quiet: bool,
     ) -> Result<()> {
+        self.exchange_code_cancellable(code, redirect_uri, verifier, quiet, None)
+    }
+
+    fn exchange_code_cancellable(
+        &self,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+        quiet: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
         let mut form = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -718,17 +1040,41 @@ impl OAuthSettings {
             form.push(("client_secret", secret));
         }
         let reply = self.request_token(&form)?;
-        self.finish_login(reply, quiet)
+        ensure_not_cancelled(cancel)?;
+        self.finish_login_with_cancel(reply, quiet, cancel)
     }
 
     fn finish_login(&self, reply: TokenReply, quiet: bool) -> Result<()> {
+        self.finish_login_with_cancel(reply, quiet, None)
+    }
+
+    fn finish_login_with_cancel(
+        &self, reply: TokenReply, quiet: bool, cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
         if reply.access_token.is_empty() {
             bail!("OAuth server returned no access token");
         }
         let refresh = reply.refresh_token.ok_or_else(|| anyhow!(
             "OAuth provider did not return a refresh token; revoke authorization and retry with offline access"
         ))?;
+        let mut session = self.credential_slot.state.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_not_cancelled(cancel)?;
+        if self.credential_generation != self.credential_slot.generation.load(Ordering::Acquire) {
+            bail!("OAuth sign-in superseded by account removal or a newer sign-in");
+        }
+        // Explicit sign-in begins a new credential generation. Older workers
+        // can never overwrite these tokens, including after account recreation.
         self.save_refresh_token(&refresh)?;
+        if let Err(error) = ensure_not_cancelled(cancel) {
+            self.credential_slot.retired.store(true, Ordering::Release);
+            self.credential_slot.generation.fetch_add(1, Ordering::AcqRel);
+            let _ = fs::remove_file(self.token_file()?);
+            return Err(error);
+        }
+        self.credential_slot.generation.fetch_add(1, Ordering::AcqRel);
+        self.credential_slot.retired.store(false, Ordering::Release);
+        session.cached_access = None;
         if !quiet {
             println!(
                 "OAuth sign-in succeeded for {:?}; refresh token stored locally with private permissions.",
@@ -850,7 +1196,9 @@ impl OAuthSettings {
                     );
                     let _ = stream.write_all(reply.as_bytes());
                     if !matching_state {
-                        bail!("OAuth callback state mismatch");
+                        // Other local processes can reach this ephemeral port.
+                        // Ignore unrelated callbacks rather than abort login.
+                        continue;
                     }
                     if let Some(code) = code {
                         break code;
@@ -864,7 +1212,7 @@ impl OAuthSettings {
             }
         };
         ensure_not_cancelled(cancel)?;
-        self.exchange_code(&code, &redirect_uri, &verifier, quiet)
+        self.exchange_code_cancellable(&code, &redirect_uri, &verifier, quiet, cancel)
     }
 
     /// Microsoft native-client redirect compatible with the authorization-code
@@ -964,6 +1312,7 @@ impl OAuthSettings {
                     TokenReply {
                         access_token,
                         refresh_token: reply.refresh_token,
+                        expires_in: None,
                         scope: None,
                     },
                     false,
@@ -1693,5 +2042,237 @@ mod tests {
             ..Default::default()
         };
         assert!(OAuthSettings::from_config("Open", &config).is_err());
+    }
+
+    #[test]
+    fn google_revocation_allows_other_google_users_with_shared_client() {
+        let mut removed = crate::config::Config::single_maildir(
+            "Burner".into(), std::path::PathBuf::from("/tmp/unused-maildir"),
+        ).accounts.remove(0);
+        removed.email = Some("burner@gmail.com".into());
+        removed.source = "imap".into();
+        removed.oauth = Some(OAuthConfig {
+            provider: "google".into(), client_id: Some("desktop-app".into()),
+            ..Default::default()
+        });
+        let mut personal = removed.clone();
+        personal.name = "Personal".into();
+        personal.email = Some("personal@gmail.com".into());
+        assert_eq!(
+            super::google_mailbox_identity(&removed).as_deref(),
+            Some("burner@gmail.com")
+        );
+        assert!(!super::google_revocation_conflicts(
+            &removed, &[personal], "desktop-app"
+        ));
+    }
+
+    #[test]
+    fn google_revocation_preserves_same_principal_or_unknown_identity() {
+        let mut removed = crate::config::Config::single_maildir(
+            "Burner".into(), std::path::PathBuf::from("/tmp/unused-maildir"),
+        ).accounts.remove(0);
+        removed.email = Some("burner@gmail.com".into());
+        removed.source = "imap".into();
+        removed.oauth = Some(OAuthConfig {
+            provider: "google".into(), client_id: Some("desktop-app".into()),
+            ..Default::default()
+        });
+        let mut alias = removed.clone();
+        alias.name = "Alias".into();
+        alias.email = Some("BURNER@gmail.com".into());
+        assert!(super::google_revocation_conflicts(&removed, &[alias], "desktop-app"));
+        let mut unknown = removed.clone();
+        unknown.email = None;
+        assert!(super::google_revocation_conflicts(&removed, &[unknown], "desktop-app"));
+    }
+
+    #[test]
+    fn credential_gate_is_shared_and_serializes_concurrent_refreshes() {
+        use std::sync::atomic::AtomicUsize;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("account.json");
+        let first = credential_slot(&path);
+        let second = credential_slot(&path);
+        assert!(Arc::ptr_eq(&first, &second));
+        let in_critical_section = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for slot in [first, second] {
+                let active = Arc::clone(&in_critical_section);
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        let _guard = slot.state.lock().unwrap();
+                        assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                        std::thread::yield_now();
+                        assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(in_critical_section.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retirement_allows_final_rotation_only_before_cleanup_and_not_after_new_login() {
+        let slot = CredentialSlot::default();
+        let old = slot.generation.load(Ordering::Acquire);
+        assert!(refresh_may_persist(&slot, old));
+        slot.retired.store(true, Ordering::Release);
+        slot.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(refresh_may_persist(&slot, old));
+        // New login supersedes the old refresh and its cleanup job.
+        slot.generation.fetch_add(1, Ordering::AcqRel);
+        slot.retired.store(false, Ordering::Release);
+        assert!(!refresh_may_persist(&slot, old));
+    }
+
+    #[test]
+    fn cancelled_login_cannot_persist_new_refresh_token() {
+        let config = OAuthConfig {
+            provider: "google".into(),
+            client_id: Some("test.apps.googleusercontent.com".into()),
+            ..Default::default()
+        };
+        let mut settings = OAuthSettings::from_config("cancel-test", &config).unwrap();
+        let slot = Arc::new(CredentialSlot::default());
+        settings.credential_slot = slot;
+        let cancel = AtomicBool::new(true);
+        let reply = TokenReply {
+            access_token: "never-save-access".into(),
+            refresh_token: Some("never-save-refresh".into()),
+            expires_in: Some(3600),
+            scope: None,
+        };
+        assert!(settings.finish_login_with_cancel(reply, true, Some(&cancel)).is_err());
+    }
+
+    #[test]
+    fn superseded_login_cannot_overwrite_a_new_generation() {
+        let config = OAuthConfig {
+            provider: "google".into(),
+            client_id: Some("test.apps.googleusercontent.com".into()),
+            ..Default::default()
+        };
+        let mut settings = OAuthSettings::from_config("superseded-test", &config).unwrap();
+        let slot = Arc::new(CredentialSlot::default());
+        slot.generation.store(1, Ordering::Release);
+        settings.credential_slot = slot;
+        settings.credential_generation = 0;
+        let reply = TokenReply {
+            access_token: "never-save-access".into(),
+            refresh_token: Some("never-save-refresh".into()),
+            expires_in: Some(3600),
+            scope: None,
+        };
+        assert!(settings.finish_login_with_cancel(reply, true, None).is_err());
+    }
+
+    #[test]
+    fn wizard_cannot_rebind_grant_to_another_client_or_account() {
+        let mut account = crate::config::Config::single_maildir(
+            "original".into(), std::path::PathBuf::from("/tmp/oauth-unused-maildir"),
+        ).accounts.remove(0);
+        account.oauth = Some(OAuthConfig {
+            provider: "google".into(),
+            client_id: Some("first.apps.googleusercontent.com".into()),
+            ..Default::default()
+        });
+        assert!(OAuthSettings::same_wizard_credential_identity(&account, &account).unwrap());
+        let mut edited = account.clone();
+        edited.name = "another".into();
+        assert!(!OAuthSettings::same_wizard_credential_identity(&account, &edited).unwrap());
+        edited = account.clone();
+        edited.oauth.as_mut().unwrap().client_id = Some("second.apps.googleusercontent.com".into());
+        assert!(!OAuthSettings::same_wizard_credential_identity(&account, &edited).unwrap());
+    }
+
+    #[test]
+    fn stale_cleanup_is_rejected_after_new_login() {
+        let slot = CredentialSlot::default();
+        let retired_generation = slot.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        slot.retired.store(true, Ordering::Release);
+        assert!(retired_slot_is_current(&slot, retired_generation));
+        slot.generation.fetch_add(1, Ordering::AcqRel);
+        slot.retired.store(false, Ordering::Release);
+        assert!(!retired_slot_is_current(&slot, retired_generation));
+    }
+
+    #[test]
+    fn old_oauth_settings_cannot_reuse_reauthenticated_session() {
+        let config = OAuthConfig {
+            provider: "google".into(),
+            client_id: Some("test.apps.googleusercontent.com".into()),
+            ..Default::default()
+        };
+        let mut settings = OAuthSettings::from_config("oauth-generation-test", &config).unwrap();
+        let slot = Arc::new(CredentialSlot::default());
+        settings.credential_slot = Arc::clone(&slot);
+        settings.credential_generation = 0;
+        assert!(settings.check_credential_active().is_ok());
+        slot.retired.store(true, Ordering::Release);
+        slot.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(settings.check_credential_active().is_err());
+        slot.generation.fetch_add(1, Ordering::AcqRel);
+        slot.retired.store(false, Ordering::Release);
+        assert!(settings.check_credential_active().is_err());
+        let mut new = settings.clone();
+        new.credential_generation = 2;
+        assert!(new.check_credential_active().is_ok());
+    }
+
+    #[test]
+    fn credential_slot_isolation_uses_entire_path() {
+        let root = tempfile::tempdir().unwrap();
+        let a = credential_slot(&root.path().join("a.json"));
+        let b = credential_slot(&root.path().join("b.json"));
+        assert!(!Arc::ptr_eq(&a, &b));
+        a.retired.store(true, Ordering::Release);
+        assert!(!b.retired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn token_reply_expiry_is_optional_and_never_required_by_old_providers() {
+        let reply: TokenReply = serde_json::from_str(
+            r#"{"access_token":"test","refresh_token":null}"#,
+        ).unwrap();
+        assert_eq!(reply.expires_in, None);
+        let reply: TokenReply = serde_json::from_str(
+            r#"{"access_token":"test","expires_in":3600}"#,
+        ).unwrap();
+        assert_eq!(reply.expires_in, Some(3600));
+    }
+
+    #[test]
+    fn unsupported_provider_revocation_is_not_reported_as_success() {
+        let config = OAuthConfig {
+            provider: "microsoft".into(),
+            client_id: Some("test-public-id".into()),
+            ..Default::default()
+        };
+        let settings = OAuthSettings::from_config("revocation-test", &config).unwrap();
+        let request = RevocationRequest { settings, token: "test".into() };
+        assert!(request.revoke().is_err());
+    }
+
+    #[test]
+    fn google_revocation_decodes_imap_logins_and_protects_other_clients() {
+        let mut removed = crate::config::Config::single_maildir(
+            "Burner".into(), std::path::PathBuf::from("/tmp/unused-maildir"),
+        ).accounts.remove(0);
+        removed.source = "imaps+xoauth2://burner%40gmail.com@imap.gmail.com:993".into();
+        removed.oauth = Some(OAuthConfig {
+            provider: "google".into(), client_id: Some("desktop-app".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            super::google_mailbox_identity(&removed).as_deref(),
+            Some("burner@gmail.com")
+        );
+        let mut different_client = removed.clone();
+        different_client.name = "Other".into();
+        different_client.oauth.as_mut().unwrap().client_id = Some("other-app".into());
+        assert!(super::google_revocation_conflicts(
+            &removed, &[different_client], "desktop-app"
+        ));
     }
 }

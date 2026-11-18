@@ -11,8 +11,8 @@ pub use input::{
 };
 pub use state::{
     AccountState, App, ComposeField, ComposeFileEntry, ComposeFilePicker, ComposeFilePreview,
-    ComposeMode, Composer, DraftSource, NewMailNotice, ReaderPosition, ReaderSelection,
+    ComposeMode, ComposeIntent, Composer, DraftSource, NewMailNotice, ReaderPosition, ReaderSelection,
     ReviewScroll, StatusLine,
 };
 
-pub(crate) use state::{NoticeBrowser, NoticeRow};
+pub(crate) use state::{MailReviewItem, NoticeBrowser, NoticeRow, REPLY_WRAP_COLUMNS};

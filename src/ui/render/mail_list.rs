@@ -365,7 +365,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Cell::from(mark),
             Cell::from(sender),
             subject_cell,
-            Cell::from(message.date_label.as_str()),
+            Cell::from(message.date_label.as_ref()),
         ])
         .height(if attachment_mark { 2 } else { 1 })
         .style(style)

@@ -545,6 +545,136 @@ fn escape_clears_mail_marks_and_visual_selection_before_closing_reader() {
 }
 
 #[test]
+fn compose_normal_a_never_crosses_a_newline() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let cases = [
+        ("abc\ndef", 2, 3, "abcX\ndef"),
+        // On the newline itself, append before it, never on the next row.
+        ("abc\ndef", 3, 3, "abcX\ndef"),
+        ("abc\n\nnext", 4, 4, "abc\nX\nnext"),
+        ("last", 4, 4, "lastX"),
+        ("", 0, 0, "X"),
+        ("αβ\nnext", 1, 2, "αβX\nnext"),
+    ];
+    for (body, at, expected_cursor, expected_body) in cases {
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = super::App::new(&config, vec![]);
+        let mut composer = Composer::new();
+        composer.switch_field(ComposeField::Body);
+        composer.body = body.into();
+        composer.cursor = at;
+        composer.mode = ComposeMode::Normal;
+        app.composer = Some(composer);
+
+        app.handle_composer_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let composer = app.composer.as_ref().unwrap();
+        assert_eq!(composer.cursor, expected_cursor, "append position in {body:?}");
+        assert_eq!(composer.mode, ComposeMode::Insert);
+
+        app.handle_composer_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert_eq!(app.composer.as_ref().unwrap().body, expected_body, "{body:?}");
+    }
+}
+
+#[test]
+fn reply_r_and_uppercase_r_use_72_columns_and_preserve_quoted_patches() {
+    use unicode_width::UnicodeWidthStr;
+
+    let patch_line = format!("diff --git a/{} b/{}", "test".repeat(25), "test".repeat(25));
+    let raw = format!(
+        "From: Reviewer <reviewer@example.org>\r\nSubject: Re: [PATCH] test\r\nMessage-ID: <patch@example.org>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{patch_line}\r\n+{}\r\n",
+        "code".repeat(25),
+    );
+    let id = MessageId("patch".into());
+    let message = crate::mail::parse_summary(
+        id.clone(),
+        raw.as_bytes(),
+        raw.len() as u64,
+        MessageFlags::empty(),
+    )
+    .unwrap();
+    let original = crate::mail::parse_body(id, raw.as_bytes()).unwrap();
+    let prose = "The change looks reasonable, but I would prefer an additional regression test that exercises the end of a logical line before the patch is applied.";
+
+    for quoted in [false, true] {
+        let mut composer = Composer::reply(&message, Some(&original), quoted);
+        assert!(composer.reply_wrap, "both r and R must enable reply wrapping");
+        assert_eq!(composer.field, ComposeField::Body);
+        assert_eq!(composer.cursor, 0);
+        for ch in prose.chars() {
+            composer.insert_char(ch);
+        }
+        assert!(
+            composer
+                .body
+                .lines()
+                .filter(|line| !line.starts_with('>') && !line.starts_with("On "))
+                .all(|line| UnicodeWidthStr::width(line) <= 72),
+            "typed reply prose must have physical newlines: {:?}",
+            composer.body
+        );
+        let transmitted = super::outgoing_from_composer(&composer, "me@example.org").unwrap();
+        assert_eq!(transmitted.body, composer.outgoing_plain_body());
+        assert!(transmitted.body.contains("\n"));
+        if quoted {
+            assert!(transmitted.body.contains(&format!("> {patch_line}")));
+            assert!(transmitted.body.contains(&format!("> +{}", "code".repeat(25))));
+        } else {
+            assert!(!transmitted.body.contains(&patch_line));
+        }
+    }
+}
+
+#[test]
+fn reply_wrapping_covers_pasted_text_unicode_undo_and_unmodified_code() {
+    use unicode_width::UnicodeWidthStr;
+
+    let mut composer = Composer::new();
+    composer.switch_field(ComposeField::Body);
+    composer.reply_wrap = true;
+    let text = format!("{} {}", "界".repeat(35), "more words to wrap here");
+    let quoted = format!("> {}", "long quoted patch source ".repeat(8));
+    let indented = format!("    {}", "keep code indentation ".repeat(8));
+    let link = format!("https://example.org/{}", "long".repeat(30));
+    composer.body = format!("{text}\n{quoted}\n{indented}\n{link}\n");
+    let unchanged = composer.body.clone();
+    let outbound = super::outgoing_from_composer(&composer, "me@example.org").unwrap();
+    assert_eq!(composer.body, unchanged, "send must never mutate the draft");
+    assert!(outbound.body.starts_with(&format!("{}\nmore", "界".repeat(35))));
+    assert!(outbound.body.contains(&quoted));
+    assert!(outbound.body.contains(&indented));
+    assert!(outbound.body.contains(&link));
+    assert!(outbound.body.lines().any(|line| UnicodeWidthStr::width(line) == 70));
+
+    composer.body = format!("{} bc", "a".repeat(70));
+    composer.cursor = composer.body.chars().count();
+    let before = composer.body.clone();
+    composer.insert_char('d');
+    assert_eq!(composer.body, format!("{}\nbcd", "a".repeat(70)));
+    composer.undo_edit(false);
+    assert_eq!(composer.body, before, "automatic wrap and character are one undo step");
+
+    let mut ordinary = Composer::new();
+    ordinary.body = text.clone();
+    assert!(!ordinary.reply_wrap);
+    assert_eq!(ordinary.outgoing_plain_body(), text);
+}
+
+#[test]
+fn reply_wrapping_setting_survives_drafts_and_older_drafts_still_load() {
+    let mut composer = Composer::new();
+    composer.reply_wrap = true;
+    let mut saved = serde_json::to_value(&composer).unwrap();
+    let restored: Composer = serde_json::from_value(saved.clone()).unwrap();
+    assert!(restored.reply_wrap);
+
+    saved.as_object_mut().unwrap().remove("reply_wrap");
+    let legacy: Composer = serde_json::from_value(saved).unwrap();
+    assert!(!legacy.reply_wrap);
+}
+
+#[test]
 fn compose_wrapped_lines_use_visual_jk_and_preserve_draft() {
     use crossterm::event::KeyCode;
     let mut composer = Composer::new();
@@ -1199,7 +1329,7 @@ fn preview_size_budget_accounts_for_decoded_html_and_plain_text() {
         plain_fallback: None,
         html_source: Some("<p>html</p>".into()),
         html_text: Some("html".into()),
-        html_lines: Some(vec![HtmlLine {
+        html_lines: Some(std::sync::Arc::new(vec![HtmlLine {
             spans: vec![HtmlSpan {
                 text: "rich".into(),
                 style: HtmlSpanStyle {
@@ -1207,7 +1337,7 @@ fn preview_size_budget_accounts_for_decoded_html_and_plain_text() {
                     ..Default::default()
                 },
             }],
-        }]),
+        }])),
         html_renderer: None,
         html_render_width: 80,
         attachment_count: 0,
@@ -2306,22 +2436,24 @@ fn reader_url_lookup_uses_the_token_under_the_cursor() {
 #[test]
 fn quoted_reply_attribution_matches_expected_shape() {
     let message = MessageSummary {
-        id: MessageId("reply".into()),
-        message_id: Some("message@example.com".into()),
-        in_reply_to: None,
-        references: Vec::new(),
-        from_name: "Takashi Iwai".into(),
-        from_address: "tiwai@suse.de".into(),
-        to: String::new(),
-        cc: String::new(),
-        bcc: String::new(),
-        subject: "Re: test".into(),
-        timestamp: 1_792_662_534,
-        date_label: String::new(),
-        size: 0,
+        headers: std::sync::Arc::new(crate::model::MessageHeaders {
+            id: MessageId("reply".into()),
+            message_id: Some("message@example.com".into()),
+            in_reply_to: None,
+            references: Vec::new().into(),
+            from_name: "Takashi Iwai".into(),
+            from_address: "tiwai@suse.de".into(),
+            to: String::new(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Re: test".into(),
+            timestamp: 1_792_662_534,
+            date_label: String::new().into(),
+            size: 0,
+            has_attachment_hint: false,
+            attachment_names_hint: Vec::new().into(),
+        }),
         flags: MessageFlags::empty(),
-        has_attachment_hint: false,
-        attachment_names_hint: Vec::new(),
     };
     let attribution = reply_attribution(&message);
     assert!(attribution.starts_with("On "));
@@ -2536,6 +2668,64 @@ fn cache_invalidation_forgets_lru_and_explicitly_stales_folder_counts() {
 }
 
 #[test]
+fn warm_mailbox_event_caches_other_folders_without_changing_current_selection() {
+    let (_dir, mut app) = local_account_fixture();
+    let account = app.account_mut().unwrap();
+    account.current_mailbox = Some("INBOX".into());
+    account.mailboxes = vec![
+        crate::model::Mailbox::new("INBOX", crate::model::MailboxRole::Inbox),
+        crate::model::Mailbox::new("Sent", crate::model::MailboxRole::Sent),
+        crate::model::Mailbox::new("Drafts", crate::model::MailboxRole::Drafts),
+        crate::model::Mailbox::new("Trash", crate::model::MailboxRole::Trash),
+    ];
+    account.plan_mailbox_warming();
+    assert_eq!(account.mailbox_warm_queue.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["Drafts", "Sent", "Trash"]);
+    let raw = b"From: sender@example.org\r\nSubject: warm draft\r\n\r\nbody";
+    let id = MessageId("imap-uid:12:7".into());
+    let summary = crate::mail::parse_summary(id, raw, raw.len() as u64,
+        MessageFlags::empty()).unwrap();
+    let account = app.account_mut().unwrap();
+    account.mailbox_warm_request = Some((1007, "Drafts".into()));
+    app.handle_worker_event(crate::worker::WorkerEvent {
+        account: 0,
+        request_id: 1007,
+        kind: crate::worker::WorkerEventKind::MailboxWarmed {
+            name: "Drafts".into(),
+            page: crate::model::MessagePage { messages: vec![summary],
+                offset: 0, next_offset: 1, has_more: false },
+            uid_validity: Some(12), uid_next: Some(8),
+        },
+    });
+    let account = app.account().unwrap();
+    assert_eq!(account.current_mailbox.as_deref(), Some("INBOX"));
+    assert!(account.messages.is_empty());
+    assert_eq!(account.mailbox_cache["Drafts"].messages[0].subject, "warm draft");
+    assert_eq!(account.uid_validities.get("Drafts"), Some(&12));
+}
+
+#[test]
+fn stale_background_folder_result_is_dropped_after_invalidation() {
+    let (_dir, mut app) = local_account_fixture();
+    let account = app.account_mut().unwrap();
+    account.current_mailbox = Some("INBOX".into());
+    account.mailbox_warm_request = Some((11, "Trash".into()));
+    account.forget_cached_folder("Trash");
+    assert!(account.mailbox_warm_request.is_none());
+    app.handle_worker_event(crate::worker::WorkerEvent {
+        account: 0, request_id: 11,
+        kind: crate::worker::WorkerEventKind::MailboxWarmed {
+            name: "Trash".into(),
+            page: crate::model::MessagePage {
+                messages: vec![], offset: 0, next_offset: 0, has_more: false,
+            },
+            uid_validity: Some(1), uid_next: Some(2),
+        },
+    });
+    assert!(!app.account().unwrap().mailbox_cache.contains_key("Trash"));
+}
+
+#[test]
 fn persistent_and_in_memory_snapshots_share_bounded_cursor_rules() {
     let (_root, mut app) = local_account_fixture();
     let account = app.account_mut().unwrap();
@@ -2575,6 +2765,88 @@ fn persistent_and_in_memory_snapshots_share_bounded_cursor_rules() {
     assert!(snapshot.has_more);
     assert_eq!(snapshot.uid_validity, Some(15));
     assert_eq!(snapshot.uid_next, Some(600));
+}
+
+#[test]
+fn persistent_snapshot_omits_rich_rows_without_discarding_live_previews() {
+    let (_root, mut app) = local_account_fixture();
+    let account = app.account_mut().unwrap();
+    let id = MessageId("imap-uid:17:4".into());
+    let raw = b"From: Test <test@example.org>\r\nSubject: HTML\r\n\r\nHello";
+    let message = crate::mail::parse_summary(
+        id.clone(), raw, raw.len() as u64, MessageFlags::empty(),
+    ).unwrap();
+    let mut body = crate::mail::parse_body(id.clone(), raw).unwrap();
+    body.html_source = Some("<p>Hello</p>".into());
+    body.html_lines = Some(std::sync::Arc::new(vec![crate::model::HtmlLine {
+        spans: vec![crate::model::HtmlSpan {
+            text: "Visible rich layout".into(),
+            ..Default::default()
+        }],
+    }]));
+    body.html_render_width = 72;
+    account.current_mailbox = Some("INBOX".into());
+    account.uid_validities.insert("INBOX".into(), 17);
+    account.messages = vec![message];
+    account.bodies.insert(id.clone(), body);
+
+    let live = account.current_cache_snapshot().unwrap();
+    let persistent = account.persistent_cache_snapshot().unwrap();
+    assert!(live.bodies[&id].html_lines.is_some());
+    assert!(persistent.bodies[&id].html_lines.is_none());
+    assert_eq!(persistent.bodies[&id].html_render_width, 0);
+    assert!(account.bodies[&id].html_lines.is_some());
+    assert_eq!(live.uid_validity, persistent.uid_validity);
+    assert_eq!(live.messages.len(), persistent.messages.len());
+}
+
+#[test]
+fn warmed_folder_refresh_moves_rich_previews_without_cloning_them() {
+    let (_root, mut app) = local_account_fixture();
+    let account = app.account_mut().unwrap();
+    let id = MessageId("imap-uid:42:9".into());
+    let raw = b"From: Test <test@example.org>\r\nSubject: Warm\r\n\r\nHello";
+    let message = crate::mail::parse_summary(
+        id.clone(), raw, raw.len() as u64, MessageFlags::empty(),
+    ).unwrap();
+    let mut body = crate::mail::parse_body(id.clone(), raw).unwrap();
+    body.html_lines = Some(std::sync::Arc::new(vec![crate::model::HtmlLine {
+        spans: vec![crate::model::HtmlSpan {
+            text: "Preserved rich layout".repeat(1024),
+            ..Default::default()
+        }],
+    }]));
+    let cached = crate::cache::CachedMailbox {
+        messages: vec![message.clone()],
+        bodies: std::iter::once((id.clone(), body)).collect(),
+        message_index: 0,
+        message_view_offset: 2,
+        next_page_offset: 1,
+        has_more: false,
+        uid_validity: Some(42),
+        uid_next: Some(10),
+    };
+    account.remember_mailbox("Drafts".into(), cached);
+    let original_ptr = account.mailbox_cache["Drafts"].bodies[&id]
+        .html_lines.as_ref().unwrap()[0].spans[0].text.as_ptr();
+    let page = crate::model::MessagePage {
+        messages: vec![message.clone()],
+        offset: 0,
+        next_offset: 1,
+        has_more: false,
+    };
+    account.accept_warmed_mailbox("Drafts".into(), page, Some(42), Some(11));
+    let refreshed = &account.mailbox_cache["Drafts"];
+    assert_eq!(refreshed.bodies[&id].html_lines.as_ref().unwrap()[0]
+        .spans[0].text.as_ptr(), original_ptr);
+    assert_eq!(refreshed.message_view_offset, 2);
+    assert_eq!(refreshed.uid_next, Some(11));
+
+    // A server UIDVALIDITY change must still discard all old bodies.
+    account.accept_warmed_mailbox("Drafts".into(), crate::model::MessagePage {
+        messages: vec![message], offset: 0, next_offset: 1, has_more: false,
+    }, Some(43), Some(12));
+    assert!(account.mailbox_cache["Drafts"].bodies.is_empty());
 }
 
 #[test]

@@ -75,6 +75,9 @@ impl App {
                     .pending_mutation_labels
                     .remove(&event.request_id)
                     .is_some();
+                // The destination can no longer be trusted after a failed
+                // move/copy. Drop the bookkeeping instead of retaining it.
+                account.pending_destination_refresh.remove(&event.request_id);
                 let uncertain_offline_mutation =
                     account.finish_deferred_mutation(event.request_id, false);
                 let failed_seen = account.pending_seen.iter().find_map(|(id, request_id)| {

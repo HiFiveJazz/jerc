@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,7 @@ use crate::backend::{MailBackend, MailboxSyncHint};
 use crate::cache::RawStore;
 use crate::mail_image::MailImageEvent;
 use crate::model::{
-    Capabilities, Mailbox, MessageBody, MessageId, MessagePage, OutgoingAttachment, OutgoingMessage,
+    Capabilities, Mailbox, MessageBody, MessageId, MessagePage, MessageSummary, OutgoingAttachment, OutgoingMessage,
 };
 use crate::outgoing::MailSender;
 
@@ -47,9 +47,27 @@ pub enum ActionKind {
         mailbox: String,
         ids: Vec<MessageId>,
     },
+    /// Low-priority read-only header page for another folder. Cache is a
+    /// display hint only; the backend must validate UIDVALIDITY.
+    WarmMailbox {
+        name: String,
+        limit: usize,
+        hint: Option<MailboxSyncHint>,
+    },
     FetchRawForCompose {
         mailbox: String,
         id: MessageId,
+        cache: Option<(PathBuf, u32)>,
+    },
+    /// Priority read + MIME preparation on the existing background IMAP
+    /// worker; a foreground fallback is available if that queue fills.
+    PrepareCompose {
+        mailbox: String,
+        id: MessageId,
+        summary: MessageSummary,
+        intent: crate::app::ComposeIntent,
+        own_addresses: Vec<String>,
+        cache: Option<(PathBuf, u32)>,
     },
     FetchAttachments {
         mailbox: String,
@@ -159,6 +177,13 @@ pub enum WorkerEventKind {
         name: String,
         error: String,
     },
+    MailboxWarmed {
+        name: String,
+        page: MessagePage,
+        uid_validity: Option<u32>,
+        uid_next: Option<u32>,
+    },
+    MailboxWarmFailed { name: String },
     BodyLoaded(MessageBody),
     BodyPrefetched {
         mailbox: String,
@@ -170,6 +195,13 @@ pub enum WorkerEventKind {
     RawLoaded {
         id: MessageId,
         raw: Vec<u8>,
+    },
+    ComposePrepared {
+        id: MessageId,
+        // Most worker events contain small headers or status updates. Keeping
+        // the large, rarely sent composer inline enlarges *every* worker and
+        // runtime event slot, including two preallocated event queues.
+        result: Result<Box<crate::app::Composer>, String>,
     },
     AttachmentsLoaded {
         mailbox: String,
@@ -212,6 +244,7 @@ pub struct WorkerEvent {
 #[derive(Debug)]
 pub enum RuntimeEvent {
     Input(crossterm::event::Event),
+    AccountCleanupFailed { name: String, error: String },
     Worker(WorkerEvent),
     /// Account reloads reuse numeric account indices. Worker results therefore
     /// travel through a per-reload relay and keep their *account epoch*, so an
@@ -242,6 +275,82 @@ pub enum RuntimeEvent {
     InputStopped,
 }
 
+/// One optional extra IMAP IDLE connection watches the mailbox currently
+/// displayed by the active account. The Inbox retains its own watcher.
+/// Changing folders cancels the previous watch without blocking the UI.
+struct SelectedIdleTarget {
+    state: Mutex<SelectedIdleState>,
+    changed: Condvar,
+}
+
+struct SelectedIdleState {
+    mailbox: Option<String>,
+    revision: u64,
+    cancel: Arc<AtomicBool>,
+    stopped: bool,
+}
+
+impl SelectedIdleTarget {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SelectedIdleState {
+                mailbox: None,
+                revision: 0,
+                cancel: Arc::new(AtomicBool::new(false)),
+                stopped: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn set_mailbox(&self, name: Option<&str>) {
+        let mut state = self.state.lock().expect("selected IDLE lock");
+        if state.stopped || state.mailbox.as_deref() == name {
+            return;
+        }
+        state.cancel.store(true, Ordering::Release);
+        state.mailbox = name.map(str::to_owned);
+        state.revision = state.revision.wrapping_add(1);
+        state.cancel = Arc::new(AtomicBool::new(false));
+        self.changed.notify_all();
+    }
+
+    fn stop(&self) {
+        let mut state = self.state.lock().expect("selected IDLE lock");
+        state.stopped = true;
+        state.cancel.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    fn wait_for_mailbox(&self) -> Option<(String, u64, Arc<AtomicBool>)> {
+        let state = self.state.lock().expect("selected IDLE lock");
+        let state = self.changed.wait_while(state, |state| {
+            !state.stopped && state.mailbox.is_none()
+        }).expect("selected IDLE lock");
+        if state.stopped {
+            return None;
+        }
+        Some((state.mailbox.clone()?, state.revision, Arc::clone(&state.cancel)))
+    }
+
+    /// After a successful watch that cannot use push, wait for the mailbox
+    /// to change. After a transport error, retry after bounded backoff or
+    /// immediately on selection change. No busy polling on unsupported IDLE.
+    fn wait_for_change(&self, revision: u64, retry: Option<Duration>) {
+        let state = self.state.lock().expect("selected IDLE lock");
+        let unchanged = |state: &mut SelectedIdleState| {
+            !state.stopped && state.revision == revision
+        };
+        if let Some(delay) = retry {
+            drop(self.changed.wait_timeout_while(state, delay, unchanged)
+                .expect("selected IDLE lock"));
+        } else {
+            drop(self.changed.wait_while(state, unchanged)
+                .expect("selected IDLE lock"));
+        }
+    }
+}
+
 pub struct WorkerHandle {
     sender: SyncSender<Action>,
     // STATUS runs on a separate IMAP session. A stalled unread-count lookup
@@ -254,6 +363,8 @@ pub struct WorkerHandle {
     status_join: Option<JoinHandle<()>>,
     idle_stop: Arc<AtomicBool>,
     idle_join: Option<JoinHandle<()>>,
+    selected_idle: Option<Arc<SelectedIdleTarget>>,
+    selected_idle_join: Option<JoinHandle<()>>,
     foreground_generation: Arc<AtomicU64>,
     unacknowledged_writes: Mutex<HashSet<u64>>,
     recovery: Option<ForegroundRecovery>,
@@ -300,9 +411,25 @@ impl WorkerHandle {
     /// existing workers. Existing callers/tests use `spawn` unchanged.
     pub fn spawn_with_idle(
         account: usize,
+        backend: Box<dyn MailBackend>,
+        status_backend: Option<Box<dyn MailBackend>>,
+        idle_backend: Option<Box<dyn MailBackend>>,
+        outgoing: Option<Box<dyn MailSender>>,
+        runtime_tx: SyncSender<RuntimeEvent>,
+    ) -> Self {
+        Self::spawn_with_idle_and_selected(
+            account, backend, status_backend, idle_backend, None, outgoing, runtime_tx,
+        )
+    }
+
+    /// The additional watcher is created only for IMAP accounts. It stays
+    /// dormant unless the active account displays a non-Inbox mailbox.
+    pub fn spawn_with_idle_and_selected(
+        account: usize,
         mut backend: Box<dyn MailBackend>,
         status_backend: Option<Box<dyn MailBackend>>,
         idle_backend: Option<Box<dyn MailBackend>>,
+        selected_idle_backend: Option<Box<dyn MailBackend>>,
         mut outgoing: Option<Box<dyn MailSender>>,
         runtime_tx: SyncSender<RuntimeEvent>,
     ) -> Self {
@@ -348,6 +475,18 @@ impl WorkerHandle {
                 .spawn(move || run_idle_worker(backend, stop, wake))
                 .expect("failed to spawn IMAP IDLE worker")
         });
+        let (selected_idle, selected_idle_join) = if let Some(backend) = selected_idle_backend {
+            let target = Arc::new(SelectedIdleTarget::new());
+            let watch_target = Arc::clone(&target);
+            let wake = status_sender.clone().unwrap_or_else(|| sender.clone());
+            let join = thread::Builder::new()
+                .name(format!("mail-idle-selected-{account}"))
+                .spawn(move || run_selected_idle_worker(backend, watch_target, wake))
+                .expect("failed to spawn selected mailbox IDLE worker");
+            (Some(target), Some(join))
+        } else {
+            (None, None)
+        };
         Self {
             sender,
             status_sender,
@@ -356,11 +495,21 @@ impl WorkerHandle {
             status_join,
             idle_stop,
             idle_join,
+            selected_idle,
+            selected_idle_join,
             foreground_generation,
             unacknowledged_writes,
             recovery: None,
             retired_foregrounds: Vec::new(),
             last_foreground_recovery: None,
+        }
+    }
+
+    /// The displayed non-Inbox folder gets at most one extra IDLE watch.
+    /// The method is nonblocking and idempotent on every UI loop iteration.
+    pub fn set_selected_idle_mailbox(&self, mailbox: Option<&str>) {
+        if let Some(target) = &self.selected_idle {
+            target.set_mailbox(mailbox);
         }
     }
 
@@ -461,7 +610,10 @@ impl WorkerHandle {
         let id = action.id;
         if matches!(
             &action.kind,
-            ActionKind::FetchBody { .. } | ActionKind::FetchAttachments { .. }
+            ActionKind::FetchBody { .. }
+                | ActionKind::FetchAttachments { .. }
+                | ActionKind::PrepareCompose { .. }
+                | ActionKind::FetchRawForCompose { .. }
         ) {
             // Priority has a separate bounded input queue, but runs on the
             // existing read-only IMAP connection. A flood of speculative
@@ -475,7 +627,11 @@ impl WorkerHandle {
                         }
                     }
                     Err(TrySendError::Full(action) | TrySendError::Disconnected(action)) => {
-                        if matches!(&action.kind, ActionKind::FetchBody { .. }) {
+                        if matches!(&action.kind,
+                            ActionKind::FetchBody { .. }
+                                | ActionKind::PrepareCompose { .. }
+                                | ActionKind::FetchRawForCompose { .. }
+                        ) {
                             // Preserve the existing body fallback, but don't
                             // make attachments wait behind a page-long FETCH.
                             self.sender.try_send(action)?;
@@ -487,7 +643,7 @@ impl WorkerHandle {
             } else {
                 self.sender.try_send(action)?;
             }
-        } else if matches!(&action.kind, ActionKind::PrefetchBodies { .. }) {
+        } else if matches!(&action.kind, ActionKind::PrefetchBodies { .. } | ActionKind::WarmMailbox { .. }) {
             // Speculative downloads must not compete with foreground work.
             match &self.status_sender {
                 Some(sender) => sender.try_send(action)?,
@@ -534,11 +690,15 @@ impl WorkerHandle {
     /// is outstanding. Read-only fetches and prefetches can be abandoned.
     pub fn detach_for_exit(&mut self) {
         self.idle_stop.store(true, Ordering::Relaxed);
+        if let Some(target) = &self.selected_idle {
+            target.stop();
+        }
         // No blocking send: the action channels may already be full.
         // No join: an IMAP operation may remain stuck until its I/O timeout.
         drop(self.join.take());
         drop(self.status_join.take());
         drop(self.idle_join.take());
+        drop(self.selected_idle_join.take());
         self.retired_foregrounds.clear();
         // Disconnect the background queue when possible. The IDLE watcher may
         // still hold a clone until it observes the stop flag.
@@ -568,6 +728,10 @@ impl WorkerHandle {
         let Some(join) = self.join.take() else { return };
         let started = Instant::now();
         self.idle_stop.store(true, Ordering::Release);
+        if let Some(target) = self.selected_idle.take() {
+            target.stop();
+        }
+        let selected_idle_join = self.selected_idle_join.take();
         let status_sender = self.status_sender.take();
         let priority_sender = self.priority_sender.take();
         let sender = self.sender.clone();
@@ -591,6 +755,11 @@ impl WorkerHandle {
                 // IDLE can remain inside TLS connect; do not join a watcher
                 // that has not observed its stop flag yet.
                 if let Some(join) = idle_join
+                    && join.is_finished()
+                {
+                    let _ = join.join();
+                }
+                if let Some(join) = selected_idle_join
                     && join.is_finished()
                 {
                     let _ = join.join();
@@ -623,6 +792,9 @@ impl WorkerHandle {
             return;
         };
         self.idle_stop.store(true, Ordering::Relaxed);
+        if let Some(target) = self.selected_idle.take() {
+            target.stop();
+        }
         // Shutdown is allowed to wait for the bounded queue to drain. Ordinary
         // UI actions use try_send() so backend pressure can never freeze input.
         // The status worker is independent: shut it down as well, but never
@@ -644,6 +816,11 @@ impl WorkerHandle {
             && idle_join.is_finished()
         {
             let _ = idle_join.join();
+        }
+        if let Some(selected_join) = self.selected_idle_join.take()
+            && selected_join.is_finished()
+        {
+            let _ = selected_join.join();
         }
     }
 }
@@ -693,6 +870,60 @@ fn run_idle_worker(
             thread::sleep(Duration::from_secs(1));
         }
         backoff_secs = (backoff_secs * 2).min(60);
+    }
+}
+
+/// A second, dormant-until-selected watcher: never SELECTs the Inbox,
+/// never holds the foreground or background IMAP session, and exits promptly
+/// on folder switches even when the previous watcher is inside IDLE.
+fn run_selected_idle_worker(
+    mut backend: Box<dyn MailBackend>,
+    target: Arc<SelectedIdleTarget>,
+    wake: SyncSender<Action>,
+) {
+    let mut backoff_secs: u64 = 2;
+    while let Some((mailbox, revision, cancel)) = target.wait_for_mailbox() {
+        if cancel.load(Ordering::Acquire) {
+            backoff_secs = 2;
+            continue;
+        }
+        let started = Instant::now();
+        let result = (|| -> anyhow::Result<()> {
+            backend.connect()?;
+            if cancel.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let mut last_wake = Instant::now() - Duration::from_secs(2);
+            backend.watch_mailbox(&mailbox, &cancel, &mut || {
+                if !cancel.load(Ordering::Acquire)
+                    && last_wake.elapsed() >= Duration::from_secs(1)
+                {
+                    let _ = wake.try_send(Action::new(ActionKind::WatchMailboxChanged(
+                        mailbox.clone(),
+                    )));
+                    last_wake = Instant::now();
+                }
+            })
+        })();
+        crate::perf::record(
+            "imap_idle_selected_session",
+            None,
+            started.elapsed(),
+            result.is_ok(),
+        );
+        if cancel.load(Ordering::Acquire) {
+            backoff_secs = 2;
+            continue;
+        }
+        if result.is_ok() {
+            // Unsupported IDLE or too-large mailbox: existing STATUS polling
+            // continues; wait for selection change rather than reconnecting.
+            backoff_secs = 2;
+            target.wait_for_change(revision, None);
+        } else {
+            target.wait_for_change(revision, Some(Duration::from_secs(backoff_secs)));
+            backoff_secs = (backoff_secs * 2).min(60);
+        }
     }
 }
 
@@ -746,7 +977,9 @@ fn run_worker(
             ActionKind::OpenMailbox { .. } => "worker_open_mailbox",
             ActionKind::FetchBody { .. } => "worker_fetch_body",
             ActionKind::PrefetchBodies { .. } => "worker_prefetch_bodies",
+            ActionKind::WarmMailbox { .. } => "worker_warm_mailbox",
             ActionKind::FetchRawForCompose { .. } => "worker_fetch_compose",
+            ActionKind::PrepareCompose { .. } => "worker_prepare_compose",
             ActionKind::FetchAttachments { .. } => "worker_fetch_attachments",
             ActionKind::ExportRaw { .. } => "worker_export_raw",
             ActionKind::SetSeen { .. } => "worker_set_seen",
@@ -803,10 +1036,21 @@ fn run_worker(
                 Ok(body) => WorkerEventKind::BodyLoaded(body),
                 Err(error) => WorkerEventKind::BodyLoadFailed { error: format!("{error:#}") },
             }),
-            ActionKind::PrefetchBodies { .. } => unreachable!("prefetch requires background worker"),
-            ActionKind::FetchRawForCompose { mailbox, id } => backend
-                .fetch_raw(&mailbox, &id)
-                .map(|raw| WorkerEventKind::RawLoaded { id, raw }),
+            ActionKind::PrefetchBodies { .. } | ActionKind::WarmMailbox { .. } => unreachable!("prefetch requires background worker"),
+            ActionKind::FetchRawForCompose { mailbox, id, cache } =>
+                fetch_raw_cached(backend, &mailbox, &id, cache.as_ref())
+                    .map(|raw| WorkerEventKind::RawLoaded { id, raw }),
+            ActionKind::PrepareCompose { mailbox, id, summary, intent, own_addresses, cache } => {
+                Ok(WorkerEventKind::ComposePrepared {
+                    id: id.clone(),
+                    result: fetch_raw_cached(backend, &mailbox, &id, cache.as_ref())
+                        .and_then(|raw| crate::app::Composer::prepare_original(
+                            &summary, id, raw, intent, &own_addresses,
+                        ))
+                        .map(Box::new)
+                        .map_err(|error| format!("{error:#}")),
+                })
+            },
             ActionKind::FetchAttachments { mailbox, id, cache } =>
                 fetch_attachments(backend, &mailbox, &id, cache.as_ref())
                     .map(|attachments| WorkerEventKind::AttachmentsLoaded { mailbox, id, attachments }),
@@ -986,10 +1230,14 @@ fn pop_background_action(
     // and speculative prefetch. Keep every attachment request; only an old
     // selected-body request is safely superseded by a newer body request.
     if let Some(index) = pending.iter().position(|action| {
-        matches!(
-            &action.kind,
-            ActionKind::FetchBody { .. } | ActionKind::FetchAttachments { .. }
-        )
+        matches!(&action.kind,
+            ActionKind::PrepareCompose { .. } | ActionKind::FetchRawForCompose { .. })
+    }) {
+        return pending.remove(index);
+    }
+    if let Some(index) = pending.iter().position(|action| {
+        matches!(&action.kind,
+            ActionKind::FetchBody { .. } | ActionKind::FetchAttachments { .. })
     }) {
         let chosen = pending.remove(index);
         if chosen
@@ -1025,6 +1273,10 @@ fn pop_background_action(
         let newest = pending.remove(index);
         pending.retain(|action| !matches!(&action.kind, ActionKind::PrefetchBodies { .. }));
         newest
+    } else if let Some(index) = pending.iter().position(|action| {
+        !matches!(&action.kind, ActionKind::WarmMailbox { .. })
+    }) {
+        pending.remove(index)
     } else {
         pending.pop_front()
     }
@@ -1111,6 +1363,36 @@ fn run_status_worker(
                 {
                     break;
                 }
+            }
+            ActionKind::PrepareCompose { mailbox, id, summary, intent, own_addresses, cache } => {
+                let result = (|| {
+                    let raw = fetch_compose_raw(&mut *backend, &mut connected, &mailbox, &id, cache.as_ref())?;
+                    crate::app::Composer::prepare_original(&summary, id.clone(), raw, intent, &own_addresses)
+                })();
+                crate::perf::record(
+                    "background_prepare_compose", Some(queue_wait), started.elapsed(), result.is_ok(),
+                );
+                if runtime_tx.send(RuntimeEvent::Worker(WorkerEvent {
+                    account,
+                    request_id: action.id,
+                    kind: WorkerEventKind::ComposePrepared {
+                        id,
+                        result: result.map(Box::new).map_err(|error| format!("{error:#}")),
+                    },
+                })).is_err() { break; }
+            }
+            ActionKind::FetchRawForCompose { mailbox, id, cache } => {
+                let result = fetch_compose_raw(&mut *backend, &mut connected, &mailbox, &id, cache.as_ref());
+                crate::perf::record(
+                    "background_fetch_compose_raw", Some(queue_wait), started.elapsed(), result.is_ok(),
+                );
+                let kind = match result {
+                    Ok(raw) => WorkerEventKind::RawLoaded { id, raw },
+                    Err(error) => WorkerEventKind::Error(format!("{error:#}")),
+                };
+                if runtime_tx.send(RuntimeEvent::Worker(WorkerEvent {
+                    account, request_id: action.id, kind,
+                })).is_err() { break; }
             }
             ActionKind::FetchAttachments { mailbox, id, cache } => {
                 // A cache hit works even when IMAP is offline or authenticating.
@@ -1325,10 +1607,88 @@ fn run_status_worker(
                     }
                 }
             }
+            ActionKind::WarmMailbox { name, limit, hint } => {
+                // One bounded page at a time; never retry a broken connection
+                // speculatively, and never report routine cache misses in UI.
+                let result = (|| {
+                    if !connected {
+                        backend.connect()?;
+                        connected = true;
+                    }
+                    let page = backend.open_mailbox_with_hint(&name, 0, limit, hint)?;
+                    Ok::<_, anyhow::Error>((
+                        page,
+                        backend.mailbox_uid_validity(&name),
+                        backend.mailbox_uid_next(&name),
+                    ))
+                })();
+                if result.is_err() {
+                    connected = false;
+                }
+                crate::perf::record(
+                    "background_warm_mailbox", Some(queue_wait), started.elapsed(), result.is_ok(),
+                );
+                let kind = match result {
+                    Ok((page, uid_validity, uid_next)) => WorkerEventKind::MailboxWarmed {
+                        name, page, uid_validity, uid_next,
+                    },
+                    Err(_) => WorkerEventKind::MailboxWarmFailed { name },
+                };
+                if runtime_tx.send(RuntimeEvent::Worker(WorkerEvent {
+                    account, request_id: action.id, kind,
+                })).is_err() {
+                    break;
+                }
+            }
             ActionKind::Shutdown => break,
             _ => {} // The background worker never performs foreground mutations.
         }
     }
+}
+
+/// A verified UIDVALIDITY-scoped raw MIME hit avoids IMAP entirely.
+/// Cache misses still fetch the exact original bytes and persist them for
+/// later forwards/attachment previews. All file I/O occurs on mail workers.
+fn fetch_raw_cached(
+    backend: &mut dyn MailBackend,
+    mailbox: &str,
+    id: &MessageId,
+    cache: Option<&(PathBuf, u32)>,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some((dir, validity)) = cache
+        && let Some(raw) = (RawStore { dir: dir.clone() }).read(mailbox, *validity, id)
+    {
+        crate::perf::record("compose_raw_cache_hit", None, Duration::ZERO, true);
+        return Ok(raw);
+    }
+    crate::perf::record("compose_raw_cache_miss", None, Duration::ZERO, true);
+    let raw = backend.fetch_raw(mailbox, id)?;
+    if let Some((dir, validity)) = cache {
+        let _ = (RawStore { dir: dir.clone() }).write(mailbox, *validity, id, &raw);
+    }
+    Ok(raw)
+}
+
+fn fetch_compose_raw(
+    backend: &mut dyn MailBackend,
+    connected: &mut bool,
+    mailbox: &str,
+    id: &MessageId,
+    cache: Option<&(PathBuf, u32)>,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some((dir, validity)) = cache
+        && let Some(raw) = (RawStore { dir: dir.clone() }).read(mailbox, *validity, id)
+    {
+        crate::perf::record("compose_raw_cache_hit", None, Duration::ZERO, true);
+        return Ok(raw);
+    }
+    if !*connected {
+        backend.connect()?;
+        *connected = true;
+    }
+    let raw = fetch_raw_cached(backend, mailbox, id, cache);
+    if raw.is_err() { *connected = false; }
+    raw
 }
 
 /// One attachment fetch, shared by the foreground fallback and the
@@ -1419,6 +1779,117 @@ mod tests {
     use std::sync::mpsc::{self, Receiver, SyncSender};
     use std::time::{Duration, Instant};
 
+    /// A controllable IMAP watch: it emits a wake, stays in IDLE until
+    /// cancelled, and deliberately calls the callback once after cancellation
+    /// to verify stale notifications cannot enter the background queue.
+    struct WatchedBackend {
+        visited: SyncSender<String>,
+    }
+
+    impl MailBackend for WatchedBackend {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::IMAP_BASIC
+        }
+        fn connect(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_mailboxes(&mut self) -> anyhow::Result<Vec<Mailbox>> {
+            Ok(Vec::new())
+        }
+        fn watch_mailbox(
+            &mut self,
+            name: &str,
+            cancel: &std::sync::atomic::AtomicBool,
+            changed: &mut dyn FnMut(),
+        ) -> anyhow::Result<()> {
+            self.visited.send(name.to_owned()).unwrap();
+            changed();
+            while !cancel.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            changed(); // must not send a stale wake after a switch
+            Ok(())
+        }
+        fn mailbox_status(&mut self, _: &str) -> anyhow::Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+        fn open_mailbox(&mut self, _: &str, _: usize, _: usize) -> anyhow::Result<MessagePage> {
+            unreachable!("IDLE backend never fetches messages")
+        }
+        fn fetch_body(&mut self, _: &str, _: &MessageId) -> anyhow::Result<MessageBody> {
+            unreachable!("IDLE backend never fetches message bodies")
+        }
+        fn fetch_raw(&mut self, _: &str, _: &MessageId) -> anyhow::Result<Vec<u8>> {
+            unreachable!("IDLE backend never fetches raw messages")
+        }
+        fn set_seen(&mut self, _: &str, _: &MessageId, _: bool) -> anyhow::Result<()> {
+            unreachable!("IDLE backend never modifies messages")
+        }
+        fn delete(&mut self, _: &str, _: &MessageId) -> anyhow::Result<()> {
+            unreachable!("IDLE backend never deletes messages")
+        }
+        fn move_to(&mut self, _: &str, _: &str, _: &MessageId) -> anyhow::Result<()> {
+            unreachable!("IDLE backend never moves messages")
+        }
+    }
+
+    #[test]
+    fn selected_idle_switch_cancels_old_watcher_and_drops_stale_wakes() {
+        use super::{SelectedIdleTarget, run_selected_idle_worker};
+        use std::sync::Arc;
+        let (visited_tx, visited_rx) = mpsc::sync_channel(8);
+        let (wake_tx, wake_rx) = mpsc::sync_channel(8);
+        let target = Arc::new(SelectedIdleTarget::new());
+        let runner_target = Arc::clone(&target);
+        let join = std::thread::spawn(move || {
+            run_selected_idle_worker(
+                Box::new(WatchedBackend { visited: visited_tx }),
+                runner_target,
+                wake_tx,
+            );
+        });
+        // The additional connection remains completely dormant on Inbox.
+        assert!(visited_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        target.set_mailbox(Some("Drafts"));
+        assert_eq!(visited_rx.recv_timeout(Duration::from_secs(1)).unwrap(), "Drafts");
+        assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(1)).unwrap().kind,
+            ActionKind::WatchMailboxChanged(name) if name == "Drafts"));
+
+        target.set_mailbox(Some("Sent"));
+        assert_eq!(visited_rx.recv_timeout(Duration::from_secs(1)).unwrap(), "Sent");
+        assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(1)).unwrap().kind,
+            ActionKind::WatchMailboxChanged(name) if name == "Sent"));
+        assert!(wake_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "retired watcher must not deliver a stale change event");
+
+        target.set_mailbox(None);
+        target.set_mailbox(Some("Trash"));
+        assert_eq!(visited_rx.recv_timeout(Duration::from_secs(1)).unwrap(), "Trash");
+        target.stop();
+        join.join().unwrap();
+        // Shutdown is permanent: a late event cannot restart the watcher.
+        target.set_mailbox(Some("Drafts"));
+        assert!(target.wait_for_mailbox().is_none());
+    }
+
+    #[test]
+    fn idle_target_is_idempotent_and_cancels_on_account_switch() {
+        use super::SelectedIdleTarget;
+        use std::sync::atomic::Ordering;
+        let target = SelectedIdleTarget::new();
+        target.set_mailbox(Some("Drafts"));
+        let (folder, revision, cancel) = target.wait_for_mailbox().unwrap();
+        assert_eq!(folder, "Drafts");
+        target.set_mailbox(Some("Drafts"));
+        let (_, unchanged, _) = target.wait_for_mailbox().unwrap();
+        assert_eq!(revision, unchanged);
+        assert!(!cancel.load(Ordering::Acquire));
+        target.set_mailbox(None);
+        assert!(cancel.load(Ordering::Acquire));
+        target.stop();
+        assert!(target.wait_for_mailbox().is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn raw_export_does_not_follow_existing_symlink() {
@@ -1501,6 +1972,98 @@ mod tests {
         compact_navigation_queue(&mut pending);
         assert_eq!(pending.len(), 1);
         assert!(matches!(&pending[0].kind, ActionKind::OpenMailbox { name, .. } if name == "new"));
+    }
+
+    #[test]
+    fn warm_folder_never_overtakes_interactive_compose_or_status() {
+        let mut pending = VecDeque::from([
+            Action::new(ActionKind::WarmMailbox {
+                name: "Drafts".into(), limit: 40, hint: None,
+            }),
+            Action::new(ActionKind::MailboxStatus("INBOX".into())),
+            Action::new(ActionKind::PrepareCompose {
+                mailbox: "INBOX".into(),
+                id: MessageId("imap-uid:9:4".into()),
+                summary: crate::mail::parse_summary(
+                    MessageId("imap-uid:9:4".into()),
+                    b"From: a@example.org\r\nSubject: sample\r\n\r\nbody",
+                    50, crate::model::MessageFlags::empty(),
+                ).unwrap(),
+                intent: crate::app::ComposeIntent::Forward,
+                own_addresses: vec![], cache: None,
+            }),
+        ]);
+        assert!(matches!(pop_background_action(&mut pending, 0).unwrap().kind,
+            ActionKind::PrepareCompose { .. }));
+        assert!(matches!(pop_background_action(&mut pending, 0).unwrap().kind,
+            ActionKind::MailboxStatus(_)));
+        assert!(matches!(pop_background_action(&mut pending, 0).unwrap().kind,
+            ActionKind::WarmMailbox { name, .. } if name == "Drafts"));
+    }
+
+    #[test]
+    fn folder_preload_uses_background_worker() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let mut worker = WorkerHandle::spawn(0,
+            Box::new(TestBackend { status_started: None, status_release: None }),
+            Some(Box::new(TestBackend { status_started: None, status_release: None })),
+            None, tx);
+        let request = worker.post(ActionKind::WarmMailbox {
+            name: "Drafts".into(), limit: 40, hint: None,
+        }).unwrap();
+        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+            panic!("expected background event");
+        };
+        assert_eq!(event.request_id, request);
+        assert!(matches!(event.kind, WorkerEventKind::MailboxWarmed { name, .. }
+            if name == "Drafts"));
+        worker.shutdown();
+    }
+
+    #[test]
+    fn forwarding_raw_cache_hit_prepares_without_network_or_attachment_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::RawStore { dir: dir.path().join("raw") };
+        let id = MessageId("imap-uid:42:7".into());
+        let raw = b"From: sender@example.org\r\nSubject: kernel thread\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nforwarded text\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=kernel.bin\r\n\r\n\x01\x02\x03\r\n--x--\r\n";
+        cache.write("INBOX", 42, &id, raw).unwrap();
+        let summary = crate::mail::parse_summary(id.clone(), raw, raw.len() as u64,
+            crate::model::MessageFlags::empty()).unwrap();
+        struct Offline;
+        impl MailBackend for Offline {
+            fn capabilities(&self) -> Capabilities { Capabilities::IMAP_BASIC }
+            fn connect(&mut self) -> anyhow::Result<()> { anyhow::bail!("offline") }
+            fn list_mailboxes(&mut self) -> anyhow::Result<Vec<Mailbox>> { anyhow::bail!("offline") }
+            fn mailbox_status(&mut self, _: &str) -> anyhow::Result<(usize,usize)> { anyhow::bail!("offline") }
+            fn open_mailbox(&mut self, _: &str, _: usize, _: usize) -> anyhow::Result<MessagePage> { anyhow::bail!("offline") }
+            fn fetch_body(&mut self, _: &str, _: &MessageId) -> anyhow::Result<MessageBody> { anyhow::bail!("offline") }
+            fn fetch_raw(&mut self, _: &str, _: &MessageId) -> anyhow::Result<Vec<u8>> { anyhow::bail!("offline") }
+            fn set_seen(&mut self, _: &str, _: &MessageId, _: bool) -> anyhow::Result<()> { anyhow::bail!("offline") }
+            fn delete(&mut self, _: &str, _: &MessageId) -> anyhow::Result<()> { anyhow::bail!("offline") }
+            fn move_to(&mut self, _: &str, _: &str, _: &MessageId) -> anyhow::Result<()> { anyhow::bail!("offline") }
+        }
+        let (tx, rx) = mpsc::sync_channel(8);
+        let mut worker = WorkerHandle::spawn(0, Box::new(Offline), Some(Box::new(Offline)), None, tx);
+        let request = worker.post(ActionKind::PrepareCompose {
+            mailbox: "INBOX".into(), id,
+            summary,
+            intent: crate::app::ComposeIntent::Forward,
+            own_addresses: vec![],
+            cache: Some((cache.dir, 42)),
+        }).unwrap();
+        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+            panic!("expected prepared compose");
+        };
+        assert_eq!(event.request_id, request);
+        match event.kind {
+            WorkerEventKind::ComposePrepared { result: Ok(composer), .. } => {
+                assert!(composer.body.contains("forwarded text"));
+                assert_eq!(composer.forwarded_raw.as_deref(), Some(&raw[..]));
+                assert!(composer.attachment_paths.is_empty());
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        worker.shutdown();
     }
 
     #[test]

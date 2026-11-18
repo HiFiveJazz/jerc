@@ -172,22 +172,24 @@ pub fn parse_summary(
     let thread = extract_thread_headers(raw_headers);
 
     Ok(MessageSummary {
-        id,
-        message_id: thread.message_id,
-        in_reply_to: thread.in_reply_to,
-        references: thread.references,
-        from_name,
-        from_address,
-        to,
-        cc,
-        bcc,
-        subject,
-        timestamp,
-        date_label,
-        size,
+        headers: std::sync::Arc::new(crate::model::MessageHeaders {
+            id,
+            message_id: thread.message_id,
+            in_reply_to: thread.in_reply_to,
+            references: thread.references.into(),
+            from_name,
+            from_address,
+            to,
+            cc,
+            bcc,
+            subject,
+            timestamp,
+            date_label: date_label.into(),
+            size,
+            has_attachment_hint: attachment_hint(raw_headers),
+            attachment_names_hint: Vec::new().into(),
+        }),
         flags,
-        has_attachment_hint: attachment_hint(raw_headers),
-        attachment_names_hint: Vec::new(),
     })
 }
 
@@ -318,6 +320,17 @@ pub const MAX_BODY_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RAW_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RENDERED_HTML_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 
+/// Attachment names only: do not decode binary payloads for a preview.
+pub(crate) fn attachment_names(raw: &[u8]) -> Result<Vec<String>> {
+    if raw.len() > MAX_RAW_MESSAGE_BYTES {
+        anyhow::bail!("message exceeds the 32 MiB MIME attachment limit");
+    }
+    let parsed = MessageParser::new().parse(raw)
+        .ok_or_else(|| anyhow!("unable to parse MIME attachments"))?;
+    Ok(attachment_parts(&parsed).into_iter().enumerate()
+        .map(|(index, part)| attachment_display_name(&part, index)).collect())
+}
+
 pub fn extract_attachments(raw: &[u8]) -> Result<Vec<OutgoingAttachment>> {
     if raw.len() > MAX_RAW_MESSAGE_BYTES {
         anyhow::bail!("message exceeds the 32 MiB MIME attachment limit");
@@ -431,11 +444,11 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         .collect();
     Ok(MessageBody {
         id,
-        plain_text,
-        plain_fallback,
-        html_source,
-        html_text,
-        html_lines,
+        plain_text: plain_text.map(Into::into),
+        plain_fallback: plain_fallback.map(Into::into),
+        html_source: html_source.map(Into::into),
+        html_text: html_text.map(Into::into),
+        html_lines: html_lines.map(std::sync::Arc::new),
         html_renderer,
         html_render_width,
         attachment_count: attachment_names.len(),
@@ -1621,7 +1634,7 @@ MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n\
         let body = parse_body(MessageId("html-colour".into()), raw).unwrap();
         let styles = body
             .html_lines
-            .as_ref()
+            .as_deref()
             .into_iter()
             .flatten()
             .flat_map(|line| line.spans.iter())

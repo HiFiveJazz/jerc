@@ -79,6 +79,9 @@ const FOREGROUND_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 // A large header FETCH may be legitimately slower than LIST/CONNECT.
 const FOREGROUND_PAGE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Conservative width for authored replies to Linux kernel mailing lists.
+pub(crate) const REPLY_WRAP_COLUMNS: usize = 72;
+
 const SMOOTH_SCROLL_ROWS: isize = 22;
 const SMOOTH_MAILBOX_ROWS: isize = SMOOTH_SCROLL_ROWS;
 const MAX_COUNT_PREFIX: usize = 99_999;
@@ -93,7 +96,7 @@ const BODY_PREFETCH_BACKWARD: usize = 6;
 const BODY_PREFETCH_FAST_FORWARD: usize = 22;
 const BODY_PREFETCH_FAST_BACKWARD: usize = 8;
 const PREFETCH_WINDOW_REARM_ROWS: usize = 12;
-const MAX_WARM_MAILBOXES: usize = 6;
+const MAX_WARM_MAILBOXES: usize = 16;
 const MAX_CACHED_PREVIEW_BODIES: usize = 80;
 const MAX_CACHED_PREVIEW_BYTES: usize = 48 * 1024 * 1024;
 // Avoid silently downloading giant attachments simply because the cursor is
@@ -110,7 +113,7 @@ fn preview_body_bytes(body: &MessageBody) -> usize {
     ]
     .into_iter()
     .flatten()
-    .map(String::len)
+    .map(|text| text.len())
     .sum::<usize>();
     let rich = body.html_lines.as_ref().map_or(0, |lines| {
         lines
@@ -592,6 +595,9 @@ pub struct Composer {
     advanced_previous: Option<(ComposeField, ComposeMode, usize)>,
     pub subject: String,
     pub body: String,
+    /// Hard-wrap newly written reply prose, leaving quoted source lines untouched.
+    #[serde(default)]
+    pub reply_wrap: bool,
     pub field: ComposeField,
     pub mode: ComposeMode,
     pub cursor: usize,
@@ -659,7 +665,7 @@ pub struct Composer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComposeIntent {
+pub enum ComposeIntent {
     Reply {
         quote: bool,
         audience: ReplyAudience,
@@ -753,6 +759,9 @@ pub struct AccountState {
     last_prefetch_anchor: Option<(String, usize, isize)>,
     mailbox_cache: HashMap<String, CachedMailbox>,
     warm_folder_order: VecDeque<String>,
+    /// Read-only speculative folder loads; only one outstanding per account.
+    mailbox_warm_queue: VecDeque<String>,
+    mailbox_warm_request: Option<(u64, String)>,
     cache_writer: Option<cache::Writer>,
     body_store: Option<cache::BodyStore>,
     raw_store: Option<cache::RawStore>,
@@ -786,6 +795,7 @@ pub struct AccountState {
     status_requests: MailboxStatusQueue,
     pending_inbox_refresh: bool,
     pending_mutation_labels: HashMap<u64, &'static str>,
+    pending_destination_refresh: HashMap<u64, String>,
     pub connecting: bool,
     connect_request_id: Option<u64>,
     // A list response/error must close only the matching list request.
@@ -992,7 +1002,7 @@ impl AccountState {
                     message.subject.as_str(),
                     message.from_name.as_str(),
                     message.from_address.as_str(),
-                    message.date_label.as_str(),
+                    message.date_label.as_ref(),
                 ];
                 match self.search_mode {
                     crate::config::MailSearchMode::Strict => fields
@@ -1457,7 +1467,7 @@ enum MutationKind {
     Unarchive { destination: String },
 }
 
-/// One-row-per-frame, 22-row target scrolling shared by delete previews.
+/// One-row-per-frame smooth cursor movement shared by review dialogs.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewScroll {
     pub position: usize,
@@ -1489,14 +1499,27 @@ impl ReviewScroll {
     }
 }
 
+/// Separate fields so mail review columns stay aligned regardless of subject length.
+#[derive(Debug, Clone)]
+pub struct MailReviewItem {
+    pub subject: String,
+    pub from_address: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct MutationConfirmation {
     pub prompt: String,
-    pub items: Vec<String>,
+    pub items: Vec<MailReviewItem>,
     pub review: ReviewScroll,
     source: String,
     ids: Vec<MessageId>,
     kind: MutationKind,
+}
+
+impl MutationConfirmation {
+    pub fn is_archive(&self) -> bool {
+        matches!(self.kind, MutationKind::Archive { .. })
+    }
 }
 
 /// An attachment is only detached after the user accepts the review.
@@ -1614,6 +1637,8 @@ pub struct App {
     /// In-app first-run or add-account setup, modal over normal mail UI.
     pub setup: Option<SetupWizard>,
     pub remove_account_confirmation: Option<String>,
+    /// Purge only after reload has dropped the removed account's cache writer.
+    pub pending_account_cleanup: Vec<crate::config::AccountConfig>,
     pub setup_config_path: PathBuf,
     pub setup_reload_requested: bool,
     setup_sender: Option<SyncSender<RuntimeEvent>>,
@@ -2303,7 +2328,10 @@ impl App {
                     );
                 }
             }
-            Err(error) => wizard.authentication_failed(&error),
+            Err(error) => {
+                wizard.cancel_authentication();
+                wizard.authentication_failed(&error);
+            }
         }
     }
 
@@ -2346,6 +2374,8 @@ impl App {
                     wizard.message = "OAuth runtime unavailable".into();
                     return;
                 };
+                // The login is provisional until the account is saved.
+                wizard.provisional_oauth_account = Some(account.clone());
                 let (request_id, cancel) = wizard.begin_authentication();
                 std::thread::spawn(move || {
                     let name = account.name.clone();
@@ -3360,7 +3390,7 @@ fn outgoing_from_composer(composer: &Composer, from: &str) -> anyhow::Result<Out
         cc: composer.cc.clone(),
         bcc: composer.bcc.clone(),
         subject: composer.subject.clone(),
-        body: composer.body.clone(),
+        body: composer.outgoing_plain_body(),
         html_body,
         attachments,
         custom_headers,

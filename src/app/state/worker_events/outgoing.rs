@@ -58,7 +58,20 @@ impl App {
                 }
             }
             WorkerEventKind::MutationComplete => {
+                let destination = account.inflight_deferred_mutations.get(&event.request_id)
+                    .and_then(|entry| match &entry.kind {
+                        cache::DeferredMutationKind::Delete => None,
+                        cache::DeferredMutationKind::Move { destination }
+                        | cache::DeferredMutationKind::Archive { destination }
+                        | cache::DeferredMutationKind::Unarchive { destination } => Some(destination.clone()),
+                    });
                 account.finish_deferred_mutation(event.request_id, true);
+                let destination = destination
+                    .or_else(|| account.pending_destination_refresh.remove(&event.request_id));
+                if let Some(destination) = destination {
+                    account.invalidate_remote_folder(&destination);
+                    account.rewarm_mailbox(&destination);
+                }
                 // Only a tracked, completed mutation may resolve the pending
                 // state. A background server-draft cleanup isn't a user action.
                 if let Some(message) = account.pending_mutation_labels.remove(&event.request_id) {
@@ -93,6 +106,7 @@ impl App {
                 // Refresh cached Drafts on the next visit, or immediately if
                 // the user is already browsing that folder.
                 account.invalidate_remote_folder(&mailbox);
+                account.rewarm_mailbox(&mailbox);
                 if account.current_mailbox.as_deref() == Some(mailbox.as_str()) {
                     let _ = account.request_mailbox_page(mailbox.clone(), 0);
                 }
@@ -169,6 +183,9 @@ impl App {
                     .collect::<Vec<_>>();
                 for name in &affected {
                     account.invalidate_remote_folder(name);
+                    if account.mailboxes.iter().any(|folder| folder.name == *name && folder.role == MailboxRole::Sent) {
+                        account.rewarm_mailbox(name);
+                    }
                 }
                 account.queue_unknown_mailbox_statuses(sent_mailbox.as_deref());
                 if account

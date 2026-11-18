@@ -276,8 +276,11 @@ impl ImapSource {
         if let Some(secret) = &self.secret {
             return Ok(secret.clone());
         }
-        if let Some(oauth) = &self.account_oauth {
-            return oauth.refresh_token();
+        if self.account_oauth.is_some() {
+            // The OAuth token manager supplies short-lived access tokens.
+            // Never read/copy the raw refresh token into an IMAP/SMTP worker
+            // just to discard it during XOAUTH2 authentication.
+            return Ok(String::new());
         }
         let command = credential_command.ok_or_else(|| {
             anyhow!(
@@ -871,7 +874,7 @@ fn summary_from_fetch(
         .map(|(name, _)| name)
         .collect::<Vec<_>>();
     summary.has_attachment_hint |= !attachment_names.is_empty();
-    summary.attachment_names_hint = attachment_names;
+    summary.attachment_names_hint = attachment_names.into_boxed_slice();
     Some(summary)
 }
 
@@ -1858,22 +1861,24 @@ mod tests {
     fn cached_summary(validity: u32, uid: u32) -> crate::model::MessageSummary {
         use crate::model::{MessageFlags, MessageId, MessageSummary};
         MessageSummary {
-            id: MessageId(format!("imap-uid:{validity}:{uid}")),
-            message_id: None,
-            in_reply_to: None,
-            references: vec![],
-            from_name: String::new(),
-            from_address: String::new(),
-            to: String::new(),
-            cc: String::new(),
-            bcc: String::new(),
-            subject: format!("subject-{uid}"),
-            timestamp: i64::from(uid),
-            date_label: String::new(),
-            size: 17,
+            headers: std::sync::Arc::new(crate::model::MessageHeaders {
+                id: MessageId(format!("imap-uid:{validity}:{uid}")),
+                message_id: None,
+                in_reply_to: None,
+                references: vec![].into(),
+                from_name: String::new(),
+                from_address: String::new(),
+                to: String::new(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: format!("subject-{uid}"),
+                timestamp: i64::from(uid),
+                date_label: String::new().into(),
+                size: 17,
+                has_attachment_hint: true,
+                attachment_names_hint: vec!["cached.pdf".into()].into(),
+            }),
             flags: MessageFlags::empty(),
-            has_attachment_hint: true,
-            attachment_names_hint: vec!["cached.pdf".into()],
         }
     }
 
@@ -1889,9 +1894,11 @@ mod tests {
         assert_eq!(page.len(), 2);
         assert_eq!(page[0].subject, "subject-8");
         assert!(page[0].flags.contains(MessageFlags::SEEN));
+        assert!(std::sync::Arc::ptr_eq(&page[0].headers, &cached[1].headers));
+        assert!(!cached[1].flags.contains(MessageFlags::SEEN));
         assert_eq!(
-            page[0].attachment_names_hint,
-            vec!["cached.pdf".to_string()]
+            page[0].attachment_names_hint.as_ref(),
+            &["cached.pdf".to_string()]
         );
     }
 

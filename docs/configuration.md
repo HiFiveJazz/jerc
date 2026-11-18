@@ -50,8 +50,7 @@ copy_to = ""
 provider = "google"
 ```
 
-Sign in with `jerc --oauth-login Personal`. Google Workspace and Microsoft 365 setups, embedded client configuration, server discovery, and login-name overrides are documented in [OAuth & discovery](oauth.md).
-
+Sign in with `jerc --oauth-login Personal`.
 ### Hide unwanted mailboxes
 
 ```toml
@@ -84,8 +83,7 @@ new_mail_bell = false
 - **Borders:** `square` is the default; `rounded` changes window corners without altering layout.
 - **Remote images:** Disabled initially to avoid unsolicited network requests triggered by opening email. Press `i` in the reader to toggle for the session.
 - **Panel widths:** The mailbox and split-preview percentages are persisted directly in this `[ui]` section when resized. Jerc no longer writes separate `mailbox-width` or `preview-width` files. Existing sidecar files are ignored; set the desired values here when upgrading.
-- **Outgoing mail privacy:** Jerc does not announce its name/version through `User-Agent` or `X-Mailer` and uses random message identifiers. Standard `MIME-Version: 1.0` and UTF-8 `Content-Type` headers describe the format, not the client. Composing plain text does not create an HTML alternative. Providers can still add SMTP routing headers.
-- **Mail refresh:** `inbox_poll_seconds` controls periodic Inbox status checks. Jerc doesn't yet use IMAP IDLE.
+- **Outgoing mail privacy:** Jerc does not announce its name/version through `User-Agent` or `X-Mailer` and uses random message identifiers. Standard `MIME-Version: 1.0` and UTF-8 `Content-Type` headers describe the format, not the client. Composing emails is plain-text does not create an HTML alternative, to keep Jerc in line with Mailing List Plain-Text workflows expectations from aerc. Providers can still add SMTP routing headers.
 
 The [example config](../config.example.toml) documents preview widths, notification styling, contact learning, and other optional settings.
 
@@ -100,7 +98,9 @@ Jerc uses separate per-user directories for different kinds of data. The exact b
 | OAuth tokens | `~/.config/jerc/oauth/` |
 | Contacts | `~/.local/share/jerc/contacts.json` |
 | Local postponed drafts | `~/.local/share/jerc/postponed/` |
-| Mail index cache | `~/.cache/jerc/mail-index/` |
+| Offline outgoing queue | `~/.local/share/jerc/outbox/` |
+| Wizard-created password files | `~/.local/share/jerc/credentials/` |
+| Mail index cache (including downloaded bodies and offline mutations) | `~/.cache/jerc/mail-index/` |
 
 
 ## Command-line tools

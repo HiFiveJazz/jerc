@@ -115,6 +115,8 @@ impl App {
                     last_prefetch_anchor: None,
                     mailbox_cache: warm_folders,
                     warm_folder_order,
+                    mailbox_warm_queue: VecDeque::new(),
+                    mailbox_warm_request: None,
                     cache_writer,
                     body_store,
                     raw_store,
@@ -141,6 +143,7 @@ impl App {
                     status_requests: MailboxStatusQueue::default(),
                     pending_inbox_refresh: false,
                     pending_mutation_labels: HashMap::new(),
+                    pending_destination_refresh: HashMap::new(),
                     connecting: false,
                     connect_request_id: None,
                     mailbox_list_request_id: None,
@@ -209,6 +212,7 @@ impl App {
             should_quit: false,
             setup: config.accounts.is_empty().then(|| SetupWizard::new(true)),
             remove_account_confirmation: None,
+            pending_account_cleanup: Vec::new(),
             setup_config_path: config
                 .config_path
                 .clone()

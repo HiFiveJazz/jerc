@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn path_for(root: &Path, account: &str) -> PathBuf {
+pub(crate) fn path_for(root: &Path, account: &str) -> PathBuf {
     // Hex encoding is an unambiguous, filesystem-safe account identifier.
     let name = account
         .as_bytes()

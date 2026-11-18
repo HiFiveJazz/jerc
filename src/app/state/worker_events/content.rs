@@ -4,16 +4,6 @@ use super::*;
 
 impl App {
     pub(super) fn handle_content_event(&mut self, event: WorkerEvent) {
-        // Only parse account identities when an event needs contact/recipient matching.
-        let own_addresses = if matches!(&event.kind, WorkerEventKind::RawLoaded { .. }) {
-            self.accounts
-                .iter()
-                .filter_map(|a| a.from.parse::<lettre::message::Mailbox>().ok())
-                .map(|a| a.email.to_string())
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
         let Some(account) = self.accounts.get_mut(event.account) else {
             return;
         };
@@ -185,44 +175,28 @@ impl App {
                                 StatusLine::error(format!("cannot open draft: {error:#}"));
                         }
                     }
-                    return;
                 }
-                let pending = self.pending_compose.as_ref().filter(|pending| {
+            }
+            WorkerEventKind::ComposePrepared { id, result } => {
+                if !self.pending_compose.as_ref().is_some_and(|pending| {
                     pending.account == event.account
                         && pending.request_id == event.request_id
                         && pending.message_id == id
-                });
-                let result = pending.and_then(|pending| {
-                    let message = account
-                        .messages
-                        .iter()
-                        .find(|message| message.id == pending.message_id)?;
-                    Some(match pending.intent {
-                        ComposeIntent::Forward => Composer::forward(message, raw),
-                        ComposeIntent::Reply { quote, audience } => {
-                            (|| -> anyhow::Result<Composer> {
-                                let targets = reply_recipients(&raw, audience, &own_addresses)?;
-                                let body = parse_body(id, &raw)?;
-                                let mut composer = Composer::reply(message, Some(&body), quote);
-                                composer.to = targets.to;
-                                composer.cc = targets.cc;
-                                Ok(composer)
-                            })()
-                        }
-                    })
-                });
+                }) { return; }
+                let intent = self.pending_compose.take().expect("correlated compose request").intent;
                 match result {
-                    Some(Ok(composer)) => {
-                        self.pending_compose = None;
-                        self.composer = Some(composer);
+                    Ok(composer) => {
+                        debug_assert_eq!(
+                            composer.forwarded_raw.is_some(),
+                            matches!(intent, ComposeIntent::Forward),
+                        );
+                        self.composer = Some(*composer);
                         self.resumed_draft_account = None;
                         self.status = StatusLine::info("ready to compose reply/forward");
                     }
-                    Some(Err(error)) => {
-                        self.pending_compose = None;
-                        self.status = StatusLine::error(format!("cannot prepare reply: {error:#}"));
+                    Err(error) => {
+                        self.status = StatusLine::error(format!("cannot prepare message: {error}"));
                     }
-                    None => {}
                 }
             }
             WorkerEventKind::MessageExported { path } => {

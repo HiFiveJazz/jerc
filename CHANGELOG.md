@@ -3,6 +3,29 @@
 Significant changes are documented here. GitHub also generates per-release
 notes from commit history when a version tag is pushed.
 
+## 0.6.6 — 2026-11-18
+
+### Faster, lighter mail
+
+- Warm other mail folders in the background and monitor the selected folder with
+  IMAP IDLE when supported, while keeping interactive requests prioritized.
+- Open forwarded messages from cached raw MIME when available and prepare
+  forwarded content off the terminal UI thread.
+- Reduce memory used by event queues, message-body snapshots, and cached mail
+  headers through shared immutable data and less copying during synchronization.
+- Optimize the default release build for size with full LTO while retaining all
+  features, including syntax-aware patch previews.
+
+### Reliability and security
+
+- Wrap reply prose to kernel-friendly line widths without rewrapping quoted
+  patches; keep Normal-mode `a` within the current line.
+- Improve account removal cleanup and harden OAuth token refresh, cancellation,
+  and revocation handling against concurrent work and stale credentials.
+- Improve bulk archive/delete confirmation dialogs and fix forwarding of
+  messages without a display name.
+- Expand regression coverage for OAuth, mailbox caching, forwarding, and editing.
+
 ## 0.6.4 — 2026-11-12
 
 ### Fixed

@@ -280,15 +280,36 @@ pub(crate) fn persistable_bodies_near(
     bodies: &HashMap<MessageId, MessageBody>,
     selected_index: usize,
 ) -> HashMap<MessageId, MessageBody> {
-    let mut selected = HashMap::with_capacity(MAX_BODIES_PER_FOLDER.min(bodies.len()));
+    persistable_bodies_near_impl(messages, bodies, selected_index, false)
+}
+
+/// Writer snapshots keep the original text/HTML, but never copy the derived
+/// rich terminal layout. The live in-session cache keeps that layout so folder
+/// switches and the reader stay fast.
+pub(crate) fn persistable_bodies_near_compact(
+    messages: &[MessageSummary],
+    bodies: &HashMap<MessageId, MessageBody>,
+    selected_index: usize,
+) -> HashMap<MessageId, MessageBody> {
+    persistable_bodies_near_impl(messages, bodies, selected_index, true)
+}
+
+/// Select the same bounded nearest-to-cursor body set for both the in-memory
+/// LRU and the writer, but let the former retain ownership of rich layouts.
+fn eligible_body_ids_near(
+    messages: &[MessageSummary],
+    bodies: &HashMap<MessageId, MessageBody>,
+    selected_index: usize,
+) -> Vec<MessageId> {
+    let mut selected = Vec::with_capacity(MAX_BODIES_PER_FOLDER.min(bodies.len()));
     let limit = messages.len().min(MAX_MESSAGES_PER_FOLDER);
     let mut positions = (0..limit).collect::<Vec<_>>();
     positions.sort_by_key(|index| index.abs_diff(selected_index));
     for index in positions {
-        let message = &messages[index];
         if selected.len() >= MAX_BODIES_PER_FOLDER {
             break;
         }
+        let message = &messages[index];
         let Some(body) = bodies.get(&message.id) else {
             continue;
         };
@@ -300,10 +321,63 @@ pub(crate) fn persistable_bodies_near(
             .saturating_add(body.html_source.as_deref().unwrap_or_default().len())
             .saturating_add(body.html_text.as_deref().unwrap_or_default().len());
         if bytes <= MAX_BODY_BYTES {
-            selected.insert(message.id.clone(), body.clone());
+            selected.push(message.id.clone());
         }
     }
     selected
+}
+
+/// Prune a warmed in-session cache without deep-cloning rich HTML layout data.
+/// Cached bodies remain fully rendered and ready for immediate folder switches.
+pub(crate) fn retain_bodies_near(
+    messages: &[MessageSummary],
+    bodies: &mut HashMap<MessageId, MessageBody>,
+    selected_index: usize,
+) {
+    let keep = eligible_body_ids_near(messages, bodies, selected_index)
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    bodies.retain(|id, _| keep.contains(id));
+}
+
+fn persistable_bodies_near_impl(
+    messages: &[MessageSummary],
+    bodies: &HashMap<MessageId, MessageBody>,
+    selected_index: usize,
+    compact: bool,
+) -> HashMap<MessageId, MessageBody> {
+    let ids = eligible_body_ids_near(messages, bodies, selected_index);
+    let mut selected = HashMap::with_capacity(ids.len());
+    for id in ids {
+        if let Some(body) = bodies.get(&id) {
+            let copy = if compact { compact_body(body) } else { Some(body.clone()) };
+            if let Some(copy) = copy {
+                selected.insert(id, copy);
+            }
+        }
+    }
+    selected
+}
+
+impl CachedMailbox {
+    /// Produce a minimal copy for the asynchronous disk writer without copying
+    /// expensive rich HTML spans from the already-warmed in-memory folder.
+    pub(crate) fn for_persistence(&self) -> Self {
+        Self {
+            messages: self.messages.clone(),
+            bodies: persistable_bodies_near_compact(
+                &self.messages,
+                &self.bodies,
+                self.message_index,
+            ),
+            message_index: self.message_index,
+            message_view_offset: self.message_view_offset,
+            next_page_offset: self.next_page_offset,
+            has_more: self.has_more,
+            uid_validity: self.uid_validity,
+            uid_next: self.uid_next,
+        }
+    }
 }
 
 pub(crate) enum Change {
@@ -455,11 +529,10 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
     let Some(dir) = dirs::cache_dir().map(|path| path.join("jerc").join("mail-index")) else {
         return (Snapshot::default(), None);
     };
-    let identity = crate::backend::redact_source(&account.source);
-    let hash = stable_key(&format!("{}\0{identity}", account.name));
-    let path = dir.join(format!("{hash:016x}.json"));
+    let stem = account_cache_stem(account);
+    let path = dir.join(format!("{stem}.json"));
     let mut mutation_store = MutationStore {
-        path: dir.join(format!("{hash:016x}.mutations.json")),
+        path: dir.join(format!("{stem}.mutations.json")),
         readable: true,
     };
     let mutations = match mutation_store.read() {
@@ -472,7 +545,7 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
         }
     };
     let body_store = BodyStore {
-        dir: dir.join(format!("{hash:016x}.bodies")),
+        dir: dir.join(format!("{stem}.bodies")),
     };
     let cache_start = Instant::now();
     let loaded = read_snapshot(&path);
@@ -487,17 +560,21 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
             .is_some_and(|snapshot| !snapshot.folders.is_empty()),
     );
     let mut snapshot = loaded.unwrap_or_default();
+    // Clone the startup index once using shared message headers and body text.
+    // The background writer needs independent folder maps, but not another
+    // expensive JSON parse or another copy of every RFC 5322 header string.
+    let writer_snapshot = snapshot.clone();
     snapshot.deferred_mutations = mutations;
     let (wake, rx) = mpsc::sync_channel::<()>(1);
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let thread_pending = Arc::clone(&pending);
-    // The original snapshot belongs to the UI. Reopen the small index on the
-    // background writer instead of cloning all cached rows on startup.
+    // The UI and writer own separate mutable indexes but share immutable
+    // message metadata until a header is actually changed.
     let writer_body_store = body_store.clone();
     let join = thread::Builder::new()
         .name("mail-cache-writer".into())
         .spawn(move || {
-            let mut stored = read_snapshot(&path).unwrap_or_default();
+            let mut stored = writer_snapshot;
             let mut body_writes = 0;
             while rx.recv().is_ok() {
                 // Coalesce status replies and quick reader changes into a
@@ -569,6 +646,11 @@ fn apply(snapshot: &mut Snapshot, change: Change) {
                 folder.messages.truncate(MAX_MESSAGES_PER_FOLDER);
                 folder.next_page_offset = folder.messages.len();
                 folder.has_more = true;
+            }
+            for body in folder.bodies.values_mut() {
+                body.html_lines = None;
+                body.html_renderer = None;
+                body.html_render_width = 0;
             }
             folder.bodies.retain(|id, body| {
                 folder.messages.iter().any(|message| &message.id == id)
@@ -893,7 +975,7 @@ pub(crate) fn compact_body(body: &MessageBody) -> Option<MessageBody> {
     ]
     .into_iter()
     .flatten()
-    .map(String::len)
+    .map(|text| text.len())
     .sum::<usize>();
     if size > MAX_BODY_FILE_BYTES as usize / 2 {
         return None;
@@ -910,6 +992,14 @@ pub(crate) fn compact_body(body: &MessageBody) -> Option<MessageBody> {
         attachment_count: body.attachment_count,
         attachment_names: body.attachment_names.clone(),
     })
+}
+
+/// Stable, per-account name for all IMAP cache artifacts.
+/// Keep this shared with account removal so purge cannot guess a filename.
+pub(crate) fn account_cache_stem(account: &AccountConfig) -> String {
+    let identity = crate::backend::redact_source(&account.source);
+    let hash = stable_key(&format!("{}\0{identity}", account.name));
+    format!("{hash:016x}")
 }
 
 fn stable_key(value: &str) -> u64 {
@@ -1157,6 +1247,25 @@ mod tests {
     }
 
     #[test]
+    fn cloned_cache_indexes_share_headers_but_not_flags() {
+        let mut original = Snapshot::default();
+        original.folders.insert("INBOX".into(), folder(23, 2));
+        let mut writer_index = original.clone();
+        let original_row = &original.folders["INBOX"].messages[0];
+        let writer_row = &writer_index.folders["INBOX"].messages[0];
+        assert!(std::sync::Arc::ptr_eq(&original_row.headers, &writer_row.headers));
+
+        writer_index.folders.get_mut("INBOX").unwrap().messages[0]
+            .flags.set(crate::model::MessageFlags::SEEN, true);
+        assert!(std::sync::Arc::ptr_eq(
+            &original.folders["INBOX"].messages[0].headers,
+            &writer_index.folders["INBOX"].messages[0].headers,
+        ));
+        assert!(original.folders["INBOX"].messages[0].unread());
+        assert!(!writer_index.folders["INBOX"].messages[0].unread());
+    }
+
+    #[test]
     fn older_cache_without_uidnext_still_loads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.json");
@@ -1219,22 +1328,24 @@ mod tests {
 
     fn summary(uid_validity: u32, uid: u32) -> MessageSummary {
         MessageSummary {
-            id: MessageId(format!("imap-uid:{uid_validity}:{uid}")),
-            message_id: None,
-            in_reply_to: None,
-            references: Vec::new(),
-            from_name: "Sender".into(),
-            from_address: "sender@example.test".into(),
-            to: "recipient@example.test".into(),
-            cc: String::new(),
-            bcc: String::new(),
-            subject: format!("Subject {uid}"),
-            timestamp: i64::from(uid),
-            date_label: "Today".into(),
-            size: 25,
+            headers: std::sync::Arc::new(crate::model::MessageHeaders {
+                id: MessageId(format!("imap-uid:{uid_validity}:{uid}")),
+                message_id: None,
+                in_reply_to: None,
+                references: Vec::new().into(),
+                from_name: "Sender".into(),
+                from_address: "sender@example.test".into(),
+                to: "recipient@example.test".into(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: format!("Subject {uid}"),
+                timestamp: i64::from(uid),
+                date_label: "Today".into(),
+                size: 25,
+                has_attachment_hint: false,
+                attachment_names_hint: vec![].into(),
+            }),
             flags: crate::model::MessageFlags::empty(),
-            has_attachment_hint: false,
-            attachment_names_hint: vec![],
         }
     }
 
@@ -1264,6 +1375,133 @@ mod tests {
             uid_validity: Some(validity),
             uid_next: None,
         }
+    }
+
+    #[test]
+    fn cached_body_clones_share_large_text_and_rendered_html_allocations() {
+        use std::sync::Arc;
+
+        let mut folder = folder(42, 1);
+        let id = folder.messages[0].id.clone();
+        let mut rich = body(id.clone(), &"plain".repeat(4096));
+        rich.plain_fallback = Some("fallback".repeat(4096).into());
+        rich.html_source = Some(format!("<p>{}</p>", "markup".repeat(4096)).into());
+        rich.html_text = Some("rendered".repeat(4096).into());
+        rich.html_lines = Some(Arc::new(vec![crate::model::HtmlLine {
+            spans: vec![crate::model::HtmlSpan {
+                text: "styled span".repeat(4096),
+                ..Default::default()
+            }],
+        }]));
+        folder.bodies.insert(id.clone(), rich);
+
+        let live = folder.clone();
+        let source = &folder.bodies[&id];
+        let copy = &live.bodies[&id];
+        for (old, new) in [
+            (&source.plain_text, &copy.plain_text),
+            (&source.plain_fallback, &copy.plain_fallback),
+            (&source.html_source, &copy.html_source),
+            (&source.html_text, &copy.html_text),
+        ] {
+            assert!(Arc::ptr_eq(old.as_ref().unwrap(), new.as_ref().unwrap()));
+        }
+        assert!(Arc::ptr_eq(
+            source.html_lines.as_ref().unwrap(),
+            copy.html_lines.as_ref().unwrap()
+        ));
+
+        // Writer snapshots omit derived rows while borrowing the same source
+        // allocations. Cloning for persistence must not consume the UI cache.
+        let disk = folder.for_persistence();
+        let saved = &disk.bodies[&id];
+        assert!(saved.html_lines.is_none());
+        assert!(Arc::ptr_eq(
+            source.html_source.as_ref().unwrap(),
+            saved.html_source.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            source.plain_text.as_ref().unwrap(),
+            saved.plain_text.as_ref().unwrap()
+        ));
+        assert!(source.html_lines.is_some());
+
+        // Shared allocations serialize as ordinary JSON strings, compatible
+        // with existing on-disk cache files and older jerc versions.
+        let bytes = serde_json::to_vec(&disk).unwrap();
+        let restored: CachedMailbox = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.bodies[&id].html_source, source.html_source);
+        assert_eq!(restored.bodies[&id].plain_text, source.plain_text);
+        assert!(restored.bodies[&id].html_lines.is_none());
+    }
+
+    #[test]
+    fn html_reflow_replaces_only_the_current_body_layout() {
+        use std::sync::Arc;
+
+        let id = MessageId("imap-uid:42:1".into());
+        let mut before = body(id, "base text");
+        before.html_source = Some("<p>source</p>".into());
+        before.html_text = Some("first render".into());
+        before.html_lines = Some(Arc::new(vec![crate::model::HtmlLine::default()]));
+
+        let mut after = before.clone();
+        after.html_text = Some("reflowed".into());
+        after.html_lines = Some(Arc::new(vec![
+            crate::model::HtmlLine::default(),
+            crate::model::HtmlLine::default(),
+        ]));
+
+        assert_eq!(before.html_text.as_deref(), Some("first render"));
+        assert_eq!(after.html_text.as_deref(), Some("reflowed"));
+        assert_eq!(before.html_lines.as_ref().unwrap().len(), 1);
+        assert_eq!(after.html_lines.as_ref().unwrap().len(), 2);
+        assert!(Arc::ptr_eq(
+            before.html_source.as_ref().unwrap(),
+            after.html_source.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn persistent_folder_snapshot_drops_derived_html_without_touching_live_body() {
+        let mut folder = folder(42, 1);
+        folder.message_index = 0;
+        folder.message_view_offset = 3;
+        folder.uid_next = Some(17);
+        let id = folder.messages[0].id.clone();
+        let mut rich = body(id.clone(), "Cached text");
+        rich.html_source = Some("<p>Cached text</p>".into());
+        rich.html_text = Some("Cached text".into());
+        rich.html_lines = Some(std::sync::Arc::new(vec![crate::model::HtmlLine {
+            spans: vec![crate::model::HtmlSpan {
+                text: "Rendered layout".repeat(4096),
+                ..Default::default()
+            }],
+        }]));
+        rich.html_renderer = Some("rich".into());
+        rich.html_render_width = 72;
+        folder.bodies.insert(id.clone(), rich);
+
+        let persistent = folder.for_persistence();
+        assert_eq!(persistent.messages[0].id, id);
+        assert_eq!(persistent.message_view_offset, 3);
+        assert_eq!(persistent.uid_validity, Some(42));
+        assert_eq!(persistent.uid_next, Some(17));
+        let body = &persistent.bodies[&id];
+        assert_eq!(body.html_source.as_deref(), Some("<p>Cached text</p>"));
+        assert_eq!(body.html_text.as_deref(), Some("Cached text"));
+        assert!(body.html_lines.is_none());
+        assert!(body.html_renderer.is_none());
+        assert_eq!(body.html_render_width, 0);
+        // Live folder switching keeps the expensive layout, by design.
+        assert!(folder.bodies[&id].html_lines.is_some());
+        assert_eq!(folder.bodies[&id].html_render_width, 72);
+
+        // Even a direct writer change from an older caller must not retain
+        // derived rich spans inside the persistent snapshot.
+        let mut snapshot = Snapshot::default();
+        apply(&mut snapshot, Change::Folder("INBOX".into(), folder));
+        assert!(snapshot.folders["INBOX"].bodies[&id].html_lines.is_none());
     }
 
     #[test]
@@ -1455,7 +1693,7 @@ mod tests {
         };
         let id = MessageId("imap-uid:17:42".into());
         let mut message = body(id.clone(), "Offline message");
-        message.html_lines = Some(vec![crate::model::HtmlLine::default()]);
+        message.html_lines = Some(std::sync::Arc::new(vec![crate::model::HtmlLine::default()]));
         let compact = compact_body(&message).unwrap();
         assert!(compact.html_lines.is_none());
         store.write("INBOX", 17, &compact).unwrap();

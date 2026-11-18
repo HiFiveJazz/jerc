@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     ATTACHMENT_HELP_ENTRIES, App, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, ComposeField,
-    ComposeMode, DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, NOTICE_HELP_ENTRIES,
+    ComposeMode, DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, MailReviewItem, NOTICE_HELP_ENTRIES,
     PICKER_HELP_ENTRIES, ReaderSelection, ranked_help_matches,
 };
 use crate::config::VisualSelectionStyle;
@@ -814,22 +814,24 @@ mod tests {
         use crate::model::{MessageFlags, MessageId, MessageSummary};
         let theme = load_themes().into_iter().next().expect("theme");
         let message = MessageSummary {
-            id: MessageId("local-id".into()),
-            message_id: Some("message@example.org".into()),
-            in_reply_to: None,
-            references: vec![],
-            from_name: "Alex Sender".into(),
-            from_address: "alex@example.org".into(),
-            to: "Recipient One <one@example.org>, Recipient Two <two@example.org>".into(),
-            cc: "CC Person <cc@example.org>".into(),
-            bcc: "BCC Person <bcc@example.org>".into(),
-            subject: "Hello".into(),
-            timestamp: 0,
-            date_label: String::new(),
-            size: 0,
+            headers: std::sync::Arc::new(crate::model::MessageHeaders {
+                id: MessageId("local-id".into()),
+                message_id: Some("message@example.org".into()),
+                in_reply_to: None,
+                references: vec![].into(),
+                from_name: "Alex Sender".into(),
+                from_address: "alex@example.org".into(),
+                to: "Recipient One <one@example.org>, Recipient Two <two@example.org>".into(),
+                cc: "CC Person <cc@example.org>".into(),
+                bcc: "BCC Person <bcc@example.org>".into(),
+                subject: "Hello".into(),
+                timestamp: 0,
+                date_label: String::new().into(),
+                size: 0,
+                has_attachment_hint: false,
+                attachment_names_hint: vec![].into(),
+            }),
             flags: MessageFlags::empty(),
-            has_attachment_hint: false,
-            attachment_names_hint: vec![],
         };
         let text = |show_details| {
             super::reader_header_lines(&message, show_details, &theme)

@@ -2,6 +2,63 @@
 
 use super::*;
 
+/// Only word-wrap ordinary authored prose. The kernel mailing lists require
+/// quoted patches, indentation, diff context and trailers to remain byte-for-
+/// byte intact; those lines must never be reformatted by the mail client.
+fn reply_prose_line(line: &str) -> bool {
+    !line.is_empty()
+        && !line.starts_with(&[' ', '\t', '>', '+', '-', '@'][..])
+        && !line.starts_with("diff --git ")
+        && !line.starts_with("index ")
+        && !line.starts_with("Signed-off-by:")
+        && !(line.starts_with("On ") && line.ends_with(" wrote:"))
+}
+
+/// Replace only inter-word ASCII spaces with actual newline characters.
+/// This leaves long URLs/tokens unbroken, preserves intentional line breaks,
+/// and never modifies quoted material from a received message.
+fn wrap_reply_prose(body: &str) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    let mut result = String::with_capacity(body.len());
+    for segment in body.split_inclusive('\n') {
+        let (line, ending) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        if !reply_prose_line(line) {
+            result.push_str(line);
+            result.push_str(ending);
+            continue;
+        }
+        let mut remainder = line;
+        while UnicodeWidthStr::width(remainder) > REPLY_WRAP_COLUMNS {
+            let mut cells = 0;
+            let mut split = None;
+            for (index, grapheme) in remainder.grapheme_indices(true) {
+                let width = UnicodeWidthStr::width(grapheme);
+                if cells + width > REPLY_WRAP_COLUMNS {
+                    break;
+                }
+                if grapheme == " " && index > 0 {
+                    split = Some(index);
+                }
+                cells += width;
+            }
+            let Some(index) = split else {
+                // A single oversized word/URL should never be cut in half.
+                break;
+            };
+            result.push_str(&remainder[..index]);
+            result.push('\n');
+            remainder = &remainder[index + 1..];
+        }
+        result.push_str(remainder);
+        result.push_str(ending);
+    }
+    result
+}
+
 impl Composer {
     pub fn new() -> Self {
         Self {
@@ -21,6 +78,7 @@ impl Composer {
             advanced_previous: None,
             subject: String::new(),
             body: String::new(),
+            reply_wrap: false,
             field: ComposeField::To,
             mode: ComposeMode::Insert,
             cursor: 0,
@@ -93,10 +151,15 @@ impl Composer {
         composer.to = recipients_in!(parsed.to());
         composer.cc = recipients_in!(parsed.cc());
         composer.bcc = recipients_in!(parsed.bcc());
-        composer.subject = summary.subject;
-        composer.body = body.plain_text.or(body.plain_fallback).unwrap_or_default();
-        composer.in_reply_to = summary.in_reply_to;
-        composer.references = summary.references;
+        composer.subject = summary.subject.clone();
+        composer.body = body
+            .plain_text
+            .or(body.plain_fallback)
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        composer.in_reply_to = summary.in_reply_to.clone();
+        composer.reply_wrap = composer.in_reply_to.is_some();
+        composer.references = summary.references.to_vec();
         // Attachments remain encoded in the original RFC5322 payload until
         // the user sends or saves. The Compose editor only modifies plain text;
         // do not re-send a stale HTML alternative with diverging content.
@@ -112,7 +175,7 @@ impl Composer {
 
     pub(super) fn reply(message: &MessageSummary, body: Option<&MessageBody>, quote: bool) -> Self {
         let subject = reply_subject(&message.subject);
-        let mut references = message.references.clone();
+        let mut references = message.references.to_vec();
         if let Some(id) = &message.message_id
             && references.last() != Some(id)
         {
@@ -169,6 +232,7 @@ impl Composer {
             advanced_previous: None,
             subject,
             body,
+            reply_wrap: true,
             field: ComposeField::Body,
             mode: ComposeMode::Insert,
             cursor,
@@ -202,8 +266,31 @@ impl Composer {
         }
     }
 
-    pub(super) fn forward(message: &MessageSummary, raw: Vec<u8>) -> anyhow::Result<Self> {
-        let parts = inline_forward_parts(&raw)?;
+    /// All costly MIME decoding for reply/forward happens on a mail worker,
+    /// never in the TUI event handler. Retain the raw bytes for faithful
+    /// RFC 5322 forwarding (including embedded images and attachments).
+    pub(crate) fn prepare_original(
+        message: &MessageSummary,
+        id: MessageId,
+        raw: Vec<u8>,
+        intent: ComposeIntent,
+        own_addresses: &[String],
+    ) -> anyhow::Result<Self> {
+        match intent {
+            ComposeIntent::Forward => Self::forward(message, raw),
+            ComposeIntent::Reply { quote, audience } => {
+                let targets = reply_recipients(&raw, audience, own_addresses)?;
+                let body = parse_body(id, &raw)?;
+                let mut composer = Self::reply(message, Some(&body), quote);
+                composer.to = targets.to;
+                composer.cc = targets.cc;
+                Ok(composer)
+            }
+        }
+    }
+
+    pub(crate) fn forward(message: &MessageSummary, raw: Vec<u8>) -> anyhow::Result<Self> {
+        let parts = crate::outgoing::inline_forward_body(&raw)?;
         let subject = forward_subject(&message.subject);
         let attribution = forward_attribution(&raw)?;
         let body = format!("\n\n{attribution}\n{}\n", parts.plain);
@@ -224,6 +311,7 @@ impl Composer {
             advanced_previous: None,
             subject,
             body,
+            reply_wrap: false,
             field: ComposeField::To,
             mode: ComposeMode::Insert,
             cursor: 0,
@@ -265,13 +353,7 @@ impl Composer {
         self.preview_forwarded_attachments.extend(
             self.forwarded_raw
                 .as_deref()
-                .and_then(|raw| crate::mail::extract_attachments(raw).ok())
-                .map(|parts| {
-                    parts
-                        .into_iter()
-                        .map(|part| part.filename)
-                        .collect::<Vec<_>>()
-                })
+                .and_then(|raw| crate::mail::attachment_names(raw).ok())
                 .unwrap_or_default(),
         );
         self.preview_rich_lines = self
@@ -289,7 +371,7 @@ impl Composer {
         let Some(raw) = self.forwarded_raw.as_deref() else {
             return Ok(None);
         };
-        let parts = inline_forward_parts(raw)?;
+        let parts = crate::outgoing::inline_forward_body(raw)?;
         Ok(parts.html.map(|html| {
             let personal_note = self.body.split(FORWARD_SEPARATOR).next().unwrap_or("");
             let original_headers = self
@@ -771,14 +853,42 @@ impl Composer {
         crate::app::vim::byte_offset(text, char_index)
     }
 
+    /// This is the exact plain body used for previews, SMTP and saved drafts.
+    /// Ordinary new messages and forwards are deliberately not reformatted.
+    pub(crate) fn outgoing_plain_body(&self) -> String {
+        if self.reply_wrap {
+            wrap_reply_prose(&self.body)
+        } else {
+            self.body.clone()
+        }
+    }
+
     pub(super) fn insert_char(&mut self, ch: char) {
         self.body_smooth_target = None;
         self.body_preferred_column = None;
         let cursor = self.cursor.min(self.char_count());
+        // Only reflow prose as it is appended. Editing within existing lines
+        // (especially a quoted patch) must never silently rewrite that text.
+        let wrap_appended_reply = self.reply_wrap
+            && self.field == ComposeField::Body
+            && ch != '\n'
+            && cursor == self.line_end();
         let byte = Self::byte_index(self.field_value(), cursor);
         self.remember_edit();
         self.field_mut().insert(byte, ch);
         self.cursor = cursor.saturating_add(1);
+        if wrap_appended_reply {
+            let start = self.line_start();
+            let end = self.line_end();
+            let first = Self::byte_index(&self.body, start);
+            let last = Self::byte_index(&self.body, end);
+            let wrapped = wrap_reply_prose(&self.body[first..last]);
+            if wrapped.as_str() != &self.body[first..last] {
+                // Each wrap replaces exactly one ASCII space with a newline;
+                // character offsets (including the cursor) remain unchanged.
+                self.body.replace_range(first..last, &wrapped);
+            }
+        }
         self.contact_suggestion = 0;
         self.dismissed_contact_query = None;
     }

@@ -267,8 +267,8 @@ impl App {
             return;
         };
         let (html_text, html_lines, html_renderer) = render_html_for_terminal(source, width);
-        body.html_text = Some(html_text);
-        body.html_lines = Some(html_lines);
+        body.html_text = Some(html_text.into());
+        body.html_lines = Some(std::sync::Arc::new(html_lines));
         body.html_renderer = Some(html_renderer);
         body.html_render_width = width;
     }

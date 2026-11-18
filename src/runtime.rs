@@ -24,9 +24,14 @@ use crate::outgoing;
 use crate::ui;
 use crate::worker::{RuntimeEvent, WorkerHandle};
 
+// The event enum is deliberately large; preallocating thousands of slots in
+// both the runtime and per-epoch relay channels wastes ~10 MiB on 64-bit Linux.
+// A bounded queue still absorbs bursts while the UI renders.
+const RUNTIME_EVENT_QUEUE_CAPACITY: usize = 512;
+
 pub fn run_tui(config: Config) -> Result<()> {
     let (config, configuration_warnings) = validate_account_configuration(config)?;
-    let (runtime_tx, runtime_rx) = sync_channel::<RuntimeEvent>(4096);
+    let (runtime_tx, runtime_rx) = sync_channel::<RuntimeEvent>(RUNTIME_EVENT_QUEUE_CAPACITY);
     let active_epoch = Arc::new(AtomicU64::new(0));
     let worker_tx = scoped_worker_sender(runtime_tx.clone(), Arc::clone(&active_epoch), 0);
     let workers = create_workers(&config, worker_tx)?;
@@ -67,14 +72,23 @@ pub fn run_tui(config: Config) -> Result<()> {
     // Quit must not wait for a busy IMAP SELECT/FETCH or for a full worker
     // queue. Keep the normal graceful worker shutdown for account reloads,
     // but detach network workers on final process exit (including UI errors).
+    // Keep cleanup/revocation jobs alive through the event loop and join them
+    // after the terminal has been restored, even if the loop returns an error.
+    let mut oauth_cleanup_jobs: Vec<thread::JoinHandle<()>> = Vec::new();
     let result = event_loop(
         &mut terminal,
         &mut app,
         runtime_rx,
         runtime_tx,
         active_epoch,
+        &mut oauth_cleanup_jobs,
     );
     app.detach_network_workers_for_exit();
+    drop(terminal);
+    drop(_terminal_guard);
+    for job in oauth_cleanup_jobs {
+        let _ = job.join();
+    }
     result
 }
 
@@ -154,7 +168,7 @@ fn scoped_worker_sender(
     active_epoch: Arc<AtomicU64>,
     epoch: u64,
 ) -> SyncSender<RuntimeEvent> {
-    let (sender, receiver) = sync_channel::<RuntimeEvent>(4096);
+    let (sender, receiver) = sync_channel::<RuntimeEvent>(RUNTIME_EVENT_QUEUE_CAPACITY);
     thread::Builder::new()
         .name("mail-event-relay".to_owned())
         .spawn(move || {
@@ -205,12 +219,20 @@ fn create_worker(
     } else {
         None
     };
+    // An independent selected-folder watch only starts when the user opens
+    // a non-Inbox mailbox; all other accounts retain their Inbox watch only.
+    let selected_idle_backend = if backend::ImapSource::supports(&account.source) {
+        Some(backend::from_account(account)?)
+    } else {
+        None
+    };
     let sender = outgoing::from_account(account)?;
-    let mut worker = WorkerHandle::spawn_with_idle(
+    let mut worker = WorkerHandle::spawn_with_idle_and_selected(
         index,
         backend,
         status_backend,
         idle_backend,
+        selected_idle_backend,
         sender,
         runtime_tx.clone(),
     );
@@ -218,6 +240,38 @@ fn create_worker(
         worker.enable_foreground_recovery(index, account.clone(), runtime_tx.clone());
     }
     Ok(worker)
+}
+
+/// Only the visible account watches its selected folder. Other accounts
+/// continue monitoring their Inbox on the original dedicated connection.
+/// Called every event-loop iteration so keyboard, mouse, worker results, and
+/// account switches all use the same reconciliation path.
+fn selected_idle_mailbox<'a>(
+    visible: bool,
+    connected: bool,
+    current: Option<&'a str>,
+    mailboxes: &[crate::model::Mailbox],
+) -> Option<&'a str> {
+    if !visible || !connected {
+        return None;
+    }
+    current.filter(|name| {
+        mailboxes.iter().any(|mailbox| {
+            mailbox.name == *name && mailbox.role != crate::model::MailboxRole::Inbox
+        })
+    })
+}
+
+fn sync_selected_idle_watchers(app: &App) {
+    for (index, account) in app.accounts.iter().enumerate() {
+        let selected = selected_idle_mailbox(
+            index == app.account_index,
+            account.capabilities.is_some(),
+            account.current_mailbox.as_deref(),
+            &account.mailboxes,
+        );
+        account.worker.set_selected_idle_mailbox(selected);
+    }
 }
 
 fn create_workers(
@@ -294,6 +348,7 @@ fn event_loop(
     runtime_rx: Receiver<RuntimeEvent>,
     runtime_tx: SyncSender<RuntimeEvent>,
     active_epoch: Arc<AtomicU64>,
+    oauth_cleanup_jobs: &mut Vec<thread::JoinHandle<()>>,
 ) -> Result<()> {
     // Animation is deadline-driven instead of timeout-driven.  The old loop only
     // advanced smooth scrolling when recv_timeout() *timed out*, so a steady
@@ -307,6 +362,7 @@ fn event_loop(
     let mut resume_detector = ResumeGapDetector::new();
 
     while !app.should_quit {
+        sync_selected_idle_watchers(app);
         app.flush_contacts(false);
         if resume_detector.check(SystemTime::now(), Instant::now()) {
             // Resume can leave IMAP sockets unusable while monotonic timers
@@ -448,6 +504,11 @@ fn event_loop(
                     wizard.finish_connection_test(request_id, report);
                 }
             }
+            RuntimeEvent::AccountCleanupFailed { name, error } => {
+                app.status = crate::app::StatusLine::error(format!(
+                    "Local account cleanup incomplete for {name}: {error}"
+                ));
+            }
             RuntimeEvent::InputStopped => break,
         }
 
@@ -490,7 +551,64 @@ fn event_loop(
                     for account in &mut old.accounts {
                         account.worker.retire_for_reload();
                     }
+                    let removed_accounts = std::mem::take(&mut old.pending_account_cleanup);
                     drop(old);
+                    // Retire credentials synchronously (only atomics, no I/O).
+                    // The background job waits for in-flight refreshes before
+                    // reading final tokens or purging files. Never block the UI
+                    // on a remote OAuth request or a refresh held by a worker.
+                    let retired_accounts: Vec<_> = removed_accounts.into_iter()
+                        .map(|removed| {
+                            let generation = crate::oauth::retire_account_token(&removed);
+                            (removed, generation)
+                        }).collect();
+                    for (removed, generation) in retired_accounts {
+                        let remaining = config.accounts.clone();
+                        let sender = runtime_tx.clone();
+                        let join = std::thread::Builder::new()
+                            .name("jerc-account-cleanup".into())
+                            .spawn(move || {
+                                let result =
+                                    crate::oauth::with_retired_account_lock(&removed, generation, || {
+                                        let revoke = crate::oauth::OAuthSettings::prepare_revocation(
+                                            &removed, &remaining,
+                                        );
+                                        let cleanup = crate::setup::purge_local_account_data(
+                                            &removed, &remaining,
+                                        );
+                                        (revoke, cleanup)
+                                    });
+                                let Some((revoke, cleanup)) = result else {
+                                    return; // A new login superseded this cleanup.
+                                };
+                                if let Err(error) = cleanup {
+                                    let _ = sender.try_send(RuntimeEvent::AccountCleanupFailed {
+                                        name: removed.name.clone(),
+                                        error: format!("{error:#}"),
+                                    });
+                                }
+                                if removed.oauth.is_some() && revoke.is_none() {
+                                    crate::perf::record(
+                                        "oauth_revoke_skipped", None, Duration::ZERO, false,
+                                    );
+                                }
+                                if let Some(job) = revoke {
+                                    let started = Instant::now();
+                                    let result = job.revoke();
+                                    crate::perf::record(
+                                        "oauth_revoke", None, started.elapsed(), result.is_ok(),
+                                    );
+                                }
+                            });
+                        match join {
+                            Ok(join) => oauth_cleanup_jobs.push(join),
+                            Err(error) => {
+                                app.status = crate::app::StatusLine::error(format!(
+                                    "Could not start local account cleanup: {error}"
+                                ));
+                            }
+                        }
+                    }
                     // Do not drain the global runtime queue: it contains
                     // input and *new* worker events too. Stale worker events
                     // are rejected by unwrap_current_worker_event instead.
@@ -763,12 +881,42 @@ mod multi_account_tests {
 }
 
 #[cfg(test)]
+mod selected_mailbox_idle_tests {
+    use super::selected_idle_mailbox;
+    use crate::model::{Mailbox, MailboxRole};
+
+    #[test]
+    fn only_active_connected_non_inbox_mailbox_is_watched() {
+        let folders = vec![
+            Mailbox::new("INBOX", MailboxRole::Inbox),
+            Mailbox::new("Drafts", MailboxRole::Drafts),
+        ];
+        assert_eq!(selected_idle_mailbox(true, true, Some("Drafts"), &folders), Some("Drafts"));
+        assert_eq!(selected_idle_mailbox(false, true, Some("Drafts"), &folders), None);
+        assert_eq!(selected_idle_mailbox(true, false, Some("Drafts"), &folders), None);
+        assert_eq!(selected_idle_mailbox(true, true, Some("INBOX"), &folders), None);
+        assert_eq!(selected_idle_mailbox(true, true, Some("Missing"), &folders), None);
+        assert_eq!(selected_idle_mailbox(true, true, None, &folders), None);
+    }
+}
+
+#[cfg(test)]
 mod account_worker_epoch_tests {
-    use super::{scoped_worker_sender, unwrap_current_worker_event};
+    use super::{RUNTIME_EVENT_QUEUE_CAPACITY, scoped_worker_sender, unwrap_current_worker_event};
     use crate::worker::{RuntimeEvent, WorkerEvent, WorkerEventKind};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, mpsc::sync_channel};
     use std::time::Duration;
+
+    #[test]
+    fn event_queue_memory_is_bounded() {
+        // Two channels reserve slots for every enum variant, including events
+        // that are normally rare. Don't let a new large inline variant bloat
+        // every empty event queue again.
+        let reserved = 2 * RUNTIME_EVENT_QUEUE_CAPACITY
+            * std::mem::size_of::<RuntimeEvent>();
+        assert!(reserved <= 768 * 1024, "runtime event queues reserve {reserved} bytes");
+    }
 
     #[test]
     fn queued_old_account_results_cannot_update_reused_account_index() {

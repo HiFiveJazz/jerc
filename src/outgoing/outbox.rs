@@ -4,7 +4,7 @@
 //! failure; the relay may have accepted DATA before the connection dropped.
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -80,6 +80,23 @@ struct FileFormatRef<'a> {
     messages: &'a [QueuedSend],
 }
 
+/// Dedicated local outgoing queue for this IMAP identity.
+/// Queued sends are deleted on explicit account removal, never server-side mail.
+pub(crate) fn path_for_account(account: &AccountConfig, data_root: &Path) -> PathBuf {
+    use ring::digest::{SHA256, digest};
+    let identity = format!(
+        "{}\0{}",
+        account.name,
+        crate::backend::redact_source(&account.source)
+    );
+    let hash = digest(&SHA256, identity.as_bytes());
+    let key = hash.as_ref()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    data_root.join("jerc").join("outbox").join(format!("{key}.json"))
+}
+
 impl Store {
     #[cfg(test)]
     pub(crate) fn for_test(path: PathBuf) -> Self {
@@ -100,19 +117,8 @@ impl Store {
         let Some(root) = dirs::data_local_dir() else {
             return (None, Vec::new());
         };
-        use ring::digest::{SHA256, digest};
-        let identity = format!(
-            "{}\0{}",
-            account.name,
-            crate::backend::redact_source(&account.source)
-        );
-        let hash = digest(&SHA256, identity.as_bytes());
-        let key = hash.as_ref()[..16]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
         let mut store = Self {
-            path: root.join("jerc").join("outbox").join(format!("{key}.json")),
+            path: path_for_account(account, &root),
             readable: true,
         };
         let messages = match store.read() {

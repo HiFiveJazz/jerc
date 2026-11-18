@@ -140,10 +140,30 @@ impl AccountState {
     }
 }
 
+/// Periodic fallback checks both the Inbox and the displayed non-Inbox
+/// mailbox. IDLE may not be advertised, may disconnect, or may be disabled
+/// for huge folders. Only metadata-only STATUS requests are issued.
+fn periodic_status_targets(mailboxes: &[Mailbox], active: Option<&str>) -> Vec<String> {
+    let mut targets = mailboxes
+        .iter()
+        .find(|mailbox| mailbox.role == MailboxRole::Inbox)
+        .map(|mailbox| vec![mailbox.name.clone()])
+        .unwrap_or_default();
+    if let Some(name) = active
+        && !targets.iter().any(|target| target == name)
+        && mailboxes.iter().any(|mailbox| mailbox.name == name)
+    {
+        targets.push(name.to_owned());
+    }
+    targets
+}
+
 impl App {
-    /// Poll just the Inbox count. No bodies and no full folder scans.
+    /// Poll Inbox counts for all accounts and the active mailbox for the
+    /// visible account. No bodies and no full folder scans.
     pub fn poll_inboxes(&mut self) {
-        for account in &mut self.accounts {
+        let visible_account = self.account_index;
+        for (index, account) in self.accounts.iter_mut().enumerate() {
             if account.capabilities.is_none()
                 || account.connecting
                 || account.mailboxes_loading
@@ -152,15 +172,12 @@ impl App {
             {
                 continue;
             }
-            let Some(inbox) = account
-                .mailboxes
-                .iter()
-                .find(|mailbox| mailbox.role == MailboxRole::Inbox)
-                .map(|mailbox| mailbox.name.clone())
-            else {
-                continue;
-            };
-            account.queue_status_refresh(inbox);
+            let active = (index == visible_account)
+                .then_some(account.current_mailbox.as_deref())
+                .flatten();
+            for name in periodic_status_targets(&account.mailboxes, active) {
+                account.queue_status_refresh(name);
+            }
             Self::pump_mailbox_status(account);
         }
     }
@@ -192,6 +209,20 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_status_fallback_includes_only_inbox_and_active_folder() {
+        let folders = vec![
+            Mailbox::new("INBOX", MailboxRole::Inbox),
+            Mailbox::new("Drafts", MailboxRole::Drafts),
+            Mailbox::new("Sent", MailboxRole::Sent),
+        ];
+        assert_eq!(periodic_status_targets(&folders, None), vec!["INBOX"]);
+        assert_eq!(periodic_status_targets(&folders, Some("INBOX")), vec!["INBOX"]);
+        assert_eq!(periodic_status_targets(&folders, Some("Drafts")), vec!["INBOX", "Drafts"]);
+        assert_eq!(periodic_status_targets(&folders, Some("Deleted")), vec!["INBOX"]);
+        assert_eq!(periodic_status_targets(&folders[..1], Some("Drafts")), vec!["INBOX"]);
+    }
 
     fn known(name: &str, counts_known: bool) -> Mailbox {
         // Use the same mailbox constructor/parser as the rest of the test suite.

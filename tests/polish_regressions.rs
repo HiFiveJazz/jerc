@@ -168,6 +168,16 @@ fn gmail_style_forward_attribution_preserves_origin_headers() {
     assert!(!forward.contains("Bcc:"));
 }
 
+#[test]
+fn forward_attribution_without_sender_name_borrows_address() {
+    let forward = jerc::outgoing::forward_attribution(
+        b"From: no-name@example.test\r\nSubject: No display name\r\n\r\nHello",
+    )
+    .unwrap();
+    assert!(forward.contains("From: no-name@example.test\n"));
+    assert!(forward.contains("Subject: No display name\n"));
+}
+
 const REACTION_WITHOUT_FILES: &[u8] = b"From: Someone <someone@example.org>\r\nSubject: Reaction\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=react\r\n\r\n--react\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nLiked your email\r\n--react\r\nContent-Type: text/vnd.google.email-reaction+json; charset=utf-8\r\n\r\n{\"emoji\":\"smile\",\"version\":1}\r\n--react\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Liked your email</p>\r\n--react--\r\n";
 
 #[test]

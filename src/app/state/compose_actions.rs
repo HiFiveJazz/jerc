@@ -155,11 +155,16 @@ impl App {
             return;
         };
         let account_index = self.account_index;
+        let cache = account.uid_validities.get(&mailbox).copied()
+            .filter(|validity| message_id.0.starts_with(&format!("imap-uid:{validity}:")))
+            .and_then(|validity| account.raw_store.as_ref()
+                .map(|store| (store.dir.clone(), validity)));
         let queued = account
             .worker
             .post(ActionKind::FetchRawForCompose {
                 mailbox: mailbox.clone(),
                 id: message_id.clone(),
+                cache,
             })
             .is_ok();
         if queued {
@@ -257,26 +262,29 @@ impl App {
             );
             return;
         }
-        // Fetch the original MIME for every reply/forward. Reply targets must
-        // come from the real To/Cc/Reply-To/List-Post headers, not the reader
-        // projection or the sender summary. Forwarding preserves raw bytes.
-        let Some((message_id, mailbox)) = self.account().and_then(|account| {
-            Some((
-                account.selected_message()?.id.clone(),
-                account.current_mailbox.clone()?,
-            ))
-        }) else {
-            return;
-        };
-        let request_id = self.account().and_then(|account| {
-            account
-                .worker
-                .post(ActionKind::FetchRawForCompose {
-                    mailbox,
-                    id: message_id.clone(),
-                })
-                .ok()
-        });
+        // MIME bytes, recipients and attachment metadata are prepared by the
+        // read-only worker. The event loop only installs the finished composer.
+        let own_addresses = self.accounts.iter()
+            .filter_map(|a| a.from.parse::<lettre::message::Mailbox>().ok())
+            .map(|a| a.email.to_string()).collect::<Vec<_>>();
+        let Some((message_id, mailbox, summary, cache)) = self.account().and_then(|account| {
+            let message = account.selected_message()?.clone();
+            let mailbox = account.current_mailbox.clone()?;
+            let cache = account.uid_validities.get(&mailbox).copied()
+                .filter(|validity| message.id.0.starts_with(&format!("imap-uid:{validity}:")))
+                .and_then(|validity| account.raw_store.as_ref()
+                    .map(|store| (store.dir.clone(), validity)));
+            Some((message.id.clone(), mailbox, message, cache))
+        }) else { return; };
+        let request_id = self.account().and_then(|account| account.worker
+            .post(ActionKind::PrepareCompose {
+                mailbox,
+                id: message_id.clone(),
+                summary,
+                intent,
+                own_addresses,
+                cache,
+            }).ok());
         if let Some(request_id) = request_id {
             self.pending_compose = Some(PendingCompose {
                 account: account_index,
@@ -873,7 +881,9 @@ impl App {
                 }
                 KeyCode::Char('i') => composer.mode = ComposeMode::Insert,
                 KeyCode::Char('a') => {
-                    composer.move_horizontal(1);
+                    // Vim's append stops at the end of the *current* line;
+                    // horizontal() can otherwise step across its newline.
+                    composer.cursor = composer.cursor.saturating_add(1).min(composer.line_end());
                     composer.mode = ComposeMode::Insert;
                 }
                 KeyCode::Char('I') => {

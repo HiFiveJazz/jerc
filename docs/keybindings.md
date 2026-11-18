@@ -81,11 +81,6 @@ Normal, Insert, and Visual modes share Vim-style movement. Search the Compose `?
 | `Ctrl-n` / `Ctrl-p` | Alternative suggestion navigation when suggestions are active |
 | `Tab` / `Enter` | Accept a contact suggestion when shown |
 
-Plain yanks (`y`, `yy`, `Y`) use a session-only internal register shared with the reader; they do not automatically copy to the system clipboard. Explicit cuts with `x` also attempt a system-clipboard copy and retain the internal register if the clipboard is unavailable. The register is not written to postponed drafts. The reader's `y` also attempts to copy to the system clipboard as before. For externally copied text, use your terminal's normal paste shortcut in Insert mode.
-
-From the send preview, `Enter` sends; `Esc` returns to the editor. Saving a draft is not the same as sending it.
-
-Jerc highlights mailing-list reply attributions (such as “On ... wrote:”), `>` quoted text, and deeper `>>`/`> >` quote levels using the active theme. The author’s unquoted reply keeps the normal foreground color. Git diff highlighting still takes precedence inside actual patch hunks. This is a native Rust text renderer; no Tree-sitter grammar or additional parser is required.
 
 ## Contacts (`Alt-c`)
 
@@ -151,7 +146,3 @@ See [Contacts](contacts.md) for importing/learning behavior and storage details.
 | `q` / `Ctrl-c` | Quit from mail browser |
 
 Terminal key handling can vary with your terminal and modifiers. When unsure, use `?` in the relevant view.
-
-In **Notices** (`!`), use `j`/`k`, `gg`/`G`, count prefixes and relative line numbers to navigate. `Space` marks rows; `v`/`V` selects a visual range with the same checkmarks and selection colors as the mail browser and Contacts. `Enter` opens a notice; `Esc` returns to the list. Press `?` for searchable keybindings. Use `d` to **dismiss** the selected notice(s) with the standard **[Y]es** / **[N]o** confirmation, or `D` to dismiss immediately. Dismissal only hides notices from Jerc's list; it does **not** delete queued mail, remove uncertain IMAP/SMTP journal records, retry work, or change anything on the mail server. An amber `!` appears in the mail browser while any undismissed notice is active. The Notices footer displays the matching notice count on the right. Queued work still syncs only when safe, and manual-review work is never retried automatically.
-
-Saved drafts: open a message inside the **Drafts** mailbox with `Enter` to preview it; select **[Y]es** to edit or **[N]o** to keep reading. `Ctrl-N` still resumes a locally postponed draft. The original server draft is retained until a replacement is saved or the message is sent successfully.

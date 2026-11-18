@@ -103,6 +103,8 @@ impl App {
                     }
                 }
                 Self::pump_mailbox_status(account);
+                account.plan_mailbox_warming();
+                account.pump_mailbox_warming();
                 account.pump_deferred_mutations();
                 account.pump_outbox();
             }
@@ -112,7 +114,11 @@ impl App {
                 }
                 // An IDLE wakeup during another STATUS is not expendable:
                 // retain one refresh per mailbox until the current request ends.
-                account.queue_status_refresh(name);
+                account.queue_status_refresh(name.clone());
+                if account.current_mailbox.as_deref() != Some(name.as_str()) {
+                    account.forget_cached_folder(&name);
+                    account.rewarm_mailbox(&name);
+                }
                 Self::pump_mailbox_status(account);
             }
             WorkerEventKind::MailboxStatus {
@@ -228,6 +234,26 @@ impl App {
                         subject,
                         excerpt,
                     });
+                }
+            }
+            WorkerEventKind::MailboxWarmed { name, page, uid_validity, uid_next } => {
+                if account.mailbox_warm_request.as_ref()
+                    != Some(&(event.request_id, name.clone())) {
+                    return; // superseded by a mutation or newer LIST
+                }
+                account.mailbox_warm_request = None;
+                if account.current_mailbox.as_deref() != Some(name.as_str()) {
+                    account.accept_warmed_mailbox(name, page, uid_validity, uid_next);
+                }
+                account.pump_mailbox_warming();
+            }
+            WorkerEventKind::MailboxWarmFailed { name } => {
+                if account.mailbox_warm_request.as_ref()
+                    == Some(&(event.request_id, name)) {
+                    account.mailbox_warm_request = None;
+                    // A failed optional preload is not an account failure.
+                    // Stop the series until the next LIST/explicit refresh.
+                    account.mailbox_warm_queue.clear();
                 }
             }
             WorkerEventKind::MailboxOpened {

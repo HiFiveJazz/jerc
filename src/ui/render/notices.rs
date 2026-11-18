@@ -308,7 +308,7 @@ fn draw_notice_confirmation(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
     } else {
         format!("Dismiss {count} notices? They will disappear from the list.")
     };
-    // Use the exact same centered Yes/No component as Review mail action.
+    // Use the same centered Yes/No component used by mail confirmations.
     draw_short_confirmation(
         frame,
         theme,

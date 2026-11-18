@@ -414,7 +414,7 @@ impl App {
 
     /// Snapshot visible names for confirmation. The preview must match the
     /// identities that will be sent to the worker even if the list changes.
-    pub(super) fn message_review_items(&self, ids: &[MessageId]) -> Vec<String> {
+    pub(super) fn message_review_items(&self, ids: &[MessageId]) -> Vec<MailReviewItem> {
         let Some(account) = self.account() else {
             return Vec::new();
         };
@@ -427,14 +427,17 @@ impl App {
         ids.iter()
             .map(|id| {
                 by_id.get(id).map_or_else(
-                    || "(message no longer loaded)".to_owned(),
-                    |message| {
-                        let subject = if message.subject.trim().is_empty() {
-                            "(no subject)"
+                    || MailReviewItem {
+                        subject: "(message no longer loaded)".to_owned(),
+                        from_address: String::new(),
+                    },
+                    |message| MailReviewItem {
+                        subject: if message.subject.trim().is_empty() {
+                            "(no subject)".to_owned()
                         } else {
-                            message.subject.as_str()
-                        };
-                        format!("{subject}  ·  {}", message.from_address)
+                            message.subject.clone()
+                        },
+                        from_address: message.from_address.clone(),
                     },
                 )
             })
@@ -670,8 +673,9 @@ impl App {
                 items,
                 review: ReviewScroll::default(),
                 prompt: format!(
-                    "Archive {} Gmail message(s)? This uses IMAP expunge; check Gmail deletion settings first. [y/N]",
-                    ids.len()
+                    "Archive {} email{}?",
+                    ids.len(),
+                    if ids.len() == 1 { "" } else { "s" }
                 ),
                 source,
                 ids,
@@ -691,9 +695,10 @@ impl App {
                     return;
                 };
                 match crate::setup::remove_account(&self.setup_config_path, &name) {
-                    Ok(()) => {
+                    Ok(account) => {
+                        self.pending_account_cleanup.push(account);
                         self.status = StatusLine::info(format!(
-                            "Removed {name:?} from local config; server mail untouched"
+                            "Removing {name:?} and its local data; server mail untouched"
                         ));
                         self.setup_reload_requested = true;
                     }
@@ -810,8 +815,19 @@ impl App {
                 self.start_mutation(confirmation.source, confirmation.ids, confirmation.kind);
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') => {
+                let cancelled_archive = self
+                    .confirmation
+                    .as_ref()
+                    .is_some_and(MutationConfirmation::is_archive);
                 self.confirmation = None;
-                self.status = StatusLine::temporary("delete cancelled", Duration::from_secs(2));
+                self.status = StatusLine::temporary(
+                    if cancelled_archive {
+                        "archive cancelled"
+                    } else {
+                        "delete cancelled"
+                    },
+                    Duration::from_secs(2),
+                );
             }
             _ => {}
         }
@@ -932,6 +948,15 @@ impl App {
                     account
                         .pending_mutation_labels
                         .insert(request, complete_label);
+                    let destination = match &kind {
+                        MutationKind::Move { destination }
+                        | MutationKind::Archive { destination }
+                        | MutationKind::Unarchive { destination } => Some(destination.clone()),
+                        MutationKind::Delete => None,
+                    };
+                    if let Some(destination) = destination {
+                        account.pending_destination_refresh.insert(request, destination);
+                    }
                     true
                 }
                 Err(_) => false,
