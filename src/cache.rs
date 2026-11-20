@@ -5,9 +5,9 @@
 //! This is a display cache, never an authority for IMAP UID mutations.
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -28,12 +28,29 @@ const MAX_BODIES_PER_FOLDER: usize = 12;
 const MAX_BODY_FILE_BYTES: u64 = 512 * 1024;
 const MAX_BODY_STORE_BYTES: u64 = 64 * 1024 * 1024;
 const PRUNE_AFTER_WRITES: usize = 8;
+// Display-cache changes can wait briefly; unlike outgoing mail and offline
+// mutations, this index is not a crash-durable journal. Coalesce bursts but
+// bound the delay under continuous background sync activity.
+const CACHE_WRITE_QUIET: Duration = Duration::from_millis(500);
+const CACHE_WRITE_MAX_DELAY: Duration = Duration::from_secs(2);
 /// Bounded pending flag changes, scoped to the server's mailbox generation.
 pub(crate) const MAX_DEFERRED_SEEN: usize = 512;
 /// Queue is bounded independently of mailbox index and MIME storage.
 pub(crate) const MAX_DEFERRED_MUTATIONS: usize = 256;
 const MAX_MUTATION_IDS: usize = 512;
 const MAX_MUTATION_JOURNAL_BYTES: u64 = 256 * 1024;
+
+// serde_json emits many tiny Write calls. Without buffering, writing a large
+// mailbox index can generate hundreds of thousands of write(2) syscalls.
+// Keep the existing streaming format and atomic temp-file replacement, but
+// coalesce those fragments before they reach the filesystem.
+const CACHE_JSON_BUFFER_BYTES: usize = 64 * 1024;
+
+fn write_json_buffered<W: Write, T: Serialize>(sink: W, value: &T) -> std::io::Result<()> {
+    let mut writer = BufWriter::with_capacity(CACHE_JSON_BUFFER_BYTES, sink);
+    serde_json::to_writer(&mut writer, value).map_err(std::io::Error::other)?;
+    writer.flush()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DeferredMutationKind {
@@ -172,15 +189,13 @@ impl MutationStore {
             tmp.as_file()
                 .set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        serde_json::to_writer(
+        write_json_buffered(
             &mut tmp,
             &MutationFileRef {
                 version: VERSION,
                 entries,
             },
-        )
-        .map_err(std::io::Error::other)?;
-        tmp.flush()?;
+        )?;
         if tmp.as_file().metadata()?.len() > MAX_MUTATION_JOURNAL_BYTES {
             return Err(std::io::Error::other(
                 "offline operation journal exceeds size limit",
@@ -218,7 +233,7 @@ impl DeferredSeen {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CachedMailbox {
     pub messages: Vec<MessageSummary>,
     pub bodies: HashMap<MessageId, MessageBody>,
@@ -438,19 +453,19 @@ impl PendingChanges {
     }
 
     fn drain_into(&mut self, snapshot: &mut Snapshot) -> bool {
-        let changed =
-            self.mailboxes.is_some() || !self.folders.is_empty() || self.deferred_seen.is_some();
+        let mut changed = false;
         if let Some(mailboxes) = self.mailboxes.take() {
-            apply(snapshot, Change::Mailboxes(mailboxes));
+            changed |= apply(snapshot, Change::Mailboxes(mailboxes));
         }
         if let Some(entries) = self.deferred_seen.take() {
-            apply(snapshot, Change::DeferredSeen(entries));
+            changed |= apply(snapshot, Change::DeferredSeen(entries));
         }
+        // Do not short-circuit: every pending change must still be applied.
         for (name, folder) in self.folders.drain() {
-            match folder {
+            changed |= match folder {
                 Some(folder) => apply(snapshot, Change::Folder(name, folder)),
                 None => apply(snapshot, Change::RemoveFolder(name)),
-            }
+            };
         }
         changed
     }
@@ -578,50 +593,7 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
     let join = thread::Builder::new()
         .name("mail-cache-writer".into())
         .spawn(move || {
-            let mut stored = writer_snapshot;
-            let mut body_writes = 0;
-            while rx.recv().is_ok() {
-                // Coalesce status replies and quick reader changes into a
-                // single disk write, without ever queueing duplicate bodies.
-                while rx.recv_timeout(Duration::from_millis(160)).is_ok() {}
-                let (index_changed, bodies) = if let Ok(mut changes) = thread_pending.lock() {
-                    let changed = changes.drain_into(&mut stored);
-                    (changed, changes.drain_bodies())
-                } else {
-                    (false, Vec::new())
-                };
-                if index_changed {
-                    let _ = write_snapshot(&path, &stored);
-                }
-                for (mailbox, validity, body) in bodies {
-                    if writer_body_store.write(&mailbox, validity, &body).is_ok() {
-                        body_writes += 1;
-                    }
-                }
-                if body_writes >= PRUNE_AFTER_WRITES {
-                    let _ = writer_body_store.prune();
-                    body_writes = 0;
-                }
-            }
-            // Final flush includes updates sent while another write was active.
-            let (index_changed, bodies) = if let Ok(mut changes) = thread_pending.lock() {
-                let changed = changes.drain_into(&mut stored);
-                (changed, changes.drain_bodies())
-            } else {
-                (false, Vec::new())
-            };
-            if index_changed {
-                let _ = write_snapshot(&path, &stored);
-            }
-            let mut final_writes = 0;
-            for (mailbox, validity, body) in bodies {
-                if writer_body_store.write(&mailbox, validity, &body).is_ok() {
-                    final_writes += 1;
-                }
-            }
-            if body_writes + final_writes > 0 {
-                let _ = writer_body_store.prune();
-            }
+            run_cache_writer(rx, path, thread_pending, writer_body_store, writer_snapshot);
         });
     match join {
         Ok(join) => (
@@ -638,13 +610,96 @@ pub(crate) fn open(account: &AccountConfig) -> (Snapshot, Option<Writer>) {
     }
 }
 
-fn apply(snapshot: &mut Snapshot, change: Change) {
+// Keep the real writer loop in one place so regression tests can exercise the
+// same batching, final flush, and shutdown behavior as production.
+fn run_cache_writer(
+    rx: Receiver<()>,
+    path: PathBuf,
+    pending: Arc<Mutex<PendingChanges>>,
+    body_store: BodyStore,
+    mut stored: Snapshot,
+) {
+    let mut index_dirty = false;
+    let mut body_writes = 0;
+    while rx.recv().is_ok() {
+        // Repeated status updates are often identical. Batch real
+        // changes without starving disk persistence on busy servers.
+        wait_for_cache_batch(&rx, CACHE_WRITE_QUIET, CACHE_WRITE_MAX_DELAY);
+        body_writes +=
+            flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut index_dirty);
+        if body_writes >= PRUNE_AFTER_WRITES {
+            let _ = body_store.prune();
+            body_writes = 0;
+        }
+    }
+    // The sender disconnects on shutdown. Persist any pending updates
+    // before joining the thread, even if the quiet timer did not fire.
+    body_writes += flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut index_dirty);
+    if body_writes > 0 {
+        let _ = body_store.prune();
+    }
+}
+
+// The event channel carries only wake tokens, not snapshots. Waiting for a
+// quiet period collapses rapid navigation and STATUS updates; the deadline
+// prevents endless traffic from postponing persistence indefinitely.
+fn wait_for_cache_batch(rx: &Receiver<()>, quiet: Duration, max_delay: Duration) {
+    let start = Instant::now();
+    loop {
+        let remaining = max_delay.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(quiet.min(remaining)) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+// Keep the index dirty if a write fails. An unchanged follow-up update or a
+// clean shutdown must still have a chance to retry the failed checkpoint.
+fn flush_cache_changes(
+    path: &Path,
+    stored: &mut Snapshot,
+    pending: &Arc<Mutex<PendingChanges>>,
+    body_store: &BodyStore,
+    index_dirty: &mut bool,
+) -> usize {
+    let (changed, bodies) = if let Ok(mut changes) = pending.lock() {
+        let changed = changes.drain_into(stored);
+        (changed, changes.drain_bodies())
+    } else {
+        (false, Vec::new())
+    };
+    *index_dirty |= changed;
+    if *index_dirty && write_snapshot(path, stored).is_ok() {
+        *index_dirty = false;
+    }
+    let mut writes = 0;
+    for (mailbox, validity, body) in bodies {
+        if matches!(body_store.write(&mailbox, validity, &body), Ok(true)) {
+            writes += 1;
+        }
+    }
+    writes
+}
+
+/// Return true only when the on-disk representation would actually change.
+/// Flags remain mutable, while shared immutable headers compare by value.
+fn apply(snapshot: &mut Snapshot, change: Change) -> bool {
     match change {
-        Change::Mailboxes(mailboxes) => snapshot.mailboxes = mailboxes,
+        Change::Mailboxes(mailboxes) => {
+            if snapshot.mailboxes == mailboxes {
+                return false;
+            }
+            snapshot.mailboxes = mailboxes;
+            true
+        }
         Change::Folder(name, mut folder) => {
             // Never cache UID-based IMAP data without a server UIDVALIDITY.
             if folder.uid_validity.is_none() {
-                return;
+                return false;
             }
             if folder.messages.len() > MAX_MESSAGES_PER_FOLDER {
                 folder.messages.truncate(MAX_MESSAGES_PER_FOLDER);
@@ -677,20 +732,32 @@ fn apply(snapshot: &mut Snapshot, change: Change) {
                     .collect::<Vec<_>>();
                 folder.bodies.retain(|id, _| keep.contains(id));
             }
-            if snapshot.folders.len() < MAX_FOLDERS || snapshot.folders.contains_key(&name) {
-                snapshot.folders.insert(name, folder);
+            if snapshot.folders.len() >= MAX_FOLDERS && !snapshot.folders.contains_key(&name) {
+                return false;
             }
+            if snapshot
+                .folders
+                .get(&name)
+                .is_some_and(|old| old == &folder)
+            {
+                return false;
+            }
+            snapshot.folders.insert(name, folder);
+            true
         }
-        Change::RemoveFolder(name) => {
-            snapshot.folders.remove(&name);
-        }
-        Change::Body(..) => {} // Persisted separately; never grows startup JSON.
+        Change::RemoveFolder(name) => snapshot.folders.remove(&name).is_some(),
+        Change::Body(..) => false, // Persisted separately; never grows startup JSON.
         Change::DeferredSeen(entries) => {
-            snapshot.deferred_seen = entries
+            let entries: Vec<_> = entries
                 .into_iter()
                 .filter(DeferredSeen::has_valid_identity)
                 .take(MAX_DEFERRED_SEEN)
                 .collect();
+            if snapshot.deferred_seen == entries {
+                return false;
+            }
+            snapshot.deferred_seen = entries;
+            true
         }
     }
 }
@@ -769,13 +836,19 @@ impl BodyStore {
             .then_some(record.body)
     }
 
-    fn write(&self, mailbox: &str, validity: u32, body: &MessageBody) -> std::io::Result<()> {
+    fn write(&self, mailbox: &str, validity: u32, body: &MessageBody) -> std::io::Result<bool> {
         if !body.id.0.starts_with(&format!("imap-uid:{validity}:")) {
             return Err(std::io::Error::other("body UIDVALIDITY mismatch"));
         }
+        let path = self.body_path(mailbox, validity, &body.id);
+        // An immutable UID-scoped MIME body is often scheduled for persistence
+        // more than once. Read/compare the existing entry before creating a
+        // temporary file; enriched metadata will still trigger replacement.
+        if self.read(mailbox, validity, &body.id).as_ref() == Some(body) {
+            return Ok(false);
+        }
         fs::create_dir_all(&self.dir)?;
         secure_private_dir(&self.dir)?;
-        let path = self.body_path(mailbox, validity, &body.id);
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
         #[cfg(unix)]
         {
@@ -783,7 +856,7 @@ impl BodyStore {
             tmp.as_file()
                 .set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        serde_json::to_writer(
+        write_json_buffered(
             &mut tmp,
             &BodyFileRef {
                 version: VERSION,
@@ -791,14 +864,12 @@ impl BodyStore {
                 validity,
                 body,
             },
-        )
-        .map_err(std::io::Error::other)?;
-        tmp.flush()?;
+        )?;
         if tmp.as_file().metadata()?.len() > MAX_BODY_FILE_BYTES {
             return Err(std::io::Error::other("body exceeds offline cache limit"));
         }
         tmp.persist(path).map_err(|error| error.error)?;
-        Ok(())
+        Ok(true)
     }
 
     fn prune(&self) -> std::io::Result<()> {
@@ -1051,7 +1122,7 @@ fn read_snapshot(path: &PathBuf) -> Option<Snapshot> {
     Some(snapshot)
 }
 
-fn write_snapshot(path: &PathBuf, snapshot: &Snapshot) -> std::io::Result<()> {
+fn write_snapshot(path: &Path, snapshot: &Snapshot) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Err(std::io::Error::other("no cache parent directory"));
     };
@@ -1064,15 +1135,13 @@ fn write_snapshot(path: &PathBuf, snapshot: &Snapshot) -> std::io::Result<()> {
         tmp.as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    serde_json::to_writer(
+    write_json_buffered(
         &mut tmp,
         &CacheFileRef {
             version: VERSION,
             snapshot,
         },
-    )
-    .map_err(std::io::Error::other)?;
-    tmp.flush()?;
+    )?;
     if tmp.as_file().metadata()?.len() > MAX_CACHE_BYTES {
         return Err(std::io::Error::other("mail cache size limit exceeded"));
     }
@@ -1083,6 +1152,37 @@ fn write_snapshot(path: &PathBuf, snapshot: &Snapshot) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_json_coalesces_small_serde_writes_without_changing_bytes() {
+        #[derive(Default)]
+        struct CountingSink {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+
+        impl Write for CountingSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // A realistic JSON collection with many tiny values; previously each
+        // string/colon/comma could cause its own write(2) syscall.
+        let headers = vec!["subject-and-sender"; 1_000];
+        let expected = serde_json::to_vec(&headers).unwrap();
+        assert!(expected.len() < CACHE_JSON_BUFFER_BYTES);
+        let mut sink = CountingSink::default();
+        write_json_buffered(&mut sink, &headers).unwrap();
+        assert_eq!(sink.bytes, expected);
+        assert_eq!(sink.writes, 1);
+    }
 
     #[test]
     fn raw_mime_store_is_private_uid_scoped_and_persistent() {
@@ -1144,6 +1244,586 @@ mod tests {
         store.write("INBOX", 12, &id, b"safe").unwrap();
         assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
         assert_eq!(store.read("INBOX", 12, &id), Some(b"safe".to_vec()));
+    }
+
+    #[test]
+    fn identical_index_updates_do_not_rewrite_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let body_store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let mut snapshot = Snapshot::default();
+        let mut dirty = false;
+
+        let inbox = folder(41, 3);
+        {
+            let mut changes = pending.lock().unwrap();
+            changes.insert(Change::Mailboxes(vec![Mailbox::new(
+                "INBOX",
+                crate::model::MailboxRole::Inbox,
+            )]));
+            changes.insert(Change::Folder("INBOX".into(), inbox.clone()));
+        }
+        assert_eq!(
+            flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty),
+            0
+        );
+        assert!(path.exists());
+        assert!(!dirty);
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).unwrap().ino()
+        };
+
+        // A fresh IMAP snapshot with equal values (not equal Arc identities)
+        // must not replace the existing inode, even after another checkpoint.
+        {
+            let mut changes = pending.lock().unwrap();
+            changes.insert(Change::Mailboxes(vec![Mailbox::new(
+                "INBOX",
+                crate::model::MailboxRole::Inbox,
+            )]));
+            changes.insert(Change::Folder("INBOX".into(), folder(41, 3)));
+            changes.insert(Change::RemoveFolder("Unknown".into()));
+            changes.insert(Change::DeferredSeen(vec![]));
+        }
+        assert_eq!(
+            flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty),
+            0
+        );
+        assert!(!dirty);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), original_inode);
+        }
+
+        // Flags really are mutable, and must cause a new checkpoint without
+        // copying the shared immutable RFC 5322 header allocation.
+        let original_headers = Arc::clone(&snapshot.folders["INBOX"].messages[0].headers);
+        let mut changed = folder(41, 3);
+        changed.messages[0]
+            .flags
+            .set(crate::model::MessageFlags::SEEN, true);
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Folder("INBOX".into(), changed));
+        flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty);
+        assert!(!dirty);
+        assert!(!snapshot.folders["INBOX"].messages[0].unread());
+        assert_eq!(
+            read_snapshot(&path).unwrap().folders["INBOX"].messages[0].flags,
+            snapshot.folders["INBOX"].messages[0].flags
+        );
+        // Original in-memory snapshots remain unaffected by COW/flag updates.
+        assert_eq!(original_headers.subject, "Subject 1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(fs::metadata(&path).unwrap().ino(), original_inode);
+        }
+    }
+
+    #[test]
+    fn uidvalidity_and_changed_headers_trigger_checkpoints() {
+        let mut snapshot = Snapshot::default();
+        assert!(apply(
+            &mut snapshot,
+            Change::Folder("INBOX".into(), folder(1, 2))
+        ));
+        assert!(!apply(
+            &mut snapshot,
+            Change::Folder("INBOX".into(), folder(1, 2))
+        ));
+        let mut edited = folder(1, 2);
+        edited.messages[0].subject = "Updated subject".into();
+        assert!(apply(&mut snapshot, Change::Folder("INBOX".into(), edited)));
+        assert!(!apply(
+            &mut snapshot,
+            Change::RemoveFolder("Unknown".into())
+        ));
+        assert!(apply(
+            &mut snapshot,
+            Change::Folder("INBOX".into(), folder(2, 2))
+        ));
+        assert_eq!(snapshot.folders["INBOX"].uid_validity, Some(2));
+        assert!(apply(&mut snapshot, Change::RemoveFolder("INBOX".into())));
+        assert!(!apply(&mut snapshot, Change::RemoveFolder("INBOX".into())));
+    }
+
+    #[test]
+    fn identical_body_is_not_rewritten_but_enriched_body_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let id = MessageId("imap-uid:17:42".into());
+        let original = body(id.clone(), "Hello");
+        assert!(store.write("INBOX", 17, &original).unwrap());
+        let path = store.body_path("INBOX", 17, &id);
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).unwrap().ino()
+        };
+        assert!(!store.write("INBOX", 17, &original).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), original_inode);
+        }
+        let mut enriched = original.clone();
+        enriched.attachment_count = 1;
+        assert!(store.write("INBOX", 17, &enriched).unwrap());
+        assert_eq!(store.read("INBOX", 17, &id).unwrap().attachment_count, 1);
+        // Corrupted persisted entries are repaired rather than treated as
+        // equivalent based on their filename or UID alone.
+        fs::write(&path, b"not json").unwrap();
+        assert!(store.write("INBOX", 17, &enriched).unwrap());
+        assert_eq!(store.read("INBOX", 17, &id).unwrap(), enriched);
+    }
+
+    #[test]
+    fn failed_index_checkpoint_is_retried_on_shutdown_without_new_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("not-a-dir");
+        fs::write(&parent, b"blocking file").unwrap();
+        let path = parent.join("index.json");
+        let body_store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Mailboxes(vec![Mailbox::new(
+                "INBOX",
+                crate::model::MailboxRole::Inbox,
+            )]));
+        let mut stored = Snapshot::default();
+        let mut dirty = false;
+        flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
+        assert!(dirty);
+        fs::remove_file(&parent).unwrap();
+        // No new event needed: final flush retries the still-dirty snapshot.
+        flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
+        assert!(!dirty);
+        assert_eq!(read_snapshot(&path).unwrap().mailboxes[0].name, "INBOX");
+    }
+
+    #[test]
+    fn continuous_cache_events_have_a_maximum_batch_delay() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(()).unwrap();
+        // A run of updates every ~2 ms must not postpone the checkpoint until
+        // the producer stops. Use a generous CI time bound, not a precise timer.
+        let sender = thread::spawn(move || {
+            for _ in 0..100 {
+                let _ = tx.try_send(());
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        rx.recv().unwrap();
+        let started = Instant::now();
+        wait_for_cache_batch(&rx, Duration::from_millis(50), Duration::from_millis(60));
+        assert!(started.elapsed() < Duration::from_millis(190));
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn buffered_json_stays_bounded_across_multiple_64k_blocks() {
+        #[derive(Default)]
+        struct CountingSink {
+            bytes: Vec<u8>,
+            write_calls: usize,
+        }
+
+        impl Write for CountingSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.write_calls += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Several hundred KiB of many small JSON fields used to issue tens
+        // of thousands of write(2) calls before we buffered serialization.
+        let values = (0..20_000)
+            .map(|index| format!("Subject {index:05}: sender@example.test"))
+            .collect::<Vec<_>>();
+        let expected = serde_json::to_vec(&values).unwrap();
+        assert!(expected.len() > CACHE_JSON_BUFFER_BYTES * 4);
+        let mut sink = CountingSink::default();
+        write_json_buffered(&mut sink, &values).unwrap();
+        assert_eq!(sink.bytes, expected);
+        assert!(sink.write_calls > 1);
+        assert!(
+            sink.write_calls <= expected.len() / CACHE_JSON_BUFFER_BYTES + 2,
+            "buffered writer made {} calls for {} bytes",
+            sink.write_calls,
+            expected.len()
+        );
+    }
+
+    #[test]
+    fn unchanged_multi_folder_refreshes_never_replace_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let body_store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let mut snapshot = Snapshot::default();
+        let mut dirty = false;
+        let mailboxes = vec![
+            Mailbox::new("INBOX", crate::model::MailboxRole::Inbox),
+            Mailbox::new("Sent", crate::model::MailboxRole::Sent),
+        ];
+
+        {
+            let mut changes = pending.lock().unwrap();
+            changes.insert(Change::Mailboxes(mailboxes.clone()));
+            changes.insert(Change::Folder("INBOX".into(), folder(81, 120)));
+            changes.insert(Change::Folder("Sent".into(), folder(82, 40)));
+        }
+        flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty);
+        assert!(!dirty);
+        let original_bytes = fs::read(&path).unwrap();
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).unwrap().ino()
+        };
+
+        // Repeated independent IMAP STATUS results arrive in different orders
+        // and reconstruct equal headers with fresh allocations.
+        for _ in 0..5 {
+            let mut changes = pending.lock().unwrap();
+            changes.insert(Change::Folder("Sent".into(), folder(82, 40)));
+            changes.insert(Change::Mailboxes(mailboxes.clone()));
+            changes.insert(Change::Folder("INBOX".into(), folder(81, 120)));
+            drop(changes);
+            assert_eq!(
+                flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty),
+                0
+            );
+            assert!(!dirty);
+            assert_eq!(fs::read(&path).unwrap(), original_bytes);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(fs::metadata(&path).unwrap().ino(), original_inode);
+            }
+        }
+
+        // A genuine flag change must still persist, without losing the other
+        // previously warmed folder.
+        let mut sent = folder(82, 40);
+        sent.messages[0]
+            .flags
+            .set(crate::model::MessageFlags::SEEN, true);
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Folder("Sent".into(), sent));
+        flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty);
+        let reloaded = read_snapshot(&path).unwrap();
+        assert!(!reloaded.folders["Sent"].messages[0].unread());
+        assert_eq!(reloaded.folders["INBOX"].messages.len(), 120);
+        assert!(!dirty);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(fs::metadata(&path).unwrap().ino(), original_inode);
+        }
+    }
+
+    #[test]
+    fn changing_only_terminal_html_layout_does_not_rewrite_disk_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let body_store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let mut stored = Snapshot::default();
+        let mut dirty = false;
+        let mut initial = folder(41, 1);
+        let id = initial.messages[0].id.clone();
+        let mut rendered = body(id.clone(), "Visible text");
+        rendered.html_source = Some("<p>Visible text</p>".into());
+        rendered.html_text = Some("Visible text".into());
+        rendered.html_lines = Some(Arc::new(vec![crate::model::HtmlLine::default()]));
+        rendered.html_render_width = 80;
+        initial.bodies.insert(id.clone(), rendered.clone());
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Folder("INBOX".into(), initial));
+        flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
+        assert!(!dirty);
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).unwrap().ino()
+        };
+        let old_bytes = fs::read(&path).unwrap();
+
+        let mut reflowed = folder(41, 1);
+        rendered.html_lines = Some(Arc::new(vec![
+            crate::model::HtmlLine::default(),
+            crate::model::HtmlLine::default(),
+        ]));
+        rendered.html_render_width = 120;
+        reflowed.bodies.insert(id, rendered);
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Folder("INBOX".into(), reflowed));
+        flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
+        assert!(!dirty);
+        assert_eq!(fs::read(&path).unwrap(), old_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        }
+    }
+
+    #[test]
+    fn mailbox_burst_keeps_only_the_final_folder_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let body_store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let mut snapshot = Snapshot::default();
+        let mut dirty = false;
+        {
+            let mut changes = pending.lock().unwrap();
+            changes.insert(Change::Folder("INBOX".into(), folder(14, 1)));
+            changes.insert(Change::Folder("Sent".into(), folder(15, 2)));
+        }
+        flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty);
+        {
+            let mut changes = pending.lock().unwrap();
+            changes.insert(Change::Folder("INBOX".into(), folder(14, 2)));
+            changes.insert(Change::RemoveFolder("INBOX".into()));
+            changes.insert(Change::Folder("INBOX".into(), folder(14, 5)));
+            changes.insert(Change::Folder("Sent".into(), folder(15, 4)));
+            changes.insert(Change::RemoveFolder("Sent".into()));
+            changes.insert(Change::RemoveFolder("NeverLoaded".into()));
+            assert_eq!(changes.folders.len(), 3);
+        }
+        flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty);
+        assert!(!dirty);
+        let persisted = read_snapshot(&path).unwrap();
+        assert_eq!(persisted.folders.len(), 1);
+        assert_eq!(persisted.folders["INBOX"].messages.len(), 5);
+        assert_eq!(persisted.folders["INBOX"].uid_validity, Some(14));
+        assert!(pending.lock().unwrap().folders.is_empty());
+    }
+
+    #[test]
+    fn queued_body_updates_write_only_the_latest_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let body_store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let mut snapshot = Snapshot::default();
+        let mut dirty = false;
+        let id = MessageId("imap-uid:19:4".into());
+        let latest = body(id.clone(), "Latest fetched text");
+        {
+            let mut changes = pending.lock().unwrap();
+            changes.insert(Change::Body("INBOX".into(), 19, body(id.clone(), "Old")));
+            changes.insert(Change::Body("INBOX".into(), 19, latest.clone()));
+        }
+        assert_eq!(
+            flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty),
+            1
+        );
+        assert!(
+            !path.exists(),
+            "body persistence must not rewrite the mailbox index"
+        );
+        assert_eq!(body_store.read("INBOX", 19, &id), Some(latest.clone()));
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(body_store.body_path("INBOX", 19, &id))
+                .unwrap()
+                .ino()
+        };
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Body("INBOX".into(), 19, latest.clone()));
+        assert_eq!(
+            flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty),
+            0
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(body_store.body_path("INBOX", 19, &id))
+                    .unwrap()
+                    .ino(),
+                original_inode
+            );
+        }
+        let mut enriched = latest;
+        enriched.attachment_count = 2;
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Body("INBOX".into(), 19, enriched.clone()));
+        assert_eq!(
+            flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty),
+            1
+        );
+        assert_eq!(body_store.read("INBOX", 19, &id), Some(enriched));
+    }
+
+    #[test]
+    fn failed_checkpoint_retries_the_latest_coalesced_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocked-parent");
+        fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("index.json");
+        let body_store = BodyStore {
+            dir: dir.path().join("bodies"),
+        };
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let mut stored = Snapshot::default();
+        let mut dirty = false;
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Folder("INBOX".into(), folder(31, 1)));
+        flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
+        assert!(dirty);
+
+        // More updates can arrive while the filesystem is unavailable; when
+        // persistence recovers it must save the newest state, not the first.
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Folder("INBOX".into(), folder(31, 3)));
+        fs::remove_file(&blocker).unwrap();
+        flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
+        assert!(!dirty);
+        assert_eq!(
+            read_snapshot(&path).unwrap().folders["INBOX"]
+                .messages
+                .len(),
+            3
+        );
+    }
+
+    fn test_cache_writer(path: PathBuf) -> Writer {
+        let (wake, rx) = mpsc::sync_channel::<()>(1);
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let body_store = BodyStore {
+            dir: path.with_extension("bodies"),
+        };
+        let worker_pending = Arc::clone(&pending);
+        let worker_store = body_store.clone();
+        let worker_path = path.clone();
+        let join = thread::spawn(move || {
+            run_cache_writer(
+                rx,
+                worker_path,
+                worker_pending,
+                worker_store,
+                Snapshot::default(),
+            );
+        });
+        Writer {
+            wake: Some(wake),
+            pending,
+            join: Some(join),
+            body_store,
+            mutation_store: MutationStore {
+                path: path.with_extension("mutations.json"),
+                readable: true,
+            },
+        }
+    }
+
+    #[test]
+    fn dropping_writer_flushes_batched_index_and_body_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let writer = test_cache_writer(path.clone());
+        let id = MessageId("imap-uid:31:1".into());
+        writer.send(Change::Folder("INBOX".into(), folder(31, 1)));
+        writer.send(Change::Body(
+            "INBOX".into(),
+            31,
+            body(id.clone(), "Saved body"),
+        ));
+        writer.send(Change::Mailboxes(vec![Mailbox::new(
+            "INBOX",
+            crate::model::MailboxRole::Inbox,
+        )]));
+        // No sleeps: an immediate quit must flush every pending cache change.
+        drop(writer);
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.mailboxes[0].name, "INBOX");
+        assert_eq!(loaded.folders["INBOX"].messages.len(), 1);
+        assert_eq!(
+            BodyStore {
+                dir: path.with_extension("bodies"),
+            }
+            .read("INBOX", 31, &id),
+            Some(body(id, "Saved body"))
+        );
+    }
+
+    #[test]
+    fn destructive_mutation_journal_is_saved_before_cache_batch_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let writer = test_cache_writer(path.clone());
+        writer.send(Change::Folder("INBOX".into(), folder(52, 1)));
+        let operation = DeferredMutation {
+            mailbox: "INBOX".into(),
+            validity: 52,
+            ids: vec![MessageId("imap-uid:52:1".into())],
+            kind: DeferredMutationKind::Delete,
+            state: DeferredMutationState::Queued,
+        };
+        writer
+            .save_mutations(std::slice::from_ref(&operation))
+            .unwrap();
+        // Crash-durable operations do not wait for the 500 ms display-cache
+        // debounce or for Writer::drop to join the background worker.
+        let journal = MutationStore {
+            path: path.with_extension("mutations.json"),
+            readable: true,
+        };
+        assert_eq!(journal.read().unwrap(), vec![operation.clone()]);
+        drop(writer);
+        assert_eq!(
+            read_snapshot(&path).unwrap().folders["INBOX"]
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(journal.read().unwrap(), vec![operation]);
     }
 
     #[test]

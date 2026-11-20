@@ -87,7 +87,7 @@ pub enum MailboxRole {
     Other,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Mailbox {
     pub name: String,
     pub role: MailboxRole,
@@ -111,7 +111,7 @@ impl Mailbox {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MessageHeaders {
     pub id: MessageId,
     pub message_id: Option<String>,
@@ -137,7 +137,7 @@ pub struct MessageHeaders {
 /// A lightweight message row. All RFC 5322 metadata is immutable and shared
 /// across UI, sync hints, warm folders and disk-writer snapshots. Only IMAP
 /// flags are independently mutable, so SEEN/FLAGGED changes need no copy.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MessageSummary {
     #[serde(flatten)]
     pub headers: Arc<MessageHeaders>,
@@ -204,7 +204,7 @@ pub struct HtmlLine {
     pub spans: Vec<HtmlSpan>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MessageBody {
     pub id: MessageId,
     /// Immutable MIME text/plain shared by live and persistent cache snapshots.
