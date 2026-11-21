@@ -954,15 +954,18 @@ fn stalled_page_request_times_out_but_preserves_cached_rows() {
 #[test]
 fn stalled_connect_request_releases_lock_and_can_retry() {
     let (_root, mut app, _rx) = fixture();
-    app.accounts[0].connecting = true;
-    app.accounts[0].connect_request_id = Some(103);
+    // Use an actual queued request ID: the process-wide counter may equal any
+    // hard-coded ID when tests run concurrently.
+    assert!(app.accounts[0].request_connect());
+    let stalled_id = app.accounts[0].connect_request_id.unwrap();
     app.accounts[0].sync_progress_at = Some(Instant::now() - Duration::from_secs(121));
     app.reconnect_offline_accounts();
     assert!(!app.accounts[0].connecting);
     assert!(!app.syncing_with_server());
+    assert!(app.accounts[0].connect_request_id.is_none());
     app.reconnect_offline_accounts();
     assert!(app.accounts[0].connecting);
-    assert_ne!(app.accounts[0].connect_request_id, Some(103));
+    assert_ne!(app.accounts[0].connect_request_id, Some(stalled_id));
 }
 
 #[test]

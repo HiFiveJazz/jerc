@@ -81,4 +81,16 @@ impl App {
     pub fn bootstrap(&mut self) {
         self.reconnect_offline_accounts();
     }
+
+    /// Offline launch still opens on-disk Maildir accounts while never
+    /// creating a remote connection or replaying queued offline writes.
+    pub fn bootstrap_local_only(&mut self, config: &crate::config::Config) {
+        for (state, account) in self.accounts.iter_mut().zip(&config.accounts) {
+            if crate::backend::BackendKind::from_source(&account.source)
+                == Some(crate::backend::BackendKind::Maildir)
+            {
+                state.request_connect();
+            }
+        }
+    }
 }

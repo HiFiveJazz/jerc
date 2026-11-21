@@ -245,7 +245,7 @@ pub struct StatusLine {
 }
 
 impl StatusLine {
-    fn info(text: impl Into<String>) -> Self {
+    pub(crate) fn info(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             is_error: false,

@@ -29,14 +29,52 @@ use crate::worker::{RuntimeEvent, WorkerHandle};
 // A bounded queue still absorbs bursts while the UI renders.
 const RUNTIME_EVENT_QUEUE_CAPACITY: usize = 512;
 
+/// CLI-only startup actions. The default remains identical to `run_tui`.
+#[derive(Debug, Default)]
+pub struct LaunchOptions {
+    pub account: Option<String>,
+    pub offline: bool,
+    pub open_first_message: bool,
+    pub compose: Option<StartupCompose>,
+}
+
+#[derive(Debug, Default)]
+pub struct StartupCompose {
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub body: String,
+    pub attachments: Vec<std::path::PathBuf>,
+}
+
+/// Runtime-only toggles, kept together so event-loop arguments stay focused.
+struct EventLoopOptions {
+    offline: bool,
+    open_first_message: bool,
+}
+
 pub fn run_tui(config: Config) -> Result<()> {
+    run_tui_with_options(config, LaunchOptions::default())
+}
+
+pub fn run_tui_with_options(config: Config, options: LaunchOptions) -> Result<()> {
     let (config, configuration_warnings) = validate_account_configuration(config)?;
     let (runtime_tx, runtime_rx) = sync_channel::<RuntimeEvent>(RUNTIME_EVENT_QUEUE_CAPACITY);
     let active_epoch = Arc::new(AtomicU64::new(0));
     let worker_tx = scoped_worker_sender(runtime_tx.clone(), Arc::clone(&active_epoch), 0);
-    let workers = create_workers(&config, worker_tx)?;
+    let account_index = options.account.as_deref().map(|name| {
+        config.accounts.iter().position(|account| account.name == name)
+            .ok_or_else(|| anyhow!("no configured account named {name:?}"))
+    }).transpose()?;
+    let workers = create_workers(&config, worker_tx, options.offline)?;
     let mut app = App::new(&config, workers);
-    app.bootstrap();
+    if let Some(index) = account_index { app.account_index = index; }
+    if options.offline { app.bootstrap_local_only(&config); } else { app.bootstrap(); }
+    if let Some(compose) = options.compose { app.open_cli_compose(compose); }
+    if options.offline {
+        app.status = crate::app::StatusLine::info("offline mode — cached mail only");
+    }
     app.attach_setup_sender(runtime_tx.clone());
     app.startup_warnings.extend(configuration_warnings);
     if !app.startup_warnings.is_empty() {
@@ -82,6 +120,10 @@ pub fn run_tui(config: Config) -> Result<()> {
         runtime_tx,
         active_epoch,
         &mut oauth_cleanup_jobs,
+        EventLoopOptions {
+            offline: options.offline,
+            open_first_message: options.open_first_message,
+        },
     );
     app.detach_network_workers_for_exit();
     drop(terminal);
@@ -142,6 +184,13 @@ fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<Str
         ));
     }
     Ok((config, warnings))
+}
+
+/// Validate account schemes and configuration without making connections.
+pub fn check_configuration(config: Config) -> Result<usize> {
+    let (checked, warnings) = validate_account_configuration(config)?;
+    anyhow::ensure!(warnings.is_empty(), "{}", warnings.join("\n"));
+    Ok(checked.accounts.len())
 }
 
 fn safe_scheme(uri: &str) -> &str {
@@ -208,7 +257,17 @@ fn create_worker(
     index: usize,
     account: &crate::config::AccountConfig,
     runtime_tx: &SyncSender<RuntimeEvent>,
+    offline: bool,
 ) -> Result<WorkerHandle> {
+    // Deliberately do not construct a network client while offline. Even
+    // manual refresh and background recovery then cannot make a connection.
+    if offline && backend::BackendKind::from_source(&account.source)
+        != Some(backend::BackendKind::Maildir)
+    {
+        return Ok(WorkerHandle::spawn_with_idle_and_selected(
+            index, Box::new(OfflineBackend), None, None, None, None, runtime_tx.clone(),
+        ));
+    }
     // JMAP workers share a bounded account-scoped metadata cache and HTTP
     // connection pool; a single account-wide watch replaces folder watchers.
     let kind = backend::BackendKind::from_source(&account.source);
@@ -270,6 +329,35 @@ fn create_worker(
     Ok(worker)
 }
 
+/// Network-free backend used by `--offline`. Restored disk caches remain
+/// available in the application, while all uncached operations fail locally.
+struct OfflineBackend;
+
+impl backend::MailBackend for OfflineBackend {
+    fn capabilities(&self) -> crate::model::Capabilities { crate::model::Capabilities::MAILDIR }
+    fn connect(&mut self) -> Result<()> { Err(anyhow!("offline mode: network access disabled")) }
+    fn list_mailboxes(&mut self) -> Result<Vec<crate::model::Mailbox>> { Err(anyhow!("offline mode")) }
+    fn mailbox_status(&mut self, _name: &str) -> Result<(usize, usize)> { Err(anyhow!("offline mode")) }
+    fn open_mailbox(&mut self, _name: &str, _offset: usize, _limit: usize) -> Result<crate::model::MessagePage> {
+        Err(anyhow!("offline mode"))
+    }
+    fn fetch_body(&mut self, _mailbox: &str, _id: &crate::model::MessageId) -> Result<crate::model::MessageBody> {
+        Err(anyhow!("offline mode"))
+    }
+    fn fetch_raw(&mut self, _mailbox: &str, _id: &crate::model::MessageId) -> Result<Vec<u8>> {
+        Err(anyhow!("offline mode"))
+    }
+    fn set_seen(&mut self, _mailbox: &str, _id: &crate::model::MessageId, _seen: bool) -> Result<()> {
+        Err(anyhow!("offline mode"))
+    }
+    fn delete(&mut self, _mailbox: &str, _id: &crate::model::MessageId) -> Result<()> {
+        Err(anyhow!("offline mode"))
+    }
+    fn move_to(&mut self, _source: &str, _destination: &str, _id: &crate::model::MessageId) -> Result<()> {
+        Err(anyhow!("offline mode"))
+    }
+}
+
 /// Only the visible account watches its selected folder. Other accounts
 /// continue monitoring their Inbox on the original dedicated connection.
 /// Called every event-loop iteration so keyboard, mouse, worker results, and
@@ -305,10 +393,11 @@ fn sync_selected_idle_watchers(app: &App) {
 fn create_workers(
     config: &Config,
     runtime_tx: SyncSender<RuntimeEvent>,
+    offline: bool,
 ) -> Result<Vec<WorkerHandle>> {
     let mut workers = Vec::with_capacity(config.accounts.len());
     for (index, account) in config.accounts.iter().enumerate() {
-        match create_worker(index, account, &runtime_tx) {
+        match create_worker(index, account, &runtime_tx, offline) {
             Ok(worker) => workers.push(worker),
             Err(error) => {
                 // A late configuration error must not synchronously drop
@@ -377,7 +466,13 @@ fn event_loop(
     runtime_tx: SyncSender<RuntimeEvent>,
     active_epoch: Arc<AtomicU64>,
     oauth_cleanup_jobs: &mut Vec<thread::JoinHandle<()>>,
+    options: EventLoopOptions,
 ) -> Result<()> {
+    let EventLoopOptions {
+        offline,
+        mut open_first_message,
+    } = options;
+
     // Animation is deadline-driven instead of timeout-driven.  The old loop only
     // advanced smooth scrolling when recv_timeout() *timed out*, so a steady
     // stream of worker events (mailbox STATUS refreshes are a common example)
@@ -392,7 +487,7 @@ fn event_loop(
     while !app.should_quit {
         sync_selected_idle_watchers(app);
         app.flush_contacts(false);
-        if resume_detector.check(SystemTime::now(), Instant::now()) {
+        if !offline && resume_detector.check(SystemTime::now(), Instant::now()) {
             // Resume can leave IMAP sockets unusable while monotonic timers
             // still think they have plenty of time. Reconnect read-only
             // sessions immediately; never detach an unacknowledged write.
@@ -405,15 +500,15 @@ fn event_loop(
         if app.expire_status() {
             render(terminal, app)?;
         }
-        if now >= next_recovery_check {
+        if !offline && now >= next_recovery_check {
             app.recover_stalled_foreground_accounts();
             next_recovery_check = now + Duration::from_secs(2);
         }
-        if now >= next_reconnect {
+        if !offline && now >= next_reconnect {
             app.reconnect_offline_accounts();
             next_reconnect = now + Duration::from_secs(10);
         }
-        if now >= next_inbox_poll {
+        if !offline && now >= next_inbox_poll {
             app.poll_inboxes();
             next_inbox_poll = now + app.inbox_poll_interval();
         }
@@ -540,6 +635,10 @@ fn event_loop(
             RuntimeEvent::InputStopped => break,
         }
 
+        if open_first_message && app.open_cli_first_message() {
+            open_first_message = false;
+        }
+
         if std::mem::take(&mut app.setup_reload_requested) {
             // A write may have reached the remote server even if its ACK is
             // still queued. Keep processing events until every write is
@@ -558,7 +657,7 @@ fn event_loop(
             let result = Config::load_or_empty(Some(&app.setup_config_path))
                 .and_then(validate_account_configuration)
                 .and_then(|(config, warnings)| {
-                    let workers = create_workers(&config, worker_tx)?;
+                    let workers = create_workers(&config, worker_tx, offline)?;
                     Ok((config, workers, warnings))
                 });
             match result {

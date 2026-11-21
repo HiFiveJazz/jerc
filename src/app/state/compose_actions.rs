@@ -197,6 +197,24 @@ impl App {
             StatusLine::info("editing saved draft; original preserved until replacement succeeds");
     }
 
+    /// Populate the existing composer from a CLI URI or patch. Merely opening
+    /// a draft does not send, queue, or persist it.
+    pub fn open_cli_compose(&mut self, draft: crate::runtime::StartupCompose) {
+        let mut composer = Composer::new();
+        composer.to = draft.to;
+        composer.cc = draft.cc;
+        composer.bcc = draft.bcc;
+        composer.subject = draft.subject;
+        composer.body = draft.body;
+        composer.attachment_paths = draft.attachments;
+        composer.field = if composer.body.is_empty() { ComposeField::To } else { ComposeField::Body };
+        composer.cursor = if composer.field == ComposeField::Body { composer.body.chars().count() } else { composer.to.chars().count() };
+        self.composer = Some(composer);
+        self.pending_draft = None;
+        self.pending_compose = None;
+        self.resumed_draft_account = None;
+    }
+
     pub(super) fn begin_compose(&mut self) {
         let Some(account) = self.account() else {
             return;

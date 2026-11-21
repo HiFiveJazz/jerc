@@ -136,11 +136,29 @@ Jerc uses separate per-user directories for different kinds of data. The exact b
 ## Command-line tools
 
 ```sh
-jerc --version
+jerc -v
+jerc -c ~/.config/jerc/config.toml
+jerc -a Personal                   # Select a configured account
+jerc --offline                    # Cached mail; no remote connections
+jerc --check-config               # Validate without opening the TUI
+jerc -m ~/Maildir -n Local
 jerc --discover-email you@example.com
 jerc --oauth-login Personal
 jerc --oauth-probe Personal
 jerc --headless-check
+
+# View local files using the existing reader
+jerc 0001-kernel-fix.patch
+jerc message.eml
+jerc mail-archive.mbox
+jerc mbox:mail-archive.mbox
+cat message.eml | jerc -
+git format-patch -1 --stdout | jerc -
+
+# Populate the existing composer; neither command sends automatically
+jerc 'mailto:person@example.org?subject=Hello'
+jerc --draft-patch 0001-kernel-fix.patch
+jerc --draft-patch 0001-kernel-fix.patch --attach extra.txt
 ```
 
-All commands are available through `jerc --help`. For developer builds, substitute `cargo run --release --` for `jerc`.
+All options, `jerc -h` (or `jerc --help`). For developer builds, substitute `cargo run --release --` for `jerc`.

@@ -400,6 +400,41 @@ impl Config {
         }
     }
 
+    /// Read UI and contacts preferences without loading or validating remote
+    /// accounts. Used for temporary local-file and standalone Maildir sessions:
+    /// the user's theme/layout still apply, but no mail account is opened.
+    pub fn load_preferences_only(path: Option<&Path>) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Preferences {
+            #[serde(default)]
+            ui: UiConfig,
+            #[serde(default)]
+            contacts: ContactsConfig,
+        }
+
+        let path = path.map_or_else(default_config_path, Path::to_path_buf);
+        let mut config = Self {
+            accounts: Vec::new(),
+            ui: UiConfig::default(),
+            contacts: ContactsConfig::default(),
+            config_path: Some(path.clone()),
+        };
+        match fs::read_to_string(&path) {
+            Ok(contents) if !contents.trim().is_empty() => {
+                let preferences: Preferences = toml::from_str(&contents)
+                    .with_context(|| format!("parsing config {}", path.display()))?;
+                config.ui = preferences.ui;
+                config.contacts = preferences.contacts;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading config {}", path.display()));
+            }
+        }
+        Ok(config)
+    }
+
     fn normalize_accounts(&mut self) {
         for account in &mut self.accounts {
             // Preserve multi-account recovery: a malformed shortcut must not
@@ -797,6 +832,41 @@ fn default_theme() -> String {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn local_file_preferences_keep_theme_without_loading_remote_accounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        // Intentionally incomplete account: local file viewing must not depend
+        // on normal remote-account deserialization or initialization.
+        std::fs::write(
+            &path,
+            "[ui]\ntheme = \"tokyonight\"\nmailbox_width_percent = 32\n\n\
+             [contacts]\nautocomplete = false\n\n[[accounts]]\nsource = \"invalid\"\n",
+        )
+        .unwrap();
+        let mut config = Config::load_preferences_only(Some(&path)).unwrap();
+        assert!(config.accounts.is_empty());
+        assert_eq!(config.ui.theme, "tokyonight");
+        assert_eq!(config.ui.mailbox_width_percent, 32);
+        assert!(!config.contacts.autocomplete);
+        assert_eq!(config.config_path.as_deref(), Some(path.as_path()));
+
+        config.accounts =
+            Config::single_maildir("Local file".to_owned(), temp.path().to_path_buf()).accounts;
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.ui.theme, "tokyonight");
+    }
+
+    #[test]
+    fn missing_local_preferences_keep_builtin_theme() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing-config.toml");
+        let config = Config::load_preferences_only(Some(&path)).unwrap();
+        assert!(config.accounts.is_empty());
+        assert_eq!(config.ui.theme, "default");
+        assert_eq!(config.config_path.as_deref(), Some(path.as_path()));
+    }
 
     #[test]
     fn notification_icon_style_parses_nerd_fonts_explicitly() {

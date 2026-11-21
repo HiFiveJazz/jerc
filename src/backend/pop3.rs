@@ -450,6 +450,12 @@ impl MailBackend for Pop3Backend {
             .ok_or_else(|| anyhow!("unable to connect to POP3 server"))?;
         socket.set_read_timeout(Some(IO_TIMEOUT))?;
         socket.set_write_timeout(Some(IO_TIMEOUT))?;
+        if self.source.starttls {
+            Self::expect_ok(&mut socket)?;
+            // Reject unsupported STLS before initializing platform TLS roots.
+            // No credentials are sent on the plaintext connection.
+            Self::command(&mut socket, "STLS")?;
+        }
         let server_name =
             ServerName::try_from(self.source.host.clone()).context("invalid POP3 TLS hostname")?;
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -460,8 +466,6 @@ impl MailBackend for Pop3Backend {
         .with_no_client_auth();
         let tls_config = Arc::new(config);
         let mut stream: Box<dyn Pop3Stream> = if self.source.starttls {
-            Self::expect_ok(&mut socket)?;
-            Self::command(&mut socket, "STLS")?;
             // Do not send USER/PASS until the TLS handshake has completed.
             Box::new(StreamOwned::new(
                 ClientConnection::new(tls_config, server_name)?,

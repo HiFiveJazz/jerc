@@ -20,7 +20,7 @@ Remote image worker ── bounded fetch/decode ─────┤
 
 The renderer is divided by surface (`src/ui/render/{mail_list,reader,compose,contacts,attachments,dialogs,help,status,setup}.rs`) with shared formatting in `common.rs`. The root `src/ui/render.rs` owns layout and overlay ordering. These modules use the same app state and theme; the split is organizational and does not change rendering behavior.
 
-`src/app/state.rs` owns the central `App`/`AccountState` data model and orchestration, not all input behavior. Focused modules under `src/app/state/` own application initialization (`initialization.rs`), top-level keyboard commands (`input_dispatch.rs`), mouse interactions (`mouse.rs`), reader positions and text motions (`reader_text.rs`), Compose/editor actions, Contacts, mailbox caching, message mutations, worker events and attachments. State regression tests live in sibling test modules under that directory rather than expanding the production state file. These modules are deliberately *not* separate state stores: there is still one `App` and one account model.
+`src/app/state.rs` defines the single UI-owned `App`/`AccountState` data model, configuration-independent limits, and state types. Methods are grouped by responsibility under `src/app/state/`: `account_state.rs` holds per-account selection/prefetch behavior; `app_core.rs`, `app_recovery.rs`, and `app_notices.rs` handle common state, connection recovery, and warnings; `app_setup.rs`, `app_animation.rs`, `app_navigation.rs`, `app_reader.rs`, and `app_controls.rs` implement the corresponding app interactions. Reusable MIME, clipboard, attachment, and viewport utilities have dedicated `*_util.rs` modules. Existing feature modules (`initialization.rs`, `input_dispatch.rs`, `mouse.rs`, `reader_text.rs`, Compose, Contacts, cache and worker events) remain separate. **All of these files implement or support the same state types**, not separate state stores. State regression tests live beside the implementation.
 
 The shared behavior layer is:
 
@@ -34,6 +34,21 @@ Mailbox cache snapshots are constructed in one place (`AccountState::current_cac
 Mailbox synchronization uses `src/app/state/account_sync.rs`: initial mailbox counts, periodic Inbox polls and IMAP IDLE notifications share one deduplicated, request-ID-correlated STATUS queue. The queue retains at most one waiting request per known mailbox, even during an IDLE notification burst, and never applies an older completion over a newer pending request. Foreground SELECT/FETCH requests still use their existing correlation IDs. A failed mutation/Seen request removes only its own pending record, not those of unrelated operations.
 
 Worker-event routing is centralized in `src/app/state/worker_events.rs`, whose focused handlers live in `worker_events/{mailbox,content,outgoing,errors}.rs`. The UI thread remains the single owner of `App`; handlers are organized by event ownership rather than creating extra state stores. Account identities are parsed only for event categories that need contact/recipient learning.
+
+The IMAP implementation and its capability-gated native threading parser live
+in `src/backend/imap/`; the JMAP implementation lives in `src/backend/jmap/`.
+Its `session.rs` module validates discovered capabilities and endpoint origins;
+`push.rs` parses and coalesces SSE state notifications but does not
+start a new worker or perform network I/O on its own. `body.rs`, `views.rs`,
+and `submission.rs` remain focused on the existing reader, search/conversation,
+and outgoing-message paths. Test modules sit alongside these implementations;
+the main protocol modules are not a dumping ground for regression tests.
+
+## Worker and cache boundaries
+
+`src/worker.rs` defines public actions, events, queue handles and worker ownership. The implementation is split into `src/worker/handle.rs` (bounded queue lifecycle, startup/shutdown, and recovery), `foreground.rs` (interactive execution and queue compaction), `background.rs` (low-priority fetch and STATUS reconciliation), `idle.rs` (separate IMAP IDLE watchers), and `helpers.rs` (raw MIME and attachment jobs). These are **the same worker threads, queues, scheduling rules, and memory bounds** as before the split; the files do not create additional workers.
+
+`src/cache.rs` retains its snapshot models, cache format, identities, limits, initialization, and offline journal. `src/cache/writer.rs` owns the existing async batched writer and index change application; `body_store.rs` and `raw_store.rs` own the existing lazy, bounded disk-backed stores. None of the modules performs disk I/O from a renderer; cache JSON and on-disk keys are unchanged.
 
 The protocol backends and the UI worker remain separate; renderers must never start filesystem or network I/O. Prefer adding behavior to the existing shared primitives over introducing new duplicate implementations.
 
@@ -78,6 +93,27 @@ Before rich conversion, HTML tables explicitly marked `role="presentation"` are 
 The composer has NORMAL, INSERT and VISUAL modes. Recipient/subject fields and the body share the same modal editing core, while Tab/Shift-Tab changes fields. Labels are rendered separately from editable text, so active fields do not lose their To/Cc/Subject identity.
 
 Esc follows modal semantics: VISUAL → NORMAL, INSERT → NORMAL, and only Esc from NORMAL closes the composer. Enter from NORMAL opens a send confirmation; sending is never bound to Ctrl-S. Reply supports quoted and unquoted variants.
+
+## Refactor boundaries
+
+- **Runtime:** `src/runtime.rs` owns the terminal event loop and the bounded
+  event channel; it does not own mailbox data or the on-disk cache.
+- **App state:** `src/app/state.rs` and its feature modules are the sole owners
+  of the interactive account view, selection, and navigation state.
+- **Workers:** `src/worker.rs` schedules and executes blocking operations;
+  `src/app/state/worker_events/` applies their results on the UI thread.
+- **Backends:** `src/backend/mod.rs` defines the shared contract; `imap/`,
+  `jmap/`, `pop3.rs`, and `maildir.rs` implement it. The transport's internal
+  mailbox/thread identity must not leak into the presentation layer.
+- **Persistence:** `src/cache.rs` and `src/outgoing/` own cache and queued
+  mutation persistence. Refactoring their modules must not alter disk formats,
+  write batching, or startup recovery behavior.
+- **Presentation:** `src/ui/render.rs` orchestrates draw order; individual
+  renderers only borrow current state and format it for Ratatui.
+
+Large tests for a module live in its adjacent `tests.rs`, while smaller focused
+regressions may remain in named sibling test modules. Moving a test does not
+change its `#[cfg(test)]` build conditions, module path, or access permissions.
 
 ## Performance invariants
 

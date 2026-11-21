@@ -64,7 +64,7 @@ The full reference lives in **[Keybindings](docs/keybindings.md)**. Press `?` in
 ## Project Status
 
 > [!WARNING]
-> Jerc is under active development. IMAP and Maildir reading, SMTP sending, drafts, and the UI are implemented and somewhat finalized. IMAP IDLE synchronization is supported with polling fallback; full conversation threading and server-backed search are planned. Expect breaking changes before 1.0.
+> Jerc is under active development. IMAP and Maildir reading, SMTP sending, drafts, and the UI are implemented and somewhat finalized. Expect breaking changes before 1.0.
 
 ## License
 

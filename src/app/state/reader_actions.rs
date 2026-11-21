@@ -609,6 +609,16 @@ impl App {
         }
     }
 
+    /// CLI local-file launch opens its first message using the normal reader.
+    /// Returns false while asynchronous Maildir scanning is still in progress.
+    pub fn open_cli_first_message(&mut self) -> bool {
+        if self.account().is_none_or(|account| account.selected_message().is_none()) {
+            return false;
+        }
+        self.open_selection();
+        self.message_open
+    }
+
     pub(super) fn open_selection(&mut self) {
         match self.focus {
             Focus::Mailboxes | Focus::Messages => {
