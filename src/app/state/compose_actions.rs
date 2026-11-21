@@ -207,8 +207,16 @@ impl App {
         composer.subject = draft.subject;
         composer.body = draft.body;
         composer.attachment_paths = draft.attachments;
-        composer.field = if composer.body.is_empty() { ComposeField::To } else { ComposeField::Body };
-        composer.cursor = if composer.field == ComposeField::Body { composer.body.chars().count() } else { composer.to.chars().count() };
+        composer.field = if composer.body.is_empty() {
+            ComposeField::To
+        } else {
+            ComposeField::Body
+        };
+        composer.cursor = if composer.field == ComposeField::Body {
+            composer.body.chars().count()
+        } else {
+            composer.to.chars().count()
+        };
         self.composer = Some(composer);
         self.pending_draft = None;
         self.pending_compose = None;

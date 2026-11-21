@@ -6,7 +6,7 @@ use clap::{ArgAction, Parser};
 
 use jerc::backend;
 use jerc::config::Config;
-use jerc::runtime::{run_tui_with_options, LaunchOptions};
+use jerc::runtime::{LaunchOptions, run_tui_with_options};
 
 mod cli_input;
 
@@ -85,7 +85,12 @@ struct Cli {
     oauth_build_info: bool,
 
     /// Inspect OAuth settings without connecting.
-    #[arg(long, help_heading = "OAuth", value_name = "ACCOUNT", conflicts_with = "oauth_login")]
+    #[arg(
+        long,
+        help_heading = "OAuth",
+        value_name = "ACCOUNT",
+        conflicts_with = "oauth_login"
+    )]
     oauth_inspect: Option<String>,
 
     /// Test OAuth and mail authentication.
@@ -127,7 +132,6 @@ struct Cli {
     /// Test accounts and scan speed without TUI.
     #[arg(long, help_heading = "Diagnostics")]
     headless_check: bool,
-
 }
 
 fn main() -> Result<()> {
@@ -235,15 +239,28 @@ fn main() -> Result<()> {
     // CLI readers use a private temporary Maildir. Hold its guard until the
     // terminal exits so it is never accidentally treated as persistent mail.
     let mut temp_maildir: Option<tempfile::TempDir> = None;
-    let mut launch = LaunchOptions { account: cli.account.clone(), offline: cli.offline, ..Default::default() };
+    let mut launch = LaunchOptions {
+        account: cli.account.clone(),
+        offline: cli.offline,
+        ..Default::default()
+    };
     let mut config = if cli.check_config {
-        anyhow::ensure!(cli.input.is_none() && cli.draft_patch.is_none() && !cli.offline && cli.attach.is_empty(),
-            "--check-config cannot be combined with interactive options");
+        anyhow::ensure!(
+            cli.input.is_none()
+                && cli.draft_patch.is_none()
+                && !cli.offline
+                && cli.attach.is_empty(),
+            "--check-config cannot be combined with interactive options"
+        );
         let config = Config::load(cli.config.as_deref())?;
         let count = jerc::runtime::check_configuration(config)?;
         println!("Configuration OK ({count} accounts)");
         return Ok(());
-    } else if cli.input.as_deref().is_some_and(|arg| !arg.starts_with("mailto:")) {
+    } else if cli
+        .input
+        .as_deref()
+        .is_some_and(|arg| !arg.starts_with("mailto:"))
+    {
         // Only load UI/contacts preferences: local files must not initialize
         // configured remote accounts, but must retain the selected theme.
         Config::load_preferences_only(cli.config.as_deref())?
@@ -255,7 +272,10 @@ fn main() -> Result<()> {
         if argument.starts_with("mailto:") {
             launch.compose = Some(cli_input::parse_mailto(argument)?);
         } else {
-            anyhow::ensure!(cli.attach.is_empty(), "--attach requires mailto: or --draft-patch");
+            anyhow::ensure!(
+                cli.attach.is_empty(),
+                "--attach requires mailto: or --draft-patch"
+            );
             let (kind, path) = if argument == "-" {
                 // Stdin has no suffix: recognize an mbox, Git patch, or RFC 5322
                 // message by its content rather than guessing its filename.
@@ -266,14 +286,15 @@ fn main() -> Result<()> {
             };
             let bytes = cli_input::read_input(&path)?;
             let kind = kind.unwrap_or_else(|| cli_input::detect_stdin_kind(&bytes));
-            let title = path.file_name().and_then(|name| name.to_str()).unwrap_or("stdin.patch");
+            let title = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("stdin.patch");
             let temporary = cli_input::prepare_reader(kind, &bytes, title)?;
             // Replace accounts only; keep the user's theme, layout and config path.
-            config.accounts = Config::single_maildir(
-                "Local file".to_owned(),
-                temporary.path().to_path_buf(),
-            )
-            .accounts;
+            config.accounts =
+                Config::single_maildir("Local file".to_owned(), temporary.path().to_path_buf())
+                    .accounts;
             temp_maildir = Some(temporary);
             launch.account = None;
             launch.open_first_message = kind != cli_input::InputKind::Mbox;
@@ -281,25 +302,34 @@ fn main() -> Result<()> {
     }
     if let Some(path) = cli.draft_patch.as_deref() {
         let bytes = cli_input::read_input(path)?;
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("stdin.patch");
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("stdin.patch");
         launch.compose = Some(cli_input::patch_draft(&bytes, name)?);
     }
     if !cli.attach.is_empty() {
-        anyhow::ensure!(launch.compose.is_some(), "--attach requires mailto: or --draft-patch");
-        launch.compose.as_mut().expect("validated composer").attachments = cli_input::validate_attachments(&cli.attach)?;
+        anyhow::ensure!(
+            launch.compose.is_some(),
+            "--attach requires mailto: or --draft-patch"
+        );
+        launch
+            .compose
+            .as_mut()
+            .expect("validated composer")
+            .attachments = cli_input::validate_attachments(&cli.attach)?;
     }
     if launch.compose.is_some() && config.accounts.is_empty() {
         let temporary = cli_input::empty_maildir()?;
-        config.accounts = Config::single_maildir(
-            "Draft".to_owned(),
-            temporary.path().to_path_buf(),
-        )
-        .accounts;
+        config.accounts =
+            Config::single_maildir("Draft".to_owned(), temporary.path().to_path_buf()).accounts;
         temp_maildir = Some(temporary);
     }
     if let Some(name) = launch.account.as_deref() {
-        anyhow::ensure!(config.accounts.iter().any(|account| account.name == name),
-            "no configured account named {name:?}");
+        anyhow::ensure!(
+            config.accounts.iter().any(|account| account.name == name),
+            "no configured account named {name:?}"
+        );
     }
     if let Some(name) = &cli.oauth_login {
         return jerc::oauth::login_account(&config.accounts, name);
@@ -460,14 +490,25 @@ mod cli_tests {
             let err = Cli::try_parse_from(["jerc", flag]).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::DisplayHelp);
             let help = err.to_string();
-            for option in ["-c, --config", "-m, --maildir", "-n, --name", "-v, --version"] {
+            for option in [
+                "-c, --config",
+                "-m, --maildir",
+                "-n, --name",
+                "-v, --version",
+            ] {
                 assert!(help.contains(option), "missing {option}: {help}");
             }
             for option in [
-                "--oauth-login", "--oauth-build-info", "--oauth-inspect",
-                "--oauth-probe", "--oauth-probe-smtp-challenge",
-                "--discover-email", "--discover-provider", "--discover-username",
-                "--discover-oauth-account", "--headless-check",
+                "--oauth-login",
+                "--oauth-build-info",
+                "--oauth-inspect",
+                "--oauth-probe",
+                "--oauth-probe-smtp-challenge",
+                "--discover-email",
+                "--discover-provider",
+                "--discover-username",
+                "--discover-oauth-account",
+                "--headless-check",
             ] {
                 assert!(help.contains(option), "missing {option}: {help}");
             }
@@ -494,13 +535,42 @@ mod cli_tests {
 
     #[test]
     fn unix_style_entry_points_parse_without_shifting_existing_flags() {
-        assert_eq!(Cli::try_parse_from(["jerc", "-a", "Personal"]).unwrap().account.as_deref(), Some("Personal"));
+        assert_eq!(
+            Cli::try_parse_from(["jerc", "-a", "Personal"])
+                .unwrap()
+                .account
+                .as_deref(),
+            Some("Personal")
+        );
         assert!(Cli::try_parse_from(["jerc", "--offline"]).unwrap().offline);
-        assert!(Cli::try_parse_from(["jerc", "--check-config"]).unwrap().check_config);
-        assert_eq!(Cli::try_parse_from(["jerc", "a.patch"]).unwrap().input.as_deref(), Some("a.patch"));
-        assert_eq!(Cli::try_parse_from(["jerc", "--draft-patch", "a.patch"]).unwrap().draft_patch, Some(PathBuf::from("a.patch")));
-        assert_eq!(Cli::try_parse_from(["jerc", "mailto:a@example.org", "--attach", "a.txt"]).unwrap().attach, vec![PathBuf::from("a.txt")]);
-        assert_eq!(Cli::try_parse_from(["jerc", "-"]).unwrap().input.as_deref(), Some("-"));
+        assert!(
+            Cli::try_parse_from(["jerc", "--check-config"])
+                .unwrap()
+                .check_config
+        );
+        assert_eq!(
+            Cli::try_parse_from(["jerc", "a.patch"])
+                .unwrap()
+                .input
+                .as_deref(),
+            Some("a.patch")
+        );
+        assert_eq!(
+            Cli::try_parse_from(["jerc", "--draft-patch", "a.patch"])
+                .unwrap()
+                .draft_patch,
+            Some(PathBuf::from("a.patch"))
+        );
+        assert_eq!(
+            Cli::try_parse_from(["jerc", "mailto:a@example.org", "--attach", "a.txt"])
+                .unwrap()
+                .attach,
+            vec![PathBuf::from("a.txt")]
+        );
+        assert_eq!(
+            Cli::try_parse_from(["jerc", "-"]).unwrap().input.as_deref(),
+            Some("-")
+        );
         assert!(Cli::try_parse_from(["jerc", "--draft-patch", "a.patch", "b.eml"]).is_err());
     }
 

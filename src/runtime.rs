@@ -63,15 +63,30 @@ pub fn run_tui_with_options(config: Config, options: LaunchOptions) -> Result<()
     let (runtime_tx, runtime_rx) = sync_channel::<RuntimeEvent>(RUNTIME_EVENT_QUEUE_CAPACITY);
     let active_epoch = Arc::new(AtomicU64::new(0));
     let worker_tx = scoped_worker_sender(runtime_tx.clone(), Arc::clone(&active_epoch), 0);
-    let account_index = options.account.as_deref().map(|name| {
-        config.accounts.iter().position(|account| account.name == name)
-            .ok_or_else(|| anyhow!("no configured account named {name:?}"))
-    }).transpose()?;
+    let account_index = options
+        .account
+        .as_deref()
+        .map(|name| {
+            config
+                .accounts
+                .iter()
+                .position(|account| account.name == name)
+                .ok_or_else(|| anyhow!("no configured account named {name:?}"))
+        })
+        .transpose()?;
     let workers = create_workers(&config, worker_tx, options.offline)?;
     let mut app = App::new(&config, workers);
-    if let Some(index) = account_index { app.account_index = index; }
-    if options.offline { app.bootstrap_local_only(&config); } else { app.bootstrap(); }
-    if let Some(compose) = options.compose { app.open_cli_compose(compose); }
+    if let Some(index) = account_index {
+        app.account_index = index;
+    }
+    if options.offline {
+        app.bootstrap_local_only(&config);
+    } else {
+        app.bootstrap();
+    }
+    if let Some(compose) = options.compose {
+        app.open_cli_compose(compose);
+    }
     if options.offline {
         app.status = crate::app::StatusLine::info("offline mode — cached mail only");
     }
@@ -261,11 +276,17 @@ fn create_worker(
 ) -> Result<WorkerHandle> {
     // Deliberately do not construct a network client while offline. Even
     // manual refresh and background recovery then cannot make a connection.
-    if offline && backend::BackendKind::from_source(&account.source)
-        != Some(backend::BackendKind::Maildir)
+    if offline
+        && backend::BackendKind::from_source(&account.source) != Some(backend::BackendKind::Maildir)
     {
         return Ok(WorkerHandle::spawn_with_idle_and_selected(
-            index, Box::new(OfflineBackend), None, None, None, None, runtime_tx.clone(),
+            index,
+            Box::new(OfflineBackend),
+            None,
+            None,
+            None,
+            None,
+            runtime_tx.clone(),
         ));
     }
     // JMAP workers share a bounded account-scoped metadata cache and HTTP
@@ -334,26 +355,53 @@ fn create_worker(
 struct OfflineBackend;
 
 impl backend::MailBackend for OfflineBackend {
-    fn capabilities(&self) -> crate::model::Capabilities { crate::model::Capabilities::MAILDIR }
-    fn connect(&mut self) -> Result<()> { Err(anyhow!("offline mode: network access disabled")) }
-    fn list_mailboxes(&mut self) -> Result<Vec<crate::model::Mailbox>> { Err(anyhow!("offline mode")) }
-    fn mailbox_status(&mut self, _name: &str) -> Result<(usize, usize)> { Err(anyhow!("offline mode")) }
-    fn open_mailbox(&mut self, _name: &str, _offset: usize, _limit: usize) -> Result<crate::model::MessagePage> {
+    fn capabilities(&self) -> crate::model::Capabilities {
+        crate::model::Capabilities::MAILDIR
+    }
+    fn connect(&mut self) -> Result<()> {
+        Err(anyhow!("offline mode: network access disabled"))
+    }
+    fn list_mailboxes(&mut self) -> Result<Vec<crate::model::Mailbox>> {
         Err(anyhow!("offline mode"))
     }
-    fn fetch_body(&mut self, _mailbox: &str, _id: &crate::model::MessageId) -> Result<crate::model::MessageBody> {
+    fn mailbox_status(&mut self, _name: &str) -> Result<(usize, usize)> {
+        Err(anyhow!("offline mode"))
+    }
+    fn open_mailbox(
+        &mut self,
+        _name: &str,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<crate::model::MessagePage> {
+        Err(anyhow!("offline mode"))
+    }
+    fn fetch_body(
+        &mut self,
+        _mailbox: &str,
+        _id: &crate::model::MessageId,
+    ) -> Result<crate::model::MessageBody> {
         Err(anyhow!("offline mode"))
     }
     fn fetch_raw(&mut self, _mailbox: &str, _id: &crate::model::MessageId) -> Result<Vec<u8>> {
         Err(anyhow!("offline mode"))
     }
-    fn set_seen(&mut self, _mailbox: &str, _id: &crate::model::MessageId, _seen: bool) -> Result<()> {
+    fn set_seen(
+        &mut self,
+        _mailbox: &str,
+        _id: &crate::model::MessageId,
+        _seen: bool,
+    ) -> Result<()> {
         Err(anyhow!("offline mode"))
     }
     fn delete(&mut self, _mailbox: &str, _id: &crate::model::MessageId) -> Result<()> {
         Err(anyhow!("offline mode"))
     }
-    fn move_to(&mut self, _source: &str, _destination: &str, _id: &crate::model::MessageId) -> Result<()> {
+    fn move_to(
+        &mut self,
+        _source: &str,
+        _destination: &str,
+        _id: &crate::model::MessageId,
+    ) -> Result<()> {
         Err(anyhow!("offline mode"))
     }
 }
