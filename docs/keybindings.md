@@ -18,7 +18,10 @@
 | `Ctrl-Shift-j` / `Ctrl-Shift-k` | Smooth-scroll mailbox list |
 | `Ctrl-d` / `Ctrl-u` | Page down / up |
 | `Enter` | Open message in the reader |
-| `/` | Filter current mailbox |
+| `/` | Filter cached/loaded current mailbox (including hidden replies) |
+| `F` | Native IMAP/JMAP mailbox search |
+| `t` | Toggle thread grouping (enabled by default) |
+| `o` | Expand or collapse selected conversation inline |
 | `Space` | Toggle mark and advance one item |
 | `v` / `V` | Start or end visual selection; `Space` marks selected range |
 | `Esc` | Clear marks or visual selection before leaving the view |
@@ -35,6 +38,41 @@
 | `b` | Show or hide mailbox sidebar |
 | `Alt-h` / `Alt-l` | Resize mailbox sidebar |
 | `Alt-Shift-h` / `Alt-Shift-l` | Resize message preview |
+
+Conversation grouping is enabled by default (`[ui] threading = false` opts out).
+`▸ 3` before a subject denotes three known messages. Press `o` to expand that
+conversation inline (`▾ 3`, with `├─` and `└─` children), or press it again to
+collapse. Multiple conversations can stay expanded. `Esc` collapses the
+selected expanded conversation, after clearing any active selection or closing
+the full reader. `Enter` reads the selected individual message. With `t` off,
+all regular mailbox rows are flat, without any conversation markers.
+`/` temporarily searches individual messages, including hidden replies, and
+clearing the filter restores the grouping. `?` then searching `thread` finds
+both threading shortcuts.
+
+Cached/loaded summaries are grouped immediately using native JMAP/Gmail/IMAP
+membership and Message-ID, In-Reply-To and References. An explicit expansion
+can request up to four bounded pages of native conversation members on the
+independent read-only worker. Supplemental rows are cached separately from the
+normal mailbox page and cursor, and survive restart within the existing cache
+limits. A complete mailbox refresh, identity change, or changed/unknown JMAP Email state discards absent supplemental rows.
+Counts reflect known
+members, not necessarily every reply. The native IMAP lookup is limited to
+20,000 messages; Gmail can still discover a single conversation through its
+provider ID. Mail actions always target individually selected messages, not
+hidden replies. `Ctrl-o` and `Ctrl-t` remain browser aliases; in the full
+reader, `o` opens a link and `t` toggles rich/plain text.
+
+Local `/` search includes recipient addresses, known attachment filenames and
+cached conversation replies. `/body:phrase` searches readable bodies currently
+loaded in memory without downloading additional pages. `F` searches the selected
+mailbox on the server; it supports `from:`, `to:`, `cc:`, `bcc:`, `subject:`,
+`body:`, `is:unread`, `is:read`, `is:starred`, `before:YYYY-MM-DD`, and
+`after:YYYY-MM-DD`. Quote multiword values. `has:attachment` works on JMAP and
+Gmail; `gmail:"..."` invokes Gmail's native query syntax (still mailbox-scoped).
+Other IMAP servers reject unsupported filters. Native IMAP text currently
+requires ASCII and bounds returned UID lists to 20,000; use `/` for Unicode
+cached searches. Server matching and date semantics differ by protocol.
 
 ## Reader
 

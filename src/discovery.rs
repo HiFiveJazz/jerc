@@ -40,6 +40,8 @@ pub struct MailConfiguration {
     pub source: &'static str,
     /// OAuth issuer was explicitly advertised and its server metadata validated.
     pub oauth_issuer: Option<String>,
+    /// HTTPS JMAP endpoint detected without submitting a username or credential.
+    pub jmap_host: Option<String>,
     pub imap: MailServer,
     pub smtp: MailServer,
 }
@@ -85,6 +87,18 @@ impl MailConfiguration {
         fn quoted(s: &str) -> String {
             toml::Value::String(s.to_owned()).to_string()
         }
+        let incoming_source = if let Some(host) = &self.jmap_host {
+            // Credentials are never included in discovered configuration.
+            let mut url =
+                Url::parse(&format!("jmaps://{host}")).expect("validated JMAP discovery hostname");
+            url.set_username(&self.imap.username)
+                .expect("valid JMAP login identity");
+            url.to_string()
+        } else if self.imap.socket == SocketType::Ssl {
+            "imap".to_owned()
+        } else {
+            "imap+starttls".to_owned()
+        };
         let mut out = format!(
             "# Suggested by {} ({})\n# Review usernames, OAuth registration, and sending identity before use.\n\
              [[accounts]]\nname = {}\nemail = {}\nsource = {}\n\
@@ -98,11 +112,7 @@ impl MailConfiguration {
                 .collect::<String>(),
             quoted("Discovered"),
             quoted(&self.email),
-            quoted(if self.imap.socket == SocketType::Ssl {
-                "imap"
-            } else {
-                "imap+starttls"
-            }),
+            quoted(&incoming_source),
             quoted(
                 match (
                     self.smtp.socket,
@@ -147,6 +157,11 @@ impl MailConfiguration {
             } else if self.imap.host.eq_ignore_ascii_case("imap.gmail.com") {
                 out.push_str("# For Google: provider = \"google\" (under [accounts.oauth]).\n");
             }
+        }
+        if let Some(host) = &self.jmap_host {
+            out.push_str(&format!(
+                "# Incoming JMAP HTTPS endpoint: {host} (verify credentials before using).\n"
+            ));
         }
         if let Some(issuer) = &self.oauth_issuer {
             out.push_str(&format!(
@@ -331,6 +346,7 @@ fn parse_autoconfig_with_domain(
         provider: provider_name,
         source,
         oauth_issuer: None,
+        jmap_host: None,
         imap,
         smtp,
     })
@@ -381,6 +397,7 @@ fn known_provider(email: &str, provider: &str, source: &'static str) -> Result<M
         provider: name.to_owned(),
         source,
         oauth_issuer: None,
+        jmap_host: None,
         imap: MailServer {
             host: imap.to_owned(),
             port: 993,
@@ -528,6 +545,7 @@ pub(crate) fn parse_pacc(email: &str, json: &str) -> Result<MailConfiguration> {
         provider: provider.into(),
         source: "PACC (domain HTTPS with DNS digest)",
         oauth_issuer,
+        jmap_host: None,
         imap: MailServer {
             host: imap.into(),
             port: 993,
@@ -832,6 +850,7 @@ fn self_hosted_mx_suggestion(email: &str, mxes: &[String]) -> Option<MailConfigu
         provider: "Self-hosted IMAP/SMTP (review suggested settings)".into(),
         source: "same-domain MX hostname hint (not a TLS connectivity test)",
         oauth_issuer: None,
+        jmap_host: None,
         imap: MailServer {
             host: host.clone(),
             port: 993,
@@ -861,6 +880,7 @@ fn srv_suggestion(
         provider: "IMAP/SMTP via DNS SRV (review suggested settings)".into(),
         source: "DNS SRV (TLS endpoints not independently verified)",
         oauth_issuer: None,
+        jmap_host: None,
         imap: MailServer {
             host: imap.0,
             port: imap.1,
@@ -885,7 +905,146 @@ pub fn discover(email: &str) -> Result<MailConfiguration> {
     discover_with_provider(email, "auto")
 }
 
+/// Public, unauthenticated HTTPS probe. Never send an email address, password,
+/// OAuth token, or credential header during JMAP discovery. A protected JMAP
+/// endpoint may return 401: that is a *hint*, not proof of account access.
+fn jmap_hint(agent: &ureq::Agent, email: &str, suggested_imap: Option<&str>) -> Option<String> {
+    let (_, domain) = address_parts(email).ok()?;
+    let candidates = [suggested_imap, Some(domain), Some("")];
+    let mut hosts = std::collections::HashSet::new();
+    for candidate in candidates.into_iter().flatten() {
+        let host = if candidate.is_empty() {
+            format!("mail.{domain}")
+        } else {
+            candidate.to_owned()
+        };
+        // A provider-selected unrelated hostname must never expand the JMAP
+        // discovery trust scope (nor silently force JMAP for Gmail/Microsoft).
+        if !host.eq_ignore_ascii_case(domain)
+            && !host.to_ascii_lowercase().ends_with(&format!(".{domain}"))
+        {
+            continue;
+        }
+        if !valid_domain(&host) || !hosts.insert(host.clone()) {
+            continue;
+        }
+        if fetch_public_jmap_session(agent, &host).is_some() {
+            return Some(host);
+        }
+    }
+    None
+}
+
+/// Follow only same-origin HTTPS redirects during public discovery. RFC 8620
+/// permits /.well-known/jmap to redirect to the actual session resource.
+fn fetch_public_jmap_session(agent: &ureq::Agent, host: &str) -> Option<serde_json::Value> {
+    let original = Url::parse(&format!("https://{host}/.well-known/jmap")).ok()?;
+    let mut endpoint = original.clone();
+    for _ in 0..=3 {
+        let mut response = agent.get(endpoint.as_str()).call().ok()?;
+        if response.status().is_redirection() {
+            let location = response.headers().get("location")?.to_str().ok()?;
+            let next = endpoint.join(location).ok()?;
+            if next.origin() != original.origin()
+                || !next.username().is_empty()
+                || next.password().is_some()
+            {
+                return None;
+            }
+            endpoint = next;
+            continue;
+        }
+        // A generic HTTP 401 is not evidence that JMAP is hosted here.
+        if !response.status().is_success() {
+            return None;
+        }
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_PACC_BYTES)
+            .read_to_vec()
+            .ok()?;
+        let session: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        if session
+            .pointer("/capabilities/urn:ietf:params:jmap:core")
+            .is_some_and(serde_json::Value::is_object)
+            && session
+                .pointer("/capabilities/urn:ietf:params:jmap:mail")
+                .is_some_and(serde_json::Value::is_object)
+        {
+            return Some(session);
+        }
+        return None;
+    }
+    None
+}
+
+/// Explicit JMAP selection also works if the server requires authentication
+/// before its session metadata can be inspected. SMTP remains an editable hint.
+fn jmap_suggestion(email: &str) -> Result<MailConfiguration> {
+    let (_, domain) = address_parts(email)?;
+    let host = format!("mail.{domain}");
+    Ok(MailConfiguration {
+        email: email.to_owned(),
+        provider: "JMAP (review HTTPS endpoint and SMTP settings)".into(),
+        source: "explicit JMAP HTTPS choice (endpoint not yet authenticated)",
+        oauth_issuer: None,
+        jmap_host: Some(host.clone()),
+        imap: MailServer {
+            host: host.clone(),
+            port: 993,
+            username: email.into(),
+            auth: "password-cleartext".into(),
+            socket: SocketType::Ssl,
+        },
+        smtp: MailServer {
+            host,
+            port: 465,
+            username: email.into(),
+            auth: "password-cleartext".into(),
+            socket: SocketType::Ssl,
+        },
+    })
+}
+
 pub fn discover_with_provider(email: &str, provider: &str) -> Result<MailConfiguration> {
+    if provider == "jmap" {
+        return jmap_suggestion(email);
+    }
+    let discovered = discover_imap_with_provider(email, provider);
+    if provider != "auto" {
+        return discovered;
+    }
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(3)))
+            .https_only(true)
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .build(),
+    );
+    let hint = jmap_hint(
+        &agent,
+        email,
+        discovered.as_ref().ok().map(|c| c.imap.host.as_str()),
+    );
+    match (discovered, hint) {
+        (Ok(mut config), host) => {
+            config.jmap_host = host;
+            Ok(config)
+        }
+        (Err(_), Some(host)) => {
+            // JMAP-only servers still deserve a reviewable account proposal.
+            // Outgoing SMTP is a hint to be verified, never silently tested.
+            let mut proposal = jmap_suggestion(email)?;
+            proposal.jmap_host = Some(host);
+            Ok(proposal)
+        }
+        (Err(error), None) => Err(error),
+    }
+}
+
+fn discover_imap_with_provider(email: &str, provider: &str) -> Result<MailConfiguration> {
     let (_, domain) = address_parts(email)?;
     if provider != "auto" {
         return known_provider(email, provider, "explicit provider hint (not verified)");
@@ -1519,5 +1678,18 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn explicit_jmap_discovery_produces_credential_free_source() {
+        let suggestion = super::jmap_suggestion("hi@fivejazz.com").unwrap();
+        assert_eq!(suggestion.jmap_host.as_deref(), Some("mail.fivejazz.com"));
+        let text = suggestion.to_toml();
+        assert!(text.contains("source = \"jmaps://hi%40fivejazz.com@mail.fivejazz.com"));
+        assert!(!text.contains("secret"));
+        let parsed: crate::config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.accounts.len(), 1);
+        assert!(crate::backend::JmapSource::supports(
+            &parsed.accounts[0].source
+        ));
     }
 }

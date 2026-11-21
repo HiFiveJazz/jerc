@@ -3,7 +3,7 @@
 
 use anyhow::{Result, anyhow};
 
-use crate::backend::{ImapBackend, ImapSource, MailBackend};
+use crate::backend::{ImapBackend, ImapSource, JmapBackend, JmapSource, MailBackend};
 use crate::config::AccountConfig;
 use crate::outgoing::{SmtpSender, SmtpSource};
 
@@ -21,11 +21,24 @@ impl ProbeReport {
 
     #[must_use]
     pub fn summary(&self) -> String {
+        self.summary_for_incoming("IMAP")
+    }
+
+    pub fn summary_for_incoming(&self, incoming: &str) -> String {
+        let outgoing = if incoming == "JMAP" {
+            "Submission"
+        } else {
+            "SMTP"
+        };
         match (&self.imap, &self.smtp) {
-            (Ok(()), Ok(())) => "IMAP ✓ · SMTP ✓ — Authentication verified; no mail sent.".into(),
-            (Err(imap), Ok(())) => format!("IMAP ✗ {imap} · SMTP ✓"),
-            (Ok(()), Err(smtp)) => format!("IMAP ✓ · SMTP ✗ {smtp}"),
-            (Err(imap), Err(smtp)) => format!("IMAP ✗ {imap} · SMTP ✗ {smtp}"),
+            (Ok(()), Ok(())) => {
+                format!("{incoming} ✓ · {outgoing} ✓ — Authentication verified; no mail sent.")
+            }
+            (Err(error), Ok(())) => format!("{incoming} ✗ {error} · {outgoing} ✓"),
+            (Ok(()), Err(error)) => format!("{incoming} ✓ · {outgoing} ✗ {error}"),
+            (Err(incoming_error), Err(smtp)) => {
+                format!("{incoming} ✗ {incoming_error} · {outgoing} ✗ {smtp}")
+            }
         }
     }
 }
@@ -43,6 +56,34 @@ pub fn test_account(mut account: AccountConfig, password: Option<String>) -> Pro
         };
     }
     let credential = password.as_deref();
+    if JmapSource::supports(&account.source) {
+        return match test_jmap(&account, credential) {
+            Ok(mut backend) => {
+                let outgoing = match backend.supports_submission() {
+                    Ok(true) => {
+                        backend.probe_submission(&crate::outgoing::sender_from_account(&account))
+                    }
+                    Ok(false) if account.outgoing.as_deref() != Some("jmap") => {
+                        test_smtp(&account, credential)
+                    }
+                    Ok(false) => Err(anyhow!("JMAP submission is not advertised")),
+                    Err(error) => Err(error),
+                };
+                ProbeReport {
+                    imap: Ok(()),
+                    smtp: outgoing.map_err(|error| safe_failure(&error, "Submission")),
+                }
+            }
+            Err(error) => ProbeReport {
+                imap: Err(safe_failure(&error, "JMAP")),
+                smtp: if account.outgoing.as_deref() == Some("jmap") {
+                    Err("JMAP Mail connection required".into())
+                } else {
+                    test_smtp(&account, credential).map_err(|error| safe_failure(&error, "SMTP"))
+                },
+            },
+        };
+    }
     let imap = test_imap(&account, credential).map_err(|error| safe_failure(&error, "IMAP"));
     // Always test both services, even when IMAP authentication failed.
     let smtp = test_smtp(&account, credential).map_err(|error| safe_failure(&error, "SMTP"));
@@ -59,6 +100,18 @@ fn test_imap(account: &AccountConfig, credential: Option<&str>) -> Result<()> {
     backend.connect()?;
     // Dropping the backend closes the temporary session; no SELECT or FETCH.
     Ok(())
+}
+
+fn test_jmap(account: &AccountConfig, credential: Option<&str>) -> Result<JmapBackend> {
+    let source = JmapSource::parse(&account.source)?;
+    let mut backend = JmapBackend::new(source, None, account)?;
+    if account.oauth.is_none() {
+        backend.set_probe_password(credential.ok_or_else(|| anyhow!("missing JMAP password"))?);
+    }
+    backend.connect()?;
+    // Listing confirms authenticated Mail access, not only a public session.
+    backend.list_mailboxes()?;
+    Ok(backend)
 }
 
 fn test_smtp(account: &AccountConfig, credential: Option<&str>) -> Result<()> {
@@ -160,5 +213,18 @@ mod tests {
         let outcome = test_account(account, Some("secret-test".into()));
         assert!(outcome.imap.is_err());
         assert!(outcome.smtp.is_err());
+    }
+    #[test]
+    fn jmap_probe_summary_reports_right_protocol() {
+        let report = ProbeReport {
+            imap: Ok(()),
+            smtp: Ok(()),
+        };
+        assert!(report.summary_for_incoming("JMAP").contains("JMAP ✓"));
+        let report = ProbeReport {
+            imap: Err("Connection failed".into()),
+            smtp: Ok(()),
+        };
+        assert!(report.summary_for_incoming("JMAP").contains("JMAP ✗"));
     }
 }

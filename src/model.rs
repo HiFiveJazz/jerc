@@ -11,6 +11,90 @@ impl fmt::Display for MessageId {
     }
 }
 
+/// The server identity of a cached mailbox and its optional sync checkpoint.
+/// IMAP's numeric representation remains compatible with version-one caches.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CacheIdentity {
+    Imap(u32),
+    Jmap {
+        account_id: String,
+        mailbox_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        email_state: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_state: Option<String>,
+    },
+}
+
+impl CacheIdentity {
+    pub fn uid_validity(&self) -> Option<u32> {
+        match self {
+            Self::Imap(value) => Some(*value),
+            Self::Jmap { .. } => None,
+        }
+    }
+
+    pub fn generation(&self) -> Self {
+        let mut identity = self.clone();
+        identity.invalidate_checkpoint();
+        identity
+    }
+
+    pub fn same_generation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Imap(a), Self::Imap(b)) => a == b,
+            (
+                Self::Jmap {
+                    account_id: a,
+                    mailbox_id: m,
+                    ..
+                },
+                Self::Jmap {
+                    account_id: b,
+                    mailbox_id: n,
+                    ..
+                },
+            ) => a == b && m == n,
+            _ => false,
+        }
+    }
+
+    pub fn invalidate_checkpoint(&mut self) {
+        if let Self::Jmap {
+            email_state,
+            query_state,
+            ..
+        } = self
+        {
+            *email_state = None;
+            *query_state = None;
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Imap(v) => *v != 0,
+            Self::Jmap {
+                account_id,
+                mailbox_id,
+                ..
+            } => !account_id.is_empty() && !mailbox_id.is_empty(),
+        }
+    }
+
+    pub fn accepts(&self, id: &MessageId) -> bool {
+        match self {
+            Self::Imap(v) => *v != 0 && id.0.starts_with(&format!("imap-uid:{v}:")),
+            Self::Jmap {
+                account_id,
+                mailbox_id,
+                ..
+            } => !account_id.is_empty() && !mailbox_id.is_empty() && !id.0.is_empty(),
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MessageFlags(u16);
 
@@ -93,8 +177,8 @@ pub struct Mailbox {
     pub role: MailboxRole,
     pub total: usize,
     pub unread: usize,
-    /// IMAP mailbox counts are intentionally filled lazily so LIST can render
-    /// immediately instead of waiting for one STATUS round trip per folder.
+    /// A displayable last-known count, including zero. It may be cached or
+    /// optimistic; freshness is tracked separately by the STATUS queue.
     pub counts_known: bool,
 }
 
@@ -114,6 +198,9 @@ impl Mailbox {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MessageHeaders {
     pub id: MessageId,
+    /// Native conversation identity; absent in old caches and other protocols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Box<[String]>,

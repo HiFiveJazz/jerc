@@ -170,7 +170,7 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry {
         category: "Message",
         key: "Esc",
-        description: "close the reader / exit selection",
+        description: "close reader/thread or clear marks",
     },
     HelpEntry {
         category: "Message",
@@ -219,6 +219,11 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         category: "Navigation",
+        key: "F",
+        description: "Server mailbox search",
+    },
+    HelpEntry {
+        category: "Navigation",
         key: "gg / G",
         description: "first / last message or line",
     },
@@ -226,6 +231,16 @@ pub const HELP_ENTRIES: &[HelpEntry] = &[
         category: "Navigation",
         key: "J / K",
         description: "next / previous mailbox",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "o",
+        description: "expand / collapse thread (list)",
+    },
+    HelpEntry {
+        category: "Navigation",
+        key: "t",
+        description: "toggle thread grouping (default on)",
     },
     HelpEntry {
         category: "View",
@@ -739,6 +754,9 @@ pub enum Command {
     ToggleSpam,
     Attachments,
     Search,
+    ServerSearch,
+    ToggleThreads,
+    OpenThread,
     ToggleSidebar,
     TogglePreviewSplit,
     Refresh,
@@ -797,6 +815,8 @@ pub fn command_for_key(key: KeyEvent) -> Command {
             KeyCode::Char('j') => Command::SmoothDown,
             KeyCode::Char('k') => Command::SmoothUp,
             KeyCode::Char('r') => Command::Refresh,
+            KeyCode::Char('t') => Command::ToggleThreads,
+            KeyCode::Char('o') => Command::OpenThread,
             KeyCode::Char('a') => Command::Attachments,
             KeyCode::PageDown => Command::NextAccount,
             KeyCode::PageUp => Command::PreviousAccount,
@@ -824,6 +844,7 @@ pub fn command_for_key(key: KeyEvent) -> Command {
         KeyCode::Char('U') => Command::Unarchive,
         KeyCode::Char('s') => Command::ToggleSpam,
         KeyCode::Char('/') => Command::Search,
+        KeyCode::Char('F') => Command::ServerSearch,
         KeyCode::Char('b') => Command::ToggleSidebar,
         KeyCode::Char('p') => Command::TogglePreviewSplit,
         KeyCode::Char('r') => Command::Reply,
@@ -1150,6 +1171,28 @@ mod tests {
     #[test]
     fn help_does_not_advertise_count_combinations_as_keybindings() {
         assert!(HELP_ENTRIES.iter().all(|entry| !entry.key.contains("20j")));
+    }
+
+    #[test]
+    fn thread_shortcuts_are_discoverable_in_searchable_help() {
+        let matches = ranked_help_matches(HELP_ENTRIES, "thread");
+        assert!(
+            matches
+                .iter()
+                .any(|&index| HELP_ENTRIES[index].category == "Navigation"
+                    && HELP_ENTRIES[index].key == "t")
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|&index| HELP_ENTRIES[index].category == "Navigation"
+                    && HELP_ENTRIES[index].key == "o")
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|&index| HELP_ENTRIES[index].key == "Esc")
+        );
     }
 
     #[test]

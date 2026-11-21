@@ -81,8 +81,9 @@ pub struct AccountConfig {
     /// `Jazz Bhatia <jazz@example.com>`. If omitted, the SMTP username is used.
     #[serde(default)]
     pub from: Option<String>,
-    /// Optional SMTP URI. Supported secure schemes are smtp://
-    /// (STARTTLS) and smtps:// (implicit TLS), with +plain, +login, +xoauth2 or +oauthbearer.
+    /// Optional outgoing transport: `jmap` for native JMAP submission, or a
+    /// secure SMTP URI (STARTTLS/implicit TLS) with optional authentication suffix.
+    /// JMAP accounts with an SMTP URI prefer native submission if advertised.
     #[serde(default)]
     pub outgoing: Option<String>,
     /// Optional command that prints the outgoing password or OAuth refresh/access
@@ -278,6 +279,9 @@ pub struct UiConfig {
     /// Message-list `/` matching: `fuzzy` (default) or `strict` (substring).
     #[serde(default)]
     pub search_mode: MailSearchMode,
+    /// Group known conversations in the mailbox by default.
+    #[serde(default = "default_true")]
+    pub threading: bool,
     /// `row` colors entire visual/marked mail and contacts rows; `gutter`
     /// colors only their left-side marker (default).
     #[serde(default)]
@@ -308,6 +312,7 @@ impl Default for UiConfig {
             new_mail_notifications: true,
             notification_icon_style: NotificationIconStyle::default(),
             search_mode: MailSearchMode::default(),
+            threading: true,
             visual_selection_style: VisualSelectionStyle::default(),
             border_style: UiBorderStyle::default(),
             new_mail_sound_name: default_mail_sound_name(),
@@ -889,6 +894,15 @@ mod tests {
         assert!(
             toml::from_str::<super::Config>("[ui]\nvisual_selection_style = \"sideways\"").is_err()
         );
+    }
+
+    #[test]
+    fn conversation_grouping_defaults_on_and_can_be_disabled() {
+        assert!(super::UiConfig::default().threading);
+        let default: super::Config = toml::from_str("[ui]\n").unwrap();
+        assert!(default.ui.threading);
+        let disabled: super::Config = toml::from_str("[ui]\nthreading = false").unwrap();
+        assert!(!disabled.ui.threading);
     }
 
     #[test]

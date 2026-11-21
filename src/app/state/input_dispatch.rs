@@ -173,12 +173,25 @@ impl App {
         if self.message_open && self.handle_reader_key(key) {
             return;
         }
-        if self.preview_split {
+        // Browser shortcuts take precedence even with split preview enabled.
+        // The full reader retains o (link) and t (HTML/plain text).
+        if !self.message_open && key.modifiers.is_empty() {
             match key.code {
-                KeyCode::Char('o') if key.modifiers.is_empty() => {
-                    self.open_reader_link();
+                KeyCode::Char('o') => {
+                    self.count_prefix = None;
+                    self.open_native_thread();
                     return;
                 }
+                KeyCode::Char('t') => {
+                    self.count_prefix = None;
+                    self.toggle_native_threads();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.preview_split {
+            match key.code {
                 KeyCode::Char('O') if key.modifiers.is_empty() => {
                     self.open_original_html();
                     return;
@@ -313,6 +326,9 @@ impl App {
                 self.count_prefix = None;
                 self.begin_search();
             }
+            Command::ServerSearch => self.begin_native_search(),
+            Command::ToggleThreads => self.toggle_native_threads(),
+            Command::OpenThread => self.open_native_thread(),
             Command::ToggleSidebar => {
                 self.count_prefix = None;
                 self.sidebar_visible = !self.sidebar_visible;
@@ -440,6 +456,13 @@ impl App {
                         StatusLine::temporary("selection cleared", Duration::from_secs(1));
                 } else if self.message_open {
                     self.close_message();
+                } else if self.account().is_some_and(|a| a.native_view.is_some()) {
+                    self.exit_native_view();
+                } else if self
+                    .account()
+                    .is_some_and(AccountState::selected_inline_expanded)
+                {
+                    self.collapse_selected_thread();
                 } else {
                     if let Some(account) = self.account_mut()
                         && !account.search_query.is_empty()

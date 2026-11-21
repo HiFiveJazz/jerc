@@ -81,6 +81,16 @@ default_mailbox = "INBOX"
 # source = "imaps://you%40gmail.com:APP_PASSWORD@imap.gmail.com:993"
 # outgoing = "smtps://you%40gmail.com:APP_PASSWORD@smtp.gmail.com:465"
 
+# Native JMAP sending (no SMTP credentials or port required):
+# [[accounts]]
+# name = "JMAP account"
+# email = "you@example.com"
+# source = "jmaps://you%40example.com@mail.example.com"
+# source_cred_cmd = "pass show mail/personal"
+# outgoing = "jmap"
+# copy_to = "auto" # default: move imported draft to Sent after acceptance
+# A configured SMTP URI instead enables fallback only if JMAP submission is absent.
+
 [ui]
 # Browser layout. Drag the mailbox divider, or press Alt-h / Alt-l to resize.
 # Width is persisted to [ui] here in config.toml after an adjustment.
@@ -97,6 +107,7 @@ theme = "default"
 # Message-list / search: fuzzy subsequence matches by default; use strict
 # for the previous case-insensitive substring filter.
 search_mode = "fuzzy" # "fuzzy" or "strict"
+threading = true # group known conversations by default; t toggles for the session
 # Mail browser, Contacts and attachment lists (including Compose pickers):
 # "row" colors the entire selected row; "gutter" keeps the row dark gray and
 # colors only its thicker blue indicator. With the mailbox sidebar visible,

@@ -21,14 +21,26 @@ impl App {
                 .spawn(cleanup_stale_attachment_files);
         });
         let app_search_mode = config.ui.search_mode;
+        let threading_enabled = config.ui.threading;
         let accounts: Vec<AccountState> = config
             .accounts
             .iter()
             .zip(workers)
             .map(|(config, worker)| {
                 let (snapshot, cache_writer) = cache::open(config);
-                let body_store = cache_writer.as_ref().map(cache::Writer::body_store);
-                let raw_store = cache_writer.as_ref().map(cache::Writer::raw_store);
+                // Both remote protocols use protocol-aware cache keys.
+                let kind = crate::backend::BackendKind::from_source(&config.source);
+                let jmap = kind == Some(crate::backend::BackendKind::Jmap);
+                let remote_cache =
+                    kind.is_some_and(crate::backend::BackendKind::persistent_remote_cache);
+                let body_store = cache_writer
+                    .as_ref()
+                    .filter(|_| remote_cache)
+                    .map(cache::Writer::body_store);
+                let raw_store = cache_writer
+                    .as_ref()
+                    .filter(|_| remote_cache)
+                    .map(cache::Writer::raw_store);
                 let deferred_seen = snapshot.deferred_seen.clone();
                 let deferred_mutations = snapshot.deferred_mutations.clone();
                 let (outbox_store, outbox) = crate::outgoing::outbox::Store::open(config);
@@ -44,11 +56,14 @@ impl App {
                     .filter(|entry| entry.state == crate::outgoing::outbox::SendState::Queued)
                     .map(|entry| entry.id.clone())
                     .collect();
-                let uid_validities = snapshot
+                let cache_identities = snapshot
                     .folders
                     .iter()
                     .filter_map(|(name, folder)| {
-                        folder.uid_validity.map(|validity| (name.clone(), validity))
+                        folder
+                            .identity
+                            .clone()
+                            .map(|identity| (name.clone(), identity))
                     })
                     .collect();
                 let uid_nexts = snapshot
@@ -120,12 +135,21 @@ impl App {
                     cache_writer,
                     body_store,
                     raw_store,
-                    uid_validities,
+                    cache_identities,
                     uid_nexts,
                     unverified_mailboxes,
                     search_query: String::new(),
                     search_editing: false,
+                    native_search_editing: false,
+                    native_view: None,
+                    local_thread_view: None,
+                    threading_enabled,
+                    local_thread_index: Default::default(),
+                    expanded_threads: HashSet::new(),
+                    inline_thread_extra: HashSet::new(),
+                    inline_thread_requests: HashMap::new(),
                     search_mode: app_search_mode,
+                    local_search_index: Default::default(),
                     bodies: HashMap::new(),
                     pending_bodies: HashSet::new(),
                     pending_seen: HashMap::new(),
@@ -142,6 +166,9 @@ impl App {
                     inflight_deferred_seen: HashMap::new(),
                     status_requests: MailboxStatusQueue::default(),
                     pending_inbox_refresh: false,
+                    jmap,
+                    pending_account_refresh: false,
+                    push_list_inflight: false,
                     pending_mutation_labels: HashMap::new(),
                     pending_destination_refresh: HashMap::new(),
                     connecting: false,
@@ -261,6 +288,10 @@ impl App {
             attachment_selection: 0,
             attachment_files: Arc::new(Vec::new()),
             opened_attachment_files: VecDeque::new(),
+            remote_attachment_refs: Vec::new(),
+            remote_preview_request: None,
+            remote_preview_file: None,
+            remote_transfer_request: None,
             attachment_source: None,
             attachment_cache: VecDeque::new(),
             attachment_marked: HashSet::new(),

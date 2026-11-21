@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.set_mailbox_view_height(usize::from(area.height.max(1)));
-    let theme = app.theme().clone();
+    let theme = app.theme();
     let account = app.account().expect("account exists");
     frame.render_widget(Clear, area);
 
@@ -157,15 +157,36 @@ pub(super) fn mail_gutter(
     marker
 }
 
+/// Use terminal-width-safe arrows, with no additional column or row. Counts
+/// are known members, not necessarily the complete server conversation.
+fn thread_subject_prefix(row: crate::threading::ThreadRow, width: usize) -> String {
+    use crate::threading::ThreadRow;
+    let (arrow, count) = match row {
+        ThreadRow::Plain => return String::new(),
+        ThreadRow::Child { last } => {
+            return if width >= 6 {
+                if last { "  └─ " } else { "  ├─ " }.to_owned()
+            } else {
+                String::new()
+            };
+        }
+        ThreadRow::Collapsed(count) => ("▸", count),
+        ThreadRow::Expanded(count) => ("▾", count),
+    };
+    let prefix = format!("{arrow} {count} ");
+    if unicode_width::UnicodeWidthStr::width(prefix.as_str()) < width {
+        prefix
+    } else if width >= 3 {
+        format!("{arrow} ")
+    } else {
+        String::new()
+    }
+}
+
 pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let theme = app.theme().clone();
     frame.render_widget(Clear, area);
 
     let search_editing = app.account().is_some_and(|account| account.search_editing);
-    let search_query = app
-        .account()
-        .map(|account| account.search_query.clone())
-        .unwrap_or_default();
     let search_split = if search_editing && area.height > 1 {
         Some(
             Layout::default()
@@ -178,20 +199,27 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let list_area = search_split.as_ref().map_or(area, |chunks| chunks[1]);
     if let Some(chunks) = &search_split {
-        draw_search_header(frame, chunks[0], &search_query, app);
+        let query = app
+            .account()
+            .map_or("", |account| account.search_query.as_str());
+        draw_search_header(frame, chunks[0], query, app);
     }
 
     // Cached rows remain normal interactive mail rows. Sync is a footer-only
     // activity; don't reserve a row or visually disable the message list.
     app.set_message_view_height(usize::from(list_area.height.max(1)));
+    let theme = app.theme();
     let account = app.account().expect("account exists");
+    let search_query = account.search_query.as_str();
     let visible = account.visible_message_indices();
     let selected_position = visible
         .iter()
         .position(|&index| index == account.message_index);
 
     if visible.is_empty() {
-        let message = if !search_query.is_empty() {
+        let message = if account.native_view.is_some() && !account.syncing_with_server() {
+            " No server results.".to_owned()
+        } else if !search_query.is_empty() && account.native_view.is_none() {
             format!(" No loaded messages match /{search_query}")
         } else if account.syncing_with_server() {
             // An empty *cached* mailbox is not proof the server mailbox is
@@ -249,6 +277,8 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let subject_width = column_areas
         .get(3)
         .map_or(0, |area| usize::from(area.width));
+    let thread_rows = account.inline_thread_rows();
+    // Projection order matches visible rows; search/flat mode has no markers.
     let rows = shown.iter().enumerate().map(|(row_position, &index)| {
         let message = &account.messages[index];
         let absolute_position = start + row_position;
@@ -270,7 +300,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Span::styled(
                 unread_mark,
                 selection_check_style(
-                    &theme,
+                    theme,
                     app.visual_selection_style,
                     visual_selected,
                     marked,
@@ -304,7 +334,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             message.from_name.as_str()
         };
         let style = browser_row_style(
-            &theme,
+            theme,
             app.visual_selection_style,
             visual_selected,
             marked,
@@ -313,13 +343,28 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         );
         // Borrow unchanged subjects and strings from the message. Own text
         // only when normalization or display-width truncation actually changes it.
-        let subject_line = match subject_for_list_cow(&message.subject) {
-            std::borrow::Cow::Borrowed(subject) => {
-                Line::raw(truncate_display_width_cow(subject, subject_width))
-            }
-            std::borrow::Cow::Owned(normalized) => {
-                Line::raw(truncate_display_width_cow(&normalized, subject_width).into_owned())
-            }
+        let prefix = thread_subject_prefix(
+            thread_rows
+                .get(absolute_position)
+                .filter(|(i, _)| *i == index)
+                .map_or(crate::threading::ThreadRow::Plain, |(_, marker)| *marker),
+            subject_width,
+        );
+        let remaining =
+            subject_width.saturating_sub(unicode_width::UnicodeWidthStr::width(prefix.as_str()));
+        let subject = match subject_for_list_cow(&message.subject) {
+            std::borrow::Cow::Borrowed(subject) => truncate_display_width_cow(subject, remaining),
+            std::borrow::Cow::Owned(normalized) => std::borrow::Cow::Owned(
+                truncate_display_width_cow(&normalized, remaining).into_owned(),
+            ),
+        };
+        let subject_line = if prefix.is_empty() {
+            Line::raw(subject)
+        } else {
+            Line::from(vec![
+                Span::styled(prefix, theme.accent()),
+                Span::raw(subject),
+            ])
         };
         let subject_cell = if attachment_mark {
             let subtitle = account.bodies.get(&message.id).map_or_else(
@@ -343,7 +388,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         // Keep the mailbox border intact. The thin purple selection marker
         // occupies the first cell to its right, followed by aligned numbers.
         let number_line = Line::from(vec![
-            mail_gutter(&theme, visual_selected, marked, app.sidebar_visible),
+            mail_gutter(theme, visual_selected, marked, app.sidebar_visible),
             Span::raw(format!(
                 "{number:>width$}",
                 width = usize::from(number_width)
@@ -351,7 +396,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ]);
         let number_cell = if attachment_mark {
             let subtitle_gutter = Line::from(mail_gutter(
-                &theme,
+                theme,
                 visual_selected,
                 marked,
                 app.sidebar_visible,
@@ -393,7 +438,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let current = position == current_position;
                 let style = if current {
                     browser_row_style(
-                        &theme,
+                        theme,
                         app.visual_selection_style,
                         visual,
                         marked,
@@ -401,7 +446,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         message.unread(),
                     )
                 } else if visual {
-                    visual_row_style(&theme)
+                    visual_row_style(theme)
                 } else {
                     theme.selected()
                 };
@@ -490,5 +535,22 @@ pub(super) fn attachment_subtitle(names: &[String]) -> String {
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join(" · ")
+    }
+}
+
+#[cfg(test)]
+mod thread_badge_tests {
+    use super::thread_subject_prefix;
+
+    #[test]
+    fn arrows_and_known_counts_fit_the_subject_column() {
+        use crate::threading::ThreadRow::*;
+        assert_eq!(thread_subject_prefix(Plain, 20), "");
+        assert_eq!(thread_subject_prefix(Collapsed(3), 20), "▸ 3 ");
+        assert_eq!(thread_subject_prefix(Expanded(3), 20), "▾ 3 ");
+        assert_eq!(thread_subject_prefix(Child { last: false }, 20), "  ├─ ");
+        assert_eq!(thread_subject_prefix(Child { last: true }, 20), "  └─ ");
+        assert_eq!(thread_subject_prefix(Collapsed(10), 3), "▸ ");
+        assert_eq!(thread_subject_prefix(Collapsed(10), 2), "");
     }
 }

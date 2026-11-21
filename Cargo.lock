@@ -1045,9 +1045,9 @@ dependencies = [
 
 [[package]]
 name = "io-imap"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea0344e4cee083928f82b34e2592ca41cf94755956f5c6308f21dd1f03fed361"
+checksum = "6dc29abf0aaf7b213697a91648634609ff7261fbe7dbcbfe5a33095567d87937"
 dependencies = [
  "anyhow",
  "base64-codec",
@@ -1077,9 +1077,9 @@ dependencies = [
 
 [[package]]
 name = "io-sasl"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41b6725f5378a27ba94468ff1663ead20f612fa16b70839af132dca27dabfe3f"
+checksum = "b74074034a8b5a55a08c4effb9d71c64ecea0617865cdcecde04721ffd877075"
 dependencies = [
  "log",
  "secrecy",
@@ -1110,7 +1110,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jerc"
-version = "0.6.63"
+version = "0.6.64"
 dependencies = [
  "anyhow",
  "base64",
@@ -1128,6 +1128,8 @@ dependencies = [
  "ratatui-image",
  "ring",
  "roxmltree",
+ "rustls",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "tempfile",

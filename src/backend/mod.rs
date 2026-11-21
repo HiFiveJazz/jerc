@@ -1,5 +1,9 @@
+mod error;
 mod imap;
+mod jmap;
 mod maildir;
+mod pop3;
+pub(crate) mod search;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -10,19 +14,72 @@ use anyhow::{Result, anyhow};
 use crate::config::AccountConfig;
 use crate::model::{Capabilities, Mailbox, MessageBody, MessageId, MessagePage, MessageSummary};
 
+pub use error::{BackendError, ErrorKind};
+pub(crate) use error::{classify, legacy_kind};
 pub use imap::{ImapBackend, ImapSource};
+pub use jmap::{JmapBackend, JmapSource};
 pub use maildir::MaildirBackend;
+pub use pop3::{Pop3Backend, Pop3Source};
+
+/// One scheme classifier for factories, cache policy and worker selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Imap,
+    Jmap,
+    Pop3,
+    Maildir,
+}
+
+impl BackendKind {
+    pub fn from_source(source: &str) -> Option<Self> {
+        if source.starts_with("maildir://") {
+            Some(Self::Maildir)
+        } else if ImapSource::supports(source) {
+            Some(Self::Imap)
+        } else if JmapSource::supports(source) {
+            Some(Self::Jmap)
+        } else if Pop3Source::supports(source) {
+            Some(Self::Pop3)
+        } else {
+            None
+        }
+    }
+    pub fn persistent_remote_cache(self) -> bool {
+        matches!(self, Self::Imap | Self::Jmap)
+    }
+}
 
 /// Construct a backend for an account. Credential commands are resolved by the
 /// backend worker during connect(), never on the UI thread.
 pub fn from_account(account: &AccountConfig) -> Result<Box<dyn MailBackend>> {
-    if account.source.starts_with("maildir://") {
+    let kind = BackendKind::from_source(&account.source);
+    if kind == Some(BackendKind::Maildir) {
         return Ok(Box::new(MaildirBackend::new(maildir_path_from_source(
             &account.source,
         )?)));
     }
 
-    if ImapSource::supports(&account.source) {
+    if kind == Some(BackendKind::Jmap) {
+        return Ok(Box::new(JmapBackend::new(
+            JmapSource::parse(&account.source)?,
+            account.source_cred_cmd.clone(),
+            account,
+        )?));
+    }
+    if kind == Some(BackendKind::Pop3) {
+        let state_path = dirs::data_dir().map(|dir| {
+            dir.join("jerc").join("pop3").join(format!(
+                "{}.json",
+                crate::cache::account_cache_stem(account)
+            ))
+        });
+        return Ok(Box::new(Pop3Backend::new(
+            Pop3Source::parse(&account.source)?,
+            account.source_cred_cmd.clone(),
+            state_path,
+        )));
+    }
+    if kind == Some(BackendKind::Imap) {
         return Ok(Box::new(ImapBackend::new(
             ImapSource::parse(&account.source)?.with_account_oauth(account)?,
             account.source_cred_cmd.clone(),
@@ -31,7 +88,7 @@ pub fn from_account(account: &AccountConfig) -> Result<Box<dyn MailBackend>> {
     }
 
     Err(anyhow!(
-        "unsupported backend scheme; currently implemented: maildir://, imaps://, imaps+login://, imaps+oauthbearer://, imaps+xoauth2://, imap+starttls://"
+        "unsupported backend scheme; currently implemented: maildir://, imaps://, imap+starttls://, jmaps://, jmaps+bearer://, pop3s://, pop3+starttls://"
     ))
 }
 
@@ -86,6 +143,14 @@ pub fn redact_source(source: &str) -> String {
         return source.to_owned();
     }
 
+    if JmapSource::supports(source) {
+        return JmapSource::parse(source)
+            .map_or_else(|_| "jmaps://<redacted>".into(), |parsed| parsed.redacted());
+    }
+    if Pop3Source::supports(source) {
+        return Pop3Source::parse(source)
+            .map_or_else(|_| "pop3s://<redacted>".into(), |parsed| parsed.redacted());
+    }
     match ImapSource::parse(source) {
         Ok(parsed) => parsed.redacted(),
         Err(_) => source.split_once("://").map_or_else(
@@ -95,12 +160,12 @@ pub fn redact_source(source: &str) -> String {
     }
 }
 
-/// Previously displayed IMAP summaries. UIDs may only be reused after a
-/// fresh SELECT confirms that UIDVALIDITY has not changed. This hint is
+/// Previously displayed remote summaries. Each backend must verify its
+/// stable cache identity and synchronization checkpoint before reuse. This hint is
 /// deliberately metadata-only: message bodies never cross the worker queue.
 #[derive(Clone)]
 pub struct MailboxSyncHint {
-    pub uid_validity: u32,
+    pub identity: crate::model::CacheIdentity,
     pub uid_next: Option<u32>,
     pub messages: Vec<MessageSummary>,
 }
@@ -108,14 +173,99 @@ pub struct MailboxSyncHint {
 impl std::fmt::Debug for MailboxSyncHint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MailboxSyncHint")
-            .field("uid_validity", &self.uid_validity)
+            .field("identity", &self.identity.generation())
             .field("uid_next", &self.uid_next)
             .field("cached_message_count", &self.messages.len())
             .finish()
     }
 }
 
+/// Native submission has already been accepted; filing failures are warnings,
+/// not send failures. No raw message copy is needed by the worker.
+#[derive(Debug)]
+pub struct NativeSendReceipt {
+    pub sent_mailbox: Option<String>,
+    pub affected_mailboxes: Vec<String>,
+    pub sent_copy_saved: bool,
+    pub sent_copy_warning: Option<String>,
+}
+
+/// A temporary query view, not a canonical mailbox cache snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailboxView {
+    Search(String),
+    Threads,
+    Thread(String),
+}
+
+impl MailboxView {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Search(_) => "Server search",
+            Self::Threads => "Conversations",
+            Self::Thread(_) => "Conversation",
+        }
+    }
+}
+
+/// Server-side attachment descriptor. Never contains credentials or a direct URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAttachment {
+    pub identity: crate::model::CacheIdentity,
+    pub blob_id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size: usize,
+}
+
 pub trait MailBackend: Send {
+    fn query_mailbox(
+        &mut self,
+        _name: &str,
+        _view: &MailboxView,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<MessagePage> {
+        Err(anyhow!(
+            "native mailbox queries are not supported by this backend"
+        ))
+    }
+    /// Last successful query's membership hints for the requested cached IDs.
+    /// These never populate the canonical cache with additional messages.
+    fn cached_thread_memberships(
+        &self,
+        _ids: &[MessageId],
+    ) -> std::collections::HashMap<MessageId, String> {
+        std::collections::HashMap::new()
+    }
+    /// Metadata only. None selects the original MIME path.
+    fn list_native_attachments(
+        &mut self,
+        _mailbox: &str,
+        _id: &MessageId,
+    ) -> Result<Option<Vec<RemoteAttachment>>> {
+        Ok(None)
+    }
+    fn download_native_attachment_into(
+        &mut self,
+        _mailbox: &str,
+        _attachment: &RemoteAttachment,
+        _writer: &mut dyn Write,
+    ) -> Result<()> {
+        Err(anyhow!("native attachment retrieval is not supported"))
+    }
+
+    /// None means native submission was not selected or is not advertised.
+    /// Errors must never trigger fallback: delivery may already have started.
+    fn submit_message(
+        &mut self,
+        _message: &crate::model::OutgoingMessage,
+        _sent_mailbox: Option<&str>,
+        _copy_to: Option<&[String]>,
+    ) -> Result<Option<NativeSendReceipt>> {
+        Ok(None)
+    }
+
     fn capabilities(&self) -> Capabilities;
     fn connect(&mut self) -> Result<()>;
     fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>>;
@@ -127,12 +277,20 @@ pub trait MailBackend: Send {
         _cancel: &AtomicBool,
         _changed: &mut dyn FnMut(),
     ) -> Result<()> {
-        Err(anyhow!("IMAP IDLE is not supported by this backend"))
+        Err(anyhow!("Push watching is not supported by this backend"))
     }
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)>;
     /// UIDVALIDITY from the currently selected mailbox, if provided by IMAP.
     fn mailbox_uid_validity(&self, _name: &str) -> Option<u32> {
         None
+    }
+    fn mailbox_cache_identity(&self, name: &str) -> Option<crate::model::CacheIdentity> {
+        self.mailbox_uid_validity(name)
+            .map(crate::model::CacheIdentity::Imap)
+    }
+    /// JMAP push reports account-wide changes rather than a SELECTed folder.
+    fn watch_is_account_wide(&self) -> bool {
+        false
     }
     fn mailbox_uid_next(&self, _name: &str) -> Option<u32> {
         None
@@ -199,7 +357,9 @@ pub trait MailBackend: Send {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImapSource, maildir_path_from_source, redact_source};
+    use super::{
+        BackendKind, ImapSource, JmapSource, Pop3Source, maildir_path_from_source, redact_source,
+    };
 
     #[test]
     fn parses_maildir_source() {
@@ -214,6 +374,43 @@ mod tests {
         assert!(ImapSource::supports("imaps://user@example.com"));
         assert!(ImapSource::supports("imaps+oauthbearer://user@example.com"));
         assert!(!ImapSource::supports("smtp://user@example.com"));
+    }
+
+    #[test]
+    fn recognizes_additional_secure_backends() {
+        assert!(JmapSource::supports("jmaps://hi@example.org"));
+        assert!(Pop3Source::supports("pop3s://hi@example.org"));
+        assert!(Pop3Source::supports("pop3+starttls://hi@example.org"));
+        assert!(!Pop3Source::supports("pop3://hi@example.org"));
+        assert!(!JmapSource::supports("jmap://hi@example.org"));
+        for source in [
+            "jmaps://hi:secret@example.org",
+            "pop3s://hi:secret@example.org",
+        ] {
+            assert!(!redact_source(source).contains("secret"));
+        }
+    }
+
+    #[test]
+    fn shared_backend_kind_selects_correct_cache_policy() {
+        for (source, kind, cached) in [
+            ("imaps+xoauth2://user@example.org", BackendKind::Imap, true),
+            ("jmaps+bearer://user@example.org", BackendKind::Jmap, true),
+            ("pop3+starttls://user@example.org", BackendKind::Pop3, false),
+            ("maildir:///tmp/mail", BackendKind::Maildir, false),
+        ] {
+            assert_eq!(BackendKind::from_source(source), Some(kind));
+            assert_eq!(kind.persistent_remote_cache(), cached);
+        }
+        assert_eq!(BackendKind::from_source("smtp://user@example.org"), None);
+    }
+
+    #[test]
+    fn debug_sources_do_not_expose_passwords() {
+        let jmap = JmapSource::parse("jmaps://user:secret-password@example.org").unwrap();
+        let pop3 = Pop3Source::parse("pop3s://user:secret-password@example.org").unwrap();
+        assert!(!format!("{jmap:?}").contains("secret-password"));
+        assert!(!format!("{pop3:?}").contains("secret-password"));
     }
 
     #[test]

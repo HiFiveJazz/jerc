@@ -4,6 +4,8 @@ use super::*;
 
 impl App {
     pub(super) fn reset_received_attachment_previews(&mut self) {
+        self.remote_preview_request = None;
+        self.remote_preview_file = None;
         self.attachment_preview = None;
         self.attachment_preview_identity = None;
         self.attachment_preview_due = None;
@@ -28,7 +30,10 @@ impl App {
         // backend checks UIDVALIDITY itself before fetching missing MIME data;
         // already-cached MIME needs no connection at all.
         let id = message.id.clone();
-        let validity = account.uid_validities.get(&mailbox).copied();
+        let validity = account
+            .cache_identities
+            .get(&mailbox)
+            .map(CacheIdentity::generation);
         let source = (self.account_index, mailbox.clone(), validity, id.clone());
         let cached = self
             .attachment_cache
@@ -64,14 +69,7 @@ impl App {
                 self.status = StatusLine::info("checking attachments…");
                 return;
             }
-            let cache = validity
-                .filter(|validity| id.0.starts_with(&format!("imap-uid:{validity}:")))
-                .and_then(|validity| {
-                    account
-                        .raw_store
-                        .as_ref()
-                        .map(|store| (store.dir.clone(), validity))
-                });
+            let cache = account.raw_cache_key(&mailbox, &id);
             let request = account.worker.post(ActionKind::FetchAttachments {
                 mailbox,
                 id: id.clone(),
@@ -90,6 +88,8 @@ impl App {
         }
         self.attachment_picker_visible = true;
         self.attachment_selection = 0;
+        self.remote_attachment_refs.clear();
+        self.remote_transfer_request = None;
         self.attachment_files = cached.clone().unwrap_or_else(|| Arc::new(Vec::new()));
         self.attachment_marked.clear();
         self.attachment_visual_anchor = None;
@@ -113,6 +113,8 @@ impl App {
         self.attachment_pending = None;
         self.attachment_pending_request_id = None;
         self.attachment_files = Arc::new(Vec::new());
+        self.remote_attachment_refs.clear();
+        self.remote_transfer_request = None;
         self.attachment_source = None;
         self.attachment_marked.clear();
         self.attachment_visual_anchor = None;
@@ -132,7 +134,21 @@ impl App {
         let Some(file) = self.attachment_files.get(index) else {
             return;
         };
-        if !received_attachment_is_image(file) && !received_attachment_is_pdf(file) {
+        let remote_text = self.remote_attachment_refs.get(index).is_some_and(|part| {
+            part.size <= 256 * 1024
+                && (part.content_type.starts_with("text/")
+                    || part.content_type.contains("json")
+                    || part.content_type.contains("xml"))
+        });
+        if !received_attachment_is_image(file) && !received_attachment_is_pdf(file) && !remote_text
+        {
+            return;
+        }
+        if self
+            .remote_preview_file
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == index)
+        {
             return;
         }
         if self
@@ -179,11 +195,39 @@ impl App {
         let Some((index, due)) = self.attachment_preview_due else {
             return;
         };
-        if Instant::now() < due || !self.attachment_preview_inflight.is_empty() {
+        if Instant::now() < due
+            || !self.attachment_preview_inflight.is_empty()
+            || self.remote_preview_request.is_some()
+        {
             return;
         }
         self.attachment_preview_due = None;
         if self.attachment_files.get(index).is_none() {
+            return;
+        }
+        if let Some(file) = self.remote_attachment_refs.get(index).cloned() {
+            if file.size > 24 * 1024 * 1024 {
+                self.attachment_preview_cache.push_back((
+                    index,
+                    Err("preview over 24 MiB; open or save the original".into()),
+                ));
+                return;
+            }
+            let Some((account, mailbox, _, _)) = self.attachment_source.as_ref() else {
+                return;
+            };
+            if let Some(owner) = self.accounts.get(*account) {
+                match owner.worker.post(ActionKind::RemoteAttachment {
+                    mailbox: mailbox.clone(),
+                    job: crate::worker::RemoteAttachmentJob::Preview { index, file },
+                }) {
+                    Ok(id) => self.remote_preview_request = Some((id, index)),
+                    Err(_) => self.attachment_preview_cache.push_back((
+                        index,
+                        Err("attachment worker is busy; move selection to retry".into()),
+                    )),
+                }
+            }
             return;
         }
         // The MIME buffers are shared with the worker, not copied per image.
@@ -222,6 +266,7 @@ impl App {
         let next = new_selection.min(self.attachment_files.len() - 1);
         if next != self.attachment_selection {
             self.attachment_selection = next;
+            self.remote_preview_file = None;
             self.attachment_preview = None;
             self.attachment_preview_identity = None;
             self.queue_attachment_preview();
@@ -669,6 +714,23 @@ impl App {
             return;
         }
         let indices = self.selected_attachment_indices();
+        if !self.remote_attachment_refs.is_empty() {
+            let files = indices
+                .into_iter()
+                .filter_map(|index| {
+                    self.remote_attachment_refs
+                        .get(index)
+                        .cloned()
+                        .map(|f| (index, f))
+                })
+                .collect();
+            if self
+                .post_remote_transfer(crate::worker::RemoteAttachmentJob::Save { directory, files })
+            {
+                self.attachment_destination_picker = None;
+            }
+            return;
+        }
         let mut saved = 0;
         let mut first_error = None;
         for index in indices {
@@ -699,5 +761,177 @@ impl App {
 
     pub fn attachment_pending_loading(&self) -> bool {
         self.attachment_pending.is_some()
+    }
+}
+
+impl App {
+    pub(super) fn post_remote_transfer(&mut self, job: crate::worker::RemoteAttachmentJob) -> bool {
+        if self.remote_transfer_request.is_some() {
+            self.status = StatusLine::info("attachment transfer already in progress");
+            return false;
+        }
+        let Some((account, mailbox, _, _)) = &self.attachment_source else {
+            return false;
+        };
+        let Some(owner) = self.accounts.get(*account) else {
+            return false;
+        };
+        match owner.worker.post(ActionKind::RemoteAttachment {
+            mailbox: mailbox.clone(),
+            job,
+        }) {
+            Ok(id) => {
+                self.remote_transfer_request = Some(id);
+                self.status = StatusLine::info("downloading selected attachment(s)…");
+                true
+            }
+            Err(_) => {
+                self.status = StatusLine::error("attachment worker is busy; retry shortly");
+                false
+            }
+        }
+    }
+
+    pub(super) fn show_remote_attachments(
+        &mut self,
+        attachments: Vec<crate::backend::RemoteAttachment>,
+    ) {
+        self.attachment_pending = None;
+        self.attachment_pending_request_id = None;
+        if attachments.is_empty() {
+            self.attachment_source = None;
+            self.status = StatusLine::info("no attachments to preview");
+            return;
+        }
+        self.reset_received_attachment_previews();
+        self.remote_transfer_request = None;
+        // Rows contain only metadata. Never write these empty placeholder
+        // buffers: all preview/open/save operations branch to remote requests.
+        self.attachment_files = Arc::new(
+            attachments
+                .iter()
+                .map(|f| OutgoingAttachment {
+                    filename: f.filename.clone(),
+                    content_type: f.content_type.clone(),
+                    data: Vec::new(),
+                })
+                .collect(),
+        );
+        self.remote_attachment_refs = attachments;
+        self.attachment_selection = 0;
+        self.attachment_picker_visible = true;
+        self.attachment_marked.clear();
+        self.attachment_visual_anchor = None;
+        self.attachment_destination_picker = None;
+        self.attachment_pending_count = 0;
+        self.attachment_pending_g = false;
+        self.attachment_smooth_target = None;
+        self.queue_attachment_preview();
+        self.status = StatusLine::info(format!(
+            "{} attachment(s); download on demand",
+            self.attachment_files.len()
+        ));
+    }
+
+    pub fn attachment_display_size(&self, index: usize) -> usize {
+        self.remote_attachment_refs.get(index).map_or_else(
+            || self.attachment_files.get(index).map_or(0, |f| f.data.len()),
+            |f| f.size,
+        )
+    }
+
+    pub fn attachment_text_preview_file(&self, index: usize) -> Option<&OutgoingAttachment> {
+        if self.remote_attachment_refs.is_empty() {
+            return self.attachment_files.get(index);
+        }
+        self.remote_preview_file
+            .as_ref()
+            .filter(|(i, _)| *i == index)
+            .map(|(_, file)| file.as_ref())
+    }
+
+    pub(super) fn finish_remote_attachment(
+        &mut self,
+        request: u64,
+        result: Result<crate::worker::RemoteAttachmentResult, String>,
+    ) {
+        use crate::worker::RemoteAttachmentResult;
+        if let Some((id, index)) = self.remote_preview_request
+            && id == request
+        {
+            self.remote_preview_request = None;
+            if !self.attachment_picker_visible || index != self.attachment_selection {
+                return;
+            }
+            match result {
+                Ok(RemoteAttachmentResult::Preview {
+                    index: received,
+                    file,
+                }) if received == index => {
+                    if !received_attachment_is_image(&file) && !received_attachment_is_pdf(&file) {
+                        self.remote_preview_file = Some((index, Arc::new(file)));
+                        return;
+                    }
+                    let queue = Arc::clone(&self.attachment_preview_results);
+                    match std::thread::Builder::new()
+                        .name("jerc-attachment-preview".into())
+                        .spawn(move || {
+                            let decoded = decode_received_attachment_preview(&file);
+                            if let Ok(mut results) = queue.lock() {
+                                results.push_back((index, decoded));
+                            }
+                        }) {
+                        Ok(_) => {
+                            self.attachment_preview_inflight.insert(index);
+                        }
+                        Err(error) => self
+                            .attachment_preview_cache
+                            .push_back((index, Err(error.to_string()))),
+                    }
+                }
+                Err(error) => self.attachment_preview_cache.push_back((index, Err(error))),
+                _ => {}
+            }
+            return;
+        }
+        if self.remote_transfer_request != Some(request) {
+            return;
+        }
+        self.remote_transfer_request = None;
+        match result {
+            Ok(RemoteAttachmentResult::Open(path)) => match open_url(&path.to_string_lossy()) {
+                Ok(()) => {
+                    self.opened_attachment_files.push_back(path);
+                    while self.opened_attachment_files.len() > 4 {
+                        self.opened_attachment_files.pop_front();
+                    }
+                    self.status = StatusLine::info("attachment opened with system viewer");
+                }
+                Err(error) => {
+                    self.status = StatusLine::error(format!("could not open attachment: {error}"))
+                }
+            },
+            Ok(RemoteAttachmentResult::Saved {
+                count,
+                directory,
+                error,
+            }) => {
+                if let Some(error) = error {
+                    self.status =
+                        StatusLine::error(format!("saved {count} file(s), error: {error}"));
+                } else {
+                    self.status = StatusLine::info(format!(
+                        "saved {count} attachment(s) to {}",
+                        directory.display()
+                    ));
+                    self.attachment_marked.clear();
+                    self.attachment_visual_anchor = None;
+                }
+            }
+            Err(error) => {
+                self.status = StatusLine::error(format!("attachment download failed: {error}"))
+            }
+            _ => {}
+        }
     }
 }

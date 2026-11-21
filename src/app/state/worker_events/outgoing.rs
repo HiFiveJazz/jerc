@@ -117,6 +117,7 @@ impl App {
                 if account.current_mailbox.as_deref() == Some(mailbox.as_str()) {
                     let _ = account.request_mailbox_page(mailbox.clone(), 0);
                 }
+                Self::pump_mailbox_status(account);
                 self.status = if cleanup_warning {
                     StatusLine::error(
                         "draft saved, but old draft cleanup was not queued; check Drafts for duplicates",
@@ -130,6 +131,7 @@ impl App {
             WorkerEventKind::MessageSent {
                 smtp_status,
                 sent_mailbox,
+                affected_mailboxes,
                 sent_copy_saved,
                 sent_copy_warning,
                 sent_copy_disabled,
@@ -182,6 +184,7 @@ impl App {
                     .iter()
                     .filter(|mailbox| {
                         matches!(mailbox.role, MailboxRole::Inbox | MailboxRole::Sent)
+                            || affected_mailboxes.contains(&mailbox.name)
                             || sent_mailbox
                                 .as_deref()
                                 .is_some_and(|name| name == mailbox.name)
@@ -190,10 +193,11 @@ impl App {
                     .collect::<Vec<_>>();
                 for name in &affected {
                     account.invalidate_remote_folder(name);
-                    if account
-                        .mailboxes
-                        .iter()
-                        .any(|folder| folder.name == *name && folder.role == MailboxRole::Sent)
+                    if affected_mailboxes.contains(name)
+                        || account
+                            .mailboxes
+                            .iter()
+                            .any(|folder| folder.name == *name && folder.role == MailboxRole::Sent)
                     {
                         account.rewarm_mailbox(name);
                     }
@@ -235,24 +239,26 @@ impl App {
                     self.composer = None;
                 }
                 account.pump_outbox();
+                let accepted = if smtp_status == "JMAP" {
+                    "JMAP accepted".to_owned()
+                } else {
+                    format!("SMTP accepted ({smtp_status})")
+                };
                 self.status = if let Some(warning) = sent_copy_warning {
-                    StatusLine::temporary(
-                        format!("SMTP accepted ({smtp_status}); {warning}"),
-                        Duration::from_secs(8),
-                    )
+                    StatusLine::temporary(format!("{accepted}; {warning}"), Duration::from_secs(8))
                 } else if sent_copy_disabled {
                     StatusLine::temporary(
-                        format!("Message accepted ({smtp_status}); Sent copy disabled"),
+                        format!("{accepted}; Sent copy disabled"),
                         Duration::from_secs(5),
                     )
                 } else if sent_copy_saved {
                     StatusLine::temporary(
-                        format!("SMTP accepted ({smtp_status}); saved to Sent"),
+                        format!("{accepted}; saved to Sent"),
                         Duration::from_secs(5),
                     )
                 } else {
                     StatusLine::temporary(
-                        format!("SMTP accepted ({smtp_status}); provider handles Sent copy"),
+                        format!("{accepted}; provider handles Sent copy"),
                         Duration::from_secs(5),
                     )
                 };

@@ -224,7 +224,16 @@ pub(super) fn draw_setup_wizard(frame: &mut Frame<'_>, app: &App) {
                 };
                 // Paint full cell width, not just as many columns as the label.
                 frame.render_widget(Block::default().style(style), row_area);
-                let label = crate::setup::LABELS[*index];
+                let label = if wizard.is_jmap() {
+                    match *index {
+                        crate::setup::IMAP_HOST => "JMAP HTTPS host",
+                        crate::setup::IMAP_PORT => "JMAP HTTPS port",
+                        crate::setup::IMAP_LOGIN => "JMAP username",
+                        _ => crate::setup::LABELS[*index],
+                    }
+                } else {
+                    crate::setup::LABELS[*index]
+                };
                 if identity_step && wizard.fields[*index].is_empty() {
                     // Examples are visual placeholders, never persisted values.
                     // Keep them dim even when the selection paints the row.

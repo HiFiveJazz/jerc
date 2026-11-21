@@ -11,6 +11,11 @@ impl AccountState {
             cached.next_page_offset = limit;
             cached.has_more = true;
         }
+        let mut known: HashSet<_> = cached.messages.iter().map(|m| m.id.clone()).collect();
+        cached
+            .thread_messages
+            .retain(|m| known.insert(m.id.clone()));
+        cached.thread_messages.truncate(limit);
         cached.message_index = cached
             .message_index
             .min(cached.messages.len().saturating_sub(1));
@@ -39,22 +44,37 @@ impl AccountState {
     }
 
     fn cache_snapshot(&self, compact: bool) -> Option<CachedMailbox> {
+        if self.native_view.is_some() {
+            return None;
+        }
         let name = self.current_mailbox.as_deref()?;
         let max_messages = cache::MAX_MESSAGES_PER_FOLDER;
-        let truncated = self.messages.len() > max_messages;
-        let retained = self.messages.len().min(max_messages);
+        let messages = self.canonical_messages();
+        let truncated = messages.len() > max_messages;
+        let retained = messages.len().min(max_messages);
+        let selected = if self.message_index >= messages.len() {
+            self.local_thread_index
+                .borrow_mut()
+                .representative(&self.messages, self.message_index)
+                .unwrap_or(0)
+        } else {
+            self.message_index
+        };
         Some(CachedMailbox {
-            messages: self.messages.iter().take(max_messages).cloned().collect(),
+            thread_messages: self
+                .messages
+                .iter()
+                .skip(messages.len())
+                .take(max_messages)
+                .cloned()
+                .collect(),
+            messages: messages.iter().take(max_messages).cloned().collect(),
             bodies: if compact {
-                cache::persistable_bodies_near_compact(
-                    &self.messages,
-                    &self.bodies,
-                    self.message_index,
-                )
+                cache::persistable_bodies_near_compact(messages, &self.bodies, selected)
             } else {
-                cache::persistable_bodies_near(&self.messages, &self.bodies, self.message_index)
+                cache::persistable_bodies_near(messages, &self.bodies, selected)
             },
-            message_index: self.message_index.min(retained.saturating_sub(1)),
+            message_index: selected.min(retained.saturating_sub(1)),
             message_view_offset: self.message_view_offset,
             next_page_offset: if truncated {
                 max_messages
@@ -62,7 +82,7 @@ impl AccountState {
                 self.next_page_offset
             },
             has_more: truncated || self.has_more,
-            uid_validity: self.uid_validities.get(name).copied(),
+            identity: self.cache_identities.get(name).cloned(),
             uid_next: self.uid_nexts.get(name).copied(),
         })
     }
@@ -88,7 +108,9 @@ impl AccountState {
         }
         let (Some(writer), Some(validity)) = (
             self.cache_writer.as_ref(),
-            self.uid_validities.get(mailbox).copied(),
+            self.cache_identities
+                .get(mailbox)
+                .map(CacheIdentity::generation),
         ) else {
             return;
         };
@@ -108,9 +130,9 @@ impl AccountState {
         else {
             return;
         };
-        // Only persist server-verified UIDs. Cached snapshots are display hints,
+        // Only persist server-verified identities. Cached snapshots are display hints,
         // never an authority for subsequent IMAP mutations.
-        if self.unverified_mailboxes.contains(name) || !self.uid_validities.contains_key(name) {
+        if self.unverified_mailboxes.contains(name) || !self.cache_identities.contains_key(name) {
             return;
         }
         if let Some(snapshot) = self.persistent_cache_snapshot() {
@@ -118,11 +140,9 @@ impl AccountState {
         }
     }
 
-    /// Give Drafts/Sent/Trash and then the remaining folders a bounded
+    /// Give cold common destinations and changed cached folders a bounded
     /// background header warm-up. This is deliberately not a thread per folder.
     pub(super) fn plan_mailbox_warming(&mut self) {
-        self.mailbox_warm_queue.clear();
-        self.mailbox_warm_request = None;
         let selected = self.current_mailbox.as_deref();
         // Sort common destinations first, preserving server LIST order within
         // a role. Do not prefetch enormous All Mail/Archive on startup.
@@ -138,8 +158,24 @@ impl AccountState {
             if selected == Some(folder.name.as_str()) {
                 continue;
             }
-            // Even a cached folder benefits from an eventual delta sync.
-            // Its existing rows remain available immediately meanwhile.
+            // A valid warm page should not be downloaded again on every LIST.
+            // Cold speculative work is restricted to commonly used folders.
+            if self.mailbox_cache.contains_key(&folder.name)
+                || self
+                    .mailbox_warm_request
+                    .as_ref()
+                    .is_some_and(|(_, name)| name == &folder.name)
+                || self.mailbox_warm_queue.contains(&folder.name)
+                || !matches!(
+                    folder.role,
+                    MailboxRole::Drafts
+                        | MailboxRole::Sent
+                        | MailboxRole::Trash
+                        | MailboxRole::Inbox
+                )
+            {
+                continue;
+            }
             self.mailbox_warm_queue.push_back(folder.name.clone());
         }
     }
@@ -159,8 +195,8 @@ impl AccountState {
                 continue;
             }
             let hint = self.mailbox_cache.get(&name).and_then(|cached| {
-                cached.uid_validity.map(|uid_validity| MailboxSyncHint {
-                    uid_validity,
+                cached.identity.clone().map(|identity| MailboxSyncHint {
+                    identity,
                     uid_next: cached.uid_next,
                     messages: cached.messages.clone(),
                 })
@@ -184,14 +220,48 @@ impl AccountState {
         &mut self,
         name: String,
         page: crate::model::MessagePage,
-        uid_validity: Option<u32>,
+        identity: Option<CacheIdentity>,
         uid_next: Option<u32>,
     ) {
         let previous = self.mailbox_cache.remove(&name);
-        let same_generation = uid_validity.is_some()
-            && previous
+        let same_generation = identity.as_ref().is_some_and(|identity| {
+            previous
                 .as_ref()
-                .is_some_and(|cached| cached.uid_validity == uid_validity);
+                .and_then(|cached| cached.identity.as_ref())
+                .is_some_and(|old| old.same_generation(identity))
+        });
+        let supplemental_compatible = previous
+            .as_ref()
+            .and_then(|cached| cached.identity.as_ref())
+            .is_some_and(|old| match (old, identity.as_ref()) {
+                (CacheIdentity::Imap(a), Some(CacheIdentity::Imap(b))) => a == b,
+                (
+                    CacheIdentity::Jmap {
+                        email_state: Some(a),
+                        ..
+                    },
+                    Some(CacheIdentity::Jmap {
+                        email_state: Some(b),
+                        ..
+                    }),
+                ) => a == b,
+                _ => false,
+            });
+        let thread_messages = if same_generation && supplemental_compatible && page.has_more {
+            previous
+                .as_ref()
+                .map(|cached| {
+                    cached
+                        .thread_messages
+                        .iter()
+                        .filter(|m| !page.messages.iter().any(|row| row.id == m.id))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let live = page
             .messages
             .iter()
@@ -210,13 +280,14 @@ impl AccountState {
             _ => (HashMap::new(), 0, 0),
         };
         let cached = CachedMailbox {
+            thread_messages,
             messages: page.messages,
             bodies,
             message_index,
             message_view_offset,
             next_page_offset: page.next_offset,
             has_more: page.has_more,
-            uid_validity,
+            identity: identity.clone(),
             uid_next,
         };
         if let Some(writer) = &self.cache_writer {
@@ -226,8 +297,10 @@ impl AccountState {
             ));
         }
         self.remember_mailbox(name.clone(), cached);
-        if let Some(validity) = uid_validity {
-            self.uid_validities.insert(name.clone(), validity);
+        if let Some(identity) = identity {
+            self.cache_identities.insert(name.clone(), identity);
+        } else {
+            self.cache_identities.remove(&name);
         }
         if let Some(next) = uid_next {
             self.uid_nexts.insert(name.clone(), next);
@@ -272,18 +345,11 @@ impl AccountState {
         self.remove_persistent_folder(name);
     }
 
-    /// Invalidate both a remote-changed folder's cache and its STATUS counts.
-    /// Do not call this for optimistically updated mutations: those know the
-    /// count delta but cannot infer the destination UIDs.
+    /// Invalidate a remote-changed folder's headers and schedule a new STATUS.
+    /// Keep the last known count visible until the server supplies its replacement.
     pub(super) fn invalidate_remote_folder(&mut self, name: &str) {
         self.forget_cached_folder(name);
-        if let Some(mailbox) = self
-            .mailboxes
-            .iter_mut()
-            .find(|mailbox| mailbox.name == name)
-        {
-            mailbox.counts_known = false;
-        }
+        self.queue_count_reconciliation(name);
     }
 
     pub(super) fn remove_persistent_folder(&self, name: &str) {
@@ -300,7 +366,21 @@ impl AccountState {
         };
         self.warm_folder_order.retain(|entry| entry != name);
         self.current_mailbox = Some(name.to_owned());
+        if let Some(identity) = cached.identity {
+            self.cache_identities.insert(name.to_owned(), identity);
+        } else {
+            self.cache_identities.remove(name);
+        }
         self.messages = cached.messages;
+        let mut ids: HashSet<_> = self.messages.iter().map(|m| m.id.clone()).collect();
+        let extra: Vec<_> = cached
+            .thread_messages
+            .into_iter()
+            .filter(|m| ids.insert(m.id.clone()))
+            .take(cache::MAX_MESSAGES_PER_FOLDER)
+            .collect();
+        let extra_ids = extra.iter().map(|m| m.id.clone()).collect();
+        self.messages.extend(extra);
         self.bodies = cached.bodies;
         self.message_index = cached
             .message_index
@@ -319,9 +399,16 @@ impl AccountState {
         self.pending_seen.clear();
         self.search_query.clear();
         self.search_editing = false;
+        self.native_search_editing = false;
+        self.native_view = None;
+        self.local_thread_view = None;
+        self.reset_inline_threads();
+        self.inline_thread_extra = extra_ids;
+        *self.local_thread_index.get_mut() = Default::default();
         self.clamp_selection();
         self.overlay_deferred_seen();
         self.overlay_deferred_mutations();
+        self.normalize_search_selection();
         // This precedes the network refresh. It identifies the moment cached
         // rows become available to the UI, not the terminal's paint latency.
         crate::perf::record("ui_cache_restore", None, Duration::ZERO, true);

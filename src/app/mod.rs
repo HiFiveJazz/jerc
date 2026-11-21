@@ -15,4 +15,6 @@ pub use state::{
     ReaderSelection, ReviewScroll, StatusLine,
 };
 
-pub(crate) use state::{MailReviewItem, NoticeBrowser, NoticeRow, REPLY_WRAP_COLUMNS};
+pub(crate) use state::{
+    MailReviewItem, NoticeBrowser, NoticeRow, REPLY_WRAP_COLUMNS, attachment_safe_name,
+};

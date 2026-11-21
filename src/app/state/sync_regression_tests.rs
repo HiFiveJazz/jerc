@@ -51,7 +51,9 @@ fn online(app: &mut App) {
     account.capabilities = Some(Capabilities::MAILDIR);
     account.mailboxes = vec![inbox()];
     account.current_mailbox = Some("INBOX".into());
-    account.uid_validities.insert("INBOX".into(), 81);
+    account
+        .cache_identities
+        .insert("INBOX".into(), CacheIdentity::Imap(81));
     account.unverified_mailboxes.remove("INBOX");
 }
 
@@ -86,6 +88,107 @@ fn page() -> MessagePage {
         next_offset: 0,
         has_more: false,
     }
+}
+
+#[test]
+fn imap_discovery_preserves_cached_counts_including_zero_and_new_folders() {
+    let (_root, mut app, _rx) = fixture();
+    waiting_for_list(&mut app, 500);
+    let mut archive = Mailbox::new("Archive", MailboxRole::Archive);
+    archive.total = 400;
+    archive.unread = 25;
+    archive.counts_known = true;
+    let mut sent = Mailbox::new("Sent", MailboxRole::Sent);
+    sent.counts_known = true;
+    app.accounts[0]
+        .mailboxes
+        .extend([archive, sent, Mailbox::new("Removed", MailboxRole::Other)]);
+    app.handle_worker_event(event(
+        500,
+        WorkerEventKind::Mailboxes(vec![
+            Mailbox::new("Archive", MailboxRole::Archive),
+            Mailbox::new("INBOX", MailboxRole::Inbox),
+            Mailbox::new("Sent", MailboxRole::Sent),
+            Mailbox::new("New", MailboxRole::Other),
+        ]),
+    ));
+    let folders = &app.accounts[0].mailboxes;
+    assert_eq!(folders.len(), 4);
+    assert_eq!(folders[0].name, "Archive");
+    assert_eq!((folders[0].total, folders[0].unread), (400, 25));
+    assert!(folders[0].counts_known);
+    assert_eq!(folders[1], inbox());
+    assert!(folders[2].counts_known);
+    assert_eq!((folders[2].total, folders[2].unread), (0, 0));
+    assert!(!folders[3].counts_known);
+    assert!(!folders.iter().any(|folder| folder.name == "Removed"));
+    app.accounts[0].mark_disconnected();
+    assert_eq!(app.accounts[0].mailboxes[0].unread, 25);
+    assert!(app.accounts[0].mailboxes[0].counts_known);
+}
+
+#[test]
+fn authoritative_discovery_replaces_cached_counts_even_with_zero() {
+    let (_root, mut app, _rx) = fixture();
+    waiting_for_list(&mut app, 501);
+    app.accounts[0].queue_count_reconciliation("INBOX");
+    let mut server = inbox();
+    server.total = 0;
+    server.unread = 0;
+    app.handle_worker_event(event(501, WorkerEventKind::Mailboxes(vec![server.clone()])));
+    assert_eq!(app.accounts[0].mailboxes, vec![server]);
+    // No extra STATUS is needed for an already authoritative JMAP-style LIST.
+    let account = &mut app.accounts[0];
+    account.messages_loading = false;
+    account.page_inflight = None;
+    account.pending_bodies.clear();
+    App::pump_mailbox_status(account);
+    assert!(!account.status_requests.busy());
+}
+
+#[test]
+fn cached_status_reconciliation_updates_counts_without_new_mail_alert() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.new_mail_notifications_enabled = true;
+    app.new_mail_bell_enabled = true;
+    app.accounts[0].status_requests.start(
+        502,
+        StatusRequest {
+            name: "INBOX".into(),
+            reason: StatusReason::Reconcile,
+        },
+    );
+    app.handle_worker_event(event(
+        502,
+        WorkerEventKind::MailboxStatus {
+            name: "INBOX".into(),
+            total: 30,
+            unread: 12,
+        },
+    ));
+    let folder = &app.accounts[0].mailboxes[0];
+    assert!(folder.counts_known);
+    assert_eq!((folder.total, folder.unread), (30, 12));
+    assert_eq!(app.new_mail_since_launch, 0);
+    assert!(!app.new_mail_bell_pending);
+    assert!(app.new_mail_notices.is_empty());
+}
+
+#[test]
+fn failed_cached_status_leaves_last_known_counts_visible() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].status_requests.start(
+        503,
+        StatusRequest {
+            name: "INBOX".into(),
+            reason: StatusReason::Reconcile,
+        },
+    );
+    app.handle_worker_event(error(503, "background mailbox count: timeout"));
+    assert_eq!(app.accounts[0].mailboxes, vec![inbox()]);
+    assert!(!app.accounts[0].status_requests.busy());
 }
 
 #[test]
@@ -238,7 +341,7 @@ fn old_page_result_after_disconnect_cannot_overwrite_cache() {
         WorkerEventKind::MailboxOpened {
             name: "INBOX".into(),
             page: page(),
-            uid_validity: Some(81),
+            identity: Some(CacheIdentity::Imap(81)),
             uid_next: None,
             elapsed_micros: 1,
         },
@@ -256,7 +359,7 @@ fn matching_page_success_finishes_spinner() {
         WorkerEventKind::MailboxOpened {
             name: "INBOX".into(),
             page: page(),
-            uid_validity: Some(81),
+            identity: Some(CacheIdentity::Imap(81)),
             uid_next: None,
             elapsed_micros: 5,
         },
@@ -274,7 +377,7 @@ fn stale_page_success_keeps_new_page_inflight() {
         WorkerEventKind::MailboxOpened {
             name: "INBOX".into(),
             page: page(),
-            uid_validity: Some(81),
+            identity: Some(CacheIdentity::Imap(81)),
             uid_next: None,
             elapsed_micros: 5,
         },
@@ -644,6 +747,56 @@ fn late_background_status_error_does_not_disconnect_recovered_session() {
     app.handle_worker_event(error(8000, "background mailbox count: connection reset"));
     assert_eq!(app.accounts[0].page_request_id, Some(81));
     assert!(app.accounts[0].capabilities.is_some());
+}
+
+#[test]
+fn jmap_refresh_preserves_inflight_discovery_and_page_correlation() {
+    let (_root, mut app, _rx) = fixture();
+    waiting_for_list(&mut app, 700);
+    app.accounts[0].jmap = true;
+    app.refresh();
+    assert_eq!(app.accounts[0].mailbox_list_request_id, Some(700));
+    assert!(!app.accounts[0].connecting);
+    app.accounts[0].mailboxes_loading = false;
+    app.accounts[0].mailbox_list_request_id = None;
+    waiting_for_page(&mut app, 701);
+    app.refresh();
+    assert_eq!(app.accounts[0].page_request_id, Some(701));
+    assert!(!app.accounts[0].connecting);
+}
+
+#[test]
+fn account_push_bursts_queue_one_followup_without_status_fanout() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].jmap = true;
+    app.handle_worker_event(event(710, WorkerEventKind::AccountChanged));
+    let request = app.accounts[0].mailbox_list_request_id.unwrap();
+    assert!(app.accounts[0].push_list_inflight);
+    assert!(!app.accounts[0].pending_account_refresh);
+    for id in 711..720 {
+        app.handle_worker_event(event(id, WorkerEventKind::AccountChanged));
+    }
+    assert_eq!(app.accounts[0].mailbox_list_request_id, Some(request));
+    assert!(app.accounts[0].pending_account_refresh);
+    assert!(!app.accounts[0].status_requests.busy());
+    app.handle_worker_event(event(request, WorkerEventKind::Mailboxes(vec![inbox()])));
+    assert!(!app.accounts[0].push_list_inflight);
+    assert!(app.accounts[0].pending_account_refresh);
+    let page_request = app.accounts[0].page_request_id.unwrap();
+    app.handle_worker_event(event(
+        page_request,
+        WorkerEventKind::MailboxOpened {
+            name: "INBOX".into(),
+            page: page(),
+            identity: Some(CacheIdentity::Imap(81)),
+            uid_next: None,
+            elapsed_micros: 0,
+        },
+    ));
+    assert!(app.accounts[0].push_list_inflight);
+    assert!(!app.accounts[0].pending_account_refresh);
+    assert_ne!(app.accounts[0].mailbox_list_request_id, Some(request));
 }
 
 #[test]
@@ -1086,7 +1239,7 @@ fn retired_page_result_cannot_replace_cached_mail_or_clear_new_sync() {
             WorkerEventKind::MailboxOpened {
                 name: "INBOX".into(),
                 page: page(),
-                uid_validity: Some(81),
+                identity: Some(CacheIdentity::Imap(81)),
                 uid_next: Some(100),
                 elapsed_micros: 1,
             },
@@ -1148,4 +1301,633 @@ fn recovered_maildir_connect_list_and_select_finish_footer_sync() {
         "replacement must progress through LIST/SELECT"
     );
     assert!(!app.accounts[0].syncing_with_server());
+}
+
+#[test]
+fn connection_notice_clears_on_confirmed_list_not_just_connect() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].mark_disconnected();
+    assert!(
+        app.all_warnings()
+            .iter()
+            .any(|w| w.contains("connection unavailable"))
+    );
+    let incident = app.accounts[0].offline_incident_number;
+
+    // A stale connect response must not clear the notice.
+    app.accounts[0].connect_request_id = Some(101);
+    app.handle_worker_event(event(
+        100,
+        WorkerEventKind::Connected {
+            capabilities: Capabilities::MAILDIR,
+        },
+    ));
+    assert!(app.accounts[0].offline_incident_active);
+
+    app.handle_worker_event(event(
+        101,
+        WorkerEventKind::Connected {
+            capabilities: Capabilities::MAILDIR,
+        },
+    ));
+    assert!(
+        app.accounts[0].offline_incident_active,
+        "successful connect is not yet a completed mailbox synchronization"
+    );
+    let list_id = app.accounts[0].mailbox_list_request_id.unwrap();
+    app.handle_worker_event(event(list_id, WorkerEventKind::Mailboxes(vec![inbox()])));
+    assert!(!app.accounts[0].offline_incident_active);
+    assert!(
+        !app.all_warnings()
+            .iter()
+            .any(|w| w.contains("connection unavailable"))
+    );
+
+    // A later outage has a new identity; don't suppress it as previously fixed.
+    app.accounts[0].mark_disconnected();
+    assert_eq!(app.accounts[0].offline_incident_number, incident + 1);
+    assert!(
+        app.all_warnings()
+            .iter()
+            .any(|w| w.contains("connection unavailable"))
+    );
+}
+
+#[test]
+fn successful_correlated_page_clears_stale_connection_notice() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].mark_disconnected();
+    assert!(app.accounts[0].offline_incident_active);
+    // Simulate a connection restored before a manual page refresh.
+    app.accounts[0].capabilities = Some(Capabilities::MAILDIR);
+    app.accounts[0].current_mailbox = Some("INBOX".into());
+    app.accounts[0].page_request_id = Some(200);
+    app.accounts[0].page_inflight = Some(("INBOX".into(), 0));
+
+    // Late superseded pages must not clear an active incident.
+    app.handle_worker_event(event(
+        199,
+        WorkerEventKind::MailboxOpened {
+            name: "INBOX".into(),
+            page: page(),
+            identity: None,
+            uid_next: None,
+            elapsed_micros: 100,
+        },
+    ));
+    assert!(app.accounts[0].offline_incident_active);
+
+    app.handle_worker_event(event(
+        200,
+        WorkerEventKind::MailboxOpened {
+            name: "INBOX".into(),
+            page: page(),
+            identity: None,
+            uid_next: None,
+            elapsed_micros: 100,
+        },
+    ));
+    assert!(!app.accounts[0].offline_incident_active);
+    assert!(
+        !app.all_warnings()
+            .iter()
+            .any(|w| w.contains("connection unavailable"))
+    );
+}
+
+#[test]
+fn failed_reconnect_does_not_clear_connection_notice() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].mark_disconnected();
+    app.accounts[0].connect_request_id = Some(301);
+    app.accounts[0].connecting = true;
+    app.handle_worker_event(error(301, "OAuth token request failed (network/TLS error)"));
+    assert!(app.accounts[0].offline_incident_active);
+    assert!(app.accounts[0].capabilities.is_none());
+    assert!(
+        app.all_warnings()
+            .iter()
+            .any(|w| w.contains("connection unavailable"))
+    );
+}
+
+#[test]
+fn native_query_results_do_not_replace_canonical_cache() {
+    let (_root, mut app, _rx) = fixture();
+    waiting_for_page(&mut app, 800);
+    let original = cached_message(&mut app);
+    let account = &mut app.accounts[0];
+    let identity = CacheIdentity::Jmap {
+        account_id: "a".into(),
+        mailbox_id: "m".into(),
+        email_state: Some("s".into()),
+        query_state: None,
+    };
+    account
+        .cache_identities
+        .insert("INBOX".into(), identity.clone());
+    account.save_current_cache();
+    account.native_view = Some(crate::backend::MailboxView::Search("test".into()));
+    let result = crate::mail::parse_summary(
+        MessageId("result".into()),
+        b"Subject: Result\r\n\r\n",
+        19,
+        MessageFlags::empty(),
+    )
+    .unwrap();
+    app.handle_worker_event(event(
+        800,
+        WorkerEventKind::MailboxOpened {
+            name: "INBOX".into(),
+            page: MessagePage {
+                messages: vec![result],
+                offset: 0,
+                next_offset: 1,
+                has_more: false,
+            },
+            identity: Some(identity.clone()),
+            uid_next: None,
+            elapsed_micros: 5,
+        },
+    ));
+    let account = &app.accounts[0];
+    assert_eq!(account.messages[0].id.0, "result");
+    assert!(account.current_cache_snapshot().is_none());
+    assert_eq!(account.mailbox_cache["INBOX"].messages[0].id, original);
+    assert_eq!(account.cache_identities["INBOX"], identity);
+}
+
+#[test]
+fn offline_conversation_projection_does_not_modify_canonical_cache() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let account = &mut app.accounts[0];
+    for (uid, raw) in [
+        (
+            10,
+            "Subject: Reply\r\nMessage-ID: <b@example.org>\r\nReferences: <a@example.org>\r\n\r\n",
+        ),
+        (
+            9,
+            "Subject: Original\r\nMessage-ID: <a@example.org>\r\n\r\n",
+        ),
+        (
+            8,
+            "Subject: Unrelated\r\nMessage-ID: <c@example.org>\r\n\r\n",
+        ),
+    ] {
+        let mut message = crate::mail::parse_summary(
+            MessageId(format!("imap-uid:81:{uid}")),
+            raw.as_bytes(),
+            0,
+            MessageFlags::empty(),
+        )
+        .unwrap();
+        message.timestamp = uid;
+        account.messages.push(message);
+    }
+    account.next_page_offset = 3;
+    account.has_more = true;
+    account.mark_disconnected();
+    assert!(app.accounts[0].threading_enabled);
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 2]);
+    assert!(app.accounts[0].local_thread_view.is_none());
+    assert_eq!(
+        app.accounts[0].inline_thread_rows(),
+        vec![
+            (0, crate::threading::ThreadRow::Collapsed(2)),
+            (2, crate::threading::ThreadRow::Plain)
+        ]
+    );
+    assert_eq!(
+        app.accounts[0]
+            .current_cache_snapshot()
+            .unwrap()
+            .messages
+            .len(),
+        3
+    );
+    app.open_native_thread();
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 1, 2]);
+    assert!(app.accounts[0].native_view.is_none());
+    assert!(!app.accounts[0].request_next_page());
+    app.collapse_selected_thread();
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 2]);
+    app.begin_search();
+    app.accounts[0].search_query = "Original".into();
+    app.accounts[0].normalize_search_selection();
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![1]);
+    app.accounts[0].search_query.clear();
+    app.accounts[0].search_editing = false;
+    app.accounts[0].normalize_search_selection();
+    assert_eq!(app.accounts[0].message_index, 0);
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 2]);
+    app.toggle_native_threads();
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 1, 2]);
+    assert!(!app.accounts[0].threading_enabled);
+    assert_eq!(app.accounts[0].next_page_offset, 3);
+    app.toggle_native_threads();
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 2]);
+    assert!(app.accounts[0].threading_enabled);
+}
+
+#[test]
+fn native_memberships_enrich_only_correlated_canonical_rows_and_survive_disconnect() {
+    use crate::threading::LocalThreadView;
+    let (_root, mut app, _rx) = fixture();
+    waiting_for_page(&mut app, 850);
+    let original = cached_message(&mut app);
+    let account = &mut app.accounts[0];
+    account.save_current_cache();
+    account.native_view = Some(crate::backend::MailboxView::Threads);
+    account.local_thread_view = Some(LocalThreadView::Collapsed);
+    let identity = CacheIdentity::Imap(81);
+    let result = account.messages[0].clone();
+    let queried = |id| {
+        event(
+            id,
+            WorkerEventKind::MailboxQueried {
+                name: "INBOX".into(),
+                page: MessagePage {
+                    messages: vec![result.clone()],
+                    offset: 0,
+                    next_offset: 1,
+                    has_more: false,
+                },
+                identity: Some(identity.clone()),
+                memberships: HashMap::from([
+                    (original.clone(), "gmail:123".into()),
+                    (MessageId("imap-uid:81:99".into()), "gmail:123".into()),
+                ]),
+                elapsed_micros: 5,
+            },
+        )
+    };
+    app.handle_worker_event(queried(849));
+    assert!(
+        app.accounts[0].mailbox_cache["INBOX"].messages[0]
+            .thread_id
+            .is_none()
+    );
+    app.handle_worker_event(queried(850));
+    assert_eq!(app.accounts[0].mailbox_cache["INBOX"].messages.len(), 1);
+    assert_eq!(
+        app.accounts[0].mailbox_cache["INBOX"].messages[0]
+            .thread_id
+            .as_deref(),
+        Some("gmail:123")
+    );
+    app.accounts[0].mark_disconnected();
+    assert_eq!(
+        app.accounts[0].local_thread_view,
+        Some(LocalThreadView::Collapsed)
+    );
+    assert_eq!(app.accounts[0].messages[0].id, original);
+    assert_eq!(
+        app.accounts[0].messages[0].thread_id.as_deref(),
+        Some("gmail:123")
+    );
+}
+
+#[test]
+fn browser_thread_shortcuts_work_with_split_preview_and_reader_bindings_are_preserved() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let id = cached_message(&mut app);
+    let account = &mut app.accounts[0];
+    account.messages[0].thread_id = Some("same".into());
+    let mut reply = account.messages[0].clone();
+    reply.id = MessageId("imap-uid:81:10".into());
+    account.messages.push(reply);
+    app.accounts[0].mark_disconnected();
+    app.preview_split = true;
+    app.focus = Focus::Messages;
+    let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+    app.handle_key(key('t'));
+    assert!(!app.accounts[0].threading_enabled);
+    app.handle_key(key('t'));
+    assert!(app.accounts[0].threading_enabled);
+    app.handle_key(key('o'));
+    assert!(app.accounts[0].selected_inline_expanded());
+    assert_eq!(app.accounts[0].selected_message().unwrap().id, id);
+    app.message_open = true;
+    app.focus = Focus::Preview;
+    app.handle_key(key('t'));
+    assert!(app.accounts[0].threading_enabled);
+    assert!(app.status.text.contains("rich and plain"));
+    app.handle_key(key('o'));
+    assert!(app.accounts[0].selected_inline_expanded());
+    assert!(app.message_open);
+    assert!(app.status.text.contains("not on a link"));
+}
+
+fn inline_message(uid: i64, subject: &str, native: Option<&str>) -> MessageSummary {
+    let raw = format!("Subject: {subject}\r\n\r\nbody");
+    let mut message = crate::mail::parse_summary(
+        MessageId(format!("imap-uid:81:{uid}")),
+        raw.as_bytes(),
+        raw.len() as u64,
+        MessageFlags::empty(),
+    )
+    .unwrap();
+    message.timestamp = uid;
+    message.thread_id = native.map(str::to_owned);
+    message
+}
+
+#[test]
+fn independent_inline_expansions_and_child_collapse_keep_other_rows() {
+    use crate::threading::ThreadRow::*;
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let account = &mut app.accounts[0];
+    account.messages = vec![
+        inline_message(10, "A reply", Some("a")),
+        inline_message(9, "B reply", Some("b")),
+        inline_message(8, "A root", Some("a")),
+        inline_message(7, "Other", None),
+        inline_message(6, "B root", Some("b")),
+    ];
+    account.mark_disconnected();
+    assert_eq!(
+        app.accounts[0].inline_thread_rows(),
+        vec![(0, Collapsed(2)), (1, Collapsed(2)), (3, Plain)]
+    );
+    app.open_native_thread();
+    app.accounts[0].message_index = 1;
+    app.open_native_thread();
+    assert_eq!(
+        app.accounts[0].inline_thread_rows(),
+        vec![
+            (0, Expanded(2)),
+            (2, Child { last: true }),
+            (1, Expanded(2)),
+            (4, Child { last: true }),
+            (3, Plain)
+        ]
+    );
+    app.accounts[0].message_index = 2;
+    app.collapse_selected_thread();
+    assert_eq!(app.accounts[0].message_index, 0);
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 1, 4, 3]);
+    app.toggle_native_threads();
+    assert!(app.accounts[0].inline_thread_rows().is_empty());
+    assert_eq!(
+        app.accounts[0].visible_message_indices(),
+        vec![0, 1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn native_discovery_preserves_cached_rows_bodies_and_regular_pagination() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let account = &mut app.accounts[0];
+    account.messages = vec![
+        inline_message(10, "Reply", Some("a")),
+        inline_message(9, "Other", None),
+        inline_message(8, "Root", Some("a")),
+    ];
+    let seed = account.messages[0].id.clone();
+    let reply = account.messages[2].id.clone();
+    account.bodies.insert(
+        reply.clone(),
+        crate::mail::parse_body(reply.clone(), b"Subject: Root\r\n\r\nbody").unwrap(),
+    );
+    account.next_page_offset = 3;
+    account.has_more = true;
+    app.open_native_thread();
+    let account = &app.accounts[0];
+    let request = *account
+        .inline_thread_requests
+        .keys()
+        .next()
+        .expect("thread query in flight");
+    assert_eq!(account.visible_message_indices(), vec![0, 2, 1]);
+    assert!(account.page_request_id.is_none());
+    assert!(account.bodies.contains_key(&reply));
+    let older = inline_message(7, "Older reply", Some("a"));
+    let older_id = older.id.clone();
+    app.accounts[0].message_index = 2;
+    app.message_open = true;
+    app.handle_worker_event(event(
+        request,
+        WorkerEventKind::ThreadDiscovered {
+            name: "INBOX".into(),
+            page: MessagePage {
+                messages: vec![older],
+                offset: 0,
+                next_offset: 1,
+                has_more: false,
+            },
+            identity: Some(CacheIdentity::Imap(81)),
+            memberships: HashMap::from([(seed, "a".into())]),
+        },
+    ));
+    let account = &app.accounts[0];
+    assert_eq!(account.visible_message_indices(), vec![0, 2, 3, 1]);
+    assert_eq!(account.selected_message().unwrap().id, reply);
+    assert!(account.selected_body().is_some());
+    assert_eq!(account.next_page_offset, 3);
+    assert!(account.has_more);
+    assert!(account.inline_thread_extra.contains(&older_id));
+    assert_eq!(account.current_cache_snapshot().unwrap().messages.len(), 3);
+    app.accounts[0].mark_disconnected();
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 2, 3, 1]);
+}
+
+#[test]
+fn collapsing_pending_conversation_ignores_late_native_result() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let original = cached_message(&mut app);
+    app.open_native_thread();
+    let request = *app.accounts[0]
+        .inline_thread_requests
+        .keys()
+        .next()
+        .unwrap();
+    app.open_native_thread();
+    assert!(app.accounts[0].inline_thread_requests.is_empty());
+    app.handle_worker_event(event(
+        request,
+        WorkerEventKind::ThreadDiscovered {
+            name: "INBOX".into(),
+            page: MessagePage {
+                messages: vec![inline_message(7, "Older", Some("a"))],
+                offset: 0,
+                next_offset: 1,
+                has_more: false,
+            },
+            identity: Some(CacheIdentity::Imap(81)),
+            memberships: HashMap::from([(original.clone(), "a".into())]),
+        },
+    ));
+    assert!(app.accounts[0].native_view.is_none());
+    assert_eq!(app.accounts[0].messages.len(), 1);
+    assert_eq!(app.accounts[0].messages[0].id, original);
+    assert!(app.accounts[0].messages[0].thread_id.is_none());
+}
+
+#[test]
+fn expansion_survives_new_representative_and_local_search() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let account = &mut app.accounts[0];
+    account.messages = vec![
+        inline_message(10, "Reply", Some("a")),
+        inline_message(9, "Other", None),
+        inline_message(8, "Root", Some("a")),
+    ];
+    account.mark_disconnected();
+    app.open_native_thread();
+    app.accounts[0]
+        .messages
+        .insert(0, inline_message(11, "New reply", Some("a")));
+    let account = &mut app.accounts[0];
+    account.message_index = 1;
+    assert_eq!(account.visible_message_indices(), vec![0, 1, 3, 2]);
+    app.begin_search();
+    app.accounts[0].search_query = "Root".into();
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![3]);
+    assert!(app.accounts[0].inline_thread_rows().is_empty());
+    app.accounts[0].search_query.clear();
+    app.accounts[0].search_editing = false;
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 1, 3, 2]);
+}
+
+#[test]
+fn supplemental_thread_reply_is_promoted_by_normal_page_without_duplication() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let account = &mut app.accounts[0];
+    account.messages = vec![
+        inline_message(10, "Reply", Some("gmail:2")),
+        inline_message(9, "Other", None),
+    ];
+    let seed = account.messages[0].id.clone();
+    let older = inline_message(8, "Root", Some("gmail:2"));
+    let older_id = older.id.clone();
+    account.messages.push(older);
+    account.inline_thread_extra.insert(older_id.clone());
+    account.expanded_threads.insert(seed);
+    account.next_page_offset = 2;
+    account.has_more = true;
+    account.page_request_id = Some(982);
+    account.page_inflight = Some(("INBOX".into(), 2));
+    app.handle_worker_event(event(
+        982,
+        WorkerEventKind::MailboxOpened {
+            name: "INBOX".into(),
+            page: MessagePage {
+                messages: vec![inline_message(8, "Root", None)],
+                offset: 2,
+                next_offset: 3,
+                has_more: false,
+            },
+            identity: Some(CacheIdentity::Imap(81)),
+            uid_next: None,
+            elapsed_micros: 5,
+        },
+    ));
+    let account = &app.accounts[0];
+    assert!(account.inline_thread_extra.is_empty());
+    assert_eq!(account.messages.len(), 3);
+    assert_eq!(account.messages[2].id, older_id);
+    assert_eq!(account.messages[2].thread_id.as_deref(), Some("gmail:2"));
+    assert_eq!(account.next_page_offset, 3);
+    assert_eq!(account.visible_message_indices(), vec![0, 2, 1]);
+    assert_eq!(account.current_cache_snapshot().unwrap().messages.len(), 3);
+}
+
+#[test]
+fn native_discovery_cannot_establish_a_new_cache_generation() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let seed = cached_message(&mut app);
+    app.open_native_thread();
+    let request = *app.accounts[0]
+        .inline_thread_requests
+        .keys()
+        .next()
+        .unwrap();
+    app.handle_worker_event(event(
+        request,
+        WorkerEventKind::ThreadDiscovered {
+            name: "INBOX".into(),
+            page: MessagePage {
+                messages: vec![inline_message(8, "Root", Some("a"))],
+                offset: 0,
+                next_offset: 1,
+                has_more: false,
+            },
+            identity: Some(CacheIdentity::Imap(82)),
+            memberships: HashMap::from([(seed, "a".into())]),
+        },
+    ));
+    let account = &app.accounts[0];
+    assert_eq!(account.messages.len(), 1);
+    assert!(account.messages[0].thread_id.is_none());
+    assert_eq!(account.cache_identities["INBOX"], CacheIdentity::Imap(81));
+    assert!(account.inline_thread_requests.is_empty());
+}
+
+#[test]
+fn supplemental_thread_rows_restore_without_advancing_canonical_cursor() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let account = &mut app.accounts[0];
+    account.messages = vec![
+        inline_message(10, "Reply", Some("a")),
+        inline_message(9, "Other", None),
+    ];
+    let reply = inline_message(7, "Older reply", Some("a"));
+    let reply_id = reply.id.clone();
+    account.inline_thread_extra.insert(reply_id.clone());
+    account.messages.push(reply);
+    account.next_page_offset = 2;
+    account.has_more = true;
+    let snapshot = account.current_cache_snapshot().unwrap();
+    assert_eq!(snapshot.messages.len(), 2);
+    assert_eq!(snapshot.thread_messages.len(), 1);
+    account.remember_mailbox("INBOX".into(), snapshot);
+    assert!(account.restore_cached_mailbox("INBOX"));
+    assert_eq!(account.next_page_offset, 2);
+    assert_eq!(account.canonical_messages().len(), 2);
+    assert!(account.inline_thread_extra.contains(&reply_id));
+    account.mark_disconnected();
+    app.accounts[0].message_index = 0;
+    app.open_native_thread();
+    assert_eq!(app.accounts[0].visible_message_indices(), vec![0, 2, 1]);
+}
+
+#[test]
+fn search_index_includes_recipients_and_attachment_names_and_invalidates() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let account = &mut app.accounts[0];
+    let mut message = inline_message(10, "Reply", None);
+    message.to = "unique-recipient@example.org".into();
+    message.attachment_names_hint = vec!["unique-report.pdf".into()].into_boxed_slice();
+    account.messages = vec![message];
+    account.search_mode = crate::config::MailSearchMode::Strict;
+    account.search_query = "unique-recipient".into();
+    assert_eq!(account.visible_message_indices(), vec![0]);
+    account.search_query = "unique-report.pdf".into();
+    assert_eq!(account.visible_message_indices(), vec![0]);
+    assert_eq!(account.visible_message_indices(), vec![0]);
+    account.messages[0].attachment_names_hint = Box::default();
+    assert!(account.visible_message_indices().is_empty());
+}
+
+#[test]
+fn imap_capability_enables_native_search_editor() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].capabilities = Some(Capabilities::IMAP_BASIC);
+    app.begin_native_search();
+    assert!(app.accounts[0].native_search_editing);
 }

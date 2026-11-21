@@ -78,17 +78,67 @@ impl App {
                 // Do not serialize the entire mailbox for every opportunistic
                 // body. The regular cache checkpoint saves it when needed.
             }
+            WorkerEventKind::RemoteAttachmentsListed {
+                mailbox,
+                id,
+                attachments,
+            } => {
+                let expected = self.attachment_source.as_ref().is_some_and(
+                    |(owner, folder, identity, message)| {
+                        *owner == event.account
+                            && folder == &mailbox
+                            && message == &id
+                            && identity.as_ref().is_some_and(|old| {
+                                attachments.iter().all(|a| old.same_generation(&a.identity))
+                            })
+                            && *identity
+                                == account
+                                    .cache_identities
+                                    .get(&mailbox)
+                                    .map(CacheIdentity::generation)
+                    },
+                );
+                if self.attachment_pending_request_id != Some(event.request_id) {
+                    return;
+                }
+                if !expected
+                    || event.account != self.account_index
+                    || account.current_mailbox.as_deref() != Some(mailbox.as_str())
+                    || !account.selected_message().is_some_and(|m| m.id == id)
+                {
+                    self.attachment_pending_request_id = None;
+                    self.attachment_pending = None;
+                    self.attachment_source = None;
+                    return;
+                }
+                self.show_remote_attachments(attachments);
+            }
+            WorkerEventKind::RemoteAttachmentCompleted(result) => {
+                if self
+                    .attachment_source
+                    .as_ref()
+                    .is_some_and(|(owner, _, _, _)| *owner == event.account)
+                {
+                    self.finish_remote_attachment(event.request_id, result);
+                }
+            }
             WorkerEventKind::AttachmentsLoaded {
                 mailbox,
                 id,
                 attachments,
             } => {
-                let expected =
-                    self.attachment_source
-                        .as_ref()
-                        .is_some_and(|(account, folder, _, wanted)| {
-                            *account == event.account && folder == &mailbox && wanted == &id
-                        });
+                let expected = self.attachment_source.as_ref().is_some_and(
+                    |(owner, folder, identity, wanted)| {
+                        *owner == event.account
+                            && folder == &mailbox
+                            && wanted == &id
+                            && *identity
+                                == account
+                                    .cache_identities
+                                    .get(&mailbox)
+                                    .map(CacheIdentity::generation)
+                    },
+                );
                 if expected
                     && self.attachment_pending.as_ref() == Some(&id)
                     && self.attachment_pending_request_id == Some(event.request_id)
@@ -113,6 +163,9 @@ impl App {
                         return;
                     }
                     self.attachment_picker_visible = true;
+                    self.remote_attachment_refs.clear();
+                    self.remote_transfer_request = None;
+                    self.reset_received_attachment_previews();
                     self.attachment_files = Arc::new(attachments);
                     if let Some(source) = self
                         .attachment_source

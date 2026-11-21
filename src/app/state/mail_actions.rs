@@ -17,6 +17,25 @@ impl AccountState {
                 _ => 0,
             };
         }
+        if self.native_view.is_some()
+            && let Some(name) = self.current_mailbox.as_deref()
+            && let Some(cached) = self.mailbox_cache.get_mut(name)
+            && let Some(message) = cached
+                .messages
+                .iter_mut()
+                .chain(&mut cached.thread_messages)
+                .find(|m| &m.id == id)
+        {
+            message.flags.set(MessageFlags::SEEN, seen);
+            if let Some(identity) = cached.identity.as_mut() {
+                identity.invalidate_checkpoint();
+            }
+        }
+        if unread_delta != 0
+            && let Some(name) = self.current_mailbox.clone()
+        {
+            self.invalidate_sync_checkpoint(&name);
+        }
         if unread_delta != 0
             && let Some(current) = self.current_mailbox.as_deref()
             && let Some(mailbox) = self
@@ -77,7 +96,7 @@ impl AccountState {
         let Some(mailbox) = self.current_mailbox.as_deref() else {
             return;
         };
-        let Some(validity) = self.uid_validities.get(mailbox).copied() else {
+        let Some(validity) = self.imap_uid_validity(mailbox) else {
             return;
         };
         let hidden = self
@@ -850,7 +869,7 @@ impl App {
             .is_some_and(|account| account.unverified_mailboxes.contains(&source));
         let validity = self.account().and_then(|account| {
             account.cache_writer.as_ref()?;
-            account.uid_validities.get(&source).copied()
+            account.imap_uid_validity(&source)
         });
         if let Some(validity) = validity {
             let journal_kind = match &kind {
@@ -996,6 +1015,9 @@ impl App {
         if removed.is_empty() {
             return;
         }
+        account.invalidate_sync_checkpoint(source);
+        // A response issued before this mutation could resurrect a removed row.
+        account.inline_thread_requests.clear();
         // Gmail All Mail is a view containing both archived and INBOX messages.
         // Unarchiving adds the INBOX label without removing that All Mail row.
         if let MutationKind::Unarchive { destination } = kind
@@ -1017,10 +1039,39 @@ impl App {
             }
             return;
         }
+        // Native views keep a separate canonical snapshot. A move/delete
+        // must not resurrect its row when Esc or a disconnect restores it.
+        if account.native_view.is_some()
+            && let Some(cached) = account.mailbox_cache.get_mut(source)
+        {
+            let before = cached.messages.len();
+            cached
+                .messages
+                .retain(|message| !selected_ids.contains(&message.id));
+            cached
+                .thread_messages
+                .retain(|message| !selected_ids.contains(&message.id));
+            for id in ids {
+                cached.bodies.remove(id);
+            }
+            if before != cached.messages.len() {
+                cached.next_page_offset = cached
+                    .next_page_offset
+                    .saturating_sub(before - cached.messages.len());
+                cached.message_index = cached
+                    .message_index
+                    .min(cached.messages.len().saturating_sub(1));
+                if let Some(identity) = cached.identity.as_mut() {
+                    identity.invalidate_checkpoint();
+                }
+            }
+        }
         account
             .messages
             .retain(|message| !selected_ids.contains(&message.id));
         for id in ids {
+            account.inline_thread_extra.remove(id);
+            account.expanded_threads.remove(id);
             account.bodies.remove(id);
             account.pending_bodies.remove(id);
             account.pending_seen.remove(id);
@@ -1028,7 +1079,7 @@ impl App {
         account.message_index = account
             .message_index
             .min(account.messages.len().saturating_sub(1));
-        account.keep_message_cursor_visible();
+        account.normalize_search_selection();
 
         let removed_unread = removed.iter().filter(|message| message.unread()).count();
         if let Some(mailbox) = account

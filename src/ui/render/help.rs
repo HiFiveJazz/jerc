@@ -131,9 +131,9 @@ pub(super) fn draw_help_palette(
 }
 
 pub(super) fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
-    let theme = app.theme().clone();
+    let theme = app.theme();
     let area = centered_rect(frame.area(), 52, 46);
-    let inner = popup_inner(frame, &theme, area, " Themes ", theme.accent());
+    let inner = popup_inner(frame, theme, area, " Themes ", theme.accent());
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -165,7 +165,10 @@ pub(super) fn draw_theme_picker(frame: &mut Frame<'_>, app: &App) {
             } else {
                 " "
             };
-            Row::new(vec![Cell::from(marker), Cell::from(candidate.name.clone())])
+            Row::new(vec![
+                Cell::from(marker),
+                Cell::from(candidate.name.as_str()),
+            ])
         });
         let table = Table::new(rows, [Constraint::Length(2), Constraint::Min(12)])
             .style(theme.text())

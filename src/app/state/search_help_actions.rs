@@ -7,6 +7,9 @@ impl App {
         if self.message_open {
             return;
         }
+        if self.account().is_some_and(|a| a.native_view.is_some()) {
+            self.exit_native_view();
+        }
         self.visual_anchor = None;
         let query = {
             let Some(account) = self.account_mut() else {
@@ -21,6 +24,10 @@ impl App {
     }
 
     pub(super) fn handle_search_key(&mut self, key: KeyEvent) {
+        if self.account().is_some_and(|a| a.native_search_editing) {
+            self.handle_native_search_key(key);
+            return;
+        }
         let mut cleared = false;
         let status = {
             let Some(account) = self.account_mut() else {
@@ -61,6 +68,11 @@ impl App {
             // This searches beyond the first page without eagerly downloading all
             // of a huge All Mail folder for a broad query.
             if !account.search_query.is_empty()
+                && !account
+                    .search_query
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with("body:")
                 && count < account.message_view_height
                 && account.has_more
                 && account.page_inflight.is_none()
@@ -228,5 +240,270 @@ impl App {
         self.theme_selected = self.theme_before_picker;
         self.theme_query.clear();
         self.theme_picker_visible = false;
+    }
+}
+
+impl App {
+    fn native_view_available(&mut self) -> bool {
+        if self.message_open {
+            return false;
+        }
+        if self.account().is_some_and(|a| {
+            a.capabilities.is_some_and(|c| c.server_search)
+                && !a.connecting
+                && a.current_mailbox
+                    .as_ref()
+                    .is_some_and(|name| a.cache_identities.contains_key(name))
+                && !a.cached_mailbox_unverified()
+        }) {
+            true
+        } else {
+            self.status = StatusLine::info(
+                "Server search requires a connected IMAP or JMAP mailbox; use / for cached search",
+            );
+            false
+        }
+    }
+
+    pub(super) fn begin_native_search(&mut self) {
+        if !self.native_view_available() {
+            return;
+        }
+        self.visual_anchor = None;
+        if let Some(account) = self.account_mut() {
+            account.search_query.clear();
+            account.search_editing = true;
+            account.native_search_editing = true;
+            account.smooth_message_target = None;
+        }
+        self.status = StatusLine::info("Server search: text, from:, subject:, is:unread");
+    }
+
+    fn handle_native_search_key(&mut self, key: KeyEvent) {
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                account.search_editing = false;
+                account.native_search_editing = false;
+                account.search_query.clear();
+            }
+            KeyCode::Enter => {
+                let query = std::mem::take(&mut account.search_query);
+                account.search_editing = false;
+                account.native_search_editing = false;
+                if !query.trim().is_empty() {
+                    self.enter_native_view(crate::backend::MailboxView::Search(query));
+                }
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                account.search_query.clear()
+            }
+            KeyCode::Backspace => {
+                account.search_query.pop();
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && account.search_query.len() < 4096 =>
+            {
+                account.search_query.push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    fn thread_server_available(&self) -> bool {
+        !self.message_open
+            && self.account().is_some_and(|a| {
+                a.capabilities.is_some()
+                    && !a.connecting
+                    && a.current_mailbox.as_ref().is_some_and(|name| {
+                        matches!(
+                            a.cache_identities.get(name),
+                            Some(CacheIdentity::Imap(_) | CacheIdentity::Jmap { .. })
+                        )
+                    })
+                    && !a.cached_mailbox_unverified()
+            })
+    }
+
+    pub(super) fn toggle_native_threads(&mut self) {
+        if self.message_open {
+            return;
+        }
+        if self.account().is_some_and(|a| a.native_view.is_some()) {
+            self.exit_native_view();
+        }
+        self.visual_anchor = None;
+        self.message_marked.clear();
+        let preview = self.preview_split;
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        account.threading_enabled = !account.threading_enabled;
+        account.local_thread_view = None;
+        account.expanded_threads.clear();
+        account.inline_thread_requests.clear();
+        account.smooth_message_target = None;
+        account.last_prefetch_anchor = None;
+        account.normalize_search_selection();
+        if preview {
+            account.request_selected_body();
+        }
+        self.status = StatusLine::info(if account.threading_enabled {
+            "Thread grouping on"
+        } else {
+            "Thread grouping off"
+        });
+    }
+
+    pub(super) fn open_native_thread(&mut self) {
+        if self.message_open {
+            return;
+        }
+        let online = self.thread_server_available();
+        let preview = self.preview_split;
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        if !account.collapsed_threads() || account.native_view.is_some() {
+            return;
+        }
+        if account.collapse_inline_thread() {
+            if preview {
+                account.request_selected_body();
+            }
+        } else {
+            let Some(message) = account.selected_message() else {
+                return;
+            };
+            let seed = message.id.clone();
+            let native = if account.jmap {
+                message.thread_id.clone()
+            } else {
+                Some(seed.0.clone())
+            };
+            let ids = account.inline_group_ids();
+            if ids.len() <= 1 && (!online || native.is_none()) {
+                return;
+            }
+            account.expanded_threads.extend(ids);
+            account.last_prefetch_anchor = None;
+            account.smooth_message_target = None;
+            account.normalize_search_selection();
+            // A single bounded page per explicit expansion. Keep this request
+            // separate from the canonical page cursor and all body requests.
+            if online
+                && account.inline_thread_requests.len() < 4
+                && let Some(name) = account.current_mailbox.clone()
+                && let Some(native) = native
+                && let Ok(request) = account.worker.post(ActionKind::DiscoverThread {
+                    name,
+                    view: crate::backend::MailboxView::Thread(native),
+                    cached_ids: account
+                        .canonical_messages()
+                        .iter()
+                        .take(cache::MAX_MESSAGES_PER_FOLDER)
+                        .map(|m| m.id.clone())
+                        .collect(),
+                    limit: account.page_size.clamp(1, 200),
+                })
+            {
+                account.inline_thread_requests.insert(request, seed);
+            }
+        }
+        self.visual_anchor = None;
+        self.message_marked.clear();
+    }
+
+    pub(super) fn collapse_selected_thread(&mut self) {
+        let preview = self.preview_split;
+        self.visual_anchor = None;
+        self.message_marked.clear();
+        if let Some(account) = self.account_mut()
+            && account.collapse_inline_thread()
+            && preview
+        {
+            account.request_selected_body();
+        }
+    }
+
+    fn enter_native_view(&mut self, view: crate::backend::MailboxView) {
+        if !self.thread_server_available() {
+            return;
+        }
+        self.visual_anchor = None;
+        self.message_marked.clear();
+        let label = view.label();
+        let preview_split = self.preview_split;
+        let Some(account) = self.account_mut() else {
+            return;
+        };
+        let Some(name) = account.current_mailbox.clone() else {
+            return;
+        };
+        if account.native_view.is_none() {
+            account.save_current_cache();
+            account.persist_current_cache();
+        }
+        account.reset_inline_threads();
+        account.native_view = Some(view);
+        account.local_thread_view = None;
+        account.search_query.clear();
+        account.search_editing = false;
+        account.native_search_editing = false;
+        account.messages.clear();
+        account.bodies.clear();
+        account.pending_bodies.clear();
+        account.body_request_id = None;
+        account.last_prefetch_window = None;
+        account.last_prefetch_anchor = None;
+        account.message_index = 0;
+        account.trim_preview_bodies();
+        account.message_view_offset = 0;
+        account.smooth_message_target = None;
+        account.page_inflight = None;
+        account.page_request_id = None;
+        account.has_more = false;
+        account.next_page_offset = 0;
+        if account.request_mailbox_page(name, 0) {
+            account.normalize_search_selection();
+            if preview_split {
+                account.request_selected_body();
+            }
+            self.status = StatusLine::info(if account.messages.is_empty() {
+                format!("{label}…")
+            } else {
+                format!("{label}: showing cached messages; checking server…")
+            });
+        } else {
+            self.exit_native_view();
+            self.status = StatusLine::error("Could not schedule native mailbox query");
+        }
+    }
+
+    pub(super) fn exit_native_view(&mut self) {
+        self.visual_anchor = None;
+        self.message_marked.clear();
+        let preview_split = self.preview_split;
+        if let Some(account) = self.account_mut() {
+            if account.native_view.is_none() {
+                account.local_thread_view = None;
+                account.search_query.clear();
+                account.search_editing = false;
+                account.native_search_editing = false;
+                account.normalize_search_selection();
+            } else {
+                Self::activate_selected_mailbox(account, preview_split);
+            }
+        }
+        self.status = StatusLine::info(if self.account().is_some_and(|a| a.threading_enabled) {
+            "Grouped mailbox view"
+        } else {
+            "Normal mailbox view"
+        });
     }
 }

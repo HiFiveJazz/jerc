@@ -110,7 +110,7 @@ fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<Str
                 let scheme = safe_scheme(&account.source);
                 warnings.push(format!(
                     "{}: incoming source uses invalid or unsupported scheme '{scheme}'. \
-                     Use maildir://, imaps://, imaps+login://, imaps+oauthbearer://, or imaps+xoauth2://, or imap+starttls://. Account skipped.",
+                     Use maildir://, imaps://, imap+starttls://, jmaps://, jmaps+bearer://, pop3s://, or pop3+starttls://. Account skipped.",
                     account.name,
                 ));
             }
@@ -127,7 +127,7 @@ fn validate_account_configuration(mut config: Config) -> Result<(Config, Vec<Str
                 let scheme = account.outgoing.as_deref().map(safe_scheme).unwrap_or("<missing>");
                 warnings.push(format!(
                     "{}: outgoing transport '{scheme}' is invalid. Use smtp:// or smtps:// \
-                     (optional +login, +plain, +none, +xoauth2 or +oauthbearer), or an absolute sendmail path. Receiving works; sending disabled until fixed.",
+                     (optional +login, +plain, +none, +xoauth2 or +oauthbearer), jmap (JMAP accounts only), or an absolute sendmail path. Receiving works; sending disabled until fixed.",
                     account.name,
                 ));
             }
@@ -209,19 +209,47 @@ fn create_worker(
     account: &crate::config::AccountConfig,
     runtime_tx: &SyncSender<RuntimeEvent>,
 ) -> Result<WorkerHandle> {
+    // JMAP workers share a bounded account-scoped metadata cache and HTTP
+    // connection pool; a single account-wide watch replaces folder watchers.
+    let kind = backend::BackendKind::from_source(&account.source);
+    if kind == Some(backend::BackendKind::Jmap) {
+        let foreground = backend::JmapBackend::new(
+            backend::JmapSource::parse(&account.source)?,
+            account.source_cred_cmd.clone(),
+            account,
+        )?;
+        let background = foreground.fork();
+        let watch = foreground.fork();
+        return Ok(WorkerHandle::spawn_with_idle_and_selected(
+            index,
+            Box::new(foreground),
+            Some(Box::new(background)),
+            Some(Box::new(watch)),
+            None,
+            outgoing::from_account(account)?,
+            runtime_tx.clone(),
+        ));
+    }
     let backend = backend::from_account(account)?;
     // STATUS and preview preloading share a lazy background session.
     // Maildir uses a separate inexpensive local worker as well, so
     // disk reads cannot stall interactive navigation.
-    let status_backend = Some(backend::from_account(account)?);
-    let idle_backend = if backend::ImapSource::supports(&account.source) {
+    // POP3 maildrops frequently reject concurrent sessions because the server
+    // locks the transaction mailbox. Keep exactly one POP3 connection; status
+    // requests share the foreground worker and speculative warming is disabled.
+    let status_backend = if kind == Some(backend::BackendKind::Pop3) {
+        None
+    } else {
+        Some(backend::from_account(account)?)
+    };
+    let idle_backend = if kind == Some(backend::BackendKind::Imap) {
         Some(backend::from_account(account)?)
     } else {
         None
     };
     // An independent selected-folder watch only starts when the user opens
     // a non-Inbox mailbox; all other accounts retain their Inbox watch only.
-    let selected_idle_backend = if backend::ImapSource::supports(&account.source) {
+    let selected_idle_backend = if kind == Some(backend::BackendKind::Imap) {
         Some(backend::from_account(account)?)
     } else {
         None
@@ -236,7 +264,7 @@ fn create_worker(
         sender,
         runtime_tx.clone(),
     );
-    if backend::ImapSource::supports(&account.source) {
+    if kind == Some(backend::BackendKind::Imap) {
         worker.enable_foreground_recovery(index, account.clone(), runtime_tx.clone());
     }
     Ok(worker)
@@ -825,12 +853,30 @@ mod multi_account_tests {
     }
 
     #[test]
+    fn secure_jmap_and_pop3_sources_are_valid_accounts() {
+        let config: Config = toml::from_str(
+            r#"
+            [[accounts]]
+            name = "Jmap"
+            source = "jmaps://user:secret@mail.example.net"
+            [[accounts]]
+            name = "Pop3"
+            source = "pop3s://user:secret@mail.example.net"
+        "#,
+        )
+        .unwrap();
+        let (validated, warnings) = validate_account_configuration(config).unwrap();
+        assert_eq!(validated.accounts.len(), 2);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn invalid_incoming_skips_only_that_account() {
         let config: Config = toml::from_str(
             r#"
             [[accounts]]
             name = "Broken"
-            source = "pop3s://user:secret@server.example.net"
+            source = "ftp://user:secret@server.example.net"
             [[accounts]]
             name = "Working"
             source = "maildir:///tmp/working"
@@ -877,7 +923,7 @@ mod multi_account_tests {
             r#"
             [[accounts]]
             name = "Broken"
-            source = "pop3s://user:secret@server.example.net"
+            source = "ftp://user:secret@server.example.net"
         "#,
         )
         .unwrap();

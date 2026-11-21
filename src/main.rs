@@ -48,14 +48,14 @@ struct Cli {
     #[arg(long, requires = "oauth_probe")]
     oauth_probe_smtp_challenge: bool,
 
-    /// Discover secure IMAP/SMTP settings using provider HTTPS autoconfig and Thunderbird ISPDB.
+    /// Discover secure IMAP/SMTP or JMAP settings using HTTPS provider autoconfig.
     /// Prints a proposed TOML account without modifying your config or credentials.
     #[arg(long, value_name = "EMAIL_ADDRESS", conflicts_with_all = ["maildir", "oauth_login", "oauth_inspect", "oauth_probe", "headless_check"])]
     discover_email: Option<String>,
 
     /// Select a known provider when domain discovery is missing or ambiguous.
     /// Does not confirm account ownership or bypass OAuth approval.
-    #[arg(long, value_parser = ["auto", "microsoft", "google"], requires = "discover_email")]
+    #[arg(long, value_parser = ["auto", "microsoft", "google", "jmap"], requires = "discover_email")]
     discover_provider: Option<String>,
 
     /// Suggest a separate IMAP/SMTP username in the generated config (no OAuth request).

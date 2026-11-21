@@ -79,11 +79,10 @@ impl AccountState {
         }
     }
 
-    /// An OAuth HTTP/TLS failure occurred before SMTP was contacted.
-    /// Restore a submitted Outbox entry to Queued, persisting the change
-    /// BEFORE allowing a future automatic replay. Other failures remain
-    /// NeedsReview because SMTP may already have accepted DATA.
-    pub(super) fn requeue_outbox_before_smtp(&mut self, request_id: u64) -> bool {
+    /// A classified network failure occurred before delivery was attempted.
+    /// Restore the Outbox entry to Queued durably before automatic replay.
+    /// Other failures remain NeedsReview because the server may have accepted it.
+    pub(super) fn requeue_outbox_before_submission(&mut self, request_id: u64) -> bool {
         let Some(id) = self.inflight_outbox.remove(&request_id) else {
             return false;
         };
@@ -155,17 +154,7 @@ impl App {
             return;
         };
         let account_index = self.account_index;
-        let cache = account
-            .uid_validities
-            .get(&mailbox)
-            .copied()
-            .filter(|validity| message_id.0.starts_with(&format!("imap-uid:{validity}:")))
-            .and_then(|validity| {
-                account
-                    .raw_store
-                    .as_ref()
-                    .map(|store| (store.dir.clone(), validity))
-            });
+        let cache = account.raw_cache_key(&mailbox, &message_id);
         let queued = account
             .worker
             .post(ActionKind::FetchRawForCompose {
@@ -214,7 +203,7 @@ impl App {
         };
         if !account.outgoing_configured {
             self.status = StatusLine::error(
-                "no outgoing SMTP transport configured; add `outgoing = ...` to this account",
+                "no outgoing transport configured; add `outgoing = ...` to this account",
             );
             return;
         }
@@ -255,7 +244,7 @@ impl App {
             .is_some_and(|account| account.outgoing_configured)
         {
             self.status = StatusLine::error(
-                "no outgoing SMTP transport configured; add `outgoing = ...` to this account",
+                "no outgoing transport configured; add `outgoing = ...` to this account",
             );
             return;
         }
@@ -280,17 +269,7 @@ impl App {
         let Some((message_id, mailbox, summary, cache)) = self.account().and_then(|account| {
             let message = account.selected_message()?.clone();
             let mailbox = account.current_mailbox.clone()?;
-            let cache = account
-                .uid_validities
-                .get(&mailbox)
-                .copied()
-                .filter(|validity| message.id.0.starts_with(&format!("imap-uid:{validity}:")))
-                .and_then(|validity| {
-                    account
-                        .raw_store
-                        .as_ref()
-                        .map(|store| (store.dir.clone(), validity))
-                });
+            let cache = account.raw_cache_key(&mailbox, &message.id);
             Some((message.id.clone(), mailbox, message, cache))
         }) else {
             return;
@@ -1165,7 +1144,8 @@ impl App {
             return;
         };
         if !account.outgoing_configured {
-            self.status = StatusLine::error("configure outgoing SMTP before resuming a draft");
+            self.status =
+                StatusLine::error("configure an outgoing transport before resuming a draft");
             return;
         }
         let result = Self::postponed_drafts_root()

@@ -333,9 +333,28 @@ type AppendLog = Arc<Mutex<Vec<AppendedMessage>>>;
 struct AppendingBackend {
     appended: AppendLog,
     fail_append: bool,
+    native: Option<bool>, // Some(true) confirmed; Some(false) ambiguous
 }
 
 impl MailBackend for AppendingBackend {
+    fn submit_message(
+        &mut self,
+        _: &OutgoingMessage,
+        _: Option<&str>,
+        _: Option<&[String]>,
+    ) -> Result<Option<jerc::backend::NativeSendReceipt>> {
+        match self.native {
+            None => Ok(None),
+            Some(false) => anyhow::bail!("native submission outcome uncertain"),
+            Some(true) => Ok(Some(jerc::backend::NativeSendReceipt {
+                sent_mailbox: Some("Sent".into()),
+                affected_mailboxes: vec!["Sent".into(), "Drafts".into()],
+                sent_copy_saved: false,
+                sent_copy_warning: Some("filing failed".into()),
+            })),
+        }
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities::MAILDIR
     }
@@ -413,6 +432,7 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
     let backend = AppendingBackend {
         appended: Arc::clone(&appended),
         fail_append: false,
+        native: None,
     };
     let (tx, rx) = sync_channel(8);
     let mut worker =
@@ -445,6 +465,7 @@ fn worker_files_the_exact_smtp_bytes_in_sent() {
         sent_copy_saved,
         sent_copy_warning,
         sent_copy_disabled,
+        ..
     } = event.kind
     else {
         panic!("expected sent event");
@@ -469,6 +490,7 @@ fn sent_append_failure_is_reported_and_not_retried_as_smtp_send() {
     let backend = AppendingBackend {
         appended: Arc::clone(&appended),
         fail_append: true,
+        native: None,
     };
     let (tx, rx) = sync_channel(8);
     let mut worker =
@@ -514,6 +536,7 @@ fn sent_copy_can_be_disabled_without_appending_to_server() {
     let backend = AppendingBackend {
         appended: Arc::clone(&appended),
         fail_append: false,
+        native: None,
     };
     let (tx, rx) = sync_channel(8);
     let mut worker =
@@ -559,6 +582,7 @@ fn sent_copy_explicit_multiple_folders_appends_both() {
     let backend = AppendingBackend {
         appended: Arc::clone(&appended),
         fail_append: false,
+        native: None,
     };
     let (tx, rx) = sync_channel(8);
     let mut worker =
@@ -604,4 +628,61 @@ fn sent_copy_explicit_multiple_folders_appends_both() {
     );
     drop(appended);
     worker.shutdown();
+}
+
+#[test]
+fn native_submission_never_falls_back_after_acceptance_or_uncertain_error() {
+    for accepted in [true, false] {
+        let appended = Arc::new(Mutex::new(Vec::new()));
+        let backend = AppendingBackend {
+            appended: Arc::clone(&appended),
+            fail_append: false,
+            native: Some(accepted),
+        };
+        struct NoSmtp;
+        impl MailSender for NoSmtp {
+            fn send(&mut self, _: &OutgoingMessage) -> Result<SendReceipt> {
+                panic!("must not fall back to SMTP after native submission");
+            }
+        }
+        let (tx, rx) = sync_channel(8);
+        let mut worker =
+            WorkerHandle::spawn(0, Box::new(backend), None, Some(Box::new(NoSmtp)), tx);
+        worker
+            .post(ActionKind::Send {
+                message: OutgoingMessage {
+                    from: "sender@example.com".into(),
+                    to: "receiver@example.com".into(),
+                    cc: String::new(),
+                    bcc: String::new(),
+                    subject: "hello".into(),
+                    body: "body".into(),
+                    html_body: None,
+                    attachments: Vec::new(),
+                    custom_headers: Vec::new(),
+                    in_reply_to: None,
+                    references: Vec::new(),
+                    forwarded_raw: None,
+                },
+                sent_mailbox: Some("Sent".into()),
+                copy_to: None,
+            })
+            .unwrap();
+        match recv_initial_foreground(&rx).kind {
+            WorkerEventKind::MessageSent {
+                smtp_status,
+                sent_copy_warning,
+                affected_mailboxes,
+                ..
+            } if accepted => {
+                assert_eq!(smtp_status, "JMAP");
+                assert!(sent_copy_warning.is_some());
+                assert!(affected_mailboxes.contains(&"Drafts".to_owned()));
+            }
+            WorkerEventKind::Error(_) if !accepted => (),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert!(appended.lock().unwrap().is_empty());
+        worker.shutdown();
+    }
 }

@@ -14,6 +14,7 @@ pub mod patch_preview;
 mod perf;
 pub mod runtime;
 pub mod theme;
+mod threading;
 pub mod ui;
 pub mod worker;
 

@@ -36,6 +36,35 @@ from = "Your Name <you@example.com>"
 > [!CAUTION]
 > Strive to use credential commands over placing reusable secrets directly in configuration files. Never commit a real account configuration to source control like git 
 
+### JMAP over HTTPS (including sending)
+
+```toml
+[[accounts]]
+name = "Personal"
+email = "you@example.com"
+source = "jmaps://you%40example.com@mail.example.com"
+source_cred_cmd = "pass show mail/personal"
+outgoing = "jmap"
+```
+
+`outgoing = "jmap"` requires the server to advertise JMAP submission for the
+primary mail account. It uses the incoming account credentials, discovers the
+matching sending identity and submits through HTTPS; SMTP configuration is not
+necessary. The setup wizard also supports this mode: select JMAP and clear the
+SMTP hostname to disable the fallback.
+
+Existing JMAP accounts with a configured SMTP URI prefer native submission when
+advertised, using SMTP only if the capability is absent. A failed or uncertain
+native submission is **never** retried through SMTP. As before, `outgoing = "none"`
+or omitting `outgoing` disables sending; an explicit sendmail path keeps using
+sendmail. The configured `from` (or `email`) must match a server identity.
+
+The default copy policy moves the imported message from Drafts to Sent after
+submission. `copy_to = "Archive, Sent"` files the same message in both folders;
+`copy_to = "none"` removes the temporary imported draft after acceptance. If
+filing fails, Jerc reports a warning without resending. Queued offline messages
+use the same submission path, and ambiguous delivery results require manual review.
+
 ### OAuth accounts
 
 ```toml
@@ -72,6 +101,7 @@ theme = "tokyo-night"
 border_style = "rounded"          # "square" or "rounded"
 visual_selection_style = "gutter" # "gutter" or "row"
 remote_images = false
+threading = true            # group known conversations by default
 mailbox_width_percent = 22  # Alt-h/l or drag the mailbox divider
 preview_width_percent = 57  # Alt-Shift-h/l or drag the reader divider
 new_mail_notifications = true

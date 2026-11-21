@@ -148,7 +148,7 @@ pub(super) fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
             Paragraph::new(format!(
                 "{}  ·  {}",
                 file.content_type,
-                attachment_human_size(file.data.len())
+                attachment_human_size(app.attachment_display_size(selected))
             ))
             .style(theme.muted()),
             Rect::new(pleft, preview_area.y.saturating_add(1), pwidth, 1),
@@ -210,7 +210,10 @@ pub(super) fn draw_attachments(frame: &mut Frame<'_>, app: &mut App) {
                     .wrap(Wrap { trim: false }),
                 content,
             );
-        } else if let Some(preview) = attachment_text_preview(file) {
+        } else if let Some(preview) = app
+            .attachment_text_preview_file(selected)
+            .and_then(attachment_text_preview)
+        {
             frame.render_widget(
                 Paragraph::new(preview)
                     .style(theme.text())

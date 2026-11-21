@@ -62,6 +62,11 @@ pub fn sender_from_account(account: &AccountConfig) -> String {
     {
         return smtp.username;
     }
+    if let Ok(jmap) = crate::backend::JmapSource::parse(&account.source)
+        && jmap.username().parse::<lettre::message::Mailbox>().is_ok()
+    {
+        return jmap.username().to_owned();
+    }
     if let Ok(imap) = crate::backend::ImapSource::parse(&account.source)
         && imap.username.parse::<lettre::message::Mailbox>().is_ok()
     {
@@ -74,6 +79,14 @@ pub fn from_account(account: &AccountConfig) -> Result<Option<Box<dyn MailSender
     let Some(source) = account.outgoing.as_deref() else {
         return Ok(None);
     };
+    if source == "jmap" {
+        anyhow::ensure!(
+            crate::backend::JmapSource::supports(&account.source),
+            "outgoing = jmap requires a JMAP incoming source"
+        );
+        // Native sending uses the existing foreground backend and session.
+        return Ok(None);
+    }
     if let Some(sender) = SendmailSender::from_outgoing(source)? {
         return Ok(Some(Box::new(sender)));
     }
@@ -137,6 +150,23 @@ mod sender_tests {
             max_messages: 100,
             page_size: 100,
         }
+    }
+
+    #[test]
+    fn native_jmap_configuration_uses_incoming_identity_and_no_smtp_sender() {
+        let config = account(
+            None,
+            "jmap",
+            "jmaps://sender%40example.org@mail.example.org",
+        );
+        assert_eq!(sender_from_account(&config), "sender@example.org");
+        assert!(super::from_account(&config).unwrap().is_none());
+        let invalid = account(
+            None,
+            "jmap",
+            "imaps://sender%40example.org@mail.example.org",
+        );
+        assert!(super::from_account(&invalid).is_err());
     }
 
     #[test]

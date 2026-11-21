@@ -14,10 +14,13 @@ impl App {
                 if account.is_abandoned_list_request(event.request_id) {
                     return;
                 }
-                // A failed OAuth token HTTP request happens before any SMTP
-                // submission. This is the only send failure we can safely
-                // queue again without checking Sent first.
-                let pre_smtp_oauth_failure = super::is_pre_smtp_oauth_network_failure(&error);
+                // Only explicitly classified pre-submission network failures
+                // may be replayed without risking duplicate delivery.
+                let safe_to_requeue = matches!(
+                    error.kind,
+                    crate::backend::ErrorKind::PreSmtpOAuth
+                        | crate::backend::ErrorKind::PreJmapSubmission
+                );
                 let failed_connect = account.connect_request_id == Some(event.request_id);
                 let failed_list = account.mailbox_list_request_id == Some(event.request_id);
                 // STATUS and attachment downloads use independent read-only
@@ -26,7 +29,7 @@ impl App {
                 let failed_status = account.status_requests.finish(event.request_id);
                 // The background worker prefixes STATUS errors. A late error
                 // from a retired count request is not a foreground failure.
-                if error.starts_with("background mailbox count:") && failed_status.is_none() {
+                if error.background_status && failed_status.is_none() {
                     return;
                 }
                 let failed_attachment =
@@ -38,12 +41,13 @@ impl App {
                 if failed_list {
                     account.mailbox_list_request_id = None;
                     account.mailboxes_loading = false;
+                    account.push_list_inflight = false;
                 }
                 if failed_list || failed_connect {
                     account.sync_progress_at = None;
                 }
                 if failed_connect
-                    || (super::is_connection_failure(&error)
+                    || (error.kind.is_connection_failure()
                         && failed_status.is_none()
                         && !failed_attachment)
                 {
@@ -75,11 +79,28 @@ impl App {
                     .pending_mutation_labels
                     .remove(&event.request_id)
                     .is_some();
-                // The destination can no longer be trusted after a failed
-                // move/copy. Drop the bookkeeping instead of retaining it.
-                account
+                // A bulk mutation may have succeeded for only some messages.
+                // Reconcile both folders; never replay a destructive request.
+                let destination = account
                     .pending_destination_refresh
-                    .remove(&event.request_id);
+                    .remove(&event.request_id)
+                    .or_else(|| {
+                        account
+                            .inflight_deferred_mutations
+                            .get(&event.request_id)
+                            .and_then(|entry| match &entry.kind {
+                                cache::DeferredMutationKind::Delete => None,
+                                cache::DeferredMutationKind::Move { destination }
+                                | cache::DeferredMutationKind::Archive { destination }
+                                | cache::DeferredMutationKind::Unarchive { destination } => {
+                                    Some(destination.clone())
+                                }
+                            })
+                    });
+                if let Some(destination) = destination {
+                    account.invalidate_remote_folder(&destination);
+                    account.rewarm_mailbox(&destination);
+                }
                 let uncertain_offline_mutation =
                     account.finish_deferred_mutation(event.request_id, false);
                 let failed_seen = account.pending_seen.iter().find_map(|(id, request_id)| {
@@ -114,8 +135,8 @@ impl App {
                 }
                 let outbox_was_inflight = account.inflight_outbox.contains_key(&event.request_id);
                 let outbox_requeued = outbox_was_inflight
-                    && pre_smtp_oauth_failure
-                    && account.requeue_outbox_before_smtp(event.request_id);
+                    && safe_to_requeue
+                    && account.requeue_outbox_before_submission(event.request_id);
                 if !outbox_requeued {
                     account.finish_outbox(event.request_id, false);
                 }
@@ -137,7 +158,7 @@ impl App {
                 // rejects STATUS for a special mailbox.
                 Self::pump_mailbox_status(account);
                 let message = if outbox_requeued {
-                    "OAuth unavailable before SMTP; Outbox message remains queued for reconnect"
+                    "Network unavailable before submission; Outbox message remains queued for reconnect"
                         .to_owned()
                 } else if uncertain_outbox_send {
                     format!(
@@ -161,8 +182,8 @@ impl App {
                 } else {
                     StatusLine::temporary_error(message, Duration::from_secs(10))
                 };
-                if send_failed && pre_smtp_oauth_failure {
-                    // We now know that SMTP was never contacted. The composer
+                if send_failed && safe_to_requeue {
+                    // We now know delivery was never attempted. The composer
                     // still contains the complete message and attachments;
                     // send_composer takes the offline Outbox path because the
                     // connection failure cleared account.capabilities above.

@@ -10,6 +10,8 @@ use super::*;
 pub(super) enum StatusReason {
     /// Initial counts are not proof that a message arrived during this session.
     Initial,
+    /// Revalidate a displayed cached count without treating it as a new-mail baseline.
+    Reconcile,
     /// An IDLE wakeup or a periodic poll may report a new message.
     Refresh,
 }
@@ -42,13 +44,14 @@ impl MailboxStatusQueue {
             .iter()
             .position(|request| request.name == name)
             .and_then(|index| self.pending.remove(index));
-        let reason = if existing
-            .as_ref()
-            .is_some_and(|request| request.reason == StatusReason::Refresh)
-        {
-            StatusReason::Refresh
-        } else {
-            reason
+        // A pending reconciliation must establish a server baseline before
+        // an IDLE/poll can infer new mail from the last known count.
+        let reason = match (existing.map(|request| request.reason), reason) {
+            (Some(StatusReason::Reconcile), _) | (_, StatusReason::Reconcile) => {
+                StatusReason::Reconcile
+            }
+            (Some(StatusReason::Refresh), _) => StatusReason::Refresh,
+            (_, reason) => reason,
         };
         let request = StatusRequest { name, reason };
         if reason == StatusReason::Refresh {
@@ -70,7 +73,7 @@ impl MailboxStatusQueue {
         self.pending.retain(|request| {
             mailboxes.iter().any(|mailbox| {
                 mailbox.name == request.name
-                    && (request.reason == StatusReason::Refresh || !mailbox.counts_known)
+                    && (request.reason != StatusReason::Initial || !mailbox.counts_known)
             })
         });
     }
@@ -79,7 +82,7 @@ impl MailboxStatusQueue {
         while let Some(request) = self.pending.pop_front() {
             if mailboxes.iter().any(|mailbox| {
                 mailbox.name == request.name
-                    && (request.reason == StatusReason::Refresh || !mailbox.counts_known)
+                    && (request.reason != StatusReason::Initial || !mailbox.counts_known)
             }) {
                 return Some(request);
             }
@@ -108,7 +111,12 @@ impl MailboxStatusQueue {
     /// Late replies must not be applied to the new connection's counts.
     pub(super) fn reset_connection(&mut self) {
         if let Some(in_flight) = self.in_flight.take() {
-            self.enqueue(in_flight.request.name, StatusReason::Refresh);
+            let reason = if in_flight.request.reason == StatusReason::Reconcile {
+                StatusReason::Reconcile
+            } else {
+                StatusReason::Refresh
+            };
+            self.enqueue(in_flight.request.name, reason);
         }
     }
 
@@ -118,6 +126,78 @@ impl MailboxStatusQueue {
 }
 
 impl AccountState {
+    /// A discovery response owns names, roles and ordering. IMAP LIST has no
+    /// counts; keep the last known values while scheduling STATUS separately.
+    /// Protocols supplying authoritative counts (e.g. JMAP) need no STATUS.
+    pub(super) fn reconcile_mailbox_list(&mut self, mut discovered: Vec<Mailbox>) {
+        self.status_requests.pending.retain(|request| {
+            discovered.iter().any(|mailbox| {
+                mailbox.name == request.name
+                    && (!mailbox.counts_known || request.reason == StatusReason::Refresh)
+            })
+        });
+        let previous: HashMap<_, _> = self
+            .mailboxes
+            .iter()
+            .filter(|mailbox| mailbox.counts_known)
+            .map(|mailbox| (mailbox.name.as_str(), (mailbox.total, mailbox.unread)))
+            .collect();
+        for mailbox in &mut discovered {
+            if mailbox.counts_known {
+                continue;
+            }
+            if let Some(&(total, unread)) = previous.get(mailbox.name.as_str()) {
+                mailbox.total = total;
+                mailbox.unread = unread;
+                mailbox.counts_known = true;
+            }
+            let reason = if mailbox.counts_known {
+                StatusReason::Reconcile
+            } else {
+                StatusReason::Initial
+            };
+            self.status_requests.enqueue(mailbox.name.clone(), reason);
+        }
+        let changed = discovered
+            .iter()
+            .filter(|mailbox| {
+                mailbox.counts_known
+                    && previous
+                        .get(mailbox.name.as_str())
+                        .is_some_and(|counts| *counts != (mailbox.total, mailbox.unread))
+                    && self.mailbox_cache.contains_key(&mailbox.name)
+            })
+            .map(|mailbox| mailbox.name.clone())
+            .collect::<Vec<_>>();
+        self.mailboxes = discovered;
+        self.mailbox_warm_queue
+            .retain(|name| self.mailboxes.iter().any(|mailbox| &mailbox.name == name));
+        if self
+            .mailbox_warm_request
+            .as_ref()
+            .is_some_and(|(_, name)| !self.mailboxes.iter().any(|mailbox| &mailbox.name == name))
+        {
+            self.mailbox_warm_request = None;
+        }
+        for name in changed {
+            if !self.mailbox_warm_queue.contains(&name) {
+                self.mailbox_warm_queue.push_back(name);
+            }
+        }
+    }
+
+    /// A mutation invalidates freshness, not the last known display value.
+    pub(super) fn queue_count_reconciliation(&mut self, name: &str) {
+        if let Some(mailbox) = self.mailboxes.iter().find(|mailbox| mailbox.name == name) {
+            let reason = if mailbox.counts_known {
+                StatusReason::Reconcile
+            } else {
+                StatusReason::Initial
+            };
+            self.status_requests.enqueue(name.to_owned(), reason);
+        }
+    }
+
     pub(super) fn queue_unknown_mailbox_statuses(&mut self, priority: Option<&str>) {
         self.status_requests.retain_mailboxes(&self.mailboxes);
         for mailbox in &self.mailboxes {
@@ -186,10 +266,23 @@ impl App {
         if account.capabilities.is_none()
             || account.connecting
             || account.status_requests.busy()
+            || account.mailboxes_loading
             || account.messages_loading
             || !account.pending_bodies.is_empty()
             || !account.pending_mutation_labels.is_empty()
         {
+            return;
+        }
+        // A JMAP push is account-wide: reconcile all mailbox metadata with
+        // one list/delta request rather than issuing STATUS for each folder.
+        // A dirty bit keeps at most one follow-up if more events arrive.
+        if account.pending_account_refresh
+            && account.page_inflight.is_none()
+            && account.pending_seen.is_empty()
+            && account.request_mailbox_list()
+        {
+            account.pending_account_refresh = false;
+            account.push_list_inflight = true;
             return;
         }
         if let Some(request) = account.status_requests.pop_ready(&account.mailboxes) {
@@ -209,6 +302,37 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_counts_do_not_skip_status_or_trigger_startup_notifications() {
+        let mut queue = MailboxStatusQueue::default();
+        queue.enqueue("INBOX".into(), StatusReason::Reconcile);
+        queue.enqueue("INBOX".into(), StatusReason::Refresh);
+        queue.retain_mailboxes(&[known("INBOX", true)]);
+        let request = queue.pop_ready(&[known("INBOX", true)]).unwrap();
+        assert_eq!(request.reason, StatusReason::Reconcile);
+        queue.start(10, request);
+        queue.reset_connection();
+        assert!(queue.finish(10).is_none());
+        let request = queue.pop_ready(&[known("INBOX", true)]).unwrap();
+        assert_eq!(request.reason, StatusReason::Reconcile);
+        queue.start(11, request);
+        // An arrival during reconciliation still merits a later refresh.
+        queue.enqueue("INBOX".into(), StatusReason::Refresh);
+        assert_eq!(queue.finish(11).unwrap().reason, StatusReason::Reconcile);
+        assert_eq!(
+            queue.pop_ready(&[known("INBOX", true)]).unwrap().reason,
+            StatusReason::Refresh
+        );
+    }
+
+    #[test]
+    fn reconcile_requests_for_removed_folders_are_discarded() {
+        let mut queue = MailboxStatusQueue::default();
+        queue.enqueue("Deleted".into(), StatusReason::Reconcile);
+        queue.retain_mailboxes(&[known("INBOX", true)]);
+        assert!(queue.pop_ready(&[known("INBOX", true)]).is_none());
+    }
 
     #[test]
     fn periodic_status_fallback_includes_only_inbox_and_active_folder() {

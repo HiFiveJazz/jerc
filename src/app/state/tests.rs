@@ -6,7 +6,7 @@ use super::{
     reader_word_target, reply_attribution, url_at_cursor,
 };
 use crate::contacts::{ContactEdit, ContactsModal};
-use crate::model::{MessageFlags, MessageId, MessageSummary};
+use crate::model::{CacheIdentity, MessageFlags, MessageId, MessageSummary};
 use ratatui::layout::Size;
 use ratatui::widgets::BorderType;
 use std::path::PathBuf;
@@ -2464,6 +2464,7 @@ fn quoted_reply_attribution_matches_expected_shape() {
     let message = MessageSummary {
         headers: std::sync::Arc::new(crate::model::MessageHeaders {
             id: MessageId("reply".into()),
+            thread_id: None,
             message_id: Some("message@example.com".into()),
             in_reply_to: None,
             references: Vec::new().into(),
@@ -2656,17 +2657,18 @@ fn seen_transition_is_idempotent_and_does_not_guess_unknown_counts() {
 }
 
 #[test]
-fn cache_invalidation_forgets_lru_and_explicitly_stales_folder_counts() {
+fn cache_invalidation_forgets_lru_but_preserves_last_known_folder_counts() {
     let (_root, mut app) = local_account_fixture();
     let account = app.account_mut().unwrap();
     let empty = crate::cache::CachedMailbox {
+        thread_messages: Vec::new(),
         messages: Vec::new(),
         bodies: std::collections::HashMap::new(),
         message_index: 0,
         message_view_offset: 0,
         next_page_offset: 0,
         has_more: false,
-        uid_validity: Some(9),
+        identity: Some(CacheIdentity::Imap(9)),
         uid_next: Some(10),
     };
     account.remember_mailbox("Drafts".into(), empty.clone());
@@ -2675,6 +2677,8 @@ fn cache_invalidation_forgets_lru_and_explicitly_stales_folder_counts() {
     account.current_mailbox = Some("INBOX".into());
     let mut draft = crate::model::Mailbox::new("Drafts", crate::model::MailboxRole::Drafts);
     draft.counts_known = true;
+    draft.total = 7;
+    draft.unread = 3;
     account.mailboxes.push(draft);
 
     account.forget_cached_folder("Drafts");
@@ -2689,8 +2693,48 @@ fn cache_invalidation_forgets_lru_and_explicitly_stales_folder_counts() {
     );
     assert!(account.mailboxes.last().unwrap().counts_known);
     account.invalidate_remote_folder("Drafts");
-    assert!(!account.mailboxes.last().unwrap().counts_known);
+    let draft = account.mailboxes.last().unwrap();
+    assert!(draft.counts_known);
+    assert_eq!((draft.total, draft.unread), (7, 3));
     assert_eq!(account.current_mailbox.as_deref(), Some("INBOX"));
+}
+
+#[test]
+fn warming_deduplicates_existing_pages_and_ignores_unused_folders() {
+    use crate::model::{Mailbox, MailboxRole};
+    let (_dir, mut app) = local_account_fixture();
+    let account = app.account_mut().unwrap();
+    account.current_mailbox = Some("INBOX".into());
+    account.mailboxes = vec![
+        Mailbox::new("INBOX", MailboxRole::Inbox),
+        Mailbox::new("Sent", MailboxRole::Sent),
+        Mailbox::new("All Mail", MailboxRole::Archive),
+        Mailbox::new("Custom", MailboxRole::Other),
+    ];
+    account.plan_mailbox_warming();
+    account.plan_mailbox_warming();
+    assert_eq!(
+        account
+            .mailbox_warm_queue
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["Sent"]
+    );
+    account.mailbox_warm_queue.clear();
+    account.accept_warmed_mailbox(
+        "Sent".into(),
+        crate::model::MessagePage {
+            messages: vec![],
+            offset: 0,
+            next_offset: 0,
+            has_more: false,
+        },
+        Some(CacheIdentity::Imap(42)),
+        None,
+    );
+    account.plan_mailbox_warming();
+    assert!(account.mailbox_warm_queue.is_empty());
 }
 
 #[test]
@@ -2730,7 +2774,7 @@ fn warm_mailbox_event_caches_other_folders_without_changing_current_selection() 
                 next_offset: 1,
                 has_more: false,
             },
-            uid_validity: Some(12),
+            identity: Some(CacheIdentity::Imap(12)),
             uid_next: Some(8),
         },
     });
@@ -2741,7 +2785,10 @@ fn warm_mailbox_event_caches_other_folders_without_changing_current_selection() 
         account.mailbox_cache["Drafts"].messages[0].subject,
         "warm draft"
     );
-    assert_eq!(account.uid_validities.get("Drafts"), Some(&12));
+    assert_eq!(
+        account.cache_identities.get("Drafts"),
+        Some(&CacheIdentity::Imap(12))
+    );
 }
 
 #[test]
@@ -2763,7 +2810,7 @@ fn stale_background_folder_result_is_dropped_after_invalidation() {
                 next_offset: 0,
                 has_more: false,
             },
-            uid_validity: Some(1),
+            identity: Some(CacheIdentity::Imap(1)),
             uid_next: Some(2),
         },
     });
@@ -2783,7 +2830,9 @@ fn persistent_and_in_memory_snapshots_share_bounded_cursor_rules() {
     )
     .unwrap();
     account.current_mailbox = Some("INBOX".into());
-    account.uid_validities.insert("INBOX".into(), 15);
+    account
+        .cache_identities
+        .insert("INBOX".into(), CacheIdentity::Imap(15));
     account.uid_nexts.insert("INBOX".into(), 600);
     account.messages = (0..405)
         .map(|i| {
@@ -2808,7 +2857,7 @@ fn persistent_and_in_memory_snapshots_share_bounded_cursor_rules() {
         crate::cache::MAX_MESSAGES_PER_FOLDER
     );
     assert!(snapshot.has_more);
-    assert_eq!(snapshot.uid_validity, Some(15));
+    assert_eq!(snapshot.identity, Some(CacheIdentity::Imap(15)));
     assert_eq!(snapshot.uid_next, Some(600));
 }
 
@@ -2831,7 +2880,9 @@ fn persistent_snapshot_omits_rich_rows_without_discarding_live_previews() {
     }]));
     body.html_render_width = 72;
     account.current_mailbox = Some("INBOX".into());
-    account.uid_validities.insert("INBOX".into(), 17);
+    account
+        .cache_identities
+        .insert("INBOX".into(), CacheIdentity::Imap(17));
     account.messages = vec![message];
     account.bodies.insert(id.clone(), body);
 
@@ -2841,7 +2892,7 @@ fn persistent_snapshot_omits_rich_rows_without_discarding_live_previews() {
     assert!(persistent.bodies[&id].html_lines.is_none());
     assert_eq!(persistent.bodies[&id].html_render_width, 0);
     assert!(account.bodies[&id].html_lines.is_some());
-    assert_eq!(live.uid_validity, persistent.uid_validity);
+    assert_eq!(live.identity, persistent.identity);
     assert_eq!(live.messages.len(), persistent.messages.len());
 }
 
@@ -2862,13 +2913,14 @@ fn warmed_folder_refresh_moves_rich_previews_without_cloning_them() {
         }],
     }]));
     let cached = crate::cache::CachedMailbox {
+        thread_messages: Vec::new(),
         messages: vec![message.clone()],
         bodies: std::iter::once((id.clone(), body)).collect(),
         message_index: 0,
         message_view_offset: 2,
         next_page_offset: 1,
         has_more: false,
-        uid_validity: Some(42),
+        identity: Some(CacheIdentity::Imap(42)),
         uid_next: Some(10),
     };
     account.remember_mailbox("Drafts".into(), cached);
@@ -2885,7 +2937,12 @@ fn warmed_folder_refresh_moves_rich_previews_without_cloning_them() {
         next_offset: 1,
         has_more: false,
     };
-    account.accept_warmed_mailbox("Drafts".into(), page, Some(42), Some(11));
+    account.accept_warmed_mailbox(
+        "Drafts".into(),
+        page,
+        Some(CacheIdentity::Imap(42)),
+        Some(11),
+    );
     let refreshed = &account.mailbox_cache["Drafts"];
     assert_eq!(
         refreshed.bodies[&id].html_lines.as_ref().unwrap()[0].spans[0]
@@ -2905,7 +2962,7 @@ fn warmed_folder_refresh_moves_rich_previews_without_cloning_them() {
             next_offset: 1,
             has_more: false,
         },
-        Some(43),
+        Some(CacheIdentity::Imap(43)),
         Some(12),
     );
     assert!(account.mailbox_cache["Drafts"].bodies.is_empty());
@@ -2936,7 +2993,9 @@ fn offline_cached_reader_queues_seen_without_sending_unverified_uid() {
     account.current_mailbox = Some("INBOX".into());
     account.messages = vec![message];
     account.bodies.insert(id.clone(), body);
-    account.uid_validities.insert("INBOX".into(), 100);
+    account
+        .cache_identities
+        .insert("INBOX".into(), CacheIdentity::Imap(100));
     account.unverified_mailboxes.insert("INBOX".into());
     super::App::mark_cached_selected_seen(account);
     assert!(account.pending_seen.is_empty());
@@ -2952,7 +3011,9 @@ fn offline_cached_reader_queues_seen_without_sending_unverified_uid() {
     assert!(account.messages[0].unread());
     // Even if a different generation has been verified, the old UID cannot
     // be submitted to the worker.
-    account.uid_validities.insert("INBOX".into(), 101);
+    account
+        .cache_identities
+        .insert("INBOX".into(), CacheIdentity::Imap(101));
     account.unverified_mailboxes.remove("INBOX");
     account.pump_deferred_seen();
     assert!(account.pending_seen.is_empty());
@@ -2967,7 +3028,9 @@ fn restoring_cached_mailbox_reapplies_pending_offline_read_flags() {
     let message =
         crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, MessageFlags::empty())
             .unwrap();
-    account.uid_validities.insert("INBOX".into(), 19);
+    account
+        .cache_identities
+        .insert("INBOX".into(), CacheIdentity::Imap(19));
     account.unverified_mailboxes.insert("INBOX".into());
     account.deferred_seen.push(crate::cache::DeferredSeen {
         mailbox: "INBOX".into(),
@@ -2978,13 +3041,14 @@ fn restoring_cached_mailbox_reapplies_pending_offline_read_flags() {
     account.mailbox_cache.insert(
         "INBOX".into(),
         crate::cache::CachedMailbox {
+            thread_messages: Vec::new(),
             messages: vec![message],
             bodies: std::collections::HashMap::new(),
             message_index: 0,
             message_view_offset: 0,
             next_page_offset: 1,
             has_more: false,
-            uid_validity: Some(19),
+            identity: Some(CacheIdentity::Imap(19)),
             uid_next: Some(9),
         },
     );
@@ -3112,7 +3176,9 @@ fn deferred_offline_delete_hides_only_original_uid_generation() {
     let id_old = MessageId("imap-uid:81:3".into());
     let id_new = MessageId("imap-uid:82:3".into());
     account.current_mailbox = Some("INBOX".into());
-    account.uid_validities.insert("INBOX".into(), 81);
+    account
+        .cache_identities
+        .insert("INBOX".into(), CacheIdentity::Imap(81));
     account.messages = vec![
         crate::mail::parse_summary(id_old.clone(), raw, raw.len() as u64, MessageFlags::empty())
             .unwrap(),
@@ -3130,7 +3196,9 @@ fn deferred_offline_delete_hides_only_original_uid_generation() {
     assert_eq!(account.messages.len(), 1);
     assert_eq!(account.messages[0].id, id_new);
     // On a new UIDVALIDITY the pending old UID must not hide new-generation mail.
-    account.uid_validities.insert("INBOX".into(), 82);
+    account
+        .cache_identities
+        .insert("INBOX".into(), CacheIdentity::Imap(82));
     account.overlay_deferred_mutations();
     assert_eq!(account.messages.len(), 1);
 }

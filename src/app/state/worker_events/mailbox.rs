@@ -3,7 +3,66 @@
 use super::*;
 
 impl App {
-    pub(super) fn handle_mailbox_event(&mut self, event: WorkerEvent) {
+    pub(super) fn handle_mailbox_event(&mut self, mut event: WorkerEvent) {
+        // A query can enrich a canonical snapshot only after verifying the
+        // request, folder and generation. It cannot establish a generation.
+        event.kind = match event.kind {
+            WorkerEventKind::MailboxQueried {
+                name,
+                page,
+                identity,
+                memberships,
+                elapsed_micros,
+            } => {
+                let Some(account) = self.accounts.get_mut(event.account) else {
+                    return;
+                };
+                if account.native_view.is_none()
+                    || account.page_request_id != Some(event.request_id)
+                    || account.current_mailbox.as_deref() != Some(name.as_str())
+                {
+                    return;
+                }
+                if account.cache_identities.get(&name).is_some_and(|old| {
+                    identity
+                        .as_ref()
+                        .is_some_and(|new| old.same_generation(new))
+                }) && let Some(cached) = account.mailbox_cache.get_mut(&name)
+                    && cached.identity.as_ref().is_some_and(|old| {
+                        identity
+                            .as_ref()
+                            .is_some_and(|new| old.same_generation(new))
+                    })
+                    && crate::threading::merge_native_ids(&mut cached.messages, &memberships)
+                    && let Some(writer) = &account.cache_writer
+                {
+                    let snapshot = CachedMailbox {
+                        thread_messages: cached.thread_messages.clone(),
+                        messages: cached.messages.clone(),
+                        bodies: cache::persistable_bodies_near_compact(
+                            &cached.messages,
+                            &cached.bodies,
+                            cached.message_index,
+                        ),
+                        message_index: cached.message_index,
+                        message_view_offset: cached.message_view_offset,
+                        next_page_offset: cached.next_page_offset,
+                        has_more: cached.has_more,
+                        identity: cached.identity.clone(),
+                        uid_next: cached.uid_next,
+                    };
+                    writer.send(cache::Change::Folder(name.clone(), snapshot));
+                }
+                WorkerEventKind::MailboxOpened {
+                    name,
+                    page,
+                    identity,
+                    uid_next: None,
+                    elapsed_micros,
+                }
+            }
+            other => other,
+        };
         // Only parse account identities when an event needs contact/recipient matching.
         let own_addresses = if matches!(&event.kind, WorkerEventKind::MailboxOpened { .. }) {
             self.accounts
@@ -18,6 +77,96 @@ impl App {
             return;
         };
         match event.kind {
+            WorkerEventKind::ThreadDiscoveryFailed => {
+                account.inline_thread_requests.remove(&event.request_id);
+                // Optional read-only discovery must not disconnect the account.
+            }
+            WorkerEventKind::ThreadDiscovered {
+                name,
+                page,
+                identity,
+                memberships,
+            } => {
+                let Some(seed) = account.inline_thread_requests.remove(&event.request_id) else {
+                    return;
+                };
+                if account.native_view.is_some()
+                    || !account.threading_enabled
+                    || account.current_mailbox.as_deref() != Some(name.as_str())
+                    || account.cached_mailbox_unverified()
+                    || account.capabilities.is_none()
+                    || page.offset != 0
+                    || !account.expanded_threads.contains(&seed)
+                    || !account.cache_identities.get(&name).is_some_and(|old| {
+                        identity
+                            .as_ref()
+                            .is_some_and(|new| old.same_generation(new))
+                    })
+                {
+                    return;
+                }
+                let Some(seed_message) = account.messages.iter().find(|m| m.id == seed) else {
+                    return;
+                };
+                let native = memberships
+                    .get(&seed)
+                    .or(seed_message.thread_id.as_ref())
+                    .cloned();
+                let Some(native) = native else {
+                    return;
+                };
+                // Preserve optimistic flags and all existing rows. Only native
+                // identity hints can modify a canonical summary here.
+                let selected = account.selected_message().map(|m| m.id.clone());
+                crate::threading::merge_native_ids(&mut account.messages, &memberships);
+                let mut existing: HashSet<_> =
+                    account.messages.iter().map(|m| m.id.clone()).collect();
+                let remaining = cache::MAX_MESSAGES_PER_FOLDER
+                    .saturating_sub(account.inline_thread_extra.len());
+                let Some(identity) = identity else {
+                    return;
+                };
+                for message in page
+                    .messages
+                    .into_iter()
+                    .filter(|m| m.thread_id.as_ref() == Some(&native) && identity.accepts(&m.id))
+                    .filter(|m| existing.insert(m.id.clone()))
+                    .take(remaining)
+                {
+                    account.inline_thread_extra.insert(message.id.clone());
+                    account.messages.push(message);
+                }
+                // Keep selected rows anchored by ID, even if authoritative
+                // membership corrects the local grouping.
+                account.overlay_deferred_mutations();
+                account.overlay_deferred_seen();
+                let live: HashSet<_> = account.messages.iter().map(|m| &m.id).collect();
+                account.inline_thread_extra.retain(|id| live.contains(id));
+                if let Some(index) =
+                    selected.and_then(|id| account.messages.iter().position(|m| m.id == id))
+                {
+                    account.message_index = index;
+                    if self.message_open && event.account == self.account_index {
+                        account
+                            .expanded_threads
+                            .insert(account.messages[index].id.clone());
+                    }
+                }
+                account.smooth_message_target = None;
+                account.last_prefetch_anchor = None;
+                account.normalize_search_selection();
+                account.persist_current_cache();
+                if event.account == self.account_index {
+                    if page.has_more {
+                        self.status =
+                            StatusLine::info("Conversation partially cached (bounded lookup)");
+                    }
+                    self.visual_anchor = None;
+                    if self.preview_split || self.message_open {
+                        account.request_selected_body();
+                    }
+                }
+            }
             WorkerEventKind::Connected { capabilities } => {
                 // A delayed response from an abandoned connection must not
                 // overwrite the new session's state.
@@ -46,14 +195,21 @@ impl App {
                     account.is_abandoned_list_request(event.request_id);
                     return;
                 }
+                let from_push = std::mem::take(&mut account.push_list_inflight);
                 account.mailbox_list_request_id = None;
                 account.mailboxes_loading = false;
                 account.sync_progress_at = None;
+                // A matching, completed LIST on a connected account proves
+                // recovery. Do not clear a newer incident if another worker
+                // already marked the account disconnected in the meantime.
+                if account.capabilities.is_some() {
+                    account.offline_incident_active = false;
+                }
                 let wanted = account
                     .current_mailbox
                     .clone()
                     .unwrap_or_else(|| account.default_mailbox.clone());
-                account.mailboxes = mailboxes
+                let discovered: Vec<Mailbox> = mailboxes
                     .into_iter()
                     .filter(|mailbox| {
                         !crate::config::mailbox_is_excluded(
@@ -62,6 +218,62 @@ impl App {
                         )
                     })
                     .collect();
+                // Initial discovery establishes a baseline. Only a push-driven
+                // list can infer arrivals from the previous live Inbox count.
+                let new_inbox = if from_push {
+                    account
+                        .mailboxes
+                        .iter()
+                        .find(|mailbox| mailbox.role == MailboxRole::Inbox)
+                        .and_then(|old| {
+                            discovered
+                                .iter()
+                                .find(|new| new.name == old.name)
+                                .map(|new| {
+                                    (
+                                        new.name.clone(),
+                                        inbox_new_mail_count(
+                                            true,
+                                            old.counts_known && new.counts_known,
+                                            old.total,
+                                            new.total,
+                                        ),
+                                    )
+                                })
+                        })
+                } else {
+                    None
+                };
+                account.reconcile_mailbox_list(discovered);
+                if let Some((name, new_count)) = new_inbox.filter(|(_, count)| *count > 0) {
+                    if self.new_mail_notifications_enabled {
+                        self.new_mail_since_launch =
+                            self.new_mail_since_launch.saturating_add(new_count);
+                        if self.new_mail_bell_enabled {
+                            self.new_mail_bell_pending = true;
+                        }
+                        if account
+                            .worker
+                            .post(ActionKind::NewMailPreview {
+                                mailbox: name,
+                                count: new_count,
+                            })
+                            .is_err()
+                        {
+                            self.new_mail_notices.push_back(NewMailNotice {
+                                account: account.name.clone(),
+                                count: new_count,
+                                sender: String::new(),
+                                subject: String::new(),
+                                excerpt: String::new(),
+                            });
+                        }
+                    }
+                    self.status = StatusLine::temporary(
+                        format!("{} new message(s) in {}", new_count, account.name),
+                        Duration::from_secs(6),
+                    );
+                }
                 account.persist_mailboxes();
                 account.mailbox_index = account
                     .mailboxes
@@ -77,6 +289,9 @@ impl App {
                 account.clamp_selection();
                 if account.mailboxes.is_empty() {
                     account.current_mailbox = None;
+                    account.native_view = None;
+                    account.local_thread_view = None;
+                    account.reset_inline_threads();
                     account.messages.clear();
                     account.bodies.clear();
                 }
@@ -89,6 +304,9 @@ impl App {
                         && !account.restore_cached_mailbox(&name)
                     {
                         account.current_mailbox = Some(name.clone());
+                        account.native_view = None;
+                        account.local_thread_view = None;
+                        account.reset_inline_threads();
                         account.messages.clear();
                         account.bodies.clear();
                         account.message_index = 0;
@@ -98,7 +316,13 @@ impl App {
                     }
                     // Cached rows remain visible while the first-page refresh
                     // runs on the interactive IMAP worker.
-                    if account.page_inflight.is_none() {
+                    if from_push
+                        && (account.page_inflight.is_some()
+                            || (self.message_open && event.account == self.account_index))
+                    {
+                        account.pending_inbox_refresh = true;
+                    } else if account.page_inflight.is_none() {
+                        account.pending_inbox_refresh = false;
                         let _ = account.request_mailbox_page(name, 0);
                     }
                 }
@@ -107,6 +331,12 @@ impl App {
                 account.pump_mailbox_warming();
                 account.pump_deferred_mutations();
                 account.pump_outbox();
+            }
+            WorkerEventKind::AccountChanged => {
+                // One follow-up for an entire burst, including events received
+                // while a previous mailbox list or message page is in flight.
+                account.pending_account_refresh = true;
+                Self::pump_mailbox_status(account);
             }
             WorkerEventKind::MailboxChanged { name } => {
                 if account.current_mailbox.as_deref() == Some(name.as_str()) {
@@ -215,6 +445,12 @@ impl App {
                         let _ = account.request_mailbox_page(name.clone(), 0);
                     }
                 }
+                if changed
+                    && account.current_mailbox.as_deref() != Some(name.as_str())
+                    && account.mailbox_cache.contains_key(&name)
+                {
+                    account.rewarm_mailbox(&name);
+                }
                 account.persist_mailboxes();
                 account.pump_deferred_mutations();
                 account.pump_outbox();
@@ -239,7 +475,7 @@ impl App {
             WorkerEventKind::MailboxWarmed {
                 name,
                 page,
-                uid_validity,
+                identity,
                 uid_next,
             } => {
                 if account.mailbox_warm_request.as_ref() != Some(&(event.request_id, name.clone()))
@@ -248,7 +484,7 @@ impl App {
                 }
                 account.mailbox_warm_request = None;
                 if account.current_mailbox.as_deref() != Some(name.as_str()) {
-                    account.accept_warmed_mailbox(name, page, uid_validity, uid_next);
+                    account.accept_warmed_mailbox(name, page, identity, uid_next);
                 }
                 account.pump_mailbox_warming();
             }
@@ -262,8 +498,8 @@ impl App {
             }
             WorkerEventKind::MailboxOpened {
                 name,
-                page,
-                uid_validity,
+                mut page,
+                identity,
                 uid_next,
                 elapsed_micros,
             } => {
@@ -281,20 +517,142 @@ impl App {
                 }
                 account.page_request_id = None;
                 account.sync_progress_at = None;
+                // A successful foreground mailbox refresh also proves recovery
+                // when the account was already connected before the failure.
+                // Never clear an incident using a stale/offline page event.
+                if account.capabilities.is_some() {
+                    account.offline_incident_active = false;
+                }
+                if let Some(view) = account.native_view.as_ref() {
+                    let label = view.label();
+                    // Query results never replace the canonical cache or its checkpoint.
+                    account.page_inflight = None;
+                    account.messages_loading = false;
+                    if account.current_mailbox.as_deref() != Some(name.as_str()) {
+                        return;
+                    }
+                    if !account.cache_identities.get(&name).is_some_and(|old| {
+                        identity
+                            .as_ref()
+                            .is_some_and(|new| old.same_generation(new))
+                    }) {
+                        // A temporary view cannot establish a new generation.
+                        account.forget_cached_folder(&name);
+                        Self::activate_selected_mailbox(account, false);
+                        return;
+                    }
+                    account.unverified_mailboxes.remove(&name);
+                    if page.offset == 0 {
+                        let selected = account.selected_message().map(|m| m.id.clone());
+                        // A cached reply can be opened while native discovery
+                        // is in flight. Never switch its reader to another
+                        // email if the first server page omits that reply.
+                        if self.message_open
+                            && event.account == self.account_index
+                            && account.local_thread_view.is_some()
+                            && selected
+                                .as_ref()
+                                .is_some_and(|id| !page.messages.iter().any(|m| &m.id == id))
+                        {
+                            account.pending_inbox_refresh = true;
+                            return;
+                        }
+                        account.messages = page.messages;
+                        account.message_index = selected
+                            .and_then(|id| account.messages.iter().position(|m| m.id == id))
+                            .unwrap_or(0);
+                        account.message_view_offset = 0;
+                    } else {
+                        let existing: HashSet<_> =
+                            account.messages.iter().map(|m| m.id.clone()).collect();
+                        account.messages.extend(
+                            page.messages
+                                .into_iter()
+                                .filter(|m| !existing.contains(&m.id)),
+                        );
+                    }
+                    account.next_page_offset = page.next_offset;
+                    account.has_more = page.has_more && page.next_offset > page.offset;
+                    let live: HashSet<_> = account.messages.iter().map(|m| m.id.clone()).collect();
+                    account.bodies.retain(|id, _| live.contains(id));
+                    account.overlay_deferred_mutations();
+                    account.overlay_deferred_seen();
+                    account.clamp_selection();
+                    account.normalize_search_selection();
+                    self.status = StatusLine::info(format!(
+                        "{label}: {} messages loaded (Esc to exit)",
+                        account.messages.len()
+                    ));
+                    if account.pending_inbox_refresh
+                        && !(self.message_open && event.account == self.account_index)
+                    {
+                        account.pending_inbox_refresh = false;
+                        let _ = account.request_mailbox_page(name, 0);
+                    } else if account.messages.is_empty() && account.has_more {
+                        let _ = account.request_next_page();
+                    }
+                    if event.account == self.account_index
+                        && (self.preview_split || self.message_open)
+                    {
+                        account.request_selected_body();
+                    }
+                    Self::pump_mailbox_status(account);
+                    return;
+                }
                 let first_page = page.offset == 0;
-                let previous_validity = account.uid_validities.get(&name).copied();
-                let generation_changed =
-                    first_page && previous_validity.is_some() && previous_validity != uid_validity;
+                let supplemental_compatible =
+                    match (account.cache_identities.get(&name), identity.as_ref()) {
+                        (Some(CacheIdentity::Imap(old)), Some(CacheIdentity::Imap(new))) => {
+                            old == new
+                        }
+                        (
+                            Some(CacheIdentity::Jmap {
+                                email_state: Some(old),
+                                ..
+                            }),
+                            Some(CacheIdentity::Jmap {
+                                email_state: Some(new),
+                                ..
+                            }),
+                        ) => old == new,
+                        _ => false,
+                    };
+                let generation_changed = account.cache_identities.get(&name).is_some_and(|old| {
+                    identity
+                        .as_ref()
+                        .is_none_or(|new| !old.same_generation(new))
+                });
+                if generation_changed && !first_page {
+                    // A page from a different server generation cannot be
+                    // appended to the old cache. Reconcile from offset zero.
+                    account.page_inflight = None;
+                    account.messages_loading = false;
+                    let _ = account.request_mailbox_page(name, 0);
+                    return;
+                }
+                let mut identity = identity;
+                if !first_page
+                    && let Some(new) = identity.as_mut()
+                    && matches!(new, CacheIdentity::Jmap { .. })
+                    && account.cache_identities.get(&name) != Some(&*new)
+                {
+                    // A multi-page snapshot spans multiple Email states;
+                    // keep it readable but don't reuse its mutable summaries.
+                    new.invalidate_checkpoint();
+                }
                 if generation_changed {
                     // Cached UIDs may point to entirely different emails after
                     // a server UIDVALIDITY reset: drop all old derived data.
                     account.forget_cached_folder(&name);
+                    account.reset_inline_threads();
                     account.bodies.clear();
                 }
-                if let Some(validity) = uid_validity {
-                    account.uid_validities.insert(name.clone(), validity);
+                if let Some(identity) = &identity {
+                    account
+                        .cache_identities
+                        .insert(name.clone(), identity.clone());
                 } else {
-                    account.uid_validities.remove(&name);
+                    account.cache_identities.remove(&name);
                 }
                 if let Some(next) = uid_next {
                     account.uid_nexts.insert(name.clone(), next);
@@ -305,7 +663,9 @@ impl App {
                 if first_page {
                     let before = account.deferred_seen.len();
                     account.deferred_seen.retain(|entry| {
-                        entry.mailbox != name || Some(entry.validity) == uid_validity
+                        entry.mailbox != name
+                            || Some(entry.validity)
+                                == identity.as_ref().and_then(CacheIdentity::uid_validity)
                     });
                     if account.deferred_seen.len() != before {
                         account.persist_deferred_seen();
@@ -321,13 +681,14 @@ impl App {
                         account.remember_mailbox(
                             name,
                             CachedMailbox {
+                                thread_messages: Vec::new(),
                                 messages: page.messages,
                                 bodies: HashMap::new(),
                                 message_index: 0,
                                 message_view_offset: 0,
                                 next_page_offset: page.next_offset,
                                 has_more: page.has_more,
-                                uid_validity,
+                                identity,
                                 uid_next,
                             },
                         );
@@ -352,14 +713,68 @@ impl App {
                     Duration::ZERO,
                     true,
                 );
+                let same_folder = account.current_mailbox.as_deref() == Some(name.as_str());
                 account.current_mailbox = Some(name.clone());
                 if page.offset == 0 {
+                    if self.message_open
+                        && event.account == self.account_index
+                        && !generation_changed
+                        && account.selected_message().is_some_and(|message| {
+                            account.inline_thread_extra.contains(&message.id)
+                                && !page.messages.iter().any(|row| row.id == message.id)
+                        })
+                    {
+                        account.pending_inbox_refresh = true;
+                        return;
+                    }
+                    if same_folder
+                        && !generation_changed
+                        && matches!(identity, Some(CacheIdentity::Imap(_)))
+                    {
+                        let old_ids = account
+                            .messages
+                            .iter()
+                            .filter_map(|m| {
+                                let id = m.thread_id.as_ref().filter(|id| {
+                                    id.starts_with("gmail:") || id.starts_with("imap-ref:")
+                                })?;
+                                Some((m.id.clone(), id.clone()))
+                            })
+                            .collect();
+                        crate::threading::merge_native_ids(&mut page.messages, &old_ids);
+                    }
                     let previous_index = account.message_index;
                     let previous_offset = account.message_view_offset;
                     let selected_id = (!generation_changed)
                         .then(|| account.selected_message().map(|message| message.id.clone()))
                         .flatten();
+                    // Keep discovered replies distinct from the canonical page.
+                    // A complete server page or changed generation invalidates
+                    // absent replies; a partial page cannot prove deletion.
+                    let mut incoming: HashSet<_> =
+                        page.messages.iter().map(|m| m.id.clone()).collect();
+                    let extras = if same_folder
+                        && !generation_changed
+                        && supplemental_compatible
+                        && page.has_more
+                        && account.native_view.is_none()
+                    {
+                        account
+                            .messages
+                            .iter()
+                            .filter(|m| {
+                                account.inline_thread_extra.contains(&m.id)
+                                    && incoming.insert(m.id.clone())
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    account.inline_thread_extra = extras.iter().map(|m| m.id.clone()).collect();
+                    account.inline_thread_requests.clear();
                     account.messages = page.messages;
+                    account.messages.extend(extras);
                     account.message_index = selected_id
                         .and_then(|id| account.messages.iter().position(|message| message.id == id))
                         .or_else(|| account.restore_message_index.take())
@@ -376,25 +791,71 @@ impl App {
                         .iter()
                         .map(|message| message.id.clone())
                         .collect::<HashSet<_>>();
+                    account.expanded_threads.retain(|id| live.contains(id));
                     account.bodies.retain(|id, _| live.contains(id));
                 } else {
-                    let existing = account
-                        .messages
-                        .iter()
-                        .map(|message| message.id.clone())
-                        .collect::<HashSet<_>>();
+                    let selected_id = account.selected_message().map(|message| message.id.clone());
+                    // Normal IMAP FETCH does not include the extension IDs
+                    // learned by native threading. Keep those hints on promotion.
+                    if matches!(identity, Some(CacheIdentity::Imap(_))) {
+                        let hints = account
+                            .messages
+                            .iter()
+                            .filter(|m| account.inline_thread_extra.contains(&m.id))
+                            .filter_map(|m| Some((m.id.clone(), m.thread_id.clone()?)))
+                            .collect();
+                        crate::threading::merge_native_ids(&mut page.messages, &hints);
+                    }
+                    let incoming: HashSet<_> = page.messages.iter().map(|m| m.id.clone()).collect();
+                    account.messages.retain(|m| {
+                        !account.inline_thread_extra.contains(&m.id) || !incoming.contains(&m.id)
+                    });
+                    account
+                        .inline_thread_extra
+                        .retain(|id| !incoming.contains(id));
+                    let existing: HashSet<_> =
+                        account.messages.iter().map(|m| m.id.clone()).collect();
                     account.messages.extend(
                         page.messages
                             .into_iter()
-                            .filter(|message| !existing.contains(&message.id)),
+                            .filter(|m| !existing.contains(&m.id)),
                     );
                     account.messages.sort_by(|a, b| {
-                        b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id))
+                        account
+                            .inline_thread_extra
+                            .contains(&a.id)
+                            .cmp(&account.inline_thread_extra.contains(&b.id))
+                            .then_with(|| b.timestamp.cmp(&a.timestamp))
+                            .then_with(|| b.id.cmp(&a.id))
                     });
+                    if let Some(index) = selected_id.as_ref().and_then(|id| {
+                        account
+                            .messages
+                            .iter()
+                            .position(|message| &message.id == id)
+                    }) {
+                        account.message_index = index;
+                    }
                 }
                 account.next_page_offset = page.next_offset;
                 account.has_more = page.has_more;
                 account.overlay_deferred_mutations();
+                // Keep an open reader attached to its exact message if a new
+                // reply becomes the representative of the same conversation.
+                if self.message_open
+                    && event.account == self.account_index
+                    && account.native_view.is_none()
+                    && account.collapsed_threads()
+                    && !account
+                        .visible_message_indices()
+                        .contains(&account.message_index)
+                    && let Some(message) = account.messages.get(account.message_index)
+                {
+                    account.expanded_threads.insert(message.id.clone());
+                }
+                if !account.pending_seen.is_empty() || !account.pending_mutation_labels.is_empty() {
+                    account.invalidate_sync_checkpoint(&name);
+                }
                 if first_page {
                     // Don't tear down an open offline reader when its cached
                     // mailbox finishes background reconciliation.
@@ -501,10 +962,14 @@ impl App {
                     .saturating_mul(4)
                     .max(account.page_size)
                     .max(PAGE_PREFETCH_MIN);
+                // A single collapsed row may represent many cached messages.
+                // Base automatic prefetch on canonical distance in that case,
+                // so a long thread cannot trigger an unbounded page scan.
+                let browse_remaining = account.remaining_for_pagination(remaining);
                 let browse_needs_more = account.search_query.is_empty()
                     && account.has_more
                     && account.page_inflight.is_none()
-                    && remaining <= prefetch_distance;
+                    && browse_remaining <= prefetch_distance;
                 if search_needs_more || browse_needs_more {
                     let _ = account.request_next_page();
                 }
@@ -564,10 +1029,24 @@ impl App {
                 account.page_inflight = None;
                 account.messages_loading = false;
                 account.sync_progress_at = None;
-                if super::is_connection_failure(&error) {
+                let thread_fallback =
+                    account.native_view.is_some() && account.local_thread_view.is_some();
+                if error.kind.is_connection_failure() {
                     account.mark_disconnected();
+                } else if thread_fallback {
+                    account.restore_thread_fallback();
+                    if error.kind == crate::backend::ErrorKind::StaleState {
+                        account.unverified_mailboxes.insert(name.clone());
+                        let _ = account.request_mailbox_page(name.clone(), 0);
+                    }
                 }
                 Self::pump_mailbox_status(account);
+                if thread_fallback {
+                    self.status = StatusLine::info(
+                        "Native threading unavailable; showing cached conversations (loaded messages only)",
+                    );
+                    return;
+                }
                 self.status = StatusLine::temporary_error(
                     format!("{}: could not open {name}: {error}", account.name),
                     Duration::from_secs(8),

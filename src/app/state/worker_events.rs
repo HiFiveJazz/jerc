@@ -9,41 +9,14 @@ mod errors;
 mod mailbox;
 mod outgoing;
 
-/// This exact error is emitted only when OAuth token acquisition fails.
-/// Since the token request precedes SMTP connection/MAIL/RCPT/DATA, it is
-/// safe to queue or requeue the unsent message without risking duplication.
+#[cfg(test)]
 pub(super) fn is_pre_smtp_oauth_network_failure(error: &str) -> bool {
-    error.trim() == "OAuth token request failed (network/TLS error)"
+    crate::backend::legacy_kind(error) == crate::backend::ErrorKind::PreSmtpOAuth
 }
 
-/// Limit reconnect transitions to recognizable transport failures, not IMAP
-/// permissions, SMTP rejected recipients, or other application errors.
+#[cfg(test)]
 pub(super) fn is_connection_failure(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    [
-        "oauth token request failed (network/tls error)",
-        "not connected",
-        "connection reset",
-        "connection refused",
-        "connection closed",
-        "connection aborted",
-        "connection lost",
-        "broken pipe",
-        "timed out",
-        "timeout",
-        "network is unreachable",
-        "network unreachable",
-        "no route to host",
-        "failed to lookup address",
-        "failed to resolve",
-        "name resolution",
-        "dns error",
-        "failed to connect",
-        "connecting to imap server",
-        "unexpected eof",
-    ]
-    .iter()
-    .any(|&phrase| error.contains(phrase))
+    crate::backend::legacy_kind(error).is_connection_failure()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -76,9 +49,13 @@ impl App {
             WorkerEventKind::Connected { .. }
             | WorkerEventKind::Mailboxes(..)
             | WorkerEventKind::MailboxChanged { .. }
+            | WorkerEventKind::AccountChanged
             | WorkerEventKind::MailboxStatus { .. }
             | WorkerEventKind::NewMailPreview { .. }
             | WorkerEventKind::MailboxOpened { .. }
+            | WorkerEventKind::MailboxQueried { .. }
+            | WorkerEventKind::ThreadDiscovered { .. }
+            | WorkerEventKind::ThreadDiscoveryFailed
             | WorkerEventKind::MailboxOpenFailed { .. }
             | WorkerEventKind::MailboxWarmed { .. }
             | WorkerEventKind::MailboxWarmFailed { .. } => EventGroup::Mailbox,
@@ -86,6 +63,8 @@ impl App {
             | WorkerEventKind::BodyLoaded(..)
             | WorkerEventKind::BodyPrefetched { .. }
             | WorkerEventKind::AttachmentsLoaded { .. }
+            | WorkerEventKind::RemoteAttachmentsListed { .. }
+            | WorkerEventKind::RemoteAttachmentCompleted(_)
             | WorkerEventKind::RawLoaded { .. }
             | WorkerEventKind::ComposePrepared { .. }
             | WorkerEventKind::MessageExported { .. } => EventGroup::Content,

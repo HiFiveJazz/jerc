@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let theme = app.theme().clone();
+    let theme = app.theme();
     let mut spans = Vec::new();
     if let Some(composer) = app
         .composer
@@ -20,7 +20,7 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ));
         spans.push(Span::styled(
             format!(" {} ", composer.mode.label()),
-            compose_mode_style(composer.mode, &theme),
+            compose_mode_style(composer.mode, theme),
         ));
         spans.push(Span::raw(" "));
         if !app.status.text.is_empty() {
@@ -48,14 +48,21 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             "NORMAL"
         };
-        spans.push(Span::styled(format!(" {mode} "), mode_style(mode, &theme)));
+        spans.push(Span::styled(format!(" {mode} "), mode_style(mode, theme)));
         spans.push(Span::raw(" "));
-        if account.search_editing {
+        if account.native_search_editing {
+            spans.push(Span::styled(
+                "Server search • Enter to submit  ",
+                theme.accent(),
+            ));
+        } else if account.search_editing {
             let matches = account.visible_message_indices().len();
             spans.push(Span::styled(
                 format!("{matches} match{}  ", if matches == 1 { "" } else { "es" }),
                 theme.muted(),
             ));
+        } else if let Some(view) = &account.native_view {
+            spans.push(Span::styled(format!("{}  ", view.label()), theme.accent()));
         } else if !account.search_query.is_empty() {
             spans.push(Span::styled(
                 format!("filter:/{}  ", account.search_query),
@@ -118,7 +125,7 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         };
         let mut mode_spans = vec![
             Span::styled("[Notices] ", Style::default().fg(theme.warning)),
-            Span::styled(format!(" {mode} "), mode_style(mode, &theme)),
+            Span::styled(format!(" {mode} "), mode_style(mode, theme)),
         ];
         if !app.notices.marked.is_empty() {
             mode_spans.push(Span::styled(
@@ -140,11 +147,11 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         // Contacts use the same global status row and mode slot as mail.
         // The contact count belongs inside the Contacts window, not here.
         let mut mode_spans = contact_status_spans(
-            &theme,
+            theme,
             app.account().map(|account| account.name.as_str()),
             modal,
         );
-        mode_spans.extend(contact_footer_details(&theme, modal));
+        mode_spans.extend(contact_footer_details(theme, modal));
         frame.render_widget(
             Paragraph::new(Line::from(mode_spans)).style(theme.status()),
             status_area,
@@ -156,7 +163,7 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
     }
     if indicator_width == crate::ui::NOTIFICATION_INDICATOR_WIDTH {
-        let (glyph, style) = notification_indicator(app, &theme);
+        let (glyph, style) = notification_indicator(app, theme);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(glyph, style)))
                 .alignment(Alignment::Right)
