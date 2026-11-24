@@ -98,6 +98,8 @@ pub enum ActionKind {
         intent: crate::app::ComposeIntent,
         own_addresses: Vec<String>,
         cache: Option<(PathBuf, CacheIdentity)>,
+        /// Never perform network I/O for unverified cached UIDs.
+        cache_only: bool,
     },
     FetchAttachments {
         mailbox: String,
@@ -314,9 +316,10 @@ pub enum WorkerEventKind {
     BodyLoadFailed {
         error: WorkerError,
     },
-    RawLoaded {
+    DraftPrepared {
         id: MessageId,
-        raw: Vec<u8>,
+        // Parsing large draft MIME belongs on a mail worker, not the UI loop.
+        result: Result<Box<crate::app::Composer>, String>,
     },
     ComposePrepared {
         id: MessageId,

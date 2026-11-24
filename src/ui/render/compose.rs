@@ -862,11 +862,10 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
     // Compose, reply and forward use exactly the same physical-row model for
     // rendering, j/k, and Ctrl-j/k. Explicit wrap rows avoid treating a long
     // forwarded line as a single invisible logical line during navigation.
-    // Reply prose is hard-wrapped for mailing lists; show the same 72-column
-    // margin in the editor, even when the terminal is much wider.
+    // Reply prose is hard-wrapped on edit for mailing lists, but the editor
+    // must use its whole viewport for quoted lines, URLs and existing text.
     composer.body_view_width = composer_body_view_width(
         usize::from(fields[6].width.saturating_sub(4)),
-        composer.reply_wrap,
     );
     let viewport_height = usize::from(fields[6].height).max(1);
     let rows = composer.body_rows();
@@ -1096,14 +1095,10 @@ pub(super) fn editor_text(
     Text::from(lines)
 }
 
-/// Logical reply width does not grow with a wide terminal; ordinary drafts do.
-fn composer_body_view_width(available: usize, reply_wrap: bool) -> usize {
-    let available = available.max(1);
-    if reply_wrap {
-        available.min(crate::app::REPLY_WRAP_COLUMNS)
-    } else {
-        available
-    }
+/// Editor soft wrapping follows the actual viewport for *all* message types.
+/// Reply prose retains its independent 72-column hard-wrap policy on input.
+fn composer_body_view_width(available: usize) -> usize {
+    available.max(1)
 }
 
 #[cfg(test)]
@@ -1111,10 +1106,9 @@ mod reply_width_tests {
     use super::composer_body_view_width;
 
     #[test]
-    fn replies_use_kernel_friendly_width_but_narrow_terminals_still_fit() {
-        assert_eq!(composer_body_view_width(140, true), 72);
-        assert_eq!(composer_body_view_width(50, true), 50);
-        assert_eq!(composer_body_view_width(0, true), 1);
-        assert_eq!(composer_body_view_width(140, false), 140);
+    fn all_messages_use_available_width_instead_of_a_reply_only_soft_margin() {
+        assert_eq!(composer_body_view_width(140), 140);
+        assert_eq!(composer_body_view_width(50), 50);
+        assert_eq!(composer_body_view_width(0), 1);
     }
 }

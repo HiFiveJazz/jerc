@@ -154,18 +154,26 @@ impl App {
             return;
         };
         let account_index = self.account_index;
+        if self.pending_draft.as_ref().is_some_and(|pending| {
+            pending.account == account_index
+                && pending.mailbox == mailbox
+                && pending.message_id == message_id
+        }) {
+            return;
+        }
         let cache = account.raw_cache_key(&mailbox, &message_id);
-        let queued = account
+        let request_id = account
             .worker
             .post(ActionKind::FetchRawForCompose {
                 mailbox: mailbox.clone(),
                 id: message_id.clone(),
                 cache,
             })
-            .is_ok();
-        if queued {
+            .ok();
+        if let Some(request_id) = request_id {
             self.pending_draft = Some(PendingDraft {
                 account: account_index,
+                request_id,
                 mailbox,
                 message_id,
                 composer: None,
@@ -234,6 +242,7 @@ impl App {
             return;
         }
         self.composer = Some(Composer::new());
+        self.pending_compose = None;
         self.pending_draft = None;
         self.resumed_draft_account = None;
     }
@@ -263,67 +272,181 @@ impl App {
         self.begin_compose_from_selected(ComposeIntent::Forward);
     }
 
+    /// Open the editor without waiting for SELECT/UIDVALIDITY or a MIME fetch.
+    /// The worker may read the immutable raw cache immediately; it must not
+    /// fetch an unverified UID from the server.
     pub(super) fn begin_compose_from_selected(&mut self, intent: ComposeIntent) {
-        let account_index = self.account_index;
-        if !self
-            .account()
-            .is_some_and(|account| account.outgoing_configured)
-        {
+        let Some(account) = self.account() else { return; };
+        if !account.outgoing_configured {
             self.status = StatusLine::error(
                 "no outgoing transport configured; add `outgoing = ...` to this account",
             );
             return;
         }
+        let Some(summary) = account.selected_message().cloned() else { return; };
+        let Some(mailbox) = account.current_mailbox.clone() else { return; };
+        // Keep the keystroke-to-first-frame path bounded. Large MIME text is
+        // quoted by the background worker rather than formatted on the UI thread.
+        let cached_body = account.bodies.get(&summary.id)
+            .filter(|body| body.display_text(false).len() <= 128 * 1024)
+            .cloned();
+        let mut source = ComposeSource {
+            cache_identity: account.cache_identities.get(&mailbox).map(CacheIdentity::generation),
+            mailbox,
+            summary,
+            intent,
+            initial_body: String::new(),
+        };
+        let mut composer = match intent {
+            ComposeIntent::Reply { quote, .. } => {
+                Composer::reply(&source.summary, cached_body.as_ref(), quote)
+            },
+            ComposeIntent::Forward => {
+                let mut editor = Composer::new();
+                editor.subject = forward_subject(&source.summary.subject);
+                editor.body = "\n\n".to_owned();
+                editor.field = ComposeField::Body;
+                editor.mode = ComposeMode::Insert;
+                editor
+            }
+        };
+        composer.original_loading = true;
+        let initial_body = composer.body.clone();
+        source.initial_body = initial_body.clone();
+        composer.original_source = Some(source.clone());
+        self.composer = Some(composer);
+        self.pending_draft = None;
+        self.resumed_draft_account = None;
+        self.pending_compose = Some(PendingCompose {
+            account: self.account_index,
+            request_id: 0,
+            message_id: source.summary.id.clone(),
+            intent,
+            mailbox: source.mailbox.clone(),
+            summary: source.summary,
+            cache_identity: source.cache_identity,
+            cache_only: false,
+            initial_body,
+        });
+        self.try_prepare_open_composer();
+    }
 
-        if self
-            .account()
-            .is_some_and(AccountState::cached_mailbox_unverified)
+    /// Re-attempt an unresolved source after an authoritative mailbox page.
+    /// A generation change *must never* cause a fetch against a recycled UID.
+    pub(super) fn try_prepare_open_composer(&mut self) {
+        let Some(pending) = self.pending_compose.as_ref() else { return; };
+        if pending.request_id != 0 || self.composer.as_ref().is_none_or(|c| !c.original_loading) {
+            return;
+        }
+        let Some(account) = self.accounts.get(pending.account) else { return; };
+        let verified = !account.unverified_mailboxes.contains(&pending.mailbox)
+            && account.capabilities.is_some();
+        let current_identity = account.cache_identities.get(&pending.mailbox);
+        if verified
+            && pending.cache_identity.as_ref().is_some_and(|old| {
+                current_identity.is_none_or(|current| !old.same_generation(current))
+            })
         {
-            self.status = StatusLine::info(
-                "reply/forward requires verified original MIME; cached mail remains readable",
+            self.pending_compose = None;
+            self.status = StatusLine::error(
+                "original mailbox identity changed; refusing to fetch a recycled message ID",
             );
             return;
         }
-        // MIME bytes, recipients and attachment metadata are prepared by the
-        // read-only worker. The event loop only installs the finished composer.
-        let own_addresses = self
-            .accounts
-            .iter()
+        if verified && current_identity.is_some_and(|identity| !identity.accepts(&pending.message_id)) {
+            self.pending_compose = None;
+            self.status = StatusLine::error(
+                "original message ID is not valid for the verified mailbox; fetch refused",
+            );
+            return;
+        }
+        let cache = current_identity
+            .filter(|identity| identity.accepts(&pending.message_id))
+            .and_then(|identity| {
+                account.raw_store.as_ref().map(|store| {
+                    (store.dir.clone(), identity.generation())
+                })
+            });
+        // The first attempt always tries the local raw MIME cache, even when
+        // offline. After a cache miss, only verified online fetches may retry.
+        let cache_only = !verified;
+        if cache_only && (cache.is_none() || pending.cache_only) {
+            self.status = StatusLine::info(
+                "composer open; original MIME pending mailbox verification (editing is available)",
+            );
+            return;
+        }
+        let own_addresses = self.accounts.iter()
             .filter_map(|a| a.from.parse::<lettre::message::Mailbox>().ok())
             .map(|a| a.email.to_string())
             .collect::<Vec<_>>();
-        let Some((message_id, mailbox, summary, cache)) = self.account().and_then(|account| {
-            let message = account.selected_message()?.clone();
-            let mailbox = account.current_mailbox.clone()?;
-            let cache = account.raw_cache_key(&mailbox, &message.id);
-            Some((message.id.clone(), mailbox, message, cache))
-        }) else {
-            return;
+        let action = ActionKind::PrepareCompose {
+            mailbox: pending.mailbox.clone(),
+            id: pending.message_id.clone(),
+            summary: pending.summary.clone(),
+            intent: pending.intent,
+            own_addresses,
+            cache,
+            cache_only,
         };
-        let request_id = self.account().and_then(|account| {
-            account
-                .worker
-                .post(ActionKind::PrepareCompose {
-                    mailbox,
-                    id: message_id.clone(),
-                    summary,
-                    intent,
-                    own_addresses,
-                    cache,
-                })
-                .ok()
-        });
-        if let Some(request_id) = request_id {
-            self.pending_compose = Some(PendingCompose {
-                account: account_index,
-                request_id,
-                message_id,
-                intent,
-            });
-            self.status = StatusLine::info("loading original message headers…");
-        } else {
-            self.status = StatusLine::error("mail worker queue is busy; reply/forward not opened");
+        match account.worker.post(action) {
+            Ok(request_id) => {
+                if let Some(pending) = self.pending_compose.as_mut() {
+                    pending.request_id = request_id;
+                    pending.cache_only = cache_only;
+                }
+                self.status = StatusLine::info(if cache_only {
+                    "composer open; loading original MIME from local cache…"
+                } else {
+                    "composer open; loading original MIME in background…"
+                });
+            }
+            Err(_) => self.status = StatusLine::error(
+                "composer open, but MIME worker is busy; retry after mailbox refresh",
+            ),
         }
+    }
+
+    /// Safely merge a prepared original without replacing text already typed
+    /// in the immediately opened editor.
+    pub(super) fn merge_prepared_compose(current: &mut Composer, prepared: Composer, source: &PendingCompose) {
+        if !current.original_loading { return; }
+        match source.intent {
+            ComposeIntent::Forward => {
+                Self::append_prepared_original(
+                    &mut current.body, &source.initial_body, &prepared.body
+                );
+                current.forwarded_raw = prepared.forwarded_raw;
+            }
+            ComposeIntent::Reply { quote, .. } => {
+                let initial_to = Composer::reply(&source.summary, None, quote).to;
+                // Recipients typed by the user must win over late Reply-To/CC
+                // parsing, but an untouched default should be corrected.
+                if current.to == initial_to { current.to = prepared.to; }
+                if current.cc.is_empty() { current.cc = prepared.cc; }
+                if quote {
+                    Self::append_prepared_original(
+                        &mut current.body, &source.initial_body, &prepared.body
+                    );
+                }
+            }
+        }
+        current.original_loading = false;
+        current.original_source = None;
+    }
+
+    fn append_prepared_original(edited: &mut String, initial: &str, prepared: &str) {
+        if edited == initial {
+            *edited = prepared.to_owned();
+        } else if initial == "\n\n" {
+            // The editor's cursor continues to refer to user-authored text.
+            // Put the quoted/forwarded original *after* those edits.
+            if !edited.ends_with('\n') { edited.push('\n'); }
+            edited.push('\n');
+            edited.push_str(prepared.trim_start_matches('\n'));
+        }
+        // When the cached body already contained the quoted text and the
+        // user edited it, do not insert a second copy or clobber those edits.
     }
 
     pub(super) fn handle_composer_key(&mut self, key: KeyEvent) {
@@ -411,6 +534,7 @@ impl App {
                 }
                 KeyCode::Char('d') | KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.composer = None;
+                    self.pending_compose = None;
                     self.resumed_draft_account = None;
                     self.status =
                         StatusLine::temporary("unsent email discarded", Duration::from_secs(2));
@@ -841,8 +965,10 @@ impl App {
                         KeyCode::Char('$') => Some(composer.yank_to_line_end()),
                         _ => None,
                     };
-                    if let Some(register) = copied {
-                        self.yank_register = Some(register);
+                    if let Some(register) = copied
+                        && let Some(status) = record_yank(&mut self.yank_register, register)
+                    {
+                        self.status = status;
                     }
                     return;
                 }
@@ -905,6 +1031,7 @@ impl App {
                         composer.exit_prompt = true;
                     } else {
                         self.composer = None;
+                        self.pending_compose = None;
                     }
                 }
                 KeyCode::Char('i') => composer.mode = ComposeMode::Insert,
@@ -949,7 +1076,13 @@ impl App {
                         .start(crate::app::vim::VimPrefix::Yank);
                     composer.vim_sequence.set_count(count);
                 }
-                KeyCode::Char('Y') => self.yank_register = Some(composer.yank_lines(count)),
+                KeyCode::Char('Y') => {
+                    if let Some(status) =
+                        record_yank(&mut self.yank_register, composer.yank_lines(count))
+                    {
+                        self.status = status;
+                    }
+                }
                 KeyCode::Char('p' | 'P') => {
                     if let Some(register) = &self.yank_register {
                         composer.paste_register(register, key.code == KeyCode::Char('p'), count);
@@ -1004,8 +1137,10 @@ impl App {
                     .vim_sequence
                     .start(crate::app::vim::VimPrefix::Inner),
                 KeyCode::Char('y') => {
-                    if let Some(register) = composer.yank_visual() {
-                        self.yank_register = Some(register);
+                    if let Some(register) = composer.yank_visual()
+                        && let Some(status) = record_yank(&mut self.yank_register, register)
+                    {
+                        self.status = status;
                     }
                     composer.visual_anchor = None;
                     composer.visual_linewise = false;
@@ -1120,6 +1255,15 @@ impl App {
             self.status = StatusLine::error(format!("could not save draft: {error:#}"));
             return;
         }
+        if composer.original_loading {
+            self.composer = None;
+            self.pending_compose = None;
+            self.resumed_draft_account = None;
+            self.status = StatusLine::info(
+                "saved locally; original MIME still missing (Ctrl+n to resume)",
+            );
+            return;
+        }
         let draft_mailbox = account
             .mailboxes
             .iter()
@@ -1157,6 +1301,7 @@ impl App {
                 .insert((self.account_index, request_id), source);
         }
         self.composer = None;
+        self.pending_compose = None;
         self.resumed_draft_account = None;
         self.status = if draft_request.is_some() {
             StatusLine::info("saved local recovery copy; saving to Drafts folder…")
@@ -1178,9 +1323,25 @@ impl App {
             .and_then(|root| crate::outgoing::drafts::load_draft(&root, &account.name));
         match result {
             Ok(Some(draft)) => {
+                let source = draft.original_source.clone();
                 self.composer = Some(draft);
                 self.resumed_draft_account = Some(self.account_index);
-                self.status = StatusLine::info("resumed locally postponed draft");
+                self.pending_compose = source.map(|source| PendingCompose {
+                    account: self.account_index,
+                    request_id: 0,
+                    message_id: source.summary.id.clone(),
+                    intent: source.intent,
+                    mailbox: source.mailbox,
+                    summary: source.summary,
+                    cache_identity: source.cache_identity,
+                    cache_only: false,
+                    initial_body: source.initial_body,
+                });
+                if self.pending_compose.is_some() {
+                    self.try_prepare_open_composer();
+                } else {
+                    self.status = StatusLine::info("resumed locally postponed draft");
+                }
             }
             Ok(None) => {
                 self.status = StatusLine::temporary(
@@ -1199,6 +1360,12 @@ impl App {
             return;
         };
         if composer.sending {
+            return;
+        }
+        if composer.original_loading {
+            self.status = StatusLine::error(
+                "original MIME/recipients not ready; wait for cached or verified source",
+            );
             return;
         }
         if composer.to.trim().is_empty()
@@ -1264,6 +1431,7 @@ impl App {
                 return;
             }
             self.composer = None;
+            self.pending_compose = None;
             self.resumed_draft_account = None;
             self.status = StatusLine::info("message saved in offline Outbox; sends on reconnect");
             return;

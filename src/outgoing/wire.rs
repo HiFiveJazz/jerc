@@ -210,7 +210,7 @@ pub fn forward_html(html: &str, attribution: &str, personal_note: &str) -> Strin
     format!("<html><body>{block}{html}</body></html>")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReplyAudience {
     Sender,
     All,

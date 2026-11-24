@@ -210,23 +210,25 @@ impl App {
                     ));
                 }
             }
-            WorkerEventKind::RawLoaded { id, raw } => {
-                if self.pending_draft.as_ref().is_some_and(|pending| {
-                    pending.account == event.account && pending.message_id == id
+            WorkerEventKind::DraftPrepared { id, result } => {
+                if !self.pending_draft.as_ref().is_some_and(|pending| {
+                    pending.account == event.account
+                        && pending.request_id == event.request_id
+                        && pending.message_id == id
                 }) {
-                    match Composer::from_server_draft(id.clone(), raw) {
-                        Ok(composer) => {
-                            if let Some(pending) = self.pending_draft.as_mut() {
-                                pending.composer = Some(composer);
-                            }
-                            self.status =
-                                StatusLine::info("Draft preview ready: [Y]es edit / [N]o preview");
+                    return;
+                }
+                match result {
+                    Ok(composer) => {
+                        if let Some(pending) = self.pending_draft.as_mut() {
+                            pending.composer = Some(*composer);
                         }
-                        Err(error) => {
-                            self.pending_draft = None;
-                            self.status =
-                                StatusLine::error(format!("cannot open draft: {error:#}"));
-                        }
+                        self.status =
+                            StatusLine::info("Draft preview ready: [Y]es edit / [N]o preview");
+                    }
+                    Err(error) => {
+                        self.pending_draft = None;
+                        self.status = StatusLine::error(format!("cannot open draft: {error}"));
                     }
                 }
             }
@@ -238,23 +240,35 @@ impl App {
                 }) {
                     return;
                 }
-                let intent = self
-                    .pending_compose
-                    .take()
-                    .expect("correlated compose request")
-                    .intent;
+                // A cache-only miss is NOT a failure to compose. The editor is
+                // already open. Wait for UIDVALIDITY verification before any
+                // network operation, while preserving the user's text.
+                if result.as_ref().err().is_some_and(|error| error.as_str() == "original MIME not cached")
+                    && self.pending_compose.as_ref().is_some_and(|p| p.cache_only)
+                {
+                    if let Some(pending) = self.pending_compose.as_mut() {
+                        pending.request_id = 0;
+                    }
+                    self.status = StatusLine::info(
+                        "composer open; original not cached, waiting for verified mailbox",
+                    );
+                    return;
+                }
+                let pending = self.pending_compose.take().expect("matching source");
                 match result {
-                    Ok(composer) => {
-                        debug_assert_eq!(
-                            composer.forwarded_raw.is_some(),
-                            matches!(intent, ComposeIntent::Forward),
-                        );
-                        self.composer = Some(*composer);
+                    Ok(prepared) => {
+                        if let Some(composer) = self.composer.as_mut() {
+                            Self::merge_prepared_compose(composer, *prepared, &pending);
+                        }
                         self.resumed_draft_account = None;
-                        self.status = StatusLine::info("ready to compose reply/forward");
+                        self.status = StatusLine::info("original MIME ready; editor preserved");
                     }
                     Err(error) => {
-                        self.status = StatusLine::error(format!("cannot prepare message: {error}"));
+                        // Leave the partial editor protected from sending or
+                        // replacing a complete forward with a text-only one.
+                        self.status = StatusLine::error(format!(
+                            "cannot load original MIME: {error}; local draft remains editable"
+                        ));
                     }
                 }
             }

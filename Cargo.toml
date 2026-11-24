@@ -34,14 +34,14 @@ patch-syntax = ["dep:tree-sitter", "dep:tree-sitter-c", "dep:tree-sitter-rust"]
 [dependencies]
 html2text = { version = "0.17.4", features = ["css"] }
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
 dirs = "7.0.0"
 io-imap = { version = "0.12.0", default-features = false, features = ["rustls-ring"] }
-lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "rustls-platform-verifier"] }
+lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "rustls-platform-verifier"] }
 mail-parser = { version = "1.0.1", features = ["full_encoding"] }
 percent-encoding = "2.3.2"
 roxmltree = "0.21.2"
@@ -56,11 +56,11 @@ tempfile = "3.27.0"
 tree-sitter = { version = "0.27.2", optional = true }
 tree-sitter-c = { version = "0.24.2", optional = true }
 tree-sitter-rust = { version = "0.24.2", optional = true }
-toml = "1.2.1"
+toml = "1.2.2"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
 ureq = { version = "=3.5.2", features = ["json"] }
-url = "2.5.8"
+url = "2.5.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 crossterm = { version = "0.29.0", default-features = false, features = ["use-dev-tty"] }

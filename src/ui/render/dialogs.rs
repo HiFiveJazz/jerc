@@ -543,19 +543,25 @@ pub(super) fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
             None
         };
         let body = body.unwrap_or_else(|| Text::from(composer.outgoing_plain_body()));
-        let max_scroll = body.lines.len().saturating_sub(usize::from(content_height));
+        let viewport = Rect::new(
+            inner.x.saturating_add(1),
+            y,
+            inner.width.saturating_sub(2),
+            content_height,
+        );
+        let paragraph = Paragraph::new(body)
+            .style(theme.text())
+            .wrap(Wrap { trim: false });
+        // line_count() includes screen rows introduced by word wrapping.
+        // Counting only logical lines clips the bottom of long messages in
+        // half-height terminals, even after pressing G or PageDown.
+        let max_scroll = paragraph
+            .line_count(viewport.width)
+            .saturating_sub(usize::from(viewport.height));
         let scroll = composer.preview_scroll.min(max_scroll);
         frame.render_widget(
-            Paragraph::new(body)
-                .style(theme.text())
-                .wrap(Wrap { trim: false })
-                .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
-            Rect::new(
-                inner.x.saturating_add(1),
-                y,
-                inner.width.saturating_sub(2),
-                content_height,
-            ),
+            paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+            viewport,
         );
     }
     let mode = if composer.preview_html && composer.preview_rich_lines.is_some() {
@@ -591,6 +597,37 @@ pub(super) fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
 mod tests {
     use super::*;
     use crate::theme::load_themes;
+
+    #[test]
+    fn wrapped_send_preview_reaches_last_row_in_short_and_narrow_terminals() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+        let mut app = App::new(&config, vec![]);
+        let mut composer = crate::app::Composer::new();
+        composer.confirm_send = true;
+        composer.preview_html = false;
+        composer.to = "to@example.org".into();
+        composer.subject = "Multiline preview".into();
+        composer.body = format!(
+            "{}\nPREVIEW_TAIL_SENTINEL",
+            "A long wrapped line with additional text beyond the short viewport. ".repeat(25)
+        );
+        composer.preview_scroll = usize::MAX;
+        app.composer = Some(composer);
+        for (width, height) in [(60u16, 19u16), (100u16, 30u16)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw_send_confirmation(frame, &app)).unwrap();
+            let rendered = (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains("PREVIEW_TAIL_SENTINEL"), "{width}x{height}: {rendered}");
+        }
+    }
 
     #[test]
     fn delete_account_confirmation_reuses_yes_no_buttons_without_cleanup_details() {

@@ -86,6 +86,8 @@ impl Composer {
             in_reply_to: None,
             references: Vec::new(),
             forwarded_raw: None,
+            original_loading: false,
+            original_source: None,
             draft_raw: None,
             draft_attachment_names: Vec::new(),
             draft_source: None,
@@ -112,7 +114,7 @@ impl Composer {
         }
     }
 
-    pub(super) fn from_server_draft(id: MessageId, raw: Vec<u8>) -> anyhow::Result<Self> {
+    pub(crate) fn from_server_draft(id: MessageId, raw: Vec<u8>) -> anyhow::Result<Self> {
         let parsed = mail_parser::MessageParser::new()
             .parse(&raw)
             .ok_or_else(|| anyhow::anyhow!("cannot parse saved draft headers"))?;
@@ -240,6 +242,8 @@ impl Composer {
             in_reply_to: message.message_id.clone(),
             references,
             forwarded_raw: None,
+            original_loading: false,
+            original_source: None,
             draft_raw: None,
             draft_attachment_names: Vec::new(),
             draft_source: None,
@@ -319,6 +323,8 @@ impl Composer {
             in_reply_to: None,
             references: Vec::new(),
             forwarded_raw: Some(raw),
+            original_loading: false,
+            original_source: None,
             draft_raw: None,
             draft_attachment_names: Vec::new(),
             draft_source: None,
@@ -346,6 +352,10 @@ impl Composer {
     }
 
     pub(super) fn prepare_send_preview(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.original_loading,
+            "original message is still loading; cannot preview an incomplete reply/forward"
+        );
         crate::outgoing::validate_recipients(&self.to, &self.cc, &self.bcc)?;
         // Only parse/reflow rich mail and attachment metadata upon opening the
         // preview, never while the terminal draws successive frames.

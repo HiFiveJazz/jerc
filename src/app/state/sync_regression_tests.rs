@@ -1018,6 +1018,11 @@ fn unrelated_worker_error_must_not_cancel_pending_reply_fetch() {
             quote: true,
             audience: ReplyAudience::Sender,
         },
+        mailbox: "INBOX".into(),
+        summary: app.accounts[0].messages[0].clone(),
+        cache_identity: Some(CacheIdentity::Imap(81)),
+        cache_only: false,
+        initial_body: "\n\n".into(),
     });
     app.handle_worker_event(error(111, "unrelated mailbox permission denied"));
     assert!(app.pending_compose.is_some());
@@ -1034,6 +1039,11 @@ fn matching_worker_error_may_cancel_pending_reply_fetch() {
         request_id: 112,
         message_id: id,
         intent: ComposeIntent::Forward,
+        mailbox: "INBOX".into(),
+        summary: app.accounts[0].messages[0].clone(),
+        cache_identity: Some(CacheIdentity::Imap(81)),
+        cache_only: false,
+        initial_body: "\n\n".into(),
     });
     app.handle_worker_event(error(112, "could not download original MIME"));
     assert!(app.pending_compose.is_none());
@@ -1049,16 +1059,69 @@ fn old_raw_reply_completion_cannot_replace_newer_compose_request() {
         request_id: 114,
         message_id: id.clone(),
         intent: ComposeIntent::Forward,
+        mailbox: "INBOX".into(),
+        summary: app.accounts[0].messages[0].clone(),
+        cache_identity: Some(CacheIdentity::Imap(81)),
+        cache_only: false,
+        initial_body: "\n\n".into(),
     });
     app.handle_worker_event(event(
         113,
-        WorkerEventKind::RawLoaded {
+        WorkerEventKind::DraftPrepared {
             id,
-            raw: b"From: friend@example.org\r\n\r\nold reply".to_vec(),
+            result: Ok(Box::new(Composer::new())),
         },
     ));
     assert!(app.pending_compose.is_some());
     assert!(app.composer.is_none());
+}
+
+#[test]
+fn draft_preview_completion_is_correlated_and_errors_do_not_leave_a_stuck_prompt() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    let id = MessageId("imap-uid:81:9".into());
+    app.pending_draft = Some(PendingDraft {
+        account: 0,
+        request_id: 201,
+        mailbox: "Drafts".into(),
+        message_id: id.clone(),
+        composer: None,
+    });
+    app.handle_worker_event(event(
+        200,
+        WorkerEventKind::DraftPrepared {
+            id: id.clone(),
+            result: Ok(Box::new(Composer::new())),
+        },
+    ));
+    assert!(app.pending_draft.as_ref().unwrap().composer.is_none());
+
+    app.handle_worker_event(event(
+        201,
+        WorkerEventKind::DraftPrepared {
+            id: id.clone(),
+            result: Err("malformed MIME".into()),
+        },
+    ));
+    assert!(app.pending_draft.is_none());
+    assert!(app.status.text.contains("malformed MIME"));
+
+    app.pending_draft = Some(PendingDraft {
+        account: 0,
+        request_id: 203,
+        mailbox: "Drafts".into(),
+        message_id: id.clone(),
+        composer: None,
+    });
+    app.handle_worker_event(event(
+        203,
+        WorkerEventKind::DraftPrepared {
+            id,
+            result: Ok(Box::new(Composer::new())),
+        },
+    ));
+    assert!(app.pending_draft.as_ref().unwrap().composer.is_some());
 }
 
 #[test]
@@ -1933,4 +1996,238 @@ fn imap_capability_enables_native_search_editor() {
     app.accounts[0].capabilities = Some(Capabilities::IMAP_BASIC);
     app.begin_native_search();
     assert!(app.accounts[0].native_search_editing);
+}
+
+#[test]
+fn unverified_cached_message_opens_forward_composer_without_waiting_for_sync() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].outgoing_configured = true;
+    app.accounts[0].unverified_mailboxes.insert("INBOX".into());
+    let id = cached_message(&mut app);
+
+    app.begin_forward();
+
+    let composer = app.composer.as_ref().expect("editor must open immediately");
+    assert_eq!(composer.subject, "Fwd: Safe offline message");
+    assert!(composer.original_loading);
+    assert_eq!(app.pending_compose.as_ref().unwrap().message_id, id);
+    assert_eq!(app.pending_compose.as_ref().unwrap().request_id, 0);
+    // A partial forward cannot accidentally drop the original attachments.
+    assert!(composer.clone().prepare_send_preview().is_err());
+    app.send_composer();
+    assert!(app.composer.is_some());
+}
+
+#[test]
+fn offline_cached_forward_prepares_without_server_verification() {
+    use std::time::Duration;
+    let (_root, mut app, rx) = fixture();
+    online(&mut app);
+    app.accounts[0].outgoing_configured = true;
+    let id = cached_message(&mut app);
+    let cache = crate::cache::RawStore {
+        dir: _root.path().join("cached-original-mime"),
+    };
+    let raw = b"From: friend@example.org\r\nSubject: Safe offline message\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nsource body";
+    cache.write("INBOX", &CacheIdentity::Imap(81), &id, raw).unwrap();
+    app.accounts[0].raw_store = Some(cache);
+    app.accounts[0].capabilities = None;
+    app.accounts[0].unverified_mailboxes.insert("INBOX".into());
+
+    app.begin_forward();
+    assert!(app.composer.as_ref().unwrap().original_loading);
+    let request_id = app.pending_compose.as_ref().unwrap().request_id;
+    assert_ne!(request_id, 0);
+    // Worker may read a generation-scoped disk snapshot without connecting.
+    let reply = loop {
+        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(3)).unwrap() else {
+            continue;
+        };
+        if event.request_id == request_id { break event; }
+    };
+    app.handle_worker_event(reply);
+    let composer = app.composer.as_ref().unwrap();
+    assert!(!composer.original_loading);
+    assert!(composer.body.contains("source body"));
+    assert_eq!(composer.forwarded_raw.as_deref(), Some(raw.as_slice()));
+}
+
+#[test]
+fn startup_cache_miss_waits_for_verified_generation_and_rejects_uid_reuse() {
+    use std::time::Duration;
+    let (_root, mut app, rx) = fixture();
+    online(&mut app);
+    app.accounts[0].outgoing_configured = true;
+    let _id = cached_message(&mut app);
+    app.accounts[0].raw_store = Some(crate::cache::RawStore {
+        dir: _root.path().join("empty-raw-store"),
+    });
+    app.accounts[0].unverified_mailboxes.insert("INBOX".into());
+    app.begin_forward();
+    let request_id = app.pending_compose.as_ref().unwrap().request_id;
+    let reply = loop {
+        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(3)).unwrap() else {
+            continue;
+        };
+        if event.request_id == request_id { break event; }
+    };
+    app.handle_worker_event(reply);
+    assert_eq!(app.pending_compose.as_ref().unwrap().request_id, 0);
+    assert!(app.composer.as_ref().unwrap().original_loading);
+
+    // A new UIDVALIDITY means the cached UID could now point to a stranger's
+    // mail. The original composer stays editable, but cannot fetch or send.
+    app.accounts[0]
+        .cache_identities
+        .insert("INBOX".into(), CacheIdentity::Imap(82));
+    app.accounts[0].unverified_mailboxes.remove("INBOX");
+    app.try_prepare_open_composer();
+    assert!(app.pending_compose.is_none());
+    assert!(app.composer.as_ref().unwrap().original_loading);
+    app.send_composer();
+    assert!(app.composer.is_some());
+}
+
+#[test]
+fn late_forward_mime_merges_below_users_typing_and_keeps_attachments() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].outgoing_configured = true;
+    let id = cached_message(&mut app);
+    app.begin_forward();
+    let request_id = app.pending_compose.as_ref().unwrap().request_id;
+    let raw = b"From: friend@example.org\r\nSubject: Safe offline message\r\n\r\noriginal contents";
+    app.composer.as_mut().unwrap().body = "My introduction\n".into();
+    app.composer.as_mut().unwrap().to = "someone@example.net".into();
+    let prepared = Composer::forward(&app.accounts[0].messages[0], raw.to_vec()).unwrap();
+    app.handle_worker_event(event(
+        request_id,
+        WorkerEventKind::ComposePrepared {
+            id,
+            result: Ok(Box::new(prepared)),
+        },
+    ));
+    let composer = app.composer.as_ref().unwrap();
+    assert!(composer.body.starts_with("My introduction"));
+    assert!(composer.body.contains("original contents"));
+    assert_eq!(composer.to, "someone@example.net");
+    assert_eq!(composer.forwarded_raw.as_deref(), Some(raw.as_slice()));
+    assert!(!composer.original_loading);
+    assert!(app.pending_compose.is_none());
+}
+
+#[test]
+fn late_reply_mime_fills_reply_to_only_when_recipient_untouched() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].outgoing_configured = true;
+    let id = cached_message(&mut app);
+    let intent = ComposeIntent::Reply {
+        quote: true,
+        audience: ReplyAudience::Sender,
+    };
+    app.begin_compose_from_selected(intent);
+    let request_id = app.pending_compose.as_ref().unwrap().request_id;
+    let raw = b"From: friend@example.org\r\nReply-To: correct@example.org\r\nSubject: Safe offline message\r\n\r\nquoted text";
+    let prepared = Composer::prepare_original(
+        &app.accounts[0].messages[0],
+        id.clone(),
+        raw.to_vec(),
+        intent,
+        &[],
+    ).unwrap();
+    app.composer.as_mut().unwrap().body = "Typed reply\n".into();
+    app.handle_worker_event(event(
+        request_id,
+        WorkerEventKind::ComposePrepared {
+            id,
+            result: Ok(Box::new(prepared)),
+        },
+    ));
+    let composer = app.composer.as_ref().unwrap();
+    assert!(composer.to.contains("correct@example.org"));
+    assert!(composer.body.starts_with("Typed reply"));
+    assert!(composer.body.contains("quoted text"));
+    assert!(!composer.original_loading);
+}
+
+#[test]
+fn quoted_reply_opens_immediately_from_in_memory_cached_body() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].outgoing_configured = true;
+    let id = cached_message(&mut app);
+    let raw = b"From: friend@example.org\r\nSubject: Safe offline message\r\n\r\nlocally cached quote";
+    let body = crate::mail::parse_body(id.clone(), raw).unwrap();
+    app.accounts[0].bodies.insert(id, body);
+    app.accounts[0].unverified_mailboxes.insert("INBOX".into());
+    app.begin_reply(true);
+    let composer = app.composer.as_ref().unwrap();
+    assert!(composer.original_loading);
+    assert!(composer.body.contains("> locally cached quote"));
+}
+
+#[test]
+fn verified_matching_uidvalidity_can_retry_a_pending_cache_miss() {
+    let (_root, mut app, rx) = fixture();
+    online(&mut app);
+    app.accounts[0].outgoing_configured = true;
+    cached_message(&mut app);
+    app.accounts[0].raw_store = Some(crate::cache::RawStore {
+        dir: _root.path().join("cache-miss"),
+    });
+    app.accounts[0].unverified_mailboxes.insert("INBOX".into());
+    app.begin_forward();
+    let id = app.pending_compose.as_ref().unwrap().request_id;
+    // Finish only the cache-only attempt. It must not fetch a stale UID.
+    loop {
+        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(3)).unwrap() else {
+            continue;
+        };
+        if event.request_id == id {
+            app.handle_worker_event(event);
+            break;
+        }
+    }
+    assert_eq!(app.pending_compose.as_ref().unwrap().request_id, 0);
+    app.accounts[0].unverified_mailboxes.remove("INBOX");
+    app.try_prepare_open_composer();
+    let pending = app.pending_compose.as_ref().unwrap();
+    assert_ne!(pending.request_id, 0);
+    assert!(!pending.cache_only);
+    assert!(app.composer.as_ref().unwrap().original_loading);
+}
+
+#[test]
+fn postponed_partial_forward_retains_original_baseline_for_safe_merge() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.accounts[0].outgoing_configured = true;
+    let _id = cached_message(&mut app);
+    app.begin_forward();
+    let mut draft = app.composer.take().unwrap();
+    draft.body = "My unsent work\n\n".into();
+    let persisted = serde_json::to_vec(&draft).unwrap();
+    let recovered: Composer = serde_json::from_slice(&persisted).unwrap();
+    assert_eq!(recovered.body, "My unsent work\n\n");
+    let source = recovered.original_source.as_ref().unwrap();
+    assert_eq!(source.initial_body, "\n\n");
+    let pending = PendingCompose {
+        account: 0,
+        request_id: 123,
+        message_id: source.summary.id.clone(),
+        intent: source.intent,
+        mailbox: source.mailbox.clone(),
+        summary: source.summary.clone(),
+        cache_identity: source.cache_identity.clone(),
+        cache_only: false,
+        initial_body: source.initial_body.clone(),
+    };
+    let raw = b"From: friend@example.org\r\nSubject: Safe offline message\r\n\r\nforwarded text";
+    let prepared = Composer::forward(&pending.summary, raw.to_vec()).unwrap();
+    let mut recovered = recovered;
+    App::merge_prepared_compose(&mut recovered, prepared, &pending);
+    assert!(recovered.body.starts_with("My unsent work"));
+    assert!(recovered.body.contains("forwarded text"));
 }

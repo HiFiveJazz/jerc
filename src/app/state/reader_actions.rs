@@ -751,20 +751,17 @@ impl App {
             return;
         }
 
-        // Always retain a private in-process register, even without wl-copy,
-        // xclip, or another clipboard helper. This can be pasted into Compose.
-        self.yank_register = Some(YankRegister {
-            text: selected.clone(),
-            linewise: self.reader_visual_linewise,
-        });
+        // Reader, Compose and Contacts share one OS clipboard/register policy.
+        if let Some(status) = record_yank(
+            &mut self.yank_register,
+            YankRegister {
+                text: selected,
+                linewise: self.reader_visual_linewise,
+            },
+        ) {
+            self.status = status;
+        }
         self.reader_visual_anchor = None;
         self.reader_visual_linewise = false;
-        self.status = match copy_text_to_clipboard(&selected) {
-            Ok(()) => StatusLine::temporary("copied reader selection", Duration::from_secs(2)),
-            Err(_) => StatusLine::temporary(
-                "copied to internal register (system clipboard unavailable)",
-                Duration::from_secs(3),
-            ),
-        };
     }
 }

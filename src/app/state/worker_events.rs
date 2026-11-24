@@ -65,7 +65,7 @@ impl App {
             | WorkerEventKind::AttachmentsLoaded { .. }
             | WorkerEventKind::RemoteAttachmentsListed { .. }
             | WorkerEventKind::RemoteAttachmentCompleted(_)
-            | WorkerEventKind::RawLoaded { .. }
+            | WorkerEventKind::DraftPrepared { .. }
             | WorkerEventKind::ComposePrepared { .. }
             | WorkerEventKind::MessageExported { .. } => EventGroup::Content,
             WorkerEventKind::SeenChanged { .. }
@@ -80,6 +80,11 @@ impl App {
             EventGroup::Content => self.handle_content_event(event),
             EventGroup::Outgoing => self.handle_outgoing_event(event),
             EventGroup::Errors => self.handle_errors_event(event),
+        }
+        // Retry an immediately-opened composer after the mailbox's authoritative
+        // identity is known, without waiting for another keypress.
+        if matches!(group, EventGroup::Mailbox | EventGroup::Content) {
+            self.try_prepare_open_composer();
         }
     }
 }

@@ -272,6 +272,40 @@ fn shared_cut_writes_clipboard_and_keeps_register_on_clipboard_failure() {
 }
 
 #[test]
+fn shared_yank_updates_clipboard_and_keeps_internal_register_on_failure() {
+    use super::YankRegister;
+    let mut register = None;
+    let mut clipboard_text = String::new();
+    let status = super::record_yank_with(
+        &mut register,
+        YankRegister { text: "message 😊\n".into(), linewise: true },
+        |text| { clipboard_text = text.to_owned(); Ok(()) },
+    ).unwrap();
+    assert!(status.text.contains("system clipboard"));
+    assert_eq!(clipboard_text, "message 😊\n");
+    assert_eq!(register.as_ref().unwrap().text, clipboard_text);
+    assert!(register.as_ref().unwrap().linewise);
+
+    let status = super::record_yank_with(
+        &mut register,
+        YankRegister { text: "other".into(), linewise: false },
+        |_| Err(std::io::Error::other("unavailable")),
+    ).unwrap();
+    assert!(status.text.contains("internal register"));
+    assert_eq!(register.as_ref().unwrap().text, "other");
+    assert!(!register.as_ref().unwrap().linewise);
+
+    let mut called = false;
+    assert!(super::record_yank_with(
+        &mut register,
+        YankRegister { text: String::new(), linewise: true },
+        |_| { called = true; Ok(()) },
+    ).is_none());
+    assert!(!called);
+    assert_eq!(register.as_ref().unwrap().text, "other");
+}
+
+#[test]
 fn compose_normal_x_cuts_to_register_in_every_header_and_body() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
@@ -1539,6 +1573,7 @@ fn draft_resume_decline_keeps_reader_and_accept_opens_composer() {
     app.setup = None;
     let make_pending = || PendingDraft {
         account: 0,
+        request_id: 42,
         mailbox: "Drafts".into(),
         message_id: MessageId("draft:42".into()),
         composer: Some(Composer::new()),

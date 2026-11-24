@@ -120,6 +120,17 @@ Normal, Insert, and Visual modes share Vim-style movement. Search the Compose `?
 | `Tab` / `Enter` | Accept a contact suggestion when shown |
 
 
+
+Yanking in the reader, Compose, and Contacts writes to both jerc's internal Vim
+register and the operating-system clipboard. The internal register preserves
+`p`/`P` even if a clipboard helper is missing; a status message reports that
+fallback. On Wayland, install `wl-clipboard` (`wl-copy`); on X11, install
+`xclip` or `xsel`. macOS uses `pbcopy`, and Windows uses `clip.exe`.
+
+Reply prose is still hard-wrapped at 72 columns when edited for mailing lists.
+The compose *display* now soft-wraps to the full available viewport width,
+so wide quoted lines and URLs no longer break at an artificial 72-column limit.
+
 ## Contacts (`Alt-c`)
 
 | Key | Action |

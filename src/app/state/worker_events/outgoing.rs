@@ -237,6 +237,7 @@ impl App {
                 }
                 if completed_current_send && event.account == self.account_index {
                     self.composer = None;
+                    self.pending_compose = None;
                 }
                 account.pump_outbox();
                 let accepted = if smtp_status == "JMAP" {

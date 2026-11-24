@@ -44,4 +44,4 @@ You can address an email to yourself without adding a contact manually.
 Existing saved contacts take precedence, and Jerc derives these identities from
 local configuration without contacting an external address-book service.
 
-**Editing contacts:** Name and Email share the composer's Insert (green), Normal (blue), and Visual (purple) modes. Press `Esc` to leave Insert/Visual, `i`/`a`/`A` to insert, `h`/`l`/`w`/`b` to navigate, `v`/`V` to select, `yy`/`Y` to yank, `p`/`P` to paste, and `u` to undo. `Ctrl-W` clears the current Name or Email field. Tab switches fields; Enter advances to Email or saves.
+**Editing contacts:** Name and Email share the composer's Insert (green), Normal (blue), and Visual (purple) modes. Press `Esc` to leave Insert/Visual, `i`/`a`/`A` to insert, `h`/`l`/`w`/`b` to navigate, `v`/`V` to select, `yy`/`Y` to yank to both the system clipboard and the internal register, `p`/`P` to paste, and `u` to undo. `Ctrl-W` clears the current Name or Email field. Tab switches fields; Enter advances to Email or saves.

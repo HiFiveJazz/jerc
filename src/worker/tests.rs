@@ -292,6 +292,7 @@ fn warm_folder_never_overtakes_interactive_compose_or_status() {
             intent: crate::app::ComposeIntent::Forward,
             own_addresses: vec![],
             cache: None,
+            cache_only: false,
         }),
     ]);
     assert!(matches!(
@@ -403,6 +404,7 @@ fn forwarding_raw_cache_hit_prepares_without_network_or_attachment_decoding() {
             intent: crate::app::ComposeIntent::Forward,
             own_addresses: vec![],
             cache: Some((cache.dir, CacheIdentity::Imap(42))),
+            cache_only: false,
         })
         .unwrap();
     let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {

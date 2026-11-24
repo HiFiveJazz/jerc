@@ -234,10 +234,15 @@ impl App {
             if let Some(prefix) = editor.vim_sequence.take_command() {
                 match (prefix, key.code) {
                     (crate::app::vim::VimPrefix::Yank, KeyCode::Char('y')) => {
-                        self.yank_register = Some(YankRegister {
-                            text: editor.value().to_owned(),
-                            linewise: false,
-                        });
+                        if let Some(status) = record_yank(
+                            &mut self.yank_register,
+                            YankRegister {
+                                text: editor.value().to_owned(),
+                                linewise: false,
+                            },
+                        ) {
+                            self.status = status;
+                        }
                     }
                     (crate::app::vim::VimPrefix::Delete, KeyCode::Char('d')) => {
                         editor.delete_range(0, editor.value().chars().count());
@@ -250,10 +255,15 @@ impl App {
                 match key.code {
                     KeyCode::Char('y') => {
                         if let Some(text) = editor.selected_text() {
-                            self.yank_register = Some(YankRegister {
-                                text,
-                                linewise: false,
-                            });
+                            if let Some(status) = record_yank(
+                                &mut self.yank_register,
+                                YankRegister {
+                                    text,
+                                    linewise: false,
+                                },
+                            ) {
+                                self.status = status;
+                            }
                         }
                         editor.mode = ComposeMode::Normal;
                         editor.visual_anchor = None;
@@ -365,10 +375,15 @@ impl App {
                     editor.vim_sequence.start(crate::app::vim::VimPrefix::Yank)
                 }
                 KeyCode::Char('Y') if editor.mode == ComposeMode::Normal => {
-                    self.yank_register = Some(YankRegister {
-                        text: editor.value().to_owned(),
-                        linewise: false,
-                    });
+                    if let Some(status) = record_yank(
+                        &mut self.yank_register,
+                        YankRegister {
+                            text: editor.value().to_owned(),
+                            linewise: false,
+                        },
+                    ) {
+                        self.status = status;
+                    }
                 }
                 KeyCode::Char('p' | 'P') if editor.mode == ComposeMode::Normal => {
                     if let Some(register) = self.yank_register.as_ref() {

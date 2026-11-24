@@ -1,8 +1,38 @@
 //! Clipboard and Vim cut/register policy.
 use super::*;
 
-/// Explicit Vim cuts (`x`) share one clipboard/register policy across
-/// Compose and Contacts. Plain yanks stay in Jerc's in-memory register.
+/// Both yanks and explicit Vim cuts share a clipboard/register policy.
+/// The private register keeps Vim p/P working even without an OS clipboard.
+
+/// Record a yank both in the private Vim register and the OS clipboard.
+/// Empty selections must not destroy an earlier successful yank.
+pub(super) fn record_yank(
+    register: &mut Option<YankRegister>,
+    yank: YankRegister,
+) -> Option<StatusLine> {
+    record_yank_with(register, yank, copy_text_to_clipboard)
+}
+
+pub(super) fn record_yank_with(
+    register: &mut Option<YankRegister>,
+    yank: YankRegister,
+    copy: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Option<StatusLine> {
+    if yank.text.is_empty() {
+        return None;
+    }
+    let copied = copy(&yank.text).is_ok();
+    *register = Some(yank);
+    Some(if copied {
+        StatusLine::temporary("yanked to system clipboard", Duration::from_secs(2))
+    } else {
+        StatusLine::temporary(
+            "yanked to internal register (system clipboard unavailable)",
+            Duration::from_secs(3),
+        )
+    })
+}
+
 pub(super) fn record_cut(
     register: &mut Option<YankRegister>,
     text: String,
@@ -69,13 +99,21 @@ pub(super) fn copy_text_to_clipboard(text: &str) -> std::io::Result<()> {
     run_clipboard_command("pbcopy", &[], text)
 }
 
+// Every jerc yank is text. Do not let wl-copy MIME-sniff message bodies:
+// git-send-email cover letters often begin with "From:", which can be
+// misidentified as message/rfc822 and rejected by other applications.
 #[cfg(all(unix, not(target_os = "macos")))]
-pub(super) fn copy_text_to_clipboard(text: &str) -> std::io::Result<()> {
-    let candidates: &[(&str, &[&str])] = &[
-        ("wl-copy", &[]),
+fn unix_clipboard_commands() -> &'static [(&'static str, &'static [&'static str])] {
+    &[
+        ("wl-copy", &["--type", "text/plain"]),
         ("xclip", &["-selection", "clipboard"]),
         ("xsel", &["--clipboard", "--input"]),
-    ];
+    ]
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(super) fn copy_text_to_clipboard(text: &str) -> std::io::Result<()> {
+    let candidates = unix_clipboard_commands();
     let mut last_error = None;
     for (program, args) in candidates {
         match run_clipboard_command(program, args, text) {
@@ -94,4 +132,20 @@ pub(super) fn copy_text_to_clipboard(_text: &str) -> std::io::Result<()> {
         std::io::ErrorKind::Unsupported,
         "clipboard copy is unsupported on this platform",
     ))
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tests {
+    use super::unix_clipboard_commands;
+
+    #[test]
+    fn wayland_copy_declares_text_plain_instead_of_sniffing_email_body() {
+        // A git-send-email cover letter starts with "From:"; MIME sniffing
+        // may otherwise advertise message/rfc822 rather than plain text.
+        let (program, args) = unix_clipboard_commands()[0];
+        assert_eq!(program, "wl-copy");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--type");
+        assert_eq!(args[1], "text/plain");
+    }
 }

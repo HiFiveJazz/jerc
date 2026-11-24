@@ -629,6 +629,13 @@ pub struct Composer {
     /// for inline forwarding, including postponed drafts. Never serialized as
     /// a .eml attachment in the default forwarding workflow.
     pub forwarded_raw: Option<Vec<u8>>,
+    /// True until the original MIME/recipients are prepared. Prevents silently
+    /// sending a partial reply/forward while the source is still loading.
+    #[serde(default)]
+    pub original_loading: bool,
+    /// A local recovery draft retains enough information to retry its source.
+    #[serde(default)]
+    original_source: Option<ComposeSource>,
     /// Original server draft, used to preserve attached MIME parts on resubmit.
     #[serde(default)]
     pub draft_raw: Option<Vec<u8>>,
@@ -685,7 +692,7 @@ pub struct Composer {
     edit_history: crate::app::vim::VimHistory<(ComposeField, String, usize)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComposeIntent {
     Reply {
         quote: bool,
@@ -694,18 +701,40 @@ pub enum ComposeIntent {
     Forward,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ComposeSource {
+    mailbox: String,
+    summary: MessageSummary,
+    cache_identity: Option<CacheIdentity>,
+    intent: ComposeIntent,
+    /// Baseline text at initial editor opening. Persist this across a locally
+    /// postponed draft so a late MIME response can never overwrite user prose.
+    #[serde(default)]
+    initial_body: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingCompose {
     account: usize,
+    /// Zero means the editor is open while a verified server identity is pending.
     request_id: u64,
     message_id: MessageId,
     intent: ComposeIntent,
+    mailbox: String,
+    summary: MessageSummary,
+    /// The immutable generation of the message selected from disk.
+    cache_identity: Option<CacheIdentity>,
+    /// A cache-only request must never access the network with an unverified UID.
+    cache_only: bool,
+    /// Snapshot of the initial editor text; late MIME must not overwrite edits.
+    initial_body: String,
 }
 
 /// A pending read-only Drafts preview. Enter opens the normal reader first;
 /// the Yes/No dialog is shown only once the original MIME is ready.
 struct PendingDraft {
     account: usize,
+    request_id: u64,
     mailbox: String,
     message_id: MessageId,
     composer: Option<Composer>,

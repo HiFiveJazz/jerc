@@ -1,6 +1,19 @@
 //! Raw MIME, attachment download and message preview helpers.
 use super::*;
 
+pub(super) fn cached_compose_raw(
+    mailbox: &str,
+    id: &MessageId,
+    cache: Option<&(PathBuf, CacheIdentity)>,
+) -> anyhow::Result<Vec<u8>> {
+    let (dir, generation) = cache.ok_or_else(|| anyhow::anyhow!("original MIME not cached"))?;
+    let raw = (RawStore { dir: dir.clone() })
+        .read(mailbox, generation, id)
+        .ok_or_else(|| anyhow::anyhow!("original MIME not cached"))?;
+    crate::perf::record("compose_raw_cache_hit", None, Duration::ZERO, true);
+    Ok(raw)
+}
+
 /// A verified UIDVALIDITY-scoped raw MIME hit avoids IMAP entirely.
 /// Cache misses still fetch the exact original bytes and persist them for
 /// later forwards/attachment previews. All file I/O occurs on mail workers.

@@ -135,13 +135,23 @@ pub(super) fn run_worker(
                 Err(error) => WorkerEventKind::BodyLoadFailed { error: WorkerError::from_error(error) },
             }),
             ActionKind::PrefetchBodies { .. } | ActionKind::WarmMailbox { .. } => unreachable!("prefetch requires background worker"),
-            ActionKind::FetchRawForCompose { mailbox, id, cache } =>
-                fetch_raw_cached(backend, &mailbox, &id, cache.as_ref())
-                    .map(|raw| WorkerEventKind::RawLoaded { id, raw }),
-            ActionKind::PrepareCompose { mailbox, id, summary, intent, own_addresses, cache } => {
-                Ok(WorkerEventKind::ComposePrepared {
+            ActionKind::FetchRawForCompose { mailbox, id, cache } => {
+                Ok(WorkerEventKind::DraftPrepared {
                     id: id.clone(),
                     result: fetch_raw_cached(backend, &mailbox, &id, cache.as_ref())
+                        .and_then(|raw| crate::app::Composer::from_server_draft(id, raw))
+                        .map(Box::new)
+                        .map_err(|error| format!("{error:#}")),
+                })
+            },
+            ActionKind::PrepareCompose { mailbox, id, summary, intent, own_addresses, cache, cache_only } => {
+                Ok(WorkerEventKind::ComposePrepared {
+                    id: id.clone(),
+                    result: (if cache_only {
+                        cached_compose_raw(&mailbox, &id, cache.as_ref())
+                    } else {
+                        fetch_raw_cached(backend, &mailbox, &id, cache.as_ref())
+                    })
                         .and_then(|raw| crate::app::Composer::prepare_original(
                             &summary, id, raw, intent, &own_addresses,
                         ))

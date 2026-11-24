@@ -92,15 +92,20 @@ pub(super) fn run_status_worker(
                 intent,
                 own_addresses,
                 cache,
+                cache_only,
             } => {
                 let result = (|| {
-                    let raw = fetch_compose_raw(
-                        &mut *backend,
-                        &mut connected,
-                        &mailbox,
-                        &id,
-                        cache.as_ref(),
-                    )?;
+                    let raw = if cache_only {
+                        cached_compose_raw(&mailbox, &id, cache.as_ref())?
+                    } else {
+                        fetch_compose_raw(
+                            &mut *backend,
+                            &mut connected,
+                            &mailbox,
+                            &id,
+                            cache.as_ref(),
+                        )?
+                    };
                     crate::app::Composer::prepare_original(
                         &summary,
                         id.clone(),
@@ -131,16 +136,17 @@ pub(super) fn run_status_worker(
             }
             ActionKind::FetchRawForCompose { mailbox, id, cache } => {
                 let result =
-                    fetch_compose_raw(&mut *backend, &mut connected, &mailbox, &id, cache.as_ref());
+                    fetch_compose_raw(&mut *backend, &mut connected, &mailbox, &id, cache.as_ref())
+                        .and_then(|raw| crate::app::Composer::from_server_draft(id.clone(), raw));
                 crate::perf::record(
-                    "background_fetch_compose_raw",
+                    "background_prepare_draft",
                     Some(queue_wait),
                     started.elapsed(),
                     result.is_ok(),
                 );
-                let kind = match result {
-                    Ok(raw) => WorkerEventKind::RawLoaded { id, raw },
-                    Err(error) => WorkerEventKind::Error(WorkerError::from_error(error)),
+                let kind = WorkerEventKind::DraftPrepared {
+                    id,
+                    result: result.map(Box::new).map_err(|error| format!("{error:#}")),
                 };
                 if runtime_tx
                     .send(RuntimeEvent::Worker(WorkerEvent {
