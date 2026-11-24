@@ -388,8 +388,15 @@ impl App {
                 if !self.new_mail_notifications_enabled {
                     // Prevent previously queued messages from appearing after mute.
                     self.new_mail_notices.clear();
+                    for account in &mut self.accounts {
+                        account.inbox_notifications.clear_pending();
+                    }
                     self.new_mail_bell_pending = false;
                     self.new_mail_since_launch = 0;
+                } else {
+                    for account in &mut self.accounts {
+                        account.inbox_notifications.reset();
+                    }
                 }
                 self.status = StatusLine::temporary(
                     if self.new_mail_notifications_enabled {
@@ -446,11 +453,11 @@ impl App {
             }
             Command::Escape => {
                 self.count_prefix = None;
-                let had_selection = self.reader_visual_anchor.take().is_some()
+                let had_selection = self.reader_navigation.visual_anchor.take().is_some()
                     | self.visual_anchor.take().is_some()
                     | !self.message_marked.is_empty();
                 self.message_marked.clear();
-                self.reader_visual_linewise = false;
+                self.reader_navigation.visual_linewise = false;
                 if had_selection {
                     self.status =
                         StatusLine::temporary("selection cleared", Duration::from_secs(1));

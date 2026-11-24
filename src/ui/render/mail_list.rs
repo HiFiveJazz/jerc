@@ -58,13 +58,11 @@ pub(super) fn draw_mailboxes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)).style(theme.text()), inner);
 }
 
-/// Visual ranges are purple, while persistent Space marks retain the theme's
-/// blue accent. In gutter mode the active row stays the usual dark gray.
-pub(super) fn visual_row_style(theme: &Theme) -> Style {
-    Style::default()
-        .fg(theme.selected_fg)
-        .bg(theme.visual)
-        .add_modifier(Modifier::BOLD)
+/// Visual ranges use the muted selection background; gutter markers remain
+/// purple and persistent Space marks retain the theme's accent.
+pub(super) fn visual_row_style(theme: &Theme, unread: bool) -> Style {
+    let base = if unread { theme.unread() } else { theme.text() };
+    theme.visual_selection(base)
 }
 
 /// Editor/reader current-line background without the list row's bold weight.
@@ -85,7 +83,7 @@ pub(super) fn browser_row_style(
     } else if active {
         theme.current_line()
     } else if mode == VisualSelectionStyle::Row && visual {
-        visual_row_style(theme)
+        visual_row_style(theme, unread)
     } else if mode == VisualSelectionStyle::Row && marked {
         theme.selected()
     } else if unread {
@@ -102,8 +100,8 @@ pub(super) fn selection_check_style(
     marked: bool,
     active: bool,
 ) -> Style {
-    if mode == VisualSelectionStyle::Row && (visual || marked) && !active {
-        // On a filled row, retain contrast rather than purple-on-purple.
+    if mode == VisualSelectionStyle::Row && marked && !visual && !active {
+        // Persistent Space marks still use the bright accent fill.
         Style::default()
             .fg(theme.selected_fg)
             .add_modifier(Modifier::BOLD)
@@ -211,7 +209,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let theme = app.theme();
     let account = app.account().expect("account exists");
     let search_query = account.search_query.as_str();
-    let visible = account.visible_message_indices();
+    let visible = account.visible_message_indices_shared();
     let selected_position = visible
         .iter()
         .position(|&index| index == account.message_index);
@@ -277,7 +275,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let subject_width = column_areas
         .get(3)
         .map_or(0, |area| usize::from(area.width));
-    let thread_rows = account.inline_thread_rows();
+    let thread_rows = account.inline_thread_rows_shared();
     // Projection order matches visible rows; search/flat mode has no markers.
     let rows = shown.iter().enumerate().map(|(row_position, &index)| {
         let message = &account.messages[index];
@@ -420,7 +418,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .style(theme.text())
         .column_spacing(1);
     // Paint every selected terminal row, including table gaps and attachment
-    // subtitles. Visual ranges are purple; independently marked rows are blue.
+    // subtitles. Visual ranges are muted; independently marked rows use the accent.
     if app.visual_selection_style == VisualSelectionStyle::Row {
         let mut y = list_area.y;
         for (row_position, &index) in shown.iter().enumerate() {
@@ -446,7 +444,7 @@ pub(super) fn draw_messages(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         message.unread(),
                     )
                 } else if visual {
-                    visual_row_style(theme)
+                    visual_row_style(theme, message.unread())
                 } else {
                     theme.selected()
                 };

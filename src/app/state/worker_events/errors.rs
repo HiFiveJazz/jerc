@@ -146,7 +146,7 @@ impl App {
                     self.pending_send = None;
                     if let Some(composer) = self.composer.as_mut() {
                         composer.sending = false;
-                        composer.confirm_send = false;
+                        composer.close_send_preview();
                     }
                 }
                 if mutation_failed && let Some(name) = account.current_mailbox.clone() {

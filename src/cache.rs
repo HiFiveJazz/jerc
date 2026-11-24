@@ -18,9 +18,13 @@ use crate::config::AccountConfig;
 use crate::model::{CacheIdentity, Mailbox, MessageBody, MessageId, MessageSummary};
 
 mod body_store;
+mod index_store;
 mod raw_store;
 mod writer;
-use self::writer::{apply, run_cache_writer};
+use self::index_store::{IndexCheckpoint, NavigationPosition};
+#[cfg(test)]
+use self::writer::apply;
+use self::writer::{apply_tracked, run_cache_writer};
 #[cfg(test)]
 use self::writer::{flush_cache_changes, wait_for_cache_batch};
 
@@ -53,7 +57,10 @@ const MAX_MUTATION_JOURNAL_BYTES: u64 = 256 * 1024;
 // coalesce those fragments before they reach the filesystem.
 const CACHE_JSON_BUFFER_BYTES: usize = 64 * 1024;
 
-fn write_json_buffered<W: Write, T: Serialize>(sink: W, value: &T) -> std::io::Result<()> {
+pub(crate) fn write_json_buffered<W: Write, T: Serialize>(
+    sink: W,
+    value: &T,
+) -> std::io::Result<()> {
     let mut writer = BufWriter::with_capacity(CACHE_JSON_BUFFER_BYTES, sink);
     serde_json::to_writer(&mut writer, value).map_err(std::io::Error::other)?;
     writer.flush()
@@ -246,7 +253,9 @@ pub(crate) struct CachedMailbox {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thread_messages: Vec<MessageSummary>,
     pub bodies: HashMap<MessageId, MessageBody>,
+    #[serde(default)]
     pub message_index: usize,
+    #[serde(default)]
     pub message_view_offset: usize,
     pub next_page_offset: usize,
     pub has_more: bool,
@@ -272,14 +281,9 @@ pub(crate) struct Snapshot {
     pub deferred_mutations: Vec<DeferredMutation>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CacheFile {
-    version: u8,
-    snapshot: Snapshot,
-}
-
 // Serialize the live snapshot by reference: cloning a potentially large mailbox
 // cache on every background write would add unnecessary allocations and latency.
+#[cfg(test)]
 #[derive(Serialize)]
 struct CacheFileRef<'a> {
     version: u8,
@@ -414,6 +418,7 @@ pub(crate) enum Change {
     Mailboxes(Vec<Mailbox>),
     Folder(String, CachedMailbox),
     RemoveFolder(String),
+    Navigation(String, CacheIdentity, usize, usize),
     Body(String, CacheIdentity, MessageBody),
     DeferredSeen(Vec<DeferredSeen>),
 }
@@ -426,6 +431,7 @@ struct PendingChanges {
     folders: HashMap<String, Option<CachedMailbox>>,
     bodies: HashMap<(String, MessageId), (CacheIdentity, MessageBody)>,
     deferred_seen: Option<Vec<DeferredSeen>>,
+    navigation: HashMap<String, NavigationPosition>,
 }
 
 impl PendingChanges {
@@ -444,7 +450,20 @@ impl PendingChanges {
                     self.bodies.insert(key, (validity, body));
                 }
             }
+            Change::Navigation(name, identity, index, offset) => {
+                if self.navigation.len() < MAX_FOLDERS || self.navigation.contains_key(&name) {
+                    self.navigation.insert(
+                        name,
+                        NavigationPosition {
+                            identity,
+                            index,
+                            offset,
+                        },
+                    );
+                }
+            }
             Change::RemoveFolder(name) => {
+                self.navigation.remove(&name);
                 if self.folders.len() == MAX_FOLDERS
                     && !self.folders.contains_key(&name)
                     && let Some(evict) = self.folders.keys().next().cloned()
@@ -463,20 +482,28 @@ impl PendingChanges {
             .collect()
     }
 
+    #[cfg(test)]
     fn drain_into(&mut self, snapshot: &mut Snapshot) -> bool {
+        self.drain_tracked(snapshot, &mut IndexCheckpoint::default())
+    }
+
+    fn drain_tracked(&mut self, snapshot: &mut Snapshot, dirty: &mut IndexCheckpoint) -> bool {
         let mut changed = false;
         if let Some(mailboxes) = self.mailboxes.take() {
-            changed |= apply(snapshot, Change::Mailboxes(mailboxes));
+            changed |= apply_tracked(snapshot, Change::Mailboxes(mailboxes), dirty);
         }
         if let Some(entries) = self.deferred_seen.take() {
-            changed |= apply(snapshot, Change::DeferredSeen(entries));
+            changed |= apply_tracked(snapshot, Change::DeferredSeen(entries), dirty);
         }
-        // Do not short-circuit: every pending change must still be applied.
         for (name, folder) in self.folders.drain() {
-            changed |= match folder {
-                Some(folder) => apply(snapshot, Change::Folder(name, folder)),
-                None => apply(snapshot, Change::RemoveFolder(name)),
+            let change = match folder {
+                Some(folder) => Change::Folder(name, folder),
+                None => Change::RemoveFolder(name),
             };
+            changed |= apply_tracked(snapshot, change, dirty);
+        }
+        for (name, position) in self.navigation.drain() {
+            changed |= dirty.apply_navigation(snapshot, &name, &position);
         }
         changed
     }
@@ -530,7 +557,7 @@ fn open_in(account: &AccountConfig, dir: &Path) -> (Snapshot, Option<Writer>) {
         dir: dir.join(format!("{stem}.bodies")),
     };
     let cache_start = Instant::now();
-    let loaded = read_snapshot(&path);
+    let loaded = index_store::load(&path);
     // A successful disk read with no usable folders is not a warm mailbox
     // cache. The log contains timing only, never account or message details.
     crate::perf::record(
@@ -539,9 +566,9 @@ fn open_in(account: &AccountConfig, dir: &Path) -> (Snapshot, Option<Writer>) {
         cache_start.elapsed(),
         loaded
             .as_ref()
-            .is_some_and(|snapshot| !snapshot.folders.is_empty()),
+            .is_some_and(|(snapshot, _)| !snapshot.folders.is_empty()),
     );
-    let mut snapshot = loaded.unwrap_or_default();
+    let (mut snapshot, checkpoint) = loaded.unwrap_or_default();
     // Clone the startup index once using shared message headers and body text.
     // The background writer needs independent folder maps, but not another
     // expensive JSON parse or another copy of every RFC 5322 header string.
@@ -556,7 +583,14 @@ fn open_in(account: &AccountConfig, dir: &Path) -> (Snapshot, Option<Writer>) {
     let join = thread::Builder::new()
         .name("mail-cache-writer".into())
         .spawn(move || {
-            run_cache_writer(rx, path, thread_pending, writer_body_store, writer_snapshot);
+            run_cache_writer(
+                rx,
+                path,
+                thread_pending,
+                writer_body_store,
+                writer_snapshot,
+                checkpoint,
+            );
         });
     match join {
         Ok(join) => (
@@ -737,44 +771,13 @@ fn stable_key(value: &str) -> u64 {
     hash
 }
 
-fn read_snapshot(path: &PathBuf) -> Option<Snapshot> {
-    let file = File::open(path).ok()?;
-    if file.metadata().ok()?.len() > MAX_CACHE_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_CACHE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_CACHE_BYTES {
-        return None;
-    }
-    let file: CacheFile = serde_json::from_slice(&bytes).ok()?;
-    if file.version != VERSION || file.snapshot.folders.len() > MAX_FOLDERS {
-        return None;
-    }
-    // Discard any legacy or invalid records lacking UIDVALIDITY.
-    let mut snapshot = file.snapshot;
-    snapshot
-        .deferred_seen
-        .retain(DeferredSeen::has_valid_identity);
-    snapshot.deferred_seen.truncate(MAX_DEFERRED_SEEN);
-    snapshot.folders.retain(|_, folder| {
-        folder.identity.as_ref().is_some_and(|identity| {
-            folder.messages.len() <= MAX_MESSAGES_PER_FOLDER
-                && folder.thread_messages.len() <= MAX_MESSAGES_PER_FOLDER
-                && identity.is_valid()
-                && folder
-                    .messages
-                    .iter()
-                    .chain(&folder.thread_messages)
-                    .all(|message| identity.accepts(&message.id))
-                && folder.bodies.keys().all(|id| identity.accepts(id))
-        })
-    });
-    Some(snapshot)
+#[cfg(test)]
+pub(crate) fn read_snapshot(path: &Path) -> Option<Snapshot> {
+    index_store::load(path).map(|(snapshot, _)| snapshot)
 }
 
+// Version-one fixtures exercise migration and backward compatibility.
+#[cfg(test)]
 fn write_snapshot(path: &Path, snapshot: &Snapshot) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Err(std::io::Error::other("no cache parent directory"));
@@ -804,6 +807,8 @@ fn write_snapshot(path: &Path, snapshot: &Snapshot) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::test_cache_writer;
 
 #[cfg(test)]
 mod offline_mutation_journal_tests;

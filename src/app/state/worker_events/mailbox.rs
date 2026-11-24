@@ -218,61 +218,22 @@ impl App {
                         )
                     })
                     .collect();
-                // Initial discovery establishes a baseline. Only a push-driven
-                // list can infer arrivals from the previous live Inbox count.
-                let new_inbox = if from_push {
-                    account
-                        .mailboxes
-                        .iter()
-                        .find(|mailbox| mailbox.role == MailboxRole::Inbox)
-                        .and_then(|old| {
-                            discovered
-                                .iter()
-                                .find(|new| new.name == old.name)
-                                .map(|new| {
-                                    (
-                                        new.name.clone(),
-                                        inbox_new_mail_count(
-                                            true,
-                                            old.counts_known && new.counts_known,
-                                            old.total,
-                                            new.total,
-                                        ),
-                                    )
-                                })
-                        })
-                } else {
-                    None
-                };
+                // LIST counts are for display, not arrival identity. JMAP
+                // pushes and the first authoritative local LIST schedule one
+                // Inbox observation, never a STATUS fanout over all folders.
+                let inbox = discovered
+                    .iter()
+                    .find(|mailbox| mailbox.role == MailboxRole::Inbox)
+                    .map(|mailbox| (mailbox.name.clone(), mailbox.counts_known));
                 account.reconcile_mailbox_list(discovered);
-                if let Some((name, new_count)) = new_inbox.filter(|(_, count)| *count > 0) {
-                    if self.new_mail_notifications_enabled {
-                        self.new_mail_since_launch =
-                            self.new_mail_since_launch.saturating_add(new_count);
-                        if self.new_mail_bell_enabled {
-                            self.new_mail_bell_pending = true;
-                        }
-                        if account
-                            .worker
-                            .post(ActionKind::NewMailPreview {
-                                mailbox: name,
-                                count: new_count,
-                            })
-                            .is_err()
-                        {
-                            self.new_mail_notices.push_back(NewMailNotice {
-                                account: account.name.clone(),
-                                count: new_count,
-                                sender: String::new(),
-                                subject: String::new(),
-                                excerpt: String::new(),
-                            });
-                        }
+                if let Some((name, counts_known)) = inbox {
+                    if counts_known
+                        && (from_push || account.inbox_notifications.needs_baseline(&name))
+                    {
+                        account.queue_status_refresh(name);
                     }
-                    self.status = StatusLine::temporary(
-                        format!("{} new message(s) in {}", new_count, account.name),
-                        Duration::from_secs(6),
-                    );
+                } else {
+                    account.inbox_notifications.reset();
                 }
                 account.persist_mailboxes();
                 account.mailbox_index = account
@@ -355,6 +316,7 @@ impl App {
                 name,
                 total,
                 unread,
+                inbox,
             } => {
                 let Some(request) = account.status_requests.finish(event.request_id) else {
                     // Never apply an old/out-of-order count result to the UI.
@@ -365,22 +327,27 @@ impl App {
                     return;
                 }
                 let from_poll = request.reason == StatusReason::Refresh;
-                let mut new_count = 0usize;
+                let mut arrival = None;
                 let mut changed = false;
                 if let Some(mailbox) = account.mailboxes.iter_mut().find(|m| m.name == name) {
                     changed = mailbox.counts_known
                         && (mailbox.total != total || mailbox.unread != unread);
-                    new_count = inbox_new_mail_count(
-                        from_poll && mailbox.role == MailboxRole::Inbox,
-                        mailbox.counts_known,
-                        mailbox.total,
-                        total,
-                    );
+                    if mailbox.role == MailboxRole::Inbox && !account.connecting {
+                        arrival = account.inbox_notifications.observe_check(
+                            &name,
+                            total,
+                            from_poll,
+                            Utc::now().timestamp(),
+                            event.request_id,
+                            inbox,
+                        );
+                    }
                     mailbox.total = total;
                     mailbox.unread = unread;
                     mailbox.counts_known = true;
                 }
-                if new_count > 0 {
+                let new_count = arrival.as_ref().map_or(0, |(count, _, _)| *count);
+                if let Some((new_count, candidate, at)) = arrival {
                     if self.new_mail_notifications_enabled {
                         self.new_mail_since_launch =
                             self.new_mail_since_launch.saturating_add(new_count);
@@ -398,23 +365,11 @@ impl App {
                         self.new_mail_bell_pending = true;
                     }
                     if self.new_mail_notifications_enabled {
-                        // Use the existing background IMAP session; do not block
-                        // rendering, fetch on the foreground session, or change \Seen.
-                        if account
-                            .worker
-                            .post(ActionKind::NewMailPreview {
-                                mailbox: name.clone(),
-                                count: new_count,
-                            })
-                            .is_err()
+                        // Read-only worker, never change Seen or block the UI.
+                        if let Some(notice) =
+                            account.queue_new_mail_preview(name.clone(), new_count, candidate, at)
                         {
-                            self.new_mail_notices.push_back(NewMailNotice {
-                                account: account.name.clone(),
-                                count: new_count,
-                                sender: String::new(),
-                                subject: String::new(),
-                                excerpt: String::new(),
-                            });
+                            self.new_mail_notices.push_back(notice);
                         }
                     }
                     if account.current_mailbox.as_deref() == Some(name.as_str()) {
@@ -458,11 +413,23 @@ impl App {
             }
             WorkerEventKind::NewMailPreview {
                 count,
-                sender,
-                subject,
-                excerpt,
+                id,
+                mut sender,
+                mut subject,
+                mut excerpt,
             } => {
-                if self.new_mail_notifications_enabled {
+                if account
+                    .inbox_notifications
+                    .finish_preview(event.request_id, Utc::now().timestamp())
+                    && self.new_mail_notifications_enabled
+                {
+                    // The same message can be the first row on several polls.
+                    // Never reuse its content as another arrival's preview.
+                    if !id.is_some_and(|id| account.inbox_notifications.first_preview(id)) {
+                        sender.clear();
+                        subject.clear();
+                        excerpt.clear();
+                    }
                     self.new_mail_notices.push_back(NewMailNotice {
                         account: account.name.clone(),
                         count,
@@ -715,6 +682,65 @@ impl App {
                 );
                 let same_folder = account.current_mailbox.as_deref() == Some(name.as_str());
                 account.current_mailbox = Some(name.clone());
+                // Learn only lightweight envelope addresses already fetched
+                // for normal browsing. Inspect only the incoming page, not
+                // the accumulated list on each pagination event. Never scan
+                // bodies or junk folders; retain the first-200-header limit.
+                let mailbox_role = account
+                    .mailboxes
+                    .iter()
+                    .find(|m| m.name == name)
+                    .map(|m| &m.role);
+                let is_sent = matches!(mailbox_role, Some(&MailboxRole::Sent));
+                let is_inbox = matches!(mailbox_role, Some(&MailboxRole::Inbox));
+                if ((is_inbox && self.contacts_learn_inbox)
+                    || (is_sent && self.contacts_learn_sent))
+                    && self.contacts_writable
+                {
+                    let mut changed = false;
+                    for message in page
+                        .messages
+                        .iter()
+                        .take(200usize.saturating_sub(page.offset))
+                    {
+                        if is_inbox
+                            && !own_addresses
+                                .iter()
+                                .any(|own| own.eq_ignore_ascii_case(&message.from_address))
+                        {
+                            changed |= self
+                                .contacts
+                                .upsert(&message.from_name, &message.from_address, false)
+                                .unwrap_or(false);
+                        }
+                        if is_sent {
+                            for (person, address) in recipients(&message.to)
+                                .into_iter()
+                                .chain(recipients(&message.cc))
+                            {
+                                if !own_addresses
+                                    .iter()
+                                    .any(|own| own.eq_ignore_ascii_case(&address))
+                                {
+                                    changed |= self
+                                        .contacts
+                                        .upsert(&person, &address, false)
+                                        .unwrap_or(false);
+                                }
+                            }
+                        }
+                    }
+                    if changed {
+                        self.contacts_dirty = true;
+                        if self.contacts_save_due.is_none() {
+                            self.contacts_save_due = Some(Instant::now() + Duration::from_secs(3));
+                        }
+                        if let Some(modal) = self.contacts_modal.as_mut() {
+                            modal.matches = self.contacts.filtered(&modal.query);
+                            modal.ensure_visible(modal.matches.len());
+                        }
+                    }
+                }
                 if page.offset == 0 {
                     if self.message_open
                         && event.account == self.account_index
@@ -887,59 +913,6 @@ impl App {
                     }
                 }
                 account.last_scan_micros = Some(elapsed_micros);
-                // Learn only lightweight envelope addresses already fetched
-                // for normal browsing. Never scan bodies or junk folders.
-                let mailbox_role = account
-                    .mailboxes
-                    .iter()
-                    .find(|m| m.name == name)
-                    .map(|m| &m.role);
-                let is_sent = matches!(mailbox_role, Some(&MailboxRole::Sent));
-                let is_inbox = matches!(mailbox_role, Some(&MailboxRole::Inbox));
-                if ((is_inbox && self.contacts_learn_inbox)
-                    || (is_sent && self.contacts_learn_sent))
-                    && self.contacts_writable
-                {
-                    let mut changed = false;
-                    for message in account.messages.iter().take(200) {
-                        if is_inbox
-                            && !own_addresses
-                                .iter()
-                                .any(|own| own.eq_ignore_ascii_case(&message.from_address))
-                        {
-                            changed |= self
-                                .contacts
-                                .upsert(&message.from_name, &message.from_address, false)
-                                .unwrap_or(false);
-                        }
-                        if is_sent {
-                            for (person, address) in recipients(&message.to)
-                                .into_iter()
-                                .chain(recipients(&message.cc))
-                            {
-                                if !own_addresses
-                                    .iter()
-                                    .any(|own| own.eq_ignore_ascii_case(&address))
-                                {
-                                    changed |= self
-                                        .contacts
-                                        .upsert(&person, &address, false)
-                                        .unwrap_or(false);
-                                }
-                            }
-                        }
-                    }
-                    if changed {
-                        self.contacts_dirty = true;
-                        if self.contacts_save_due.is_none() {
-                            self.contacts_save_due = Some(Instant::now() + Duration::from_secs(3));
-                        }
-                        if let Some(modal) = self.contacts_modal.as_mut() {
-                            modal.matches = self.contacts.filtered(&modal.query);
-                            modal.ensure_visible(modal.matches.len());
-                        }
-                    }
-                }
                 account.overlay_deferred_seen();
                 account.pump_deferred_seen();
                 account.persist_current_cache();

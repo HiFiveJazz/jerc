@@ -276,22 +276,33 @@ impl App {
     /// The worker may read the immutable raw cache immediately; it must not
     /// fetch an unverified UID from the server.
     pub(super) fn begin_compose_from_selected(&mut self, intent: ComposeIntent) {
-        let Some(account) = self.account() else { return; };
+        let Some(account) = self.account() else {
+            return;
+        };
         if !account.outgoing_configured {
             self.status = StatusLine::error(
                 "no outgoing transport configured; add `outgoing = ...` to this account",
             );
             return;
         }
-        let Some(summary) = account.selected_message().cloned() else { return; };
-        let Some(mailbox) = account.current_mailbox.clone() else { return; };
+        let Some(summary) = account.selected_message().cloned() else {
+            return;
+        };
+        let Some(mailbox) = account.current_mailbox.clone() else {
+            return;
+        };
         // Keep the keystroke-to-first-frame path bounded. Large MIME text is
         // quoted by the background worker rather than formatted on the UI thread.
-        let cached_body = account.bodies.get(&summary.id)
+        let cached_body = account
+            .bodies
+            .get(&summary.id)
             .filter(|body| body.display_text(false).len() <= 128 * 1024)
             .cloned();
         let mut source = ComposeSource {
-            cache_identity: account.cache_identities.get(&mailbox).map(CacheIdentity::generation),
+            cache_identity: account
+                .cache_identities
+                .get(&mailbox)
+                .map(CacheIdentity::generation),
             mailbox,
             summary,
             intent,
@@ -300,7 +311,7 @@ impl App {
         let mut composer = match intent {
             ComposeIntent::Reply { quote, .. } => {
                 Composer::reply(&source.summary, cached_body.as_ref(), quote)
-            },
+            }
             ComposeIntent::Forward => {
                 let mut editor = Composer::new();
                 editor.subject = forward_subject(&source.summary.subject);
@@ -334,11 +345,15 @@ impl App {
     /// Re-attempt an unresolved source after an authoritative mailbox page.
     /// A generation change *must never* cause a fetch against a recycled UID.
     pub(super) fn try_prepare_open_composer(&mut self) {
-        let Some(pending) = self.pending_compose.as_ref() else { return; };
+        let Some(pending) = self.pending_compose.as_ref() else {
+            return;
+        };
         if pending.request_id != 0 || self.composer.as_ref().is_none_or(|c| !c.original_loading) {
             return;
         }
-        let Some(account) = self.accounts.get(pending.account) else { return; };
+        let Some(account) = self.accounts.get(pending.account) else {
+            return;
+        };
         let verified = !account.unverified_mailboxes.contains(&pending.mailbox)
             && account.capabilities.is_some();
         let current_identity = account.cache_identities.get(&pending.mailbox);
@@ -353,7 +368,9 @@ impl App {
             );
             return;
         }
-        if verified && current_identity.is_some_and(|identity| !identity.accepts(&pending.message_id)) {
+        if verified
+            && current_identity.is_some_and(|identity| !identity.accepts(&pending.message_id))
+        {
             self.pending_compose = None;
             self.status = StatusLine::error(
                 "original message ID is not valid for the verified mailbox; fetch refused",
@@ -363,9 +380,10 @@ impl App {
         let cache = current_identity
             .filter(|identity| identity.accepts(&pending.message_id))
             .and_then(|identity| {
-                account.raw_store.as_ref().map(|store| {
-                    (store.dir.clone(), identity.generation())
-                })
+                account
+                    .raw_store
+                    .as_ref()
+                    .map(|store| (store.dir.clone(), identity.generation()))
             });
         // The first attempt always tries the local raw MIME cache, even when
         // offline. After a cache miss, only verified online fetches may retry.
@@ -376,7 +394,9 @@ impl App {
             );
             return;
         }
-        let own_addresses = self.accounts.iter()
+        let own_addresses = self
+            .accounts
+            .iter()
             .filter_map(|a| a.from.parse::<lettre::message::Mailbox>().ok())
             .map(|a| a.email.to_string())
             .collect::<Vec<_>>();
@@ -401,20 +421,30 @@ impl App {
                     "composer open; loading original MIME in background…"
                 });
             }
-            Err(_) => self.status = StatusLine::error(
-                "composer open, but MIME worker is busy; retry after mailbox refresh",
-            ),
+            Err(_) => {
+                self.status = StatusLine::error(
+                    "composer open, but MIME worker is busy; retry after mailbox refresh",
+                )
+            }
         }
     }
 
     /// Safely merge a prepared original without replacing text already typed
     /// in the immediately opened editor.
-    pub(super) fn merge_prepared_compose(current: &mut Composer, prepared: Composer, source: &PendingCompose) {
-        if !current.original_loading { return; }
+    pub(super) fn merge_prepared_compose(
+        current: &mut Composer,
+        prepared: Composer,
+        source: &PendingCompose,
+    ) {
+        if !current.original_loading {
+            return;
+        }
         match source.intent {
             ComposeIntent::Forward => {
                 Self::append_prepared_original(
-                    &mut current.body, &source.initial_body, &prepared.body
+                    &mut current.body,
+                    &source.initial_body,
+                    &prepared.body,
                 );
                 current.forwarded_raw = prepared.forwarded_raw;
             }
@@ -422,11 +452,18 @@ impl App {
                 let initial_to = Composer::reply(&source.summary, None, quote).to;
                 // Recipients typed by the user must win over late Reply-To/CC
                 // parsing, but an untouched default should be corrected.
-                if current.to == initial_to { current.to = prepared.to; }
-                if current.cc.is_empty() { current.cc = prepared.cc; }
+                if current.to == initial_to {
+                    current.to = prepared.to;
+                }
+                if current.cc.is_empty() {
+                    current.cc = prepared.cc;
+                }
                 if quote {
+                    current.reply_html_quote = prepared.reply_html_quote;
                     Self::append_prepared_original(
-                        &mut current.body, &source.initial_body, &prepared.body
+                        &mut current.body,
+                        &source.initial_body,
+                        &prepared.body,
                     );
                 }
             }
@@ -441,7 +478,9 @@ impl App {
         } else if initial == "\n\n" {
             // The editor's cursor continues to refer to user-authored text.
             // Put the quoted/forwarded original *after* those edits.
-            if !edited.ends_with('\n') { edited.push('\n'); }
+            if !edited.ends_with('\n') {
+                edited.push('\n');
+            }
             edited.push('\n');
             edited.push_str(prepared.trim_start_matches('\n'));
         }
@@ -452,7 +491,7 @@ impl App {
     pub(super) fn handle_composer_key(&mut self, key: KeyEvent) {
         let suggestions = self.contact_suggestions();
         if !suggestions.is_empty() {
-            if matches!(key.code, KeyCode::Tab | KeyCode::Enter) {
+            if key.code == KeyCode::Enter {
                 let selected = self
                     .composer
                     .as_ref()
@@ -548,72 +587,66 @@ impl App {
             }
             return;
         }
-        if composer.confirm_send {
-            // The user reviews headers and the body before the final Send key.
-            match key.code {
-                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.confirm_send = false;
-                    }
-                    self.send_composer();
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.confirm_send = false;
-                    }
-                }
-                KeyCode::Char('t') => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.preview_html = !composer.preview_html;
-                        composer.preview_scroll = 0;
-                    }
-                }
-                KeyCode::Char('O') => self.open_compose_browser_preview(),
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.preview_scroll = composer.preview_scroll.saturating_add(1);
-                    }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.preview_scroll = composer.preview_scroll.saturating_sub(1);
-                    }
-                }
-                KeyCode::Char('G') | KeyCode::End => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.preview_scroll = usize::MAX;
-                    }
-                }
-                KeyCode::Char('g') | KeyCode::Home => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.preview_scroll = 0;
-                    }
-                }
-                KeyCode::PageDown => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.preview_scroll = composer.preview_scroll.saturating_add(15);
-                    }
-                }
-                KeyCode::PageUp => {
-                    if let Some(composer) = self.composer.as_mut() {
-                        composer.preview_scroll = composer.preview_scroll.saturating_sub(15);
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
         if composer.help_visible {
             let composer = self.composer.as_mut().expect("composer exists");
             if crate::app::help_palette::handle_help_key(
                 key,
-                crate::app::COMPOSE_HELP_ENTRIES,
+                composer.compose_help_entries(),
                 &mut composer.help_query,
                 &mut composer.help_selected,
                 &mut composer.help_scroll,
                 crate::app::help_palette::HelpKeys::TEXT_MODAL,
             ) {
                 composer.help_visible = false;
+            }
+            return;
+        }
+        if composer.confirm_send {
+            let composer = self.composer.as_mut().expect("composer exists");
+            match key.code {
+                KeyCode::Enter if composer.send_preview.navigation.visual_anchor.is_some() => {}
+                KeyCode::Esc if composer.send_preview.navigation.visual_anchor.is_some() => {
+                    composer.clear_preview_visual();
+                }
+                KeyCode::Char('v' | 'V') => {
+                    composer.toggle_preview_visual(key.code == KeyCode::Char('V'));
+                }
+                KeyCode::Char('y') => {
+                    if let Some(selection) = composer.preview_visual_range() {
+                        let text =
+                            reader_selection_text(&composer.send_preview.layout.text, selection);
+                        let linewise = composer.send_preview.navigation.visual_linewise;
+                        composer.clear_preview_visual();
+                        if let Some(status) =
+                            record_yank(&mut self.yank_register, YankRegister { text, linewise })
+                        {
+                            self.status = status;
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    composer.close_send_preview();
+                    self.send_composer();
+                }
+                KeyCode::Esc => {
+                    composer.close_send_preview();
+                }
+                KeyCode::Char('?') => {
+                    composer.send_preview.clear_pending_motion();
+                    composer.help_visible = true;
+                    composer.help_query.clear();
+                    composer.help_selected = 0;
+                    composer.help_scroll = 0;
+                }
+                KeyCode::Char('t') => {
+                    composer.send_preview.toggle_mode();
+                }
+                KeyCode::Char('C') => {
+                    self.quoted_diff_highlighting = !self.quoted_diff_highlighting;
+                    composer.send_preview.invalidate_layout();
+                }
+                KeyCode::Char('O') => self.open_compose_browser_preview(),
+                _ => composer.handle_preview_motion(key),
             }
             return;
         }
@@ -880,7 +913,12 @@ impl App {
             }
             return;
         }
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        // Headers use Tab for field navigation even while typing. The body
+        // keeps its literal Insert-mode tab for prose and patches.
+        if (composer.mode == ComposeMode::Normal
+            || (composer.mode == ComposeMode::Insert && composer.field != ComposeField::Body))
+            && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+        {
             let next = if key.code == KeyCode::Tab {
                 composer.field.next()
             } else {
@@ -895,6 +933,9 @@ impl App {
                     composer.mode = ComposeMode::Normal;
                     composer.visual_anchor = None;
                     composer.visual_linewise = false;
+                }
+                KeyCode::Tab if composer.field == ComposeField::Body => {
+                    composer.insert_char('\t');
                 }
                 KeyCode::Enter if composer.field == ComposeField::Body => {
                     composer.insert_char('\n')
@@ -1196,17 +1237,7 @@ impl App {
         };
         let html = match composer.outgoing_html_preview() {
             Ok(Some(html)) => html,
-            Ok(None) => {
-                // Plain-text-only emails still have a safe HTML browser projection.
-                let escaped = composer
-                    .body
-                    .replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;");
-                format!(
-                    "<html><meta charset=\"utf-8\"><body><pre style=\"white-space:pre-wrap\">{escaped}</pre></body></html>"
-                )
-            }
+            Ok(None) => composer.plain_review_html(),
             Err(error) => {
                 self.status = StatusLine::error(format!("cannot preview HTML: {error:#}"));
                 return;
@@ -1259,9 +1290,8 @@ impl App {
             self.composer = None;
             self.pending_compose = None;
             self.resumed_draft_account = None;
-            self.status = StatusLine::info(
-                "saved locally; original MIME still missing (Ctrl+n to resume)",
-            );
+            self.status =
+                StatusLine::info("saved locally; original MIME still missing (Ctrl+n to resume)");
             return;
         }
         let draft_mailbox = account

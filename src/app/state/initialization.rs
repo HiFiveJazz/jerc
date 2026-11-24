@@ -7,6 +7,7 @@ impl App {
     /// shell. The cache writers still perform their ordinary local flush.
     pub fn detach_network_workers_for_exit(&mut self) {
         for account in &mut self.accounts {
+            account.persist_current_navigation();
             account.worker.detach_for_exit();
         }
     }
@@ -117,6 +118,7 @@ impl App {
                     smooth_preview_target: None,
                     preview_max_scroll: 0,
                     prefer_html: true,
+                    reader_html_width: None,
                     // Interactive pagination has its own small page size, so an old
                     // `max_messages = 500` config no longer makes All Mail block on
                     // five hundred headers before first paint.
@@ -165,6 +167,7 @@ impl App {
                     inflight_outbox: HashMap::new(),
                     inflight_deferred_seen: HashMap::new(),
                     status_requests: MailboxStatusQueue::default(),
+                    inbox_notifications: InboxNotifications::default(),
                     pending_inbox_refresh: false,
                     jmap,
                     pending_account_refresh: false,
@@ -262,19 +265,14 @@ impl App {
             sidebar_visible: true,
             preview_split: false,
             message_open: false,
-            reader_cursor: 0,
-            reader_column: 0,
-            reader_visual_anchor: None,
-            reader_visual_linewise: false,
-            reader_smooth_target: None,
-            reader_preferred_column: None,
-            reader_pending_g: false,
+            reader_navigation: ReaderNavigation::default(),
             reader_pending_inner_object: false,
             reader_line_count: 0,
             reader_view_height: 1,
             reader_scroll_follow_pending: false,
             image_picker: None,
             image_loader: None,
+            image_runtime_tx: None,
             reader_image: None,
             reader_image_pending: None,
             reader_image_size_hint: None,
@@ -340,6 +338,7 @@ impl App {
             contacts_learn_sent: config.contacts.learn_from_sent,
             contacts_dirty: false,
             contacts_save_due: None,
+            contacts_save_task: None,
             pending_compose: None,
             pending_draft: None,
             pending_draft_replacements: HashMap::new(),

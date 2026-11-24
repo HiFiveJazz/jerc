@@ -16,6 +16,8 @@ pub struct Theme {
     pub unread: Color,
     pub selected_fg: Color,
     pub selected_bg: Color,
+    /// Background-only overlay for Vim Visual selections.
+    pub visual_selection_bg: Color,
     pub border: Color,
     /// Border shape selected in [ui], applied to all built-in and custom themes.
     pub border_type: BorderType,
@@ -59,8 +61,14 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// Apply a Visual selection without changing foreground or modifiers.
+    #[must_use]
+    pub fn visual_selection(&self, base: Style) -> Style {
+        base.bg(self.visual_selection_bg)
+    }
+
     /// Subtle current-row/current-line style shared by mailbox, message list,
-    /// and the Vim reader cursor line. Visual selections keep using `selected()`.
+    /// and the Vim reader cursor line.
     #[must_use]
     pub fn current_line(&self) -> Style {
         Style::default()
@@ -107,6 +115,7 @@ struct ThemeSpec {
     border: Option<String>,
     selected_fg: Option<String>,
     selected_bg: Option<String>,
+    visual_selection_bg: Option<String>,
 }
 
 const BUILTIN_THEMES: &[(&str, &str)] = &[
@@ -203,6 +212,11 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
             .unwrap_or_else(|| spec.primary.as_deref().unwrap_or("#7aa2f7")),
     )?;
 
+    let visual_selection_bg = match spec.visual_selection_bg.as_deref() {
+        Some(value) => parse_color(value)?,
+        None => derive_visual_selection_bg(background, surface, primary),
+    };
+
     Ok(Theme {
         id,
         name,
@@ -212,6 +226,7 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
         unread: success,
         selected_fg,
         selected_bg,
+        visual_selection_bg,
         border,
         border_type: BorderType::Plain,
         error,
@@ -220,6 +235,21 @@ fn parse_theme(json: &str, fallback_id: &str) -> Result<Theme> {
         popup_bg: surface,
         status_bg: background,
     })
+}
+
+// Older custom themes need no migration. Blend their base with a small
+// amount of accent, retaining a dark or light palette as appropriate.
+fn derive_visual_selection_bg(background: Color, surface: Color, accent: Color) -> Color {
+    let (r, g, b) = match (background, surface) {
+        (Color::Rgb(r, g, b), _) | (_, Color::Rgb(r, g, b)) => (r, g, b),
+        _ => (26, 27, 38),
+    };
+    let (ar, ag, ab) = match accent {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (122, 162, 247),
+    };
+    let blend = |base: u8, tint: u8| ((u16::from(base) * 3 + u16::from(tint)) / 4) as u8;
+    Color::Rgb(blend(r, ar), blend(g, ag), blend(b, ab))
 }
 
 fn parse_color(value: &str) -> Result<Color> {
@@ -251,6 +281,7 @@ fn fallback_theme() -> Theme {
         unread: Color::White,
         selected_fg: Color::Black,
         selected_bg: Color::Cyan,
+        visual_selection_bg: Color::Rgb(40, 52, 87),
         border: Color::DarkGray,
         border_type: BorderType::Plain,
         error: Color::LightRed,
@@ -303,6 +334,61 @@ mod tests {
         use ratatui::style::Color;
         let theme = parse_theme(include_str!("../themes/tokyo-night.json"), "tokyo-night").unwrap();
         assert_eq!(theme.visual, Color::Rgb(187, 154, 247));
+    }
+
+    #[test]
+    fn all_builtin_visual_selections_preserve_foreground_and_modifiers() {
+        use ratatui::style::{Color, Modifier, Style};
+        let expected = [
+            ("default", Color::Rgb(53, 70, 83)),
+            ("nord", Color::Rgb(67, 76, 94)),
+            ("gruvbox", Color::Rgb(80, 73, 69)),
+            ("catppuccin", Color::Rgb(69, 71, 90)),
+            ("tokyo-night", Color::Rgb(40, 52, 87)),
+            ("monochrome", Color::Rgb(58, 58, 58)),
+        ];
+        assert_eq!(expected.len(), super::BUILTIN_THEMES.len());
+        for ((id, json), (expected_id, bg)) in super::BUILTIN_THEMES.iter().zip(expected) {
+            assert_eq!(*id, expected_id);
+            let theme = parse_theme(json, id).unwrap();
+            assert_eq!(theme.visual_selection_bg, bg);
+            assert_ne!(bg, theme.selected_bg);
+            assert_ne!(bg, theme.popup_bg);
+            for color in [
+                theme.foreground,
+                theme.error,
+                theme.unread,
+                theme.visual,
+                theme.accent,
+            ] {
+                let base = Style::default()
+                    .fg(color)
+                    .bg(theme.popup_bg)
+                    .add_modifier(Modifier::UNDERLINED | Modifier::ITALIC)
+                    .remove_modifier(Modifier::BOLD);
+                assert_eq!(theme.visual_selection(base), base.bg(bg));
+            }
+        }
+    }
+
+    #[test]
+    fn custom_visual_selection_is_optional_and_overridable() {
+        let old = parse_theme(r##"{"background":"#202020","primary":"#606060"}"##, "old").unwrap();
+        assert_eq!(
+            old.visual_selection_bg,
+            ratatui::style::Color::Rgb(48, 48, 48)
+        );
+        let light =
+            parse_theme(r##"{"background":"#f0f0f0","primary":"#707070"}"##, "light").unwrap();
+        assert_eq!(
+            light.visual_selection_bg,
+            ratatui::style::Color::Rgb(208, 208, 208)
+        );
+        let custom = parse_theme(r##"{"visual_selection_bg":"#123456"}"##, "custom").unwrap();
+        assert_eq!(
+            custom.visual_selection_bg,
+            ratatui::style::Color::Rgb(18, 52, 86)
+        );
     }
 
     #[test]

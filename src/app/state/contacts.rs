@@ -15,10 +15,34 @@ impl App {
     }
 
     pub fn contact_save_deadline(&self) -> Option<Instant> {
+        if self.contacts_save_task.is_some() {
+            // Never busy-spin on a dirty deadline while a save is in flight.
+            return Some(Instant::now() + Duration::from_millis(100));
+        }
         self.contacts_save_due
     }
 
+    fn contact_save_failed(&mut self, error: anyhow::Error) {
+        self.contacts_dirty = true;
+        self.contacts_save_due = Some(Instant::now() + Duration::from_secs(10));
+        self.status = StatusLine::error(format!("contacts not saved: {error:#}"));
+    }
+
     pub fn flush_contacts(&mut self, force: bool) {
+        if let Some(task) = &self.contacts_save_task {
+            if !force && !task.is_finished() {
+                return;
+            }
+            let result = self
+                .contacts_save_task
+                .take()
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("contact save worker panicked")));
+            if let Err(error) = result {
+                self.contact_save_failed(error);
+            }
+        }
         if !self.contacts_dirty || !self.contacts_writable {
             return;
         }
@@ -29,15 +53,24 @@ impl App {
         {
             return;
         }
-        match self.contacts.save(&self.contacts_path) {
-            Ok(()) => {
-                self.contacts_dirty = false;
-                self.contacts_save_due = None;
+        self.contacts_dirty = false;
+        self.contacts_save_due = None;
+        if force {
+            // Explicit edits, account reload and graceful exit must commit
+            // the newest state after any older asynchronous snapshot.
+            if let Err(error) = self.contacts.save(&self.contacts_path) {
+                self.contact_save_failed(error);
             }
-            Err(error) => {
-                self.contacts_save_due = Some(Instant::now() + Duration::from_secs(10));
-                self.status = StatusLine::error(format!("contacts not saved: {error:#}"));
-            }
+            return;
+        }
+        let book = self.contacts.clone();
+        let path = self.contacts_path.clone();
+        match std::thread::Builder::new()
+            .name("contacts-save".into())
+            .spawn(move || book.save(&path))
+        {
+            Ok(task) => self.contacts_save_task = Some(task),
+            Err(error) => self.contact_save_failed(error.into()),
         }
     }
 
@@ -254,16 +287,16 @@ impl App {
             if editor.mode == ComposeMode::Visual {
                 match key.code {
                     KeyCode::Char('y') => {
-                        if let Some(text) = editor.selected_text() {
-                            if let Some(status) = record_yank(
+                        if let Some(text) = editor.selected_text()
+                            && let Some(status) = record_yank(
                                 &mut self.yank_register,
                                 YankRegister {
                                     text,
                                     linewise: false,
                                 },
-                            ) {
-                                self.status = status;
-                            }
+                            )
+                        {
+                            self.status = status;
                         }
                         editor.mode = ComposeMode::Normal;
                         editor.visual_anchor = None;
@@ -694,7 +727,9 @@ impl App {
                     modal.selected = position;
                 }
                 modal.ensure_visible(modal.matches.len());
-                self.status = StatusLine::temporary("contact saved", Duration::from_secs(2));
+                if !self.contacts_dirty {
+                    self.status = StatusLine::temporary("contact saved", Duration::from_secs(2));
+                }
             }
             Err(error) => self.status = StatusLine::error(format!("contact: {error:#}")),
         }

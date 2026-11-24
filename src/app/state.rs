@@ -12,13 +12,16 @@ use ratatui::layout::Size;
 use ratatui::widgets::BorderType;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
-pub use self::reader_text::{ReaderPosition, ReaderSelection};
-use self::reader_text::{
-    ReaderWordMotion, reader_scroll_for_visual_cursor, reader_selection_text, reader_word_target,
-    url_at_cursor,
-};
+use self::reader_text::{reader_scroll_for_visual_cursor, url_at_cursor};
+use self::send_preview::SendPreview;
+pub(crate) use self::send_preview::SendPreviewMode;
 use crate::app::navigation::{bounded_index, reveal_row, wrapped_index as offset_index};
-use crate::app::vim::{YankRegister, inner_text_object_range};
+use crate::app::vim::{
+    ReaderNavigation, YankRegister, inner_text_object_range, reader_selection_text,
+};
+pub use crate::app::vim::{ReaderPosition, ReaderSelection};
+#[cfg(test)]
+use crate::app::vim::{ReaderWordMotion, reader_word_target};
 
 use crate::app::{
     ATTACHMENT_HELP_ENTRIES, CONTACT_HELP_ENTRIES, Command, DESTINATION_HELP_ENTRIES, Focus,
@@ -31,7 +34,6 @@ use crate::contacts::{
     ContactBook, ContactEdit, ContactsModal, recipient_query, recipients, replace_recipient,
     replace_recipients,
 };
-use crate::mail::{parse_body, render_html_for_terminal};
 use crate::mail_image::{MailImageEvent, MailImageLoader};
 use crate::model::{
     CacheIdentity, Capabilities, HtmlLine, Mailbox, MailboxRole, MessageBody, MessageFlags,
@@ -70,7 +72,7 @@ use self::compose_util::*;
 use self::view_util::*;
 mod account_cache;
 mod account_sync;
-use self::account_sync::{MailboxStatusQueue, StatusReason};
+use self::account_sync::{InboxNotifications, MailboxStatusQueue, StatusReason};
 pub(crate) use self::manual_review::{ReviewItem, ReviewOperation};
 use self::notice_ack::{NoticeAcknowledgments, key_digest};
 pub(crate) use self::notices::{NoticeBrowser, NoticeRow};
@@ -89,6 +91,7 @@ mod notices;
 mod reader_actions;
 mod reader_text;
 mod search_help_actions;
+mod send_preview;
 mod worker_events;
 
 // Only a foreground network operation can hold the sync footer. If its
@@ -226,9 +229,8 @@ fn preview_travel_positions(position: usize, destination: usize, count: usize) -
     positions.into_iter().filter(|p| seen.insert(*p)).collect()
 }
 
-/// Only a completed background poll against a known Inbox baseline can
-/// trigger a new-message alert. STATUS counts are not message identities;
-/// an equal count with concurrent arrival/deletion needs future UID tracking.
+/// Count-only fallback for backends without a reliable identity checkpoint.
+/// An equal count with concurrent arrival/deletion cannot be detected here.
 fn inbox_new_mail_count(from_poll: bool, known: bool, previous: usize, now: usize) -> usize {
     if from_poll && known {
         now.saturating_sub(previous)
@@ -328,9 +330,20 @@ pub(crate) struct ComposeBodyRow {
     pub continuation: bool,
 }
 
+/// Display a literal tab as four spaces without changing the draft bytes.
+pub(crate) const COMPOSE_TAB_SPACES: &str = "    ";
+
+fn compose_grapheme_width(grapheme: &str) -> usize {
+    if grapheme == "\t" {
+        COMPOSE_TAB_SPACES.len()
+    } else {
+        unicode_width::UnicodeWidthStr::width(grapheme)
+    }
+}
+
 /// Use the same column width for rendering and Vim motions. The four cells
 /// reserved for line numbers are excluded by the caller.
-fn compose_body_rows(body: &str, width: usize) -> Vec<ComposeBodyRow> {
+pub(crate) fn compose_body_rows(body: &str, width: usize) -> Vec<ComposeBodyRow> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut start = 0;
@@ -339,6 +352,8 @@ fn compose_body_rows(body: &str, width: usize) -> Vec<ComposeBodyRow> {
     let mut cells = 0usize;
     let mut continuation = false;
     let mut position = 0;
+    let mut break_at = None;
+    let mut previous_space = false;
     for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(body, true) {
         if grapheme.ends_with('\n') {
             let trailing = grapheme.chars().count().saturating_sub(1);
@@ -355,23 +370,38 @@ fn compose_body_rows(body: &str, width: usize) -> Vec<ComposeBodyRow> {
             logical_line += 1;
             cells = 0;
             continuation = false;
+            break_at = None;
+            previous_space = false;
             continue;
         }
-        let char_width = unicode_width::UnicodeWidthStr::width(grapheme).min(width);
+        let whitespace = grapheme.chars().all(char::is_whitespace);
+        if previous_space && !whitespace && position > start {
+            break_at = Some((position, cells));
+        }
+        let char_width = compose_grapheme_width(grapheme).min(width);
         if cells > 0 && cells + char_width > width {
+            // Prefer moving the entire word to the next visual row. Only a
+            // token wider than the viewport itself needs a hard visual split.
+            let (end, used) = if whitespace {
+                break_at = None;
+                (position, cells)
+            } else {
+                break_at.take().unwrap_or((position, cells))
+            };
             rows.push(ComposeBodyRow {
                 start,
-                end: position,
+                end,
                 line_start,
                 logical_line,
                 continuation,
             });
-            start = position;
-            cells = 0;
+            start = end;
+            cells = cells.saturating_sub(used);
             continuation = true;
         }
         cells += char_width;
         position += grapheme.chars().count();
+        previous_space = whitespace;
     }
     rows.push(ComposeBodyRow {
         start,
@@ -396,7 +426,9 @@ fn compose_body_column(body: &str, start: usize, cursor: usize) -> usize {
         .skip(start)
         .take(cursor.saturating_sub(start))
         .collect::<String>();
-    unicode_width::UnicodeWidthStr::width(text.as_str())
+    unicode_segmentation::UnicodeSegmentation::graphemes(text.as_str(), true)
+        .map(compose_grapheme_width)
+        .sum()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -585,6 +617,14 @@ pub struct DraftSource {
     pub id: MessageId,
 }
 
+/// Original HTML and its exact editable plain quotation. This is preview-only;
+/// it must never become an outgoing MIME alternative or forwarded attachment.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReplyHtmlQuote {
+    source: Arc<str>,
+    quoted_body: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Composer {
     pub to: String,
@@ -629,6 +669,8 @@ pub struct Composer {
     /// for inline forwarding, including postponed drafts. Never serialized as
     /// a .eml attachment in the default forwarding workflow.
     pub forwarded_raw: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply_html_quote: Option<ReplyHtmlQuote>,
     /// True until the original MIME/recipients are prepared. Prevents silently
     /// sending a partial reply/forward while the source is still loading.
     #[serde(default)]
@@ -652,15 +694,9 @@ pub struct Composer {
     /// Prompt before discarding a nonempty unsent message. Not stored in drafts.
     #[serde(skip)]
     pub exit_prompt: bool,
-    /// Rich vs plain rendering in pre-send review; ephemeral, not draft content.
+    /// Transient outgoing review; never persisted with drafts.
     #[serde(skip)]
-    pub preview_html: bool,
-    #[serde(skip)]
-    pub preview_scroll: usize,
-    #[serde(skip)]
-    pub preview_rich_lines: Option<Vec<HtmlLine>>,
-    #[serde(skip)]
-    pub preview_forwarded_attachments: Vec<String>,
+    pub(crate) send_preview: SendPreview,
     #[serde(skip)]
     pub help_visible: bool,
     #[serde(skip)]
@@ -678,6 +714,8 @@ pub struct Composer {
     pub body_view_width: usize,
     #[serde(skip)]
     pub body_scroll: usize,
+    #[serde(skip)]
+    body_saved_cursor: Option<usize>,
     #[serde(skip)]
     pub body_smooth_target: Option<usize>,
     #[serde(skip)]
@@ -790,7 +828,7 @@ struct LocalSearchIndex {
     query: String,
     mode: crate::config::MailSearchMode,
     headers: Vec<std::sync::Weak<crate::model::MessageHeaders>>,
-    rows: Vec<usize>,
+    rows: Arc<Vec<usize>>,
 }
 
 impl LocalSearchIndex {
@@ -799,7 +837,7 @@ impl LocalSearchIndex {
         messages: &[MessageSummary],
         query: &str,
         mode: crate::config::MailSearchMode,
-    ) -> Vec<usize> {
+    ) -> Arc<Vec<usize>> {
         if self.query == query
             && self.mode == mode
             && self.headers.len() == messages.len()
@@ -809,7 +847,7 @@ impl LocalSearchIndex {
                 .zip(messages)
                 .all(|(old, message)| old.as_ptr() == Arc::as_ptr(&message.headers))
         {
-            return self.rows.clone();
+            return Arc::clone(&self.rows);
         }
         self.query = query.to_owned();
         self.mode = mode;
@@ -847,8 +885,8 @@ impl LocalSearchIndex {
         if mode == crate::config::MailSearchMode::Fuzzy {
             matches.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         }
-        self.rows = matches.into_iter().map(|(index, _)| index).collect();
-        self.rows.clone()
+        self.rows = Arc::new(matches.into_iter().map(|(index, _)| index).collect());
+        Arc::clone(&self.rows)
     }
 }
 
@@ -875,6 +913,7 @@ pub struct AccountState {
     pub smooth_preview_target: Option<u16>,
     pub preview_max_scroll: u16,
     pub prefer_html: bool,
+    reader_html_width: Option<usize>,
     pub page_size: usize,
     pub next_page_offset: usize,
     pub has_more: bool,
@@ -930,6 +969,7 @@ pub struct AccountState {
     // Correlates Seen ACKs with the original mailbox, including navigation.
     inflight_deferred_seen: HashMap<u64, cache::DeferredSeen>,
     status_requests: MailboxStatusQueue,
+    inbox_notifications: InboxNotifications,
     pending_inbox_refresh: bool,
     jmap: bool,
     pending_account_refresh: bool,
@@ -989,7 +1029,23 @@ pub struct ReviewScroll {
 }
 
 impl ReviewScroll {
+    /// Normalize both the actual position and any queued destination on resize.
+    pub fn clamp(&mut self, count: usize) {
+        let last = count.saturating_sub(1);
+        self.position = self.position.min(last);
+        self.target = self
+            .target
+            .map(|target| target.min(last))
+            .filter(|target| *target != self.position);
+    }
+
+    pub fn jump(&mut self, position: usize, count: usize) {
+        self.position = position.min(count.saturating_sub(1));
+        self.target = None;
+    }
+
     pub fn queue(&mut self, count: usize, delta: isize) {
+        self.clamp(count);
         let origin = self.target.unwrap_or(self.position);
         let next = origin
             .saturating_add_signed(delta)
@@ -1172,13 +1228,7 @@ pub struct App {
     pub sidebar_visible: bool,
     pub preview_split: bool,
     pub message_open: bool,
-    pub reader_cursor: usize,
-    pub reader_column: usize,
-    pub reader_visual_anchor: Option<ReaderPosition>,
-    reader_visual_linewise: bool,
-    reader_smooth_target: Option<usize>,
-    reader_preferred_column: Option<usize>,
-    reader_pending_g: bool,
+    pub(crate) reader_navigation: ReaderNavigation,
     reader_pending_inner_object: bool,
     reader_line_count: usize,
     reader_view_height: usize,
@@ -1187,6 +1237,7 @@ pub struct App {
     reader_scroll_follow_pending: bool,
     image_picker: Option<Picker>,
     image_loader: Option<MailImageLoader>,
+    image_runtime_tx: Option<SyncSender<RuntimeEvent>>,
     reader_image: Option<ReaderImage>,
     reader_image_pending: Option<String>,
     reader_image_size_hint: Option<(Option<u32>, Option<u32>)>,
@@ -1263,6 +1314,7 @@ pub struct App {
     contacts_learn_sent: bool,
     contacts_dirty: bool,
     contacts_save_due: Option<Instant>,
+    contacts_save_task: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     pending_compose: Option<PendingCompose>,
     pending_draft: Option<PendingDraft>,
     /// Draft replacement cleanup is tied to the exact APPEND response.

@@ -3,7 +3,7 @@
 //! A submitted SMTP operation is intentionally NOT retried after an ambiguous
 //! failure; the relay may have accepted DATA before the connection dropped.
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -186,14 +186,13 @@ impl Store {
             file.as_file()
                 .set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        serde_json::to_writer(
+        crate::cache::write_json_buffered(
             &mut file,
             &FileFormatRef {
                 version: VERSION,
                 messages,
             },
         )?;
-        file.flush()?;
         if file.as_file().metadata()?.len() > MAX_OUTBOX_BYTES {
             return Err(anyhow!(
                 "outgoing mail too large for the offline queue (64 MiB limit)"

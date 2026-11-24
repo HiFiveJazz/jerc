@@ -121,27 +121,20 @@ remote_images = false
 # Check Inbox counts in the background every 20 seconds. (IMAP IDLE can
 # replace polling in a future backend release.) Minimum 10 seconds.
 inbox_poll_seconds = 20
-# Optional audible terminal bell when a previously-known Inbox count rises.
+# Optional immediate terminal bell at arrival, in addition to the desktop notice.
 # The terminal's own bell settings determine whether a sound plays.
 new_mail_bell = false
-# Desktop notifications are ON by default. A sound-name hint asks the installed
-# sound theme (including COSMIC, when selected system-wide) to play its email sound.
-# Requires a freedesktop notification daemon and `notify-send` (libnotify).
-# The notification sound-name hint is optional; actual audio requires a sound
-# theme + daemon that honors it. For an optional terminal bell, set
-# new_mail_bell = true and enable audible bell in the terminal.
-# Press N or click the footer bell to toggle desktop alerts and their sound
-# for the current session; the configured value is restored on restart.
+# Desktop notifications are ON by default (requires notify-send/libnotify).
+# Put an OGG/OGA, WAV or FLAC sound in ~/.config/jerc/sounds/ (or beside a
+# custom config.toml in sounds/). No sound is bundled. Prefer new-mail.*.
+# If no sound is available, use the terminal bell. An optional sound-name
+# instead asks the desktop sound theme to play an alert.
+# Press N or click the footer bell to toggle notifications and their sound.
 new_mail_notifications = true
-# Fallback symbols always work: ● enabled, ○ muted, ● 3 = three new
-# arrivals observed since launching jerc (not total unread mail).
-# Use "nerd" if your terminal uses a Nerd Font: 󰂚 enabled, 󰂛 muted.
+# ● enabled, ○ muted; the number counts arrivals observed since launching jerc.
 notification_icon_style = "unicode" # "unicode" or "nerd"
-new_mail_sound_name = "message-new-email"
-# Optional direct sound if your notification daemon ignores sound-name hints.
-# Requires `pw-play` (PipeWire) or `paplay` (PulseAudio), absolute file path.
-# Use the included assets/sounds/new-mail.oga from the repository if desired.
-# new_mail_sound_file = "/absolute/path/to/jerc/assets/sounds/new-mail.oga"
+# new_mail_sound_name = "message-new-email"
+# new_mail_sound_file = "sounds/new-mail.oga" # relative or absolute
 
 # Legacy layout options are still accepted so existing configs keep loading.
 # sidebar_width = 24

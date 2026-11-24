@@ -393,6 +393,13 @@ fn guessed_attachment_type(name: &str, bytes: &[u8]) -> &'static str {
 }
 
 pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
+    let mut body = parse_body_compact(id, raw)?;
+    layout_message_html(&mut body, 100);
+    Ok(body)
+}
+
+/// Network/prefetch workers retain source, not a speculative terminal layout.
+pub(crate) fn parse_body_compact(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
     if raw.len() > MAX_BODY_MESSAGE_BYTES {
         anyhow::bail!("message exceeds the 8 MiB reader limit; export the raw message instead");
     }
@@ -419,10 +426,10 @@ pub fn parse_body(id: MessageId, raw: &[u8]) -> Result<MessageBody> {
         .enumerate()
         .map(|(index, part)| attachment_display_name(&part, index))
         .collect();
-    render_message_body(id, plain_text, html_source, attachment_names)
+    compact_message_body(id, plain_text, html_source, attachment_names)
 }
 
-pub(crate) fn render_message_body(
+pub(crate) fn compact_message_body(
     id: MessageId,
     plain_text: Option<String>,
     html_source: Option<String>,
@@ -448,26 +455,42 @@ pub(crate) fn render_message_body(
     } else {
         None
     };
-    let rendered_html = html_source
-        .as_deref()
-        .map(|html| render_html_for_terminal(html, 100));
-    let html_render_width = if rendered_html.is_some() { 100 } else { 0 };
-    let (html_text, html_lines, html_renderer) = rendered_html
-        .map(|(text, lines, renderer)| (Some(text), Some(lines), Some(renderer)))
-        .unwrap_or((None, None, None));
-
+    let html_text = if plain_fallback.is_some() {
+        None
+    } else {
+        html_source
+            .as_deref()
+            .map(mail_parser::html_to_text)
+            .map(|text| clean_reader_text(&text))
+            .map(Into::into)
+    };
     Ok(MessageBody {
         id,
         plain_text: plain_text.map(Into::into),
         plain_fallback: plain_fallback.map(Into::into),
         html_source: html_source.map(Into::into),
-        html_text: html_text.map(Into::into),
-        html_lines: html_lines.map(std::sync::Arc::new),
-        html_renderer,
-        html_render_width,
+        html_text,
+        html_lines: None,
+        html_renderer: None,
+        html_render_width: 0,
         attachment_count: attachment_names.len(),
         attachment_names,
     })
+}
+
+/// Materialize only the requested viewport; unchanged widths are free.
+pub(crate) fn layout_message_html(body: &mut MessageBody, width: usize) {
+    if body.html_render_width == width && body.html_lines.is_some() {
+        return;
+    }
+    let Some(source) = body.html_source.as_deref() else {
+        return;
+    };
+    let (text, lines, renderer) = render_html_for_terminal(source, width);
+    body.html_text = Some(text.into());
+    body.html_lines = Some(std::sync::Arc::new(lines));
+    body.html_renderer = Some(renderer);
+    body.html_render_width = width;
 }
 
 pub fn render_html_for_terminal(html: &str, width: usize) -> (String, Vec<HtmlLine>, String) {
@@ -476,7 +499,7 @@ pub fn render_html_for_terminal(html: &str, width: usize) -> (String, Vec<HtmlLi
     // such as links/strong/emphasis remains tagged. Ratatui maps those tags to
     // the active jerc theme, which gives HTML mail the same useful visual
     // landmarks as a terminal browser without spawning an external process for
-    // every message. The worker produces a fallback layout; reader mode can
+    // every message. Workers warm the requested viewport; reader mode can
     // reflow the preserved HTML when its actual viewport width changes.
     let flattened_html = flatten_presentation_tables_html(html);
     // Terminals cannot vertically offset glyphs, but Unicode superscripts

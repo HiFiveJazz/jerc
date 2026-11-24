@@ -36,7 +36,6 @@ impl App {
                 account.persist_body(&body);
                 account.bodies.insert(id.clone(), body);
                 account.trim_preview_bodies();
-                account.persist_current_cache();
 
                 if (self.message_open || self.preview_split)
                     && account
@@ -243,7 +242,10 @@ impl App {
                 // A cache-only miss is NOT a failure to compose. The editor is
                 // already open. Wait for UIDVALIDITY verification before any
                 // network operation, while preserving the user's text.
-                if result.as_ref().err().is_some_and(|error| error.as_str() == "original MIME not cached")
+                if result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.as_str() == "original MIME not cached")
                     && self.pending_compose.as_ref().is_some_and(|p| p.cache_only)
                 {
                     if let Some(pending) = self.pending_compose.as_mut() {

@@ -137,13 +137,13 @@ fn authoritative_discovery_replaces_cached_counts_even_with_zero() {
     server.unread = 0;
     app.handle_worker_event(event(501, WorkerEventKind::Mailboxes(vec![server.clone()])));
     assert_eq!(app.accounts[0].mailboxes, vec![server]);
-    // No extra STATUS is needed for an already authoritative JMAP-style LIST.
+    // One Inbox observation establishes the notification identity baseline.
     let account = &mut app.accounts[0];
     account.messages_loading = false;
     account.page_inflight = None;
     account.pending_bodies.clear();
     App::pump_mailbox_status(account);
-    assert!(!account.status_requests.busy());
+    assert!(account.status_requests.busy());
 }
 
 #[test]
@@ -165,6 +165,7 @@ fn cached_status_reconciliation_updates_counts_without_new_mail_alert() {
             name: "INBOX".into(),
             total: 30,
             unread: 12,
+            inbox: None,
         },
     ));
     let folder = &app.accounts[0].mailboxes[0];
@@ -173,6 +174,61 @@ fn cached_status_reconciliation_updates_counts_without_new_mail_alert() {
     assert_eq!(app.new_mail_since_launch, 0);
     assert!(!app.new_mail_bell_pending);
     assert!(app.new_mail_notices.is_empty());
+}
+
+#[test]
+fn first_live_poll_and_optimistic_count_changes_do_not_announce_old_mail() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.new_mail_notifications_enabled = true;
+    app.new_mail_bell_enabled = true;
+    for (id, total) in [(60_000, 500), (60_001, 500)] {
+        // A cached count, or an optimistic local mutation that temporarily
+        // changes the displayed total, is not the notification baseline.
+        app.accounts[0].mailboxes[0].total = 1;
+        app.accounts[0].status_requests.start(
+            id,
+            StatusRequest {
+                name: "INBOX".into(),
+                reason: StatusReason::Refresh,
+            },
+        );
+        app.handle_worker_event(event(
+            id,
+            WorkerEventKind::MailboxStatus {
+                name: "INBOX".into(),
+                total,
+                unread: 10,
+                inbox: None,
+            },
+        ));
+        assert_eq!(app.new_mail_count(), 0);
+        assert!(!app.take_new_mail_bell());
+        assert!(app.take_new_mail_notice().is_none());
+    }
+}
+
+#[test]
+fn unsolicited_or_late_notification_preview_is_ignored() {
+    let (_root, mut app, _rx) = fixture();
+    online(&mut app);
+    app.new_mail_notifications_enabled = true;
+    let stale = || WorkerEventKind::NewMailPreview {
+        count: 1,
+        id: Some(MessageId("old".into())),
+        sender: "Old sender".into(),
+        subject: "Old subject".into(),
+        excerpt: "Old body".into(),
+    };
+    app.handle_worker_event(event(60_010, stale()));
+    assert!(app.take_new_mail_notice().is_none());
+    app.handle_command(Command::ToggleNotifications);
+    app.handle_command(Command::ToggleNotifications);
+    app.handle_worker_event(event(60_010, stale()));
+    assert!(app.take_new_mail_notice().is_none());
+    app.accounts[0].mark_disconnected();
+    app.handle_worker_event(event(60_010, stale()));
+    assert!(app.take_new_mail_notice().is_none());
 }
 
 #[test]
@@ -612,6 +668,7 @@ fn status_inflight_is_requeued_on_disconnect_and_late_result_ignored() {
             name: "INBOX".into(),
             total: 900,
             unread: 899,
+            inbox: None,
         },
     ));
     assert_eq!(app.accounts[0].mailboxes[0].total, 1);
@@ -634,6 +691,7 @@ fn old_status_reply_does_not_finish_new_status() {
             name: "INBOX".into(),
             total: 20,
             unread: 18,
+            inbox: None,
         },
     ));
     assert!(app.accounts[0].status_requests.busy());
@@ -1983,8 +2041,12 @@ fn search_index_includes_recipients_and_attachment_names_and_invalidates() {
     account.search_query = "unique-recipient".into();
     assert_eq!(account.visible_message_indices(), vec![0]);
     account.search_query = "unique-report.pdf".into();
-    assert_eq!(account.visible_message_indices(), vec![0]);
-    assert_eq!(account.visible_message_indices(), vec![0]);
+    let rows = account.visible_message_indices_shared();
+    assert_eq!(rows.as_slice(), &[0]);
+    assert!(Arc::ptr_eq(
+        &rows,
+        &account.visible_message_indices_shared()
+    ));
     account.messages[0].attachment_names_hint = Box::default();
     assert!(account.visible_message_indices().is_empty());
 }
@@ -2019,9 +2081,35 @@ fn unverified_cached_message_opens_forward_composer_without_waiting_for_sync() {
     assert!(app.composer.is_some());
 }
 
+// fixture() has no status/priority worker: PrepareCompose runs on the
+// foreground worker and its completion carries a generation tag. Dispatch it
+// through the production generation guard, just as the runtime does.
+fn deliver_foreground_compose_result(app: &mut App, rx: &Receiver<RuntimeEvent>, request_id: u64) {
+    assert_ne!(request_id, 0, "compose request must have been queued");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let runtime_event = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("foreground compose request must complete");
+        let RuntimeEvent::ForegroundWorker { generation, event } = runtime_event else {
+            continue;
+        };
+        if event.request_id != request_id {
+            continue;
+        }
+        assert_eq!(event.account, 0);
+        assert_eq!(generation, app.accounts[0].foreground_generation);
+        assert!(matches!(
+            &event.kind,
+            WorkerEventKind::ComposePrepared { .. }
+        ));
+        app.handle_foreground_worker_event(generation, event);
+        break;
+    }
+}
+
 #[test]
 fn offline_cached_forward_prepares_without_server_verification() {
-    use std::time::Duration;
     let (_root, mut app, rx) = fixture();
     online(&mut app);
     app.accounts[0].outgoing_configured = true;
@@ -2030,7 +2118,9 @@ fn offline_cached_forward_prepares_without_server_verification() {
         dir: _root.path().join("cached-original-mime"),
     };
     let raw = b"From: friend@example.org\r\nSubject: Safe offline message\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nsource body";
-    cache.write("INBOX", &CacheIdentity::Imap(81), &id, raw).unwrap();
+    cache
+        .write("INBOX", &CacheIdentity::Imap(81), &id, raw)
+        .unwrap();
     app.accounts[0].raw_store = Some(cache);
     app.accounts[0].capabilities = None;
     app.accounts[0].unverified_mailboxes.insert("INBOX".into());
@@ -2040,13 +2130,7 @@ fn offline_cached_forward_prepares_without_server_verification() {
     let request_id = app.pending_compose.as_ref().unwrap().request_id;
     assert_ne!(request_id, 0);
     // Worker may read a generation-scoped disk snapshot without connecting.
-    let reply = loop {
-        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(3)).unwrap() else {
-            continue;
-        };
-        if event.request_id == request_id { break event; }
-    };
-    app.handle_worker_event(reply);
+    deliver_foreground_compose_result(&mut app, &rx, request_id);
     let composer = app.composer.as_ref().unwrap();
     assert!(!composer.original_loading);
     assert!(composer.body.contains("source body"));
@@ -2055,7 +2139,6 @@ fn offline_cached_forward_prepares_without_server_verification() {
 
 #[test]
 fn startup_cache_miss_waits_for_verified_generation_and_rejects_uid_reuse() {
-    use std::time::Duration;
     let (_root, mut app, rx) = fixture();
     online(&mut app);
     app.accounts[0].outgoing_configured = true;
@@ -2066,13 +2149,7 @@ fn startup_cache_miss_waits_for_verified_generation_and_rejects_uid_reuse() {
     app.accounts[0].unverified_mailboxes.insert("INBOX".into());
     app.begin_forward();
     let request_id = app.pending_compose.as_ref().unwrap().request_id;
-    let reply = loop {
-        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(3)).unwrap() else {
-            continue;
-        };
-        if event.request_id == request_id { break event; }
-    };
-    app.handle_worker_event(reply);
+    deliver_foreground_compose_result(&mut app, &rx, request_id);
     assert_eq!(app.pending_compose.as_ref().unwrap().request_id, 0);
     assert!(app.composer.as_ref().unwrap().original_loading);
 
@@ -2136,7 +2213,8 @@ fn late_reply_mime_fills_reply_to_only_when_recipient_untouched() {
         raw.to_vec(),
         intent,
         &[],
-    ).unwrap();
+    )
+    .unwrap();
     app.composer.as_mut().unwrap().body = "Typed reply\n".into();
     app.handle_worker_event(event(
         request_id,
@@ -2153,12 +2231,74 @@ fn late_reply_mime_fills_reply_to_only_when_recipient_untouched() {
 }
 
 #[test]
+fn late_reply_mime_preserves_named_recipients_and_user_edits() {
+    for audience in [ReplyAudience::Sender, ReplyAudience::All] {
+        for edited in [false, true] {
+            let (_root, mut app, _rx) = fixture();
+            online(&mut app);
+            app.accounts[0].outgoing_configured = true;
+            let id = cached_message(&mut app);
+            let raw = b"From: James Schneider <james@example.org>\r\nTo: Reviewer <reviewer@example.org>\r\nSubject: Safe offline message\r\n\nquoted text";
+            app.accounts[0].messages[0] = crate::mail::parse_summary(
+                id.clone(),
+                raw,
+                raw.len() as u64,
+                MessageFlags::empty(),
+            )
+            .unwrap();
+            let intent = ComposeIntent::Reply {
+                quote: true,
+                audience,
+            };
+            app.begin_compose_from_selected(intent);
+            let request_id = app.pending_compose.as_ref().unwrap().request_id;
+            assert_eq!(
+                app.composer.as_ref().unwrap().to,
+                "James Schneider <james@example.org>"
+            );
+            if edited {
+                app.composer.as_mut().unwrap().to = "My Choice <choice@example.org>".into();
+            }
+            let prepared = Composer::prepare_original(
+                &app.accounts[0].messages[0],
+                id.clone(),
+                raw.to_vec(),
+                intent,
+                &[],
+            )
+            .unwrap();
+            app.handle_worker_event(event(
+                request_id,
+                WorkerEventKind::ComposePrepared {
+                    id,
+                    result: Ok(Box::new(prepared)),
+                },
+            ));
+            let composer = app.composer.as_ref().unwrap();
+            assert_eq!(
+                composer.to,
+                if edited {
+                    "My Choice <choice@example.org>"
+                } else {
+                    "James Schneider <james@example.org>"
+                }
+            );
+            if audience == ReplyAudience::All {
+                assert_eq!(composer.cc, "Reviewer <reviewer@example.org>");
+            }
+            assert!(!composer.original_loading);
+        }
+    }
+}
+
+#[test]
 fn quoted_reply_opens_immediately_from_in_memory_cached_body() {
     let (_root, mut app, _rx) = fixture();
     online(&mut app);
     app.accounts[0].outgoing_configured = true;
     let id = cached_message(&mut app);
-    let raw = b"From: friend@example.org\r\nSubject: Safe offline message\r\n\r\nlocally cached quote";
+    let raw =
+        b"From: friend@example.org\r\nSubject: Safe offline message\r\n\r\nlocally cached quote";
     let body = crate::mail::parse_body(id.clone(), raw).unwrap();
     app.accounts[0].bodies.insert(id, body);
     app.accounts[0].unverified_mailboxes.insert("INBOX".into());
@@ -2181,15 +2321,7 @@ fn verified_matching_uidvalidity_can_retry_a_pending_cache_miss() {
     app.begin_forward();
     let id = app.pending_compose.as_ref().unwrap().request_id;
     // Finish only the cache-only attempt. It must not fetch a stale UID.
-    loop {
-        let RuntimeEvent::Worker(event) = rx.recv_timeout(Duration::from_secs(3)).unwrap() else {
-            continue;
-        };
-        if event.request_id == id {
-            app.handle_worker_event(event);
-            break;
-        }
-    }
+    deliver_foreground_compose_result(&mut app, &rx, id);
     assert_eq!(app.pending_compose.as_ref().unwrap().request_id, 0);
     app.accounts[0].unverified_mailboxes.remove("INBOX");
     app.try_prepare_open_composer();

@@ -10,9 +10,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    ATTACHMENT_HELP_ENTRIES, App, COMPOSE_HELP_ENTRIES, CONTACT_HELP_ENTRIES, ComposeField,
-    ComposeMode, DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, MailReviewItem,
-    NOTICE_HELP_ENTRIES, PICKER_HELP_ENTRIES, ReaderSelection, ranked_help_matches,
+    ATTACHMENT_HELP_ENTRIES, App, CONTACT_HELP_ENTRIES, ComposeField, ComposeMode,
+    DESTINATION_HELP_ENTRIES, HELP_ENTRIES, HelpEntry, MailReviewItem, NOTICE_HELP_ENTRIES,
+    PICKER_HELP_ENTRIES, ReaderSelection, ranked_help_matches,
 };
 use crate::config::VisualSelectionStyle;
 use crate::model::{HtmlLine, HtmlSpanStyle, MessageFlags};
@@ -30,6 +30,12 @@ struct ReaderView<'a> {
     theme: &'a Theme,
 }
 
+impl ReaderView<'_> {
+    fn highlights_current_line(self, line: usize) -> bool {
+        self.active && self.cursor == line && self.visual.is_none()
+    }
+}
+
 // Feature renderers share the original theme and layout helpers through this
 // module. Keep the entry point here so overlay stacking remains explicit.
 mod attachments;
@@ -42,6 +48,7 @@ mod mail_list;
 mod notices;
 mod quote;
 mod reader;
+mod send_review;
 mod setup;
 mod status;
 
@@ -55,6 +62,7 @@ use self::mail_list::*;
 use self::notices::*;
 use self::quote::*;
 use self::reader::*;
+use self::send_review::*;
 use self::setup::*;
 use self::status::*;
 
@@ -111,6 +119,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             .is_some_and(|composer| composer.confirm_send)
         {
             draw_send_confirmation(frame, app);
+            if app
+                .composer
+                .as_ref()
+                .is_some_and(|composer| composer.help_visible)
+            {
+                draw_compose_help(frame, app);
+            }
         } else if app
             .composer
             .as_ref()
@@ -189,6 +204,9 @@ fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     };
 
+    // A browser without a split previews the next fullscreen opening. The
+    // split renderer overrides this hint with its exact pane width.
+    app.remember_reader_html_width(usize::from(area.width).saturating_sub(5));
     if app.message_open {
         draw_message(frame, app, area);
         return;

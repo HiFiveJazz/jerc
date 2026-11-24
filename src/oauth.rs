@@ -862,8 +862,7 @@ impl OAuthSettings {
                 None
             },
         };
-        serde_json::to_writer(&mut staging, &data)?;
-        staging.flush()?;
+        crate::cache::write_json_buffered(&mut staging, &data)?;
         staging
             .persist(&path)
             .map_err(|err| anyhow!("writing OAuth credentials: {}", err.error))?;

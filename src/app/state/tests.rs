@@ -1,6 +1,6 @@
 use super::{
     ComposeField, ComposeMode, Composer, Focus, PendingDraft, ReaderPosition, ReaderSelection,
-    ReaderWordMotion, SMOOTH_SCROLL_ROWS, bounded_index, inner_text_object_range,
+    ReaderWordMotion, SMOOTH_SCROLL_ROWS, SendPreviewMode, bounded_index, inner_text_object_range,
     message_view_offset, offset_index, preview_neighbor_positions, preview_travel_positions,
     reader_image_target_size, reader_scroll_for_visual_cursor, reader_selection_text,
     reader_word_target, reply_attribution, url_at_cursor,
@@ -10,6 +10,122 @@ use crate::model::{CacheIdentity, MessageFlags, MessageId, MessageSummary};
 use ratatui::layout::Size;
 use ratatui::widgets::BorderType;
 use std::path::PathBuf;
+
+#[test]
+fn asynchronous_contacts_save_drains_latest_snapshot_on_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    app.contacts = crate::contacts::ContactBook::default();
+    app.contacts_path = root.path().join("contacts.json");
+    app.contacts_writable = true;
+    app.contacts
+        .upsert("First", "first@example.org", false)
+        .unwrap();
+    app.mark_contacts_dirty();
+    app.contacts_save_due = Some(std::time::Instant::now());
+    app.flush_contacts(false);
+    assert!(app.contacts_save_task.is_some());
+    app.contacts
+        .upsert("Second", "second@example.org", true)
+        .unwrap();
+    app.mark_contacts_dirty();
+    app.flush_contacts(true);
+    assert!(app.contacts_save_task.is_none());
+    assert!(!app.contacts_dirty);
+    assert_eq!(
+        crate::contacts::ContactBook::load(&app.contacts_path)
+            .unwrap()
+            .entries,
+        app.contacts.entries
+    );
+}
+
+#[test]
+fn failed_background_contact_save_is_retried_without_losing_edits() {
+    let root = tempfile::tempdir().unwrap();
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    app.contacts = crate::contacts::ContactBook::default();
+    app.contacts_writable = true;
+    let blocked = root.path().join("blocked");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    app.contacts_path = blocked.join("contacts.json");
+    app.contacts
+        .upsert("First", "first@example.org", false)
+        .unwrap();
+    app.mark_contacts_dirty();
+    app.contacts_save_due = Some(std::time::Instant::now());
+    app.flush_contacts(false);
+    assert!(app.contacts_save_task.is_some());
+    app.flush_contacts(true);
+    assert!(app.contacts_dirty);
+    assert!(app.contacts_save_task.is_none());
+    app.contacts_path = root.path().join("contacts.json");
+    app.flush_contacts(true);
+    assert!(!app.contacts_dirty);
+    assert_eq!(
+        crate::contacts::ContactBook::load(&app.contacts_path)
+            .unwrap()
+            .entries,
+        app.contacts.entries
+    );
+}
+
+#[test]
+fn incoming_pages_do_not_relearn_previous_headers_or_churn_aliases() {
+    use crate::model::{Mailbox, MailboxRole, MessagePage};
+    use crate::worker::{WorkerEvent, WorkerEventKind};
+    let (_root, mut app) = local_account_fixture();
+    app.contacts = crate::contacts::ContactBook::default();
+    app.contacts_writable = true;
+    app.contacts_learn_inbox = true;
+    app.preview_split = false;
+    app.account_mut().unwrap().mailboxes = vec![Mailbox::new("INBOX", MailboxRole::Inbox)];
+    let apply_page = |app: &mut super::App, request, offset, sender: &str| {
+        let raw = format!("From: {sender}\r\nSubject: Test\r\n\r\nBody");
+        let mut flags = MessageFlags::empty();
+        flags.set(MessageFlags::SEEN, true);
+        let message = crate::mail::parse_summary(
+            MessageId(format!("imap-uid:41:{}", offset + 1)),
+            raw.as_bytes(),
+            raw.len() as u64,
+            flags,
+        )
+        .unwrap();
+        app.account_mut().unwrap().page_request_id = Some(request);
+        app.handle_worker_event(WorkerEvent {
+            account: 0,
+            request_id: request,
+            kind: WorkerEventKind::MailboxOpened {
+                name: "INBOX".into(),
+                page: MessagePage {
+                    messages: vec![message],
+                    offset,
+                    next_offset: offset + 1,
+                    has_more: true,
+                },
+                identity: Some(CacheIdentity::Imap(41)),
+                uid_next: None,
+                elapsed_micros: 0,
+            },
+        });
+    };
+    apply_page(&mut app, 100, 0, "First <first@example.org>");
+    assert!(app.contacts_dirty);
+    app.contacts_dirty = false;
+    app.contacts_save_due = None;
+    apply_page(&mut app, 101, 1, "Alias <first@example.org>");
+    assert!(!app.contacts_dirty);
+    assert_eq!(app.contacts.entries[0].name, "First");
+    // Removing a learned contact must not cause an unrelated page to relearn
+    // the old header. Only the incoming sender is eligible here.
+    app.contacts.entries.clear();
+    apply_page(&mut app, 102, 2, "New <new@example.org>");
+    assert!(app.contacts_dirty);
+    assert!(app.contacts.find("first@example.org").is_none());
+    assert!(app.contacts.find("new@example.org").is_some());
+}
 
 #[test]
 fn quit_is_immediate_without_outstanding_writes() {
@@ -278,9 +394,16 @@ fn shared_yank_updates_clipboard_and_keeps_internal_register_on_failure() {
     let mut clipboard_text = String::new();
     let status = super::record_yank_with(
         &mut register,
-        YankRegister { text: "message 😊\n".into(), linewise: true },
-        |text| { clipboard_text = text.to_owned(); Ok(()) },
-    ).unwrap();
+        YankRegister {
+            text: "message 😊\n".into(),
+            linewise: true,
+        },
+        |text| {
+            clipboard_text = text.to_owned();
+            Ok(())
+        },
+    )
+    .unwrap();
     assert!(status.text.contains("system clipboard"));
     assert_eq!(clipboard_text, "message 😊\n");
     assert_eq!(register.as_ref().unwrap().text, clipboard_text);
@@ -288,19 +411,32 @@ fn shared_yank_updates_clipboard_and_keeps_internal_register_on_failure() {
 
     let status = super::record_yank_with(
         &mut register,
-        YankRegister { text: "other".into(), linewise: false },
+        YankRegister {
+            text: "other".into(),
+            linewise: false,
+        },
         |_| Err(std::io::Error::other("unavailable")),
-    ).unwrap();
+    )
+    .unwrap();
     assert!(status.text.contains("internal register"));
     assert_eq!(register.as_ref().unwrap().text, "other");
     assert!(!register.as_ref().unwrap().linewise);
 
     let mut called = false;
-    assert!(super::record_yank_with(
-        &mut register,
-        YankRegister { text: String::new(), linewise: true },
-        |_| { called = true; Ok(()) },
-    ).is_none());
+    assert!(
+        super::record_yank_with(
+            &mut register,
+            YankRegister {
+                text: String::new(),
+                linewise: true
+            },
+            |_| {
+                called = true;
+                Ok(())
+            },
+        )
+        .is_none()
+    );
     assert!(!called);
     assert_eq!(register.as_ref().unwrap().text, "other");
 }
@@ -570,11 +706,11 @@ fn escape_clears_mail_marks_and_visual_selection_before_closing_reader() {
     app.message_open = true;
     app.message_marked.insert(MessageId("chosen".into()));
     app.visual_anchor = Some(0);
-    app.reader_visual_anchor = Some(ReaderPosition { line: 0, column: 0 });
+    app.reader_navigation.visual_anchor = Some(ReaderPosition { line: 0, column: 0 });
     app.handle_command(crate::app::Command::Escape);
     assert!(app.message_marked.is_empty());
     assert!(app.visual_anchor.is_none());
-    assert!(app.reader_visual_anchor.is_none());
+    assert!(app.reader_navigation.visual_anchor.is_none());
     assert!(app.message_open, "first Escape must keep the reader open");
 }
 
@@ -1878,11 +2014,40 @@ fn picker_has_parent_and_file_preview_and_count_navigation() {
 fn send_review_can_prepare_rich_preview_without_an_html_alternative() {
     let mut composer = Composer::new();
     composer.to = "friend@example.com".to_owned();
-    composer.body = "Hello!".to_owned();
+    composer.body = "Hello <tag> & friends!\nhttps://example.org\n\tindented".to_owned();
+    let original = composer.body.clone();
     composer.prepare_send_preview().unwrap();
     assert!(composer.confirm_send);
-    assert!(composer.preview_rich_lines.is_none());
-    assert_eq!(composer.preview_scroll, 0);
+    assert_eq!(composer.send_preview.mode, SendPreviewMode::Plain);
+    assert!(composer.outgoing_html_preview().unwrap().is_none());
+    let html = composer.plain_review_html();
+    assert!(composer.send_preview.document.html_source.is_none());
+    assert!(html.contains("&lt;tag&gt; &amp; friends!"));
+    assert!(html.contains("<a href=\"https://example.org\">"));
+    let rich = composer.plain_review_lines();
+    let text = rich
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(text, original.replace('\t', super::COMPOSE_TAB_SPACES));
+    assert!(
+        rich.iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| { span.style.link.as_deref() == Some("https://example.org") })
+    );
+    assert_eq!(composer.outgoing_plain_body(), original);
+    assert_eq!(composer.send_preview.navigation.row, 0);
+    composer.close_send_preview();
+    assert!(!composer.confirm_send);
+    assert!(composer.send_preview.document.html_source.is_none());
+    assert!(composer.send_preview.layout.rows.is_empty());
+    assert_eq!(composer.body, original);
 }
 
 #[test]
@@ -4386,4 +4551,417 @@ fn dismissed_notice_stays_hidden_across_acknowledgment_and_restart() {
     assert!(restarted.filtered_notices().is_empty());
     assert_eq!(restarted.manual_review_count(), 1);
     assert_eq!(restarted.accounts[0].deferred_mutations, vec![entry]);
+}
+
+#[test]
+fn compose_soft_wrap_keeps_words_and_source_offsets() {
+    let body = "alpha beta gamma\nhello 世界 again\nabcdefghijklmnop\n";
+    let rows = super::compose_body_rows(body, 8);
+    let chars: Vec<char> = body.chars().collect();
+    let text: Vec<String> = rows
+        .iter()
+        .map(|row| chars[row.start..row.end].iter().collect())
+        .collect();
+    assert_eq!(
+        text,
+        [
+            "alpha ", "beta ", "gamma", "hello ", "世界 ", "again", "abcdefgh", "ijklmnop", ""
+        ]
+    );
+    assert_eq!(text[..3].concat(), "alpha beta gamma");
+    assert_eq!(text[3..6].concat(), "hello 世界 again");
+    assert_eq!(text[6..8].concat(), "abcdefghijklmnop");
+}
+
+#[test]
+fn compose_tab_round_trip_restores_body_cursor_and_scroll() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    // An accountless App starts in the setup wizard, which owns keyboard input.
+    app.setup = None;
+    let mut composer = Composer::new();
+    composer.switch_field(ComposeField::Body);
+    composer.body = "αβ top\nsecond\nthird\nfourth".into();
+    composer.cursor = 2;
+    composer.mode = ComposeMode::Normal;
+    app.composer = Some(composer);
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(app.composer.as_ref().unwrap().field, ComposeField::To);
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(app.composer.as_ref().unwrap().field, ComposeField::Cc);
+    app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    let composer = app.composer.as_mut().unwrap();
+    assert_eq!(composer.field, ComposeField::Body);
+    assert_eq!(composer.cursor, 2);
+    composer.cursor = 15;
+    composer.body_scroll = 2;
+    composer.switch_field(ComposeField::Cc);
+    composer.switch_field(ComposeField::Body);
+    assert_eq!(composer.cursor, 15);
+    assert_eq!(composer.body_scroll, 2);
+}
+
+#[test]
+fn compose_insert_tab_navigates_headers_without_editing_them() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    app.setup = None;
+    app.contacts_autocomplete = false;
+    let mut composer = Composer::new();
+    composer.to = "to@example.org".into();
+    composer.cc = "cc@example.org".into();
+    composer.bcc = "bcc@example.org".into();
+    composer.subject = "Subject".into();
+    composer.body = "aβ".into();
+    composer.switch_field(ComposeField::Body);
+    composer.cursor = 1;
+    composer.switch_field(ComposeField::To);
+    composer.mode = ComposeMode::Insert;
+    app.composer = Some(composer);
+
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+    app.handle_key(tab);
+    assert_eq!(app.composer.as_ref().unwrap().field, ComposeField::Cc);
+    app.handle_key(backtab);
+    assert_eq!(app.composer.as_ref().unwrap().field, ComposeField::To);
+    for field in [
+        ComposeField::Cc,
+        ComposeField::Bcc,
+        ComposeField::Subject,
+        ComposeField::Body,
+    ] {
+        app.handle_key(tab);
+        let composer = app.composer.as_ref().unwrap();
+        assert_eq!(composer.field, field);
+        assert_eq!(composer.mode, ComposeMode::Insert);
+        if field != ComposeField::Body {
+            assert_eq!(composer.cursor, composer.char_count());
+        }
+    }
+    let composer = app.composer.as_ref().unwrap();
+    assert_eq!(composer.cursor, 1);
+    assert_eq!(composer.to, "to@example.org");
+    assert_eq!(composer.cc, "cc@example.org");
+    assert_eq!(composer.bcc, "bcc@example.org");
+    assert_eq!(composer.subject, "Subject");
+    assert_eq!(composer.body, "aβ");
+    app.handle_key(tab);
+    let composer = app.composer.as_ref().unwrap();
+    assert_eq!(composer.field, ComposeField::Body);
+    assert_eq!(composer.body, "a\tβ");
+}
+
+#[test]
+fn compose_insert_tab_moves_past_suggestions_and_enter_accepts() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    app.setup = None;
+    app.contacts_autocomplete = true;
+    app.contacts = crate::contacts::ContactBook::default();
+    app.contacts
+        .upsert("Alex", "alex@example.org", true)
+        .unwrap();
+    let mut composer = Composer::new();
+    composer.to = "Alex".into();
+    composer.switch_field(ComposeField::To);
+    composer.mode = ComposeMode::Insert;
+    app.composer = Some(composer);
+    assert!(!app.contact_suggestions().is_empty());
+
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let composer = app.composer.as_ref().unwrap();
+    assert_eq!(composer.field, ComposeField::Cc);
+    assert_eq!(composer.to, "Alex");
+    assert_eq!(composer.mode, ComposeMode::Insert);
+
+    app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert!(!app.contact_suggestions().is_empty());
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let composer = app.composer.as_ref().unwrap();
+    assert_eq!(composer.field, ComposeField::To);
+    assert_eq!(composer.mode, ComposeMode::Insert);
+    assert!(composer.to.contains("alex@example.org"));
+}
+
+#[test]
+fn compose_insert_tab_indents_body_without_switching_fields() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    app.setup = None;
+    let mut composer = Composer::new();
+    composer.switch_field(ComposeField::Body);
+    composer.body = "aβ".into();
+    composer.cursor = 1;
+    composer.mode = ComposeMode::Insert;
+    app.composer = Some(composer);
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    app.handle_key(tab);
+    let composer = app.composer.as_ref().unwrap();
+    assert_eq!(composer.field, ComposeField::Body);
+    assert_eq!(composer.body, "a\tβ");
+    assert_eq!(composer.cursor, 2);
+    assert_eq!(super::compose_body_column(&composer.body, 0, 2), 5);
+    let rows = super::compose_body_rows(&composer.body, 5);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].end, 2);
+    assert_eq!(rows[1].start, 2);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(tab);
+    assert_eq!(app.composer.as_ref().unwrap().field, ComposeField::To);
+    app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(app.composer.as_ref().unwrap().cursor, 2);
+    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(app.composer.as_ref().unwrap().body, "aβ");
+}
+
+#[test]
+fn outgoing_review_visual_yank_uses_shared_register_and_esc_does_not_send() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::text::Line;
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    app.setup = None;
+    let mut composer = Composer::new();
+    composer.to = "friend@example.org".into();
+    composer.body = "a😊bc\nsecond line".into();
+    composer.field = ComposeField::Body;
+    composer.mode = ComposeMode::Normal;
+    composer.prepare_send_preview().unwrap();
+    composer.send_preview.layout.rows = vec![Line::raw("a😊bc"), Line::raw("second line")];
+    composer.send_preview.layout.text = composer.body.clone();
+    composer.send_preview.layout.height = 8;
+    composer.send_preview.navigation.column = 1;
+    app.composer = Some(composer);
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    app.handle_key(key(KeyCode::Char('v')));
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(
+        app.composer
+            .as_ref()
+            .unwrap()
+            .preview_visual_range()
+            .unwrap()
+            .start
+            .column,
+        1
+    );
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.composer.as_ref().unwrap().confirm_send);
+    app.handle_key(key(KeyCode::Char('y')));
+    assert_eq!(app.yank_register.as_ref().unwrap().text, "😊b");
+    assert!(!app.yank_register.as_ref().unwrap().linewise);
+    assert!(
+        app.composer
+            .as_ref()
+            .unwrap()
+            .preview_visual_range()
+            .is_none()
+    );
+    app.handle_key(key(KeyCode::Char('V')));
+    app.handle_key(key(KeyCode::Char('j')));
+    app.handle_key(key(KeyCode::Char('y')));
+    assert_eq!(
+        app.yank_register.as_ref().unwrap().text,
+        "a😊bc\nsecond line"
+    );
+    assert!(app.yank_register.as_ref().unwrap().linewise);
+    app.handle_key(key(KeyCode::Char('v')));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.composer.as_ref().unwrap().confirm_send);
+    assert!(
+        app.composer
+            .as_ref()
+            .unwrap()
+            .preview_visual_range()
+            .is_none()
+    );
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.composer.as_ref().unwrap().confirm_send);
+    // The review never edits the draft or sends anything while selecting.
+    assert_eq!(app.composer.as_ref().unwrap().body, "a😊bc\nsecond line");
+}
+
+#[test]
+fn reply_html_quote_survives_background_merge_and_local_draft_recovery() {
+    let raw = b"From: system <system@example.org>\r\nTo: friend@example.org\r\nSubject: Moderation\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=example\r\n\r\n--example\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain [post](https://example.org/post)\r\n--example\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p><b>HTML_ONLY_SENTINEL</b></p></body></html>\r\n--example--\r\n";
+    let id = MessageId("reply-html".into());
+    let summary =
+        crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, MessageFlags::empty())
+            .unwrap();
+    let intent = super::ComposeIntent::Reply {
+        quote: true,
+        audience: super::ReplyAudience::Sender,
+    };
+    let prepared =
+        Composer::prepare_original(&summary, id.clone(), raw.to_vec(), intent, &[]).unwrap();
+    let mut current = Composer::reply(&summary, None, true);
+    current.original_loading = true;
+    let pending = super::PendingCompose {
+        account: 0,
+        request_id: 1,
+        message_id: id,
+        intent,
+        mailbox: "INBOX".into(),
+        summary,
+        cache_identity: None,
+        cache_only: false,
+        initial_body: current.body.clone(),
+    };
+    current.body = "My reply\n\n".into();
+    super::App::merge_prepared_compose(&mut current, prepared, &pending);
+    let (before, attribution, html, after) = current.reply_html_review_parts().unwrap();
+    assert!(before.contains("My reply"));
+    assert!(attribution.contains("wrote:"));
+    assert!(html.contains("HTML_ONLY_SENTINEL"));
+    assert!(after.is_empty());
+    let sent_plain = current.outgoing_plain_body();
+    assert!(sent_plain.contains("> Plain [post]"));
+    assert!(!sent_plain.contains("HTML_ONLY_SENTINEL"));
+    assert!(current.forwarded_raw.is_none());
+    assert!(current.outgoing_html_preview().unwrap().is_none());
+    let mut recovered: Composer =
+        serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+    assert!(recovered.reply_html_review_parts().is_some());
+    recovered.body = recovered.body.replace("Plain [post]", "Edited [post]");
+    assert!(recovered.reply_html_review_parts().is_none());
+}
+
+#[test]
+fn reader_and_composer_visual_selection_share_actual_text_boundaries() {
+    let text = "abé\n\n漢字\tend\nlast";
+    let mut composer = Composer::new();
+    composer.body = text.to_owned();
+    composer.switch_field(ComposeField::Body);
+    composer.mode = ComposeMode::Visual;
+    for (anchor, cursor) in [(1, 8), (8, 1)] {
+        composer.visual_anchor = Some(anchor);
+        composer.cursor = cursor;
+        let selection = ReaderSelection {
+            start: ReaderPosition { line: 0, column: 1 },
+            end: ReaderPosition { line: 2, column: 3 },
+        };
+        assert_eq!(selection.columns_for_line(1, 0), None);
+        assert_eq!(selection.columns_for_line(2, 6), Some((0, 3)));
+        assert_eq!(reader_selection_text(text, selection), "bé\n\n漢字\te");
+        assert_eq!(
+            composer.yank_visual().unwrap().text,
+            reader_selection_text(text, selection)
+        );
+    }
+    composer.visual_linewise = true;
+    composer.visual_anchor = Some(1);
+    composer.cursor = 8;
+    let selection = ReaderSelection {
+        start: ReaderPosition { line: 0, column: 0 },
+        end: ReaderPosition {
+            line: 2,
+            column: usize::MAX,
+        },
+    };
+    assert_eq!(reader_selection_text(text, selection), "abé\n\n漢字\tend");
+    // Linewise editor yanks retain their existing terminating newline.
+    assert_eq!(
+        composer.yank_visual().unwrap().text,
+        format!("{}\n", reader_selection_text(text, selection))
+    );
+}
+
+#[test]
+fn graphics_configuration_does_not_start_remote_image_loader() {
+    let config: crate::config::Config = toml::from_str("[ui]\nremote_images = false\n").unwrap();
+    let mut app = super::App::new(&config, vec![]);
+    let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+    app.configure_mail_images(ratatui_image::picker::Picker::halfblocks(), tx);
+    assert!(app.image_picker.is_some());
+    assert!(app.image_runtime_tx.is_some());
+    assert!(app.image_loader.is_none());
+}
+
+#[test]
+fn cached_preview_neoscroll_and_body_fetch_do_not_rewrite_mailbox_index() {
+    use crate::worker::{WorkerEvent, WorkerEventKind};
+    let (root, mut app) = local_account_fixture();
+    let path = root.path().join("index.json");
+    let raw = b"From: Test <test@example.org>\r\nSubject: Cached\r\n\r\nOffline";
+    app.preview_split = true;
+    app.focus = Focus::Messages;
+    {
+        let account = app.account_mut().unwrap();
+        account.current_mailbox = Some("INBOX".into());
+        account
+            .cache_identities
+            .insert("INBOX".into(), CacheIdentity::Imap(41));
+        account.cache_writer = Some(crate::cache::test_cache_writer(path.clone()));
+        account.threading_enabled = false;
+        account.has_more = false;
+        account.next_page_offset = 60;
+        account.message_view_height = 10;
+        let mut flags = MessageFlags::empty();
+        flags.set(MessageFlags::SEEN, true);
+        for uid in 1..=60 {
+            let id = MessageId(format!("imap-uid:41:{uid}"));
+            account.messages.push(
+                crate::mail::parse_summary(id.clone(), raw, raw.len() as u64, flags).unwrap(),
+            );
+            account
+                .bodies
+                .insert(id.clone(), crate::mail::parse_body(id, raw).unwrap());
+        }
+        account.persist_current_cache();
+        // Flush the initial index, then reopen the real cache writer.
+        drop(account.cache_writer.take());
+        account.cache_writer = Some(crate::cache::test_cache_writer(path.clone()));
+    }
+    let original = std::fs::read(&path).unwrap();
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path).unwrap().ino()
+    };
+    for target in [59, 0, 59, 0, 59, 30] {
+        app.account_mut().unwrap().smooth_message_target = Some(target);
+        for _ in 0..60 {
+            app.advance_animation();
+        }
+        assert_eq!(app.account().unwrap().message_index, target);
+    }
+    // A selected-body completion saves the body, not a new folder index.
+    let id = app
+        .account()
+        .unwrap()
+        .selected_message()
+        .unwrap()
+        .id
+        .clone();
+    {
+        let account = app.account_mut().unwrap();
+        account.bodies.remove(&id);
+        account.body_request_id = Some(77);
+    }
+    app.handle_worker_event(WorkerEvent {
+        account: 0,
+        request_id: 77,
+        kind: WorkerEventKind::BodyLoaded(crate::mail::parse_body(id.clone(), raw).unwrap()),
+    });
+    let account = app.account_mut().unwrap();
+    assert!(account.bodies.contains_key(&id));
+    account.persist_current_navigation();
+    drop(account.cache_writer.take());
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+    assert_eq!(
+        crate::cache::read_snapshot(&path).unwrap().folders["INBOX"].message_index,
+        30
+    );
 }

@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::{MailBackend, imap::run_credential_command};
-use crate::mail::{MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body, parse_summary};
+use crate::mail::{
+    MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body_compact, parse_summary,
+};
 use crate::model::{
     Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage,
     MessageSummary,
@@ -356,14 +358,13 @@ impl Pop3Backend {
             tmp.as_file()
                 .set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        serde_json::to_writer(
+        crate::cache::write_json_buffered(
             &mut tmp,
             &LocalSeen {
                 version: 1,
                 seen: self.seen.clone(),
             },
         )?;
-        tmp.flush()?;
         tmp.as_file().sync_all()?;
         tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
@@ -514,6 +515,36 @@ impl MailBackend for Pop3Backend {
         Ok((self.entries.len(), unread))
     }
 
+    fn inbox_status(
+        &mut self,
+        name: &str,
+        previous: Option<&super::InboxCheckpoint>,
+    ) -> Result<((usize, usize), super::InboxCheck)> {
+        let counts = self.mailbox_status(name)?;
+        let check = if self.entries.len() <= super::notifications::MAX_TRACKED_IDS {
+            super::InboxCheck::ids(
+                previous,
+                self.entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.uidl.clone(),
+                            MessageId(format!("pop3-uidl:{}", entry.uidl)),
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            super::InboxCheck::default()
+        };
+        Ok((counts, check))
+    }
+
+    fn notification_raw(&mut self, _mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
+        let number = self.resolve_number(id)?;
+        self.fetch_number(number, MAX_BODY_MESSAGE_BYTES)
+    }
+
     fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage> {
         ensure!(
             name.eq_ignore_ascii_case("INBOX"),
@@ -547,7 +578,7 @@ impl MailBackend for Pop3Backend {
     fn fetch_body(&mut self, _mailbox: &str, id: &MessageId) -> Result<MessageBody> {
         let number = self.resolve_number(id)?;
         let raw = self.fetch_number(number, MAX_BODY_MESSAGE_BYTES)?;
-        parse_body(id.clone(), &raw)
+        parse_body_compact(id.clone(), &raw)
     }
 
     fn fetch_raw(&mut self, _mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {

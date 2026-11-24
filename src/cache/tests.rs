@@ -132,7 +132,7 @@ fn identical_index_updates_do_not_rewrite_cache_file() {
     };
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let mut snapshot = Snapshot::default();
-    let mut dirty = false;
+    let mut dirty = IndexCheckpoint::default();
 
     let inbox = folder(41, 3);
     {
@@ -148,7 +148,7 @@ fn identical_index_updates_do_not_rewrite_cache_file() {
         0
     );
     assert!(path.exists());
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     #[cfg(unix)]
     let original_inode = {
         use std::os::unix::fs::MetadataExt;
@@ -171,7 +171,7 @@ fn identical_index_updates_do_not_rewrite_cache_file() {
         flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty),
         0
     );
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -190,7 +190,7 @@ fn identical_index_updates_do_not_rewrite_cache_file() {
         .unwrap()
         .insert(Change::Folder("INBOX".into(), changed));
     flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty);
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     assert!(!snapshot.folders["INBOX"].messages[0].unread());
     assert_eq!(
         read_snapshot(&path).unwrap().folders["INBOX"].messages[0].flags,
@@ -310,13 +310,13 @@ fn failed_index_checkpoint_is_retried_on_shutdown_without_new_changes() {
             crate::model::MailboxRole::Inbox,
         )]));
     let mut stored = Snapshot::default();
-    let mut dirty = false;
+    let mut dirty = IndexCheckpoint::default();
     flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
-    assert!(dirty);
+    assert!(dirty.is_dirty());
     fs::remove_file(&parent).unwrap();
     // No new event needed: final flush retries the still-dirty snapshot.
     flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     assert_eq!(read_snapshot(&path).unwrap().mailboxes[0].name, "INBOX");
 }
 
@@ -387,7 +387,7 @@ fn unchanged_multi_folder_refreshes_never_replace_the_index() {
     };
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let mut snapshot = Snapshot::default();
-    let mut dirty = false;
+    let mut dirty = IndexCheckpoint::default();
     let mailboxes = vec![
         Mailbox::new("INBOX", crate::model::MailboxRole::Inbox),
         Mailbox::new("Sent", crate::model::MailboxRole::Sent),
@@ -400,7 +400,7 @@ fn unchanged_multi_folder_refreshes_never_replace_the_index() {
         changes.insert(Change::Folder("Sent".into(), folder(82, 40)));
     }
     flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty);
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     let original_bytes = fs::read(&path).unwrap();
     #[cfg(unix)]
     let original_inode = {
@@ -420,7 +420,7 @@ fn unchanged_multi_folder_refreshes_never_replace_the_index() {
             flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty),
             0
         );
-        assert!(!dirty);
+        assert!(!dirty.is_dirty());
         assert_eq!(fs::read(&path).unwrap(), original_bytes);
         #[cfg(unix)]
         {
@@ -443,7 +443,7 @@ fn unchanged_multi_folder_refreshes_never_replace_the_index() {
     let reloaded = read_snapshot(&path).unwrap();
     assert!(!reloaded.folders["Sent"].messages[0].unread());
     assert_eq!(reloaded.folders["INBOX"].messages.len(), 120);
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -460,7 +460,7 @@ fn changing_only_terminal_html_layout_does_not_rewrite_disk_index() {
     };
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let mut stored = Snapshot::default();
-    let mut dirty = false;
+    let mut dirty = IndexCheckpoint::default();
     let mut initial = folder(41, 1);
     let id = initial.messages[0].id.clone();
     let mut rendered = body(id.clone(), "Visible text");
@@ -474,7 +474,7 @@ fn changing_only_terminal_html_layout_does_not_rewrite_disk_index() {
         .unwrap()
         .insert(Change::Folder("INBOX".into(), initial));
     flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     #[cfg(unix)]
     let inode = {
         use std::os::unix::fs::MetadataExt;
@@ -494,7 +494,7 @@ fn changing_only_terminal_html_layout_does_not_rewrite_disk_index() {
         .unwrap()
         .insert(Change::Folder("INBOX".into(), reflowed));
     flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     assert_eq!(fs::read(&path).unwrap(), old_bytes);
     #[cfg(unix)]
     {
@@ -512,7 +512,7 @@ fn mailbox_burst_keeps_only_the_final_folder_state() {
     };
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let mut snapshot = Snapshot::default();
-    let mut dirty = false;
+    let mut dirty = IndexCheckpoint::default();
     {
         let mut changes = pending.lock().unwrap();
         changes.insert(Change::Folder("INBOX".into(), folder(14, 1)));
@@ -530,7 +530,7 @@ fn mailbox_burst_keeps_only_the_final_folder_state() {
         assert_eq!(changes.folders.len(), 3);
     }
     flush_cache_changes(&path, &mut snapshot, &pending, &body_store, &mut dirty);
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     let persisted = read_snapshot(&path).unwrap();
     assert_eq!(persisted.folders.len(), 1);
     assert_eq!(persisted.folders["INBOX"].messages.len(), 5);
@@ -550,7 +550,7 @@ fn queued_body_updates_write_only_the_latest_value() {
     };
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let mut snapshot = Snapshot::default();
-    let mut dirty = false;
+    let mut dirty = IndexCheckpoint::default();
     let id = MessageId("imap-uid:19:4".into());
     let latest = body(id.clone(), "Latest fetched text");
     {
@@ -632,13 +632,13 @@ fn failed_checkpoint_retries_the_latest_coalesced_data() {
     };
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let mut stored = Snapshot::default();
-    let mut dirty = false;
+    let mut dirty = IndexCheckpoint::default();
     pending
         .lock()
         .unwrap()
         .insert(Change::Folder("INBOX".into(), folder(31, 1)));
     flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
-    assert!(dirty);
+    assert!(dirty.is_dirty());
 
     // More updates can arrive while the filesystem is unavailable; when
     // persistence recovers it must save the newest state, not the first.
@@ -648,7 +648,7 @@ fn failed_checkpoint_retries_the_latest_coalesced_data() {
         .insert(Change::Folder("INBOX".into(), folder(31, 3)));
     fs::remove_file(&blocker).unwrap();
     flush_cache_changes(&path, &mut stored, &pending, &body_store, &mut dirty);
-    assert!(!dirty);
+    assert!(!dirty.is_dirty());
     assert_eq!(
         read_snapshot(&path).unwrap().folders["INBOX"]
             .messages
@@ -657,7 +657,7 @@ fn failed_checkpoint_retries_the_latest_coalesced_data() {
     );
 }
 
-fn test_cache_writer(path: PathBuf) -> Writer {
+pub(crate) fn test_cache_writer(path: PathBuf) -> Writer {
     let (wake, rx) = mpsc::sync_channel::<()>(1);
     let pending = Arc::new(Mutex::new(PendingChanges::default()));
     let body_store = BodyStore {
@@ -666,13 +666,15 @@ fn test_cache_writer(path: PathBuf) -> Writer {
     let worker_pending = Arc::clone(&pending);
     let worker_store = body_store.clone();
     let worker_path = path.clone();
+    let (snapshot, checkpoint) = index_store::load(&path).unwrap_or_default();
     let join = thread::spawn(move || {
         run_cache_writer(
             rx,
             worker_path,
             worker_pending,
             worker_store,
-            Snapshot::default(),
+            snapshot,
+            checkpoint,
         );
     });
     Writer {
@@ -1675,4 +1677,643 @@ fn cache_identity_keys_are_stable_and_distinct() {
     assert_eq!(stable_key("account\0imap-a"), stable_key("account\0imap-a"));
     assert_ne!(stable_key("account\0imap-a"), stable_key("account\0imap-b"));
     assert_ne!(stable_key("account\0imap-a"), stable_key("other\0imap-a"));
+}
+
+/// Read the committed revision paths instead of relying on timestamp
+/// granularity or the randomized JSON map order.
+fn committed_shards(path: &Path) -> HashMap<String, PathBuf> {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(manifest["version"], 3);
+    manifest["folders"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(name, shard)| {
+            (
+                name.clone(),
+                index_store::shard_dir(path).join(shard["file"].as_str().unwrap()),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn split_index_migrates_legacy_cache_and_retains_offline_state() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let mut old = Snapshot::default();
+    let mut inbox = folder(41, 12);
+    inbox.message_index = 7;
+    inbox.message_view_offset = 4;
+    let id = inbox.messages[7].id.clone();
+    inbox
+        .bodies
+        .insert(id.clone(), body(id.clone(), "warm offline body"));
+    old.folders.insert("INBOX".into(), inbox);
+    old.folders.insert("Sent/旅行".into(), folder(42, 2));
+    old.mailboxes
+        .push(Mailbox::new("INBOX", crate::model::MailboxRole::Inbox));
+    old.deferred_seen.push(DeferredSeen {
+        mailbox: "INBOX".into(),
+        validity: 41,
+        id,
+        seen: true,
+    });
+    write_snapshot(&path, &old).unwrap();
+    let journal = path.with_extension("mutations.json");
+    let store = MutationStore {
+        path: journal.clone(),
+        readable: true,
+    };
+    let mutation = DeferredMutation {
+        mailbox: "INBOX".into(),
+        validity: 41,
+        ids: vec![old.folders["INBOX"].messages[0].id.clone()],
+        kind: DeferredMutationKind::Delete,
+        state: DeferredMutationState::Queued,
+    };
+    store.save(std::slice::from_ref(&mutation)).unwrap();
+    let journal_bytes = fs::read(&journal).unwrap();
+    // Migration happens even if the user opens and immediately closes jerc.
+    drop(test_cache_writer(path.clone()));
+    let loaded = read_snapshot(&path).unwrap();
+    assert_eq!(loaded.folders, old.folders);
+    assert_eq!(loaded.mailboxes, old.mailboxes);
+    assert_eq!(loaded.deferred_seen, old.deferred_seen);
+    assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+    assert_eq!(store.read().unwrap(), vec![mutation]);
+    let shards = committed_shards(&path);
+    assert_eq!(shards.len(), 2);
+    let disk: serde_json::Value =
+        serde_json::from_slice(&fs::read(&shards["INBOX"]).unwrap()).unwrap();
+    assert!(disk["folder"].get("message_index").is_none());
+    assert!(disk["folder"].get("message_view_offset").is_none());
+    assert!(index_store::navigation_path(&path).exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for file in [
+            &path,
+            &shards["INBOX"],
+            &index_store::navigation_path(&path),
+        ] {
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn navigation_and_rotating_inline_bodies_never_rewrite_mailbox_shards() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let store = BodyStore {
+        dir: path.with_extension("bodies"),
+    };
+    let pending = Arc::new(Mutex::new(PendingChanges::default()));
+    let mut stored = Snapshot::default();
+    let mut dirty = IndexCheckpoint::default();
+    let original = folder(31, 100);
+    pending
+        .lock()
+        .unwrap()
+        .insert(Change::Folder("INBOX".into(), original.clone()));
+    pending
+        .lock()
+        .unwrap()
+        .insert(Change::Folder("Sent".into(), folder(32, 50)));
+    flush_cache_changes(&path, &mut stored, &pending, &store, &mut dirty);
+    let before = fs::read(&path).unwrap();
+    let shards = committed_shards(&path);
+    // Simulate repeated background refreshes at different cursor positions,
+    // with a different nearby body set in each snapshot.
+    for n in 0..300 {
+        let mut next = original.clone();
+        next.message_index = n % 100;
+        next.message_view_offset = next.message_index.saturating_sub(10);
+        let id = next.messages[next.message_index].id.clone();
+        next.bodies.insert(id.clone(), body(id, "cached preview"));
+        pending
+            .lock()
+            .unwrap()
+            .insert(Change::Folder("INBOX".into(), next));
+        flush_cache_changes(&path, &mut stored, &pending, &store, &mut dirty);
+        assert!(!dirty.is_dirty());
+    }
+    // Deliberate checkpoint is small and separately coalesced.
+    for n in 0..90 {
+        pending.lock().unwrap().insert(Change::Navigation(
+            "INBOX".into(),
+            CacheIdentity::Imap(31),
+            n,
+            n.saturating_sub(10),
+        ));
+    }
+    flush_cache_changes(&path, &mut stored, &pending, &store, &mut dirty);
+    assert!(!dirty.is_dirty());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(committed_shards(&path), shards);
+    let loaded = read_snapshot(&path).unwrap();
+    assert_eq!(loaded.folders["INBOX"].message_index, 89);
+    assert_eq!(loaded.folders["INBOX"].message_view_offset, 79);
+    // Real Seen changes still save the affected folder, not its neighbors.
+    let mut changed = original;
+    changed.messages[0]
+        .flags
+        .set(crate::model::MessageFlags::SEEN, true);
+    pending
+        .lock()
+        .unwrap()
+        .insert(Change::Folder("INBOX".into(), changed));
+    pending
+        .lock()
+        .unwrap()
+        .insert(Change::DeferredSeen(vec![DeferredSeen {
+            mailbox: "INBOX".into(),
+            validity: 31,
+            id: stored.folders["INBOX"].messages[0].id.clone(),
+            seen: true,
+        }]));
+    flush_cache_changes(&path, &mut stored, &pending, &store, &mut dirty);
+    assert!(!dirty.is_dirty());
+    let after = committed_shards(&path);
+    assert_ne!(after["INBOX"], shards["INBOX"]);
+    assert_eq!(after["Sent"], shards["Sent"]);
+    assert!(!shards["INBOX"].exists());
+    let reloaded = read_snapshot(&path).unwrap();
+    assert!(!reloaded.folders["INBOX"].messages[0].unread());
+    assert_eq!(reloaded.deferred_seen.len(), 1);
+    assert_eq!(reloaded.folders["INBOX"].message_index, 89);
+    // A stale generation cannot restore old cursor positions.
+    pending
+        .lock()
+        .unwrap()
+        .insert(Change::Folder("INBOX".into(), folder(33, 2)));
+    pending.lock().unwrap().insert(Change::Navigation(
+        "INBOX".into(),
+        CacheIdentity::Imap(31),
+        89,
+        79,
+    ));
+    flush_cache_changes(&path, &mut stored, &pending, &store, &mut dirty);
+    assert_eq!(
+        read_snapshot(&path).unwrap().folders["INBOX"].message_index,
+        0
+    );
+}
+
+#[test]
+fn failed_split_migration_leaves_the_legacy_snapshot_readable() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let mut snapshot = Snapshot::default();
+    snapshot.folders.insert("INBOX".into(), folder(31, 3));
+    write_snapshot(&path, &snapshot).unwrap();
+    let original = fs::read(&path).unwrap();
+    let shard_dir = index_store::shard_dir(&path);
+    fs::write(&shard_dir, b"blocked").unwrap();
+    let (stored, mut dirty) = index_store::load(&path).unwrap();
+    assert!(dirty.flush(&path, &stored).is_err());
+    assert!(dirty.is_dirty());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(read_snapshot(&path).unwrap().folders, snapshot.folders);
+    fs::remove_file(shard_dir).unwrap();
+    dirty.flush(&path, &stored).unwrap();
+    assert!(!dirty.is_dirty());
+    assert_eq!(read_snapshot(&path).unwrap().folders, snapshot.folders);
+}
+
+#[test]
+fn split_index_isolates_corrupt_shards_and_navigation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(31, 5)));
+    writer.send(Change::Folder("Sent".into(), folder(32, 5)));
+    drop(writer);
+    let shards = committed_shards(&path);
+    fs::write(&shards["Sent"], b"invalid").unwrap();
+    fs::write(index_store::navigation_path(&path), b"invalid").unwrap();
+    let loaded = read_snapshot(&path).unwrap();
+    assert_eq!(loaded.folders["INBOX"].messages.len(), 5);
+    assert!(!loaded.folders.contains_key("Sent"));
+    assert_eq!(loaded.folders["INBOX"].message_index, 0);
+}
+
+#[test]
+fn stale_writer_never_publishes_retired_shard_references() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(31, 5)));
+    writer.send(Change::Folder("Sent".into(), folder(32, 3)));
+    drop(writer);
+    let (mut stale, mut stale_checkpoint) = index_store::load(&path).unwrap();
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(31, 6)));
+    drop(writer);
+    // Models an app reload where the new writer was initialized before the
+    // old writer flushed its last batch. Last writer still wins as before.
+    apply_tracked(
+        &mut stale,
+        Change::Folder("Sent".into(), folder(32, 4)),
+        &mut stale_checkpoint,
+    );
+    stale_checkpoint.flush(&path, &stale).unwrap();
+    let loaded = read_snapshot(&path).unwrap();
+    assert_eq!(loaded.folders["INBOX"].messages.len(), 5);
+    assert_eq!(loaded.folders["Sent"].messages.len(), 4);
+    assert!(committed_shards(&path).values().all(|path| path.is_file()));
+}
+
+#[cfg(unix)]
+#[test]
+fn unchanged_raw_mime_does_not_replace_file() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let store = RawStore {
+        dir: root.path().join("raw"),
+    };
+    let identity = CacheIdentity::Imap(41);
+    let id = MessageId("imap-uid:41:1".into());
+    let raw = vec![b'x'; 32 * 1024 + 3];
+    store.write("INBOX", &identity, &id, &raw).unwrap();
+    let path = store.raw_path("INBOX", &identity, &id);
+    let inode = fs::metadata(&path).unwrap().ino();
+    store.write("INBOX", &identity, &id, &raw).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    let mut changed = raw;
+    *changed.last_mut().unwrap() = b'y';
+    store.write("INBOX", &identity, &id, &changed).unwrap();
+    assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(store.read("INBOX", &identity, &id), Some(changed));
+}
+
+#[test]
+fn split_checkpoint_respects_aggregate_index_budget_and_retries() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(31, 2)));
+    drop(writer);
+    let original = fs::read(&path).unwrap();
+    let before = committed_shards(&path);
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    for (name, generation) in [("INBOX", 31), ("Sent", 32)] {
+        let mut oversized = folder(generation, 1);
+        oversized.messages[0].subject = "x".repeat(MAX_CACHE_BYTES as usize / 2);
+        apply_tracked(
+            &mut stored,
+            Change::Folder(name.into(), oversized),
+            &mut dirty,
+        );
+    }
+    assert!(dirty.flush(&path, &stored).is_err());
+    assert!(dirty.is_dirty());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(committed_shards(&path), before);
+    assert_eq!(
+        read_snapshot(&path).unwrap().folders["INBOX"]
+            .messages
+            .len(),
+        2
+    );
+    apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), folder(31, 3)),
+        &mut dirty,
+    );
+    apply_tracked(
+        &mut stored,
+        Change::Folder("Sent".into(), folder(32, 2)),
+        &mut dirty,
+    );
+    dirty.flush(&path, &stored).unwrap();
+    assert!(!dirty.is_dirty());
+    assert_eq!(read_snapshot(&path).unwrap().folders.len(), 2);
+}
+
+fn committed_pages(path: &Path, name: &str) -> Vec<PathBuf> {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    manifest["folders"][name]["pages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|page| index_store::shard_dir(path).join(page["file"].as_str().unwrap()))
+        .collect()
+}
+
+#[test]
+fn page_append_reuses_large_base_and_persists_only_new_headers_and_changed_bodies() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    let mut initial = folder(41, 100);
+    initial.has_more = true;
+    let id = initial.messages[0].id.clone();
+    initial
+        .bodies
+        .insert(id.clone(), body(id.clone(), &"a".repeat(100 * 1024)));
+    writer.send(Change::Folder("INBOX".into(), initial));
+    writer.send(Change::Folder("Sent".into(), folder(42, 5)));
+    drop(writer);
+    let base = committed_shards(&path);
+    let original = fs::read(&base["INBOX"]).unwrap();
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    let mut next = stored.folders["INBOX"].clone();
+    next.messages
+        .extend((101..=120).map(|uid| summary(41, uid)));
+    next.next_page_offset = 120;
+    next.uid_next = Some(121);
+    let new_id = next.messages[119].id.clone();
+    next.bodies
+        .insert(new_id.clone(), body(new_id, "new offline preview"));
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), next),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    assert_eq!(committed_shards(&path), base);
+    assert_eq!(fs::read(&base["INBOX"]).unwrap(), original);
+    let pages = committed_pages(&path, "INBOX");
+    assert_eq!(pages.len(), 1);
+    assert!(fs::metadata(&pages[0]).unwrap().len() < original.len() as u64 / 4);
+    let page: serde_json::Value = serde_json::from_slice(&fs::read(&pages[0]).unwrap()).unwrap();
+    assert_eq!(page["start"], 100);
+    assert_eq!(page["messages"].as_array().unwrap().len(), 20);
+    assert_eq!(page["bodies"].as_object().unwrap().len(), 1);
+    assert_eq!(read_snapshot(&path).unwrap().folders, stored.folders);
+    // Reopening and appending another page preserves the prior chain.
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    let mut next = stored.folders["INBOX"].clone();
+    next.messages.push(summary(41, 121));
+    next.next_page_offset = 121;
+    next.has_more = false;
+    next.bodies
+        .insert(id.clone(), body(id, "updated offline preview"));
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), next),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    let after = committed_pages(&path, "INBOX");
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0], pages[0]);
+    assert_eq!(read_snapshot(&path).unwrap().folders, stored.folders);
+}
+
+#[test]
+fn page_append_loads_v2_lazily_and_preserves_navigation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    let mut initial = folder(41, 20);
+    initial.message_index = 7;
+    initial.message_view_offset = 3;
+    writer.send(Change::Folder("INBOX".into(), initial));
+    drop(writer);
+    let base = committed_shards(&path);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["version"] = 2.into();
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let legacy_bytes = fs::read(&path).unwrap();
+    drop(test_cache_writer(path.clone()));
+    assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    assert_eq!(stored.folders["INBOX"].message_index, 7);
+    let mut next = stored.folders["INBOX"].clone();
+    next.messages.push(summary(41, 21));
+    next.next_page_offset = 21;
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), next),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    assert_eq!(committed_shards(&path), base);
+    assert_eq!(committed_pages(&path, "INBOX").len(), 1);
+    assert_eq!(read_snapshot(&path).unwrap().folders, stored.folders);
+}
+
+#[test]
+fn page_append_retries_from_original_offset_after_failed_stage() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(41, 20)));
+    drop(writer);
+    let original = fs::read(&path).unwrap();
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), folder(41, 25)),
+        &mut dirty
+    ));
+    let dir = index_store::shard_dir(&path);
+    let backup = root.path().join("backup");
+    fs::rename(&dir, &backup).unwrap();
+    fs::write(&dir, b"blocked").unwrap();
+    let error = dirty.flush(&path, &stored).unwrap_err();
+    // The simulated filesystem error must reach staging, not merely fail
+    // to acquire the transaction lock.
+    assert_ne!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(dirty.is_dirty());
+    fs::remove_file(&dir).unwrap();
+    fs::rename(&backup, &dir).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        read_snapshot(&path).unwrap().folders["INBOX"]
+            .messages
+            .len(),
+        20
+    );
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), folder(41, 30)),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    let pages = committed_pages(&path, "INBOX");
+    assert_eq!(pages.len(), 1);
+    let page: serde_json::Value = serde_json::from_slice(&fs::read(&pages[0]).unwrap()).unwrap();
+    assert_eq!(page["start"], 20);
+    assert_eq!(page["messages"].as_array().unwrap().len(), 10);
+    assert_eq!(read_snapshot(&path).unwrap().folders, stored.folders);
+}
+
+#[test]
+fn page_append_compacts_on_flag_change_and_reclaims_old_chain() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(41, 20)));
+    writer.send(Change::Folder("Sent".into(), folder(42, 20)));
+    drop(writer);
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), folder(41, 25)),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    let base = committed_shards(&path);
+    let pages = committed_pages(&path, "INBOX");
+    assert_eq!(pages.len(), 1);
+    let mut changed = folder(41, 30);
+    changed.messages[0]
+        .flags
+        .set(crate::model::MessageFlags::SEEN, true);
+    let id = changed.messages[0].id.clone();
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), changed),
+        &mut dirty
+    ));
+    assert!(apply_tracked(
+        &mut stored,
+        Change::DeferredSeen(vec![DeferredSeen {
+            mailbox: "INBOX".into(),
+            validity: 41,
+            id,
+            seen: true,
+        }]),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    assert!(committed_pages(&path, "INBOX").is_empty());
+    assert!(!pages[0].exists());
+    assert!(!base["INBOX"].exists());
+    assert_eq!(committed_shards(&path)["Sent"], base["Sent"]);
+    let loaded = read_snapshot(&path).unwrap();
+    assert_eq!(loaded.folders, stored.folders);
+    assert_eq!(loaded.deferred_seen, stored.deferred_seen);
+}
+
+#[test]
+fn page_chain_is_bounded_and_compaction_retains_all_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(41, 80)));
+    drop(writer);
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    for n in 1..=index_store::MAX_PAGE_REVISIONS {
+        let count = 80 + n as u32;
+        assert!(apply_tracked(
+            &mut stored,
+            Change::Folder("INBOX".into(), folder(41, count)),
+            &mut dirty
+        ));
+        dirty.flush(&path, &stored).unwrap();
+        assert_eq!(committed_pages(&path, "INBOX").len(), n);
+    }
+    let pages = committed_pages(&path, "INBOX");
+    let base = committed_shards(&path);
+    let count = 81 + index_store::MAX_PAGE_REVISIONS as u32;
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), folder(41, count)),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    assert!(committed_pages(&path, "INBOX").is_empty());
+    assert!(pages.iter().all(|page| !page.exists()));
+    assert!(!base["INBOX"].exists());
+    assert_eq!(read_snapshot(&path).unwrap().folders, stored.folders);
+}
+
+#[test]
+fn corrupt_page_invalidates_only_its_own_folder() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(41, 20)));
+    writer.send(Change::Folder("Sent".into(), folder(42, 20)));
+    drop(writer);
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), folder(41, 25)),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    let pages = committed_pages(&path, "INBOX");
+    assert_eq!(pages.len(), 1);
+    fs::write(&pages[0], b"invalid").unwrap();
+    let loaded = read_snapshot(&path).unwrap();
+    assert!(!loaded.folders.contains_key("INBOX"));
+    assert_eq!(loaded.folders["Sent"].messages.len(), 20);
+}
+
+#[test]
+fn page_append_reorders_and_generation_changes_require_full_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(41, 20)));
+    drop(writer);
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), folder(41, 25)),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    let old_pages = committed_pages(&path, "INBOX");
+    assert_eq!(old_pages.len(), 1);
+    let mut reordered = folder(41, 30);
+    reordered.messages.swap(0, 1);
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), reordered),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    assert!(committed_pages(&path, "INBOX").is_empty());
+    assert!(!old_pages[0].exists());
+    assert_eq!(read_snapshot(&path).unwrap().folders, stored.folders);
+    let base = committed_shards(&path);
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), folder(42, 35)),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    assert!(committed_pages(&path, "INBOX").is_empty());
+    assert!(!base["INBOX"].exists());
+    assert_eq!(read_snapshot(&path).unwrap().folders, stored.folders);
+}
+
+#[test]
+fn removing_mailbox_reclaims_its_base_and_all_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index.json");
+    let writer = test_cache_writer(path.clone());
+    writer.send(Change::Folder("INBOX".into(), folder(41, 20)));
+    writer.send(Change::Folder("Sent".into(), folder(42, 20)));
+    drop(writer);
+    let (mut stored, mut dirty) = index_store::load(&path).unwrap();
+    assert!(apply_tracked(
+        &mut stored,
+        Change::Folder("INBOX".into(), folder(41, 25)),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    let pages = committed_pages(&path, "INBOX");
+    let base = committed_shards(&path);
+    assert!(apply_tracked(
+        &mut stored,
+        Change::RemoveFolder("INBOX".into()),
+        &mut dirty
+    ));
+    dirty.flush(&path, &stored).unwrap();
+    assert!(!base["INBOX"].exists());
+    assert!(pages.iter().all(|page| !page.exists()));
+    assert_eq!(committed_shards(&path)["Sent"], base["Sent"]);
+    assert_eq!(read_snapshot(&path).unwrap().folders, stored.folders);
 }

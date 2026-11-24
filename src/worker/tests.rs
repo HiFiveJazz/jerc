@@ -235,6 +235,7 @@ fn open(name: &str) -> Action {
 
 fn body(mailbox: &str) -> Action {
     Action::new(ActionKind::FetchBody {
+        html_width: None,
         mailbox: mailbox.into(),
         id: MessageId("imap-uid:1".into()),
     })
@@ -430,10 +431,12 @@ fn background_scheduler_yields_to_status_after_four_bodies() {
     let mut pending = VecDeque::from([
         Action::new(ActionKind::MailboxStatus("INBOX".into())),
         Action::new(ActionKind::PrefetchBodies {
+            html_width: None,
             mailbox: "A".into(),
             ids: vec![],
         }),
         Action::new(ActionKind::PrefetchBodies {
+            html_width: None,
             mailbox: "B".into(),
             ids: vec![],
         }),
@@ -444,6 +447,7 @@ fn background_scheduler_yields_to_status_after_four_bodies() {
     assert!(matches!(&pending[0].kind, ActionKind::MailboxStatus(_)));
 
     pending.push_back(Action::new(ActionKind::PrefetchBodies {
+        html_width: None,
         mailbox: "C".into(),
         ids: vec![],
     }));
@@ -458,6 +462,7 @@ fn selected_message_beats_status_and_obsolete_body_requests() {
     let mut pending = VecDeque::from([
         Action::new(ActionKind::MailboxStatus("INBOX".into())),
         Action::new(ActionKind::PrefetchBodies {
+            html_width: None,
             mailbox: "INBOX".into(),
             ids: vec![],
         }),
@@ -692,6 +697,7 @@ fn interactive_body_can_finish_while_foreground_headers_are_blocked() {
     let id = MessageId("imap-uid:9:123".into());
     let requested = worker
         .post(ActionKind::FetchBody {
+            html_width: None,
             mailbox: "INBOX".into(),
             id: id.clone(),
         })
@@ -723,6 +729,7 @@ fn background_prefetch_delivers_body_without_changing_read_state() {
     let id = MessageId("imap-uid:9:123".into());
     let requested = worker
         .post(ActionKind::PrefetchBodies {
+            html_width: None,
             mailbox: "INBOX".into(),
             ids: vec![id.clone()],
         })
@@ -794,6 +801,7 @@ fn attachment_preempts_prefetch_and_survives_status_queue_compaction() {
     let mut pending = VecDeque::from([
         Action::new(ActionKind::MailboxStatus("INBOX".into())),
         Action::new(ActionKind::PrefetchBodies {
+            html_width: None,
             mailbox: "INBOX".into(),
             ids: vec![],
         }),
@@ -803,6 +811,7 @@ fn attachment_preempts_prefetch_and_survives_status_queue_compaction() {
             cache: None,
         }),
         Action::new(ActionKind::PrefetchBodies {
+            html_width: None,
             mailbox: "Sent".into(),
             ids: vec![],
         }),
@@ -918,6 +927,7 @@ fn slow_background_prefetch_never_blocks_interactive_open() {
     let mut worker = WorkerHandle::spawn(0, foreground, Some(background), None, tx);
     worker
         .post(ActionKind::PrefetchBodies {
+            html_width: None,
             mailbox: "INBOX".into(),
             ids: vec![MessageId("imap-uid:1:1".into())],
         })
@@ -1004,4 +1014,97 @@ fn raw_export_writes_exact_message_bytes() {
             0o600
         );
     }
+}
+
+#[test]
+fn new_mail_preview_uses_verified_identity_not_sender_date_or_first_row() {
+    let root = tempfile::tempdir().unwrap();
+    for folder in ["new", "cur", "tmp"] {
+        std::fs::create_dir(root.path().join(folder)).unwrap();
+    }
+    let raw = b"From: Sender <sender@example.org>\r\nSubject: Example patch\r\nDate: Mon, 23 Nov 2026 12:00:00 +0000\r\n\r\nExample body\r\n";
+    let unrelated = b"From: Other <other@example.org>\r\nSubject: Unrelated first row\r\nDate: Tue, 24 Nov 2026 12:00:00 +0000\r\n\r\nNot the new arrival\r\n";
+    std::fs::write(root.path().join("new/old"), unrelated).unwrap();
+    let mut backend = crate::backend::MaildirBackend::new(root.path().into());
+    backend.connect().unwrap();
+    let (_, first) = backend.inbox_status("INBOX", None).unwrap();
+    assert_eq!(first.count, 0);
+    std::fs::remove_file(root.path().join("new/old")).unwrap();
+    std::fs::write(root.path().join("new/message"), raw).unwrap();
+    let ((total, unread), next) = backend
+        .inbox_status("INBOX", first.checkpoint.as_ref())
+        .unwrap();
+    assert_eq!((total, unread, next.count), (1, 1, 1));
+    let candidate = next.candidate.unwrap();
+    std::fs::write(root.path().join("new/unrelated"), unrelated).unwrap();
+    let event = super::helpers::new_mail_preview(&mut backend, "INBOX", 1, candidate.clone());
+    assert!(
+        matches!(event, WorkerEventKind::NewMailPreview { count: 1, id: Some(id), sender, subject, excerpt }
+        if id == candidate && sender == "Sender" && subject == "Example patch" && excerpt.contains("Example body"))
+    );
+    std::fs::remove_file(root.path().join("new/message")).unwrap();
+    let event = super::helpers::new_mail_preview(&mut backend, "INBOX", 1, candidate);
+    assert!(
+        matches!(event, WorkerEventKind::NewMailPreview { count: 1, id: None, sender, subject, excerpt }
+        if sender.is_empty() && subject.is_empty() && excerpt.is_empty())
+    );
+    assert_eq!(backend.mailbox_status("INBOX").unwrap(), (1, 1));
+}
+
+#[test]
+fn selected_idle_thread_is_lazy_and_timeout_retires_unselected_target() {
+    use super::SelectedIdleTarget;
+    let idle_target = SelectedIdleTarget::new();
+    assert!(
+        idle_target
+            .wait_for_mailbox_timeout(Duration::ZERO)
+            .is_none()
+    );
+    idle_target.set_mailbox(Some("Drafts"));
+    assert!(
+        idle_target
+            .wait_for_mailbox_timeout(Duration::ZERO)
+            .is_none()
+    );
+
+    let (visited_tx, visited_rx) = mpsc::sync_channel(8);
+    let (tx, _rx) = mpsc::sync_channel(16);
+    let mut worker = WorkerHandle::spawn_with_idle_and_selected(
+        0,
+        Box::new(TestBackend {
+            status_started: None,
+            status_release: None,
+        }),
+        None,
+        None,
+        Some(Box::new(WatchedBackend {
+            visited: visited_tx,
+            account_wide: false,
+        })),
+        None,
+        tx,
+    );
+    assert!(worker.selected_idle_join.is_none());
+    worker.set_selected_idle_mailbox(None);
+    assert!(worker.selected_idle_join.is_none());
+    worker.set_selected_idle_mailbox(Some("Drafts"));
+    assert_eq!(
+        visited_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "Drafts"
+    );
+    worker.selected_idle.as_ref().unwrap().stop();
+    let until = Instant::now() + Duration::from_secs(1);
+    while !worker.selected_idle_join.as_ref().unwrap().is_finished() {
+        assert!(Instant::now() < until, "retired watcher did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    worker.set_selected_idle_mailbox(None);
+    assert!(worker.selected_idle_join.is_none());
+    assert!(worker.selected_idle_backend.is_some());
+    worker.set_selected_idle_mailbox(Some("Sent"));
+    assert_eq!(
+        visited_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "Sent"
+    );
+    worker.shutdown();
 }

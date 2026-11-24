@@ -29,7 +29,7 @@ use url::Url;
 
 use super::{BackendError, ErrorKind, MailBackend, MailboxSyncHint, imap::run_credential_command};
 use crate::config::AccountConfig;
-use crate::mail::{MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body};
+use crate::mail::{MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body_compact};
 use crate::model::{
     CacheIdentity, Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageHeaders,
     MessageId, MessagePage, MessageSummary,
@@ -1260,6 +1260,83 @@ impl MailBackend for JmapBackend {
         Ok((mailbox.total_emails, mailbox.unread_emails))
     }
 
+    fn inbox_status(
+        &mut self,
+        name: &str,
+        previous: Option<&super::InboxCheckpoint>,
+    ) -> Result<((usize, usize), super::InboxCheck)> {
+        use super::{InboxCheck, InboxCheckpoint};
+        let counts = self.mailbox_status(name)?;
+        let mailbox = self.mailbox_id(name)?;
+        let account = self.session()?.account_id.clone();
+        let args = email_query_arguments(&mailbox, 0, 1);
+        if let Some(InboxCheckpoint::Jmap {
+            account: old_account,
+            mailbox: old_mailbox,
+            state,
+        }) = previous
+            && *old_account == account
+            && *old_mailbox == mailbox
+        {
+            match self.call(
+                "Email/queryChanges",
+                json!({
+                    "filter": args["filter"], "sort": args["sort"],
+                    "sinceQueryState": state, "maxChanges": MAX_CHANGES,
+                }),
+            ) {
+                Ok(response) => {
+                    if let Some((next, count, candidate)) = inbox_query_delta(state, &response) {
+                        return Ok((
+                            counts,
+                            InboxCheck {
+                                checkpoint: Some(InboxCheckpoint::Jmap {
+                                    account,
+                                    mailbox,
+                                    state: next,
+                                }),
+                                count,
+                                candidate,
+                            },
+                        ));
+                    }
+                }
+                Err(error) if changes_unavailable(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // Establish a baseline with one ID, not all messages in the Inbox.
+        // Unsupported/expired query states are silently rebaselined.
+        let query = self.call("Email/query", args)?;
+        let checkpoint = query["queryState"]
+            .as_str()
+            .filter(|state| !state.is_empty())
+            .filter(|_| query["canCalculateChanges"].as_bool() == Some(true))
+            .map(|state| InboxCheckpoint::Jmap {
+                account,
+                mailbox,
+                state: state.to_owned(),
+            });
+        Ok((
+            counts,
+            InboxCheck {
+                checkpoint,
+                ..InboxCheck::default()
+            },
+        ))
+    }
+
+    fn notification_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
+        let _ = self.mailbox_id(mailbox)?;
+        let mut response = self.raw_response(id)?;
+        Ok(response
+            .body_mut()
+            .with_config()
+            .limit(MAX_BODY_MESSAGE_BYTES as u64)
+            .read_to_vec()
+            .map_err(|error| BackendError::transport("reading JMAP notification", &error))?)
+    }
+
     fn mailbox_cache_identity(&self, name: &str) -> Option<CacheIdentity> {
         let checkpoint = self.checkpoint.as_ref()?;
         let CacheIdentity::Jmap {
@@ -1448,7 +1525,7 @@ impl MailBackend for JmapBackend {
             .limit(MAX_BODY_MESSAGE_BYTES as u64)
             .read_to_vec()
             .map_err(|error| BackendError::transport("reading JMAP message body", &error))?;
-        parse_body(id.clone(), &raw)
+        parse_body_compact(id.clone(), &raw)
     }
 
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
@@ -1755,6 +1832,45 @@ fn query_snapshot(query: &Value, limit: usize) -> Option<QuerySnapshot> {
         total,
         limit,
     })
+}
+
+// An ID removed and re-added in one delta was reordered, not newly added.
+fn inbox_query_delta(old: &str, response: &Value) -> Option<(String, usize, Option<MessageId>)> {
+    if response["oldQueryState"].as_str()? != old {
+        return None;
+    }
+    let next = response["newQueryState"].as_str()?.to_owned();
+    if next.is_empty() {
+        return None;
+    }
+    let removed: HashSet<_> = id_array(&response["removed"])?.into_iter().collect();
+    let added = response["added"].as_array()?;
+    if removed.len().saturating_add(added.len()) > MAX_CHANGES {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut count = 0;
+    let mut candidate: Option<(u64, MessageId)> = None;
+    for item in added {
+        let id = item["id"].as_str()?;
+        let index = item["index"].as_u64()?;
+        if id.is_empty() || !seen.insert(id) {
+            return None;
+        }
+        if !removed.contains(id) {
+            count += 1;
+            if candidate
+                .as_ref()
+                .is_none_or(|(old_index, _)| index < *old_index)
+            {
+                candidate = Some((index, MessageId(id.to_owned())));
+            }
+        }
+    }
+    if next == old && count != 0 {
+        return None;
+    }
+    Some((next, count, candidate.map(|(_, id)| id)))
 }
 
 fn apply_query_changes(old: &QuerySnapshot, response: &Value) -> Option<QuerySnapshot> {

@@ -629,11 +629,19 @@ impl App {
         }
         self.attachment_preview_identity = Some(identity);
         self.attachment_preview = None;
-        let Some((_, Ok(image))) = self
+        // LRU, not FIFO: keep repeatedly viewed attachments hot even when
+        // other previews have completed since their original decode.
+        let Some(position) = self
             .attachment_preview_cache
             .iter()
-            .find(|(cached, _)| *cached == self.attachment_selection)
+            .position(|(cached, _)| *cached == self.attachment_selection)
         else {
+            return;
+        };
+        if let Some(entry) = self.attachment_preview_cache.remove(position) {
+            self.attachment_preview_cache.push_back(entry);
+        }
+        let Some((_, Ok(image))) = self.attachment_preview_cache.back() else {
             return;
         };
         let Some(picker) = &self.image_picker else {

@@ -89,18 +89,6 @@ impl WorkerHandle {
                 .spawn(move || run_idle_worker(backend, stop, wake))
                 .expect("failed to spawn IMAP IDLE worker")
         });
-        let (selected_idle, selected_idle_join) = if let Some(backend) = selected_idle_backend {
-            let target = Arc::new(SelectedIdleTarget::new());
-            let watch_target = Arc::clone(&target);
-            let wake = status_sender.clone().unwrap_or_else(|| sender.clone());
-            let join = thread::Builder::new()
-                .name(format!("mail-idle-selected-{account}"))
-                .spawn(move || run_selected_idle_worker(backend, watch_target, wake))
-                .expect("failed to spawn selected mailbox IDLE worker");
-            (Some(target), Some(join))
-        } else {
-            (None, None)
-        };
         Self {
             sender,
             status_sender,
@@ -109,8 +97,10 @@ impl WorkerHandle {
             status_join,
             idle_stop,
             idle_join,
-            selected_idle,
-            selected_idle_join,
+            selected_idle: None,
+            selected_idle_join: None,
+            selected_idle_backend,
+            selected_idle_account: account,
             foreground_generation,
             unacknowledged_writes,
             recovery: None,
@@ -121,9 +111,38 @@ impl WorkerHandle {
 
     /// The displayed non-Inbox folder gets at most one extra IDLE watch.
     /// The method is nonblocking and idempotent on every UI loop iteration.
-    pub fn set_selected_idle_mailbox(&self, mailbox: Option<&str>) {
+    pub fn set_selected_idle_mailbox(&mut self, mailbox: Option<&str>) {
+        if self
+            .selected_idle_join
+            .as_ref()
+            .is_some_and(|join| join.is_finished())
+            && let Some(join) = self.selected_idle_join.take()
+        {
+            self.selected_idle_backend = join.join().ok();
+            self.selected_idle = None;
+        }
         if let Some(target) = &self.selected_idle {
             target.set_mailbox(mailbox);
+            return;
+        }
+        let Some(mailbox) = mailbox else { return };
+        let Some(backend) = self.selected_idle_backend.take() else {
+            return;
+        };
+        let target = Arc::new(SelectedIdleTarget::new());
+        target.set_mailbox(Some(mailbox));
+        let watch_target = Arc::clone(&target);
+        let wake = self
+            .status_sender
+            .clone()
+            .unwrap_or_else(|| self.sender.clone());
+        // A failure to start this optional watcher leaves ordinary polling intact.
+        if let Ok(join) = thread::Builder::new()
+            .name(format!("mail-idle-selected-{}", self.selected_idle_account))
+            .spawn(move || run_selected_idle_worker(backend, watch_target, wake))
+        {
+            self.selected_idle = Some(target);
+            self.selected_idle_join = Some(join);
         }
     }
 
@@ -276,6 +295,7 @@ impl WorkerHandle {
         } else if matches!(
             &action.kind,
             ActionKind::MailboxStatus(_)
+                | ActionKind::InboxStatus { .. }
                 | ActionKind::WatchMailboxChanged(_)
                 | ActionKind::WatchAccountChanged
                 | ActionKind::NewMailPreview { .. }

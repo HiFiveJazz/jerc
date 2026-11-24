@@ -8,8 +8,8 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::backend::MailBackend;
 use crate::mail::{
-    MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body, parse_summary, read_all_limited,
-    read_header_block,
+    MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body_compact, parse_summary,
+    read_all_limited, read_header_block,
 };
 use crate::model::{
     Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage,
@@ -214,6 +214,66 @@ impl MailBackend for MaildirBackend {
         Self::mailbox_counts(&path)
     }
 
+    fn inbox_status(
+        &mut self,
+        name: &str,
+        previous: Option<&super::InboxCheckpoint>,
+    ) -> Result<((usize, usize), super::InboxCheck)> {
+        let path = self.mailbox_path(name)?;
+        let mut total = 0;
+        let mut unread = 0;
+        let mut entries = Vec::new();
+        for subdir in ["new", "cur"] {
+            let dir = path.join(subdir);
+            if !dir.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let filename = entry.file_name();
+                let filename = filename.to_string_lossy();
+                total += 1;
+                if subdir == "new" || !flags_from_filename(&filename).contains(MessageFlags::SEEN) {
+                    unread += 1;
+                }
+                if entries.len() <= super::notifications::MAX_TRACKED_IDS {
+                    entries.push((
+                        split_maildir_info(&filename).0.to_owned(),
+                        message_id_for(name, subdir, &filename),
+                    ));
+                }
+            }
+        }
+        Ok(((total, unread), super::InboxCheck::ids(previous, entries)))
+    }
+
+    fn notification_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
+        // Resolve the candidate directly, without scanning/parsing the Inbox.
+        let mut parts = id.0.split('\0');
+        let (Some(folder), Some(subdir), Some(filename), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            bail!("invalid Maildir notification identity");
+        };
+        if folder != mailbox
+            || !matches!(subdir, "new" | "cur")
+            || Path::new(filename).components().count() != 1
+            || !matches!(
+                Path::new(filename).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            bail!("invalid Maildir notification path");
+        }
+        read_all_limited(
+            File::open(self.mailbox_path(mailbox)?.join(subdir).join(filename))?,
+            MAX_BODY_MESSAGE_BYTES,
+        )
+    }
+
     fn open_mailbox(&mut self, name: &str, offset: usize, limit: usize) -> Result<MessagePage> {
         let messages = self.scan_mailbox(name)?;
         let start = offset.min(messages.len());
@@ -235,7 +295,7 @@ impl MailBackend for MaildirBackend {
         let path = self.locate(mailbox, id)?;
         let raw = read_all_limited(File::open(&path)?, MAX_BODY_MESSAGE_BYTES)
             .with_context(|| format!("reading message from {}", path.display()))?;
-        parse_body(id.clone(), &raw).context("parsing Maildir message body")
+        parse_body_compact(id.clone(), &raw).context("parsing Maildir message body")
     }
 
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {

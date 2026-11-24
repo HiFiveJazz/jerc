@@ -289,11 +289,11 @@ pub struct UiConfig {
     /// Outer borders: `square` (default) or `rounded`.
     #[serde(default)]
     pub border_style: UiBorderStyle,
-    /// freedesktop sound theme name; COSMIC-installed themes can provide this.
+    /// Optional freedesktop sound theme name; empty uses the terminal bell.
     #[serde(default = "default_mail_sound_name")]
     pub new_mail_sound_name: String,
-    /// Optional explicit audio file for desktops that ignore notification sound hints.
-    /// Requires pw-play or paplay in PATH; otherwise the sound hint still works.
+    /// Optional explicit sound file, absolute or relative to config.toml.
+    /// When absent, discover an audio file in the config's sounds directory.
     #[serde(default)]
     pub new_mail_sound_file: Option<String>,
 }
@@ -822,7 +822,7 @@ fn default_true() -> bool {
 }
 
 fn default_mail_sound_name() -> String {
-    "message-new-email".to_owned()
+    String::new()
 }
 
 fn default_theme() -> String {
@@ -908,7 +908,7 @@ mod tests {
             super::NotificationIconStyle::Unicode
         );
         assert_eq!(config.ui.search_mode, super::MailSearchMode::Fuzzy);
-        assert_eq!(config.ui.new_mail_sound_name, "message-new-email");
+        assert!(config.ui.new_mail_sound_name.is_empty());
     }
 
     #[test]

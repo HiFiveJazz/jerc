@@ -10,7 +10,7 @@ pub(super) fn contact_surface_style(theme: &Theme) -> Style {
 }
 
 /// Autocomplete is an overlay, not a new compose field: users keep their
-/// normal Vim cursor, and Tab/Enter accept the highlighted address.
+/// normal Vim cursor. Enter accepts the highlighted address; Tab moves fields.
 pub(super) fn draw_contact_suggestions(frame: &mut Frame<'_>, app: &App) {
     let ids = app.contact_suggestions();
     if ids.is_empty() {
@@ -236,7 +236,7 @@ pub(super) fn contact_editor_field_spans(
             if at_cursor {
                 block
             } else if selected {
-                theme.selected()
+                theme.visual_selection(style)
             } else {
                 style
             },

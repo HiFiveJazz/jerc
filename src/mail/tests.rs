@@ -2,8 +2,8 @@
 use super::{
     coalesce_rich_spans, compact_bare_list_markers, compact_decorative_horizontal_rules,
     compact_generic_image_alt_lines, compact_prose_whitespace, compact_social_link_chrome,
-    extract_thread_headers, parse_body, parse_summary, read_all_limited, read_header_block,
-    render_html_for_terminal, simplify_layout_table_blocks,
+    extract_thread_headers, layout_message_html, parse_body, parse_body_compact, parse_summary,
+    read_all_limited, read_header_block, render_html_for_terminal, simplify_layout_table_blocks,
 };
 use crate::model::{HtmlLine, HtmlSpan, HtmlSpanStyle, MessageFlags, MessageId};
 use std::io::Cursor;
@@ -712,4 +712,30 @@ Content-Type: text/html; charset=utf-8\r\n\
             .is_some_and(|text| text.contains("Hello"))
     );
     assert!(body.display_text(false).contains("Hello"));
+}
+
+#[test]
+fn compact_html_keeps_source_and_text_and_materializes_only_requested_width() {
+    let raw = b"From: sender@example.com\r\nSubject: HTML\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<table><tr><td>Hello</td><td><a href=\"https://example.org/\">World</a></td></tr></table>";
+    let mut body = parse_body_compact(MessageId("compact-html".into()), raw).unwrap();
+    assert!(body.has_html_alternative());
+    assert!(body.display_text(false).contains("Hello"));
+    assert!(body.html_lines.is_none());
+    assert_eq!(body.html_render_width, 0);
+    layout_message_html(&mut body, 64);
+    assert_eq!(body.html_render_width, 64);
+    assert_eq!(body.html_links(), vec!["https://example.org/".to_owned()]);
+    let layout = body.html_lines.as_ref().unwrap().clone();
+    layout_message_html(&mut body, 64);
+    assert!(std::sync::Arc::ptr_eq(
+        &layout,
+        body.html_lines.as_ref().unwrap()
+    ));
+    layout_message_html(&mut body, 48);
+    assert!(!std::sync::Arc::ptr_eq(
+        &layout,
+        body.html_lines.as_ref().unwrap()
+    ));
+    assert_eq!(body.html_render_width, 48);
+    assert!(body.display_text(true).contains("World"));
 }

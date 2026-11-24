@@ -45,7 +45,9 @@ pub(super) fn run_worker(
         let operation = match &action.kind {
             ActionKind::Connect => "worker_connect",
             ActionKind::ListMailboxes => "worker_list_mailboxes",
-            ActionKind::MailboxStatus(_) => "worker_mailbox_status",
+            ActionKind::MailboxStatus(_) | ActionKind::InboxStatus { .. } => {
+                "worker_mailbox_status"
+            }
             ActionKind::WakePriority => "worker_wake_priority",
             ActionKind::WatchMailboxChanged(_) | ActionKind::WatchAccountChanged => {
                 "worker_idle_changed"
@@ -89,8 +91,8 @@ pub(super) fn run_worker(
                     capabilities: backend.capabilities(),
                 }),
             ActionKind::ListMailboxes => backend.list_mailboxes().map(WorkerEventKind::Mailboxes),
-            ActionKind::NewMailPreview { mailbox, count } => {
-                Ok(new_mail_preview(backend, &mailbox, count))
+            ActionKind::NewMailPreview { mailbox, count, id } => {
+                Ok(new_mail_preview(backend, &mailbox, count, id))
             }
             ActionKind::WatchMailboxChanged(name) => Ok(WorkerEventKind::MailboxChanged { name }),
             ActionKind::WatchAccountChanged => Ok(WorkerEventKind::AccountChanged),
@@ -99,7 +101,11 @@ pub(super) fn run_worker(
                     name,
                     total,
                     unread,
+                    inbox: None,
                 }
+            }),
+            ActionKind::InboxStatus { name, previous } => backend.inbox_status(&name, previous.as_ref()).map(|((total, unread), inbox)| {
+                WorkerEventKind::MailboxStatus { name, total, unread, inbox: Some(inbox) }
             }),
             ActionKind::OpenMailbox { name, offset, limit, hint } => {
                 let start = Instant::now();
@@ -130,8 +136,13 @@ pub(super) fn run_worker(
                 })
             }
             ActionKind::DiscoverThread { name, view, cached_ids, limit } => Ok(discover_thread(backend, name, &view, &cached_ids, limit)),
-            ActionKind::FetchBody { mailbox, id } => Ok(match backend.fetch_body(&mailbox, &id) {
-                Ok(body) => WorkerEventKind::BodyLoaded(body),
+            ActionKind::FetchBody { mailbox, id, html_width } => Ok(match backend.fetch_body(&mailbox, &id) {
+                Ok(mut body) => {
+                    if let Some(width) = html_width {
+                        crate::mail::layout_message_html(&mut body, width);
+                    }
+                    WorkerEventKind::BodyLoaded(body)
+                },
                 Err(error) => WorkerEventKind::BodyLoadFailed { error: WorkerError::from_error(error) },
             }),
             ActionKind::PrefetchBodies { .. } | ActionKind::WarmMailbox { .. } => unreachable!("prefetch requires background worker"),
@@ -390,9 +401,12 @@ pub(super) fn pop_background_action(
     }
     let status_index = (bodies_since_status >= 4)
         .then(|| {
-            pending
-                .iter()
-                .position(|action| matches!(&action.kind, ActionKind::MailboxStatus(_)))
+            pending.iter().position(|action| {
+                matches!(
+                    &action.kind,
+                    ActionKind::MailboxStatus(_) | ActionKind::InboxStatus { .. }
+                )
+            })
         })
         .flatten();
     if let Some(index) = status_index {

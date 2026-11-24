@@ -301,7 +301,31 @@ pub fn reply_recipients(
                 // excludes local identities to avoid echoing the thread back
                 // to the account that sent the original message.
                 if audience != ReplyAudience::All || !own.contains(&address.to_ascii_lowercase()) {
-                    push_unique(&mut to, &mut seen, address);
+                    let mut name = mailbox.name().unwrap_or_default().trim();
+                    // A bare Reply-To for the same address need not erase the
+                    // display name supplied by From. Never borrow a name for
+                    // a different routing address.
+                    let fallback = if name.is_empty() {
+                        message.from().and_then(|from| {
+                            from.mailboxes().find_map(|sender| {
+                                if sender
+                                    .address()?
+                                    .trim()
+                                    .eq_ignore_ascii_case(address.trim())
+                                {
+                                    sender.name().map(str::to_owned)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(fallback) = fallback.as_deref() {
+                        name = fallback.trim();
+                    }
+                    push_unique(&mut to, &mut seen, address, name);
                 }
             }
         }
@@ -314,9 +338,19 @@ pub fn reply_recipients(
                         continue;
                     }
                     if to.is_empty() {
-                        push_unique(&mut to, &mut seen, address);
+                        push_unique(
+                            &mut to,
+                            &mut seen,
+                            address,
+                            mailbox.name().unwrap_or_default(),
+                        );
                     } else {
-                        push_unique(&mut cc, &mut seen, address);
+                        push_unique(
+                            &mut cc,
+                            &mut seen,
+                            address,
+                            mailbox.name().unwrap_or_default(),
+                        );
                     }
                 }
             }
@@ -331,10 +365,18 @@ pub fn reply_recipients(
     })
 }
 
-fn push_unique(out: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
-    let key = value.trim().to_ascii_lowercase();
+fn push_unique(out: &mut Vec<String>, seen: &mut HashSet<String>, address: &str, name: &str) {
+    let key = address.trim().to_ascii_lowercase();
     if !key.is_empty() && seen.insert(key) {
-        out.push(value.trim().to_owned());
+        out.push(
+            crate::contacts::Contact {
+                name: name.trim().to_owned(),
+                email: address.trim().to_owned(),
+                saved: false,
+                favorite: false,
+            }
+            .display(),
+        );
     }
 }
 

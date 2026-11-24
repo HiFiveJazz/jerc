@@ -251,6 +251,29 @@ impl App {
             }
             return;
         }
+        if let Some(composer) = self.composer.as_mut()
+            && composer.confirm_send
+        {
+            if !composer.help_visible {
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollDown => 1,
+                    MouseEventKind::ScrollUp => -1,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    let code = if delta > 0 {
+                        KeyCode::Down
+                    } else {
+                        KeyCode::Up
+                    };
+                    composer.send_preview.clear_pending_motion();
+                    composer.handle_preview_motion(KeyEvent::new(code, KeyModifiers::NONE));
+                }
+            }
+            self.mailbox_resizing = false;
+            self.preview_resizing = false;
+            return;
+        }
         if self.message_open {
             self.preview_resizing = false;
             let key = match mouse.kind {

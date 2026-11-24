@@ -2,7 +2,9 @@ mod error;
 mod imap;
 mod jmap;
 mod maildir;
+mod notifications;
 mod pop3;
+pub use notifications::{InboxCheck, InboxCheckpoint};
 pub(crate) mod search;
 
 use std::io::Write;
@@ -219,6 +221,9 @@ pub struct RemoteAttachment {
 }
 
 pub trait MailBackend: Send {
+    /// Release session-only state when a selected-folder watcher retires.
+    fn release_idle_resources(&mut self) {}
+
     fn query_mailbox(
         &mut self,
         _name: &str,
@@ -280,6 +285,19 @@ pub trait MailBackend: Send {
         Err(anyhow!("Push watching is not supported by this backend"))
     }
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)>;
+    /// A notification-only live observation; never infer arrival from a UI count.
+    fn inbox_status(
+        &mut self,
+        name: &str,
+        _previous: Option<&InboxCheckpoint>,
+    ) -> Result<((usize, usize), InboxCheck)> {
+        Ok((self.mailbox_status(name)?, InboxCheck::default()))
+    }
+    /// Bounded raw MIME for a proven arrival. Implementations can stream to
+    /// the smaller body limit instead of downloading a full export.
+    fn notification_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
+        self.fetch_raw(mailbox, id)
+    }
     /// UIDVALIDITY from the currently selected mailbox, if provided by IMAP.
     fn mailbox_uid_validity(&self, _name: &str) -> Option<u32> {
         None

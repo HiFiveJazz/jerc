@@ -10,7 +10,7 @@ use ratatui::style::Color;
 use unicode_width::UnicodeWidthStr;
 
 #[test]
-fn visual_ranges_are_purple_and_marks_remain_blue() {
+fn visual_ranges_are_muted_and_marks_remain_blue() {
     use crate::config::VisualSelectionStyle;
     let theme = load_themes()
         .into_iter()
@@ -40,7 +40,7 @@ fn visual_ranges_are_purple_and_marks_remain_blue() {
     );
     assert_eq!(
         super::browser_row_style(&theme, VisualSelectionStyle::Row, true, false, false, false).bg,
-        Some(theme.visual)
+        Some(theme.visual_selection_bg)
     );
     assert_eq!(
         super::browser_row_style(&theme, VisualSelectionStyle::Row, false, true, true, false),
@@ -53,6 +53,24 @@ fn visual_ranges_are_purple_and_marks_remain_blue() {
     assert_eq!(
         super::browser_row_style(&theme, VisualSelectionStyle::Row, false, true, true, true),
         theme.unread().bg(theme.popup_bg)
+    );
+    for unread in [false, true] {
+        let base = if unread { theme.unread() } else { theme.text() };
+        assert_eq!(
+            super::browser_row_style(
+                &theme,
+                VisualSelectionStyle::Row,
+                true,
+                false,
+                false,
+                unread
+            ),
+            theme.visual_selection(base)
+        );
+    }
+    assert_eq!(
+        super::selection_check_style(&theme, VisualSelectionStyle::Row, true, false, false).fg,
+        Some(theme.visual)
     );
     let visual = super::browser_gutter(&theme, true, false);
     assert_eq!(visual.content.as_ref(), "▍");
@@ -127,6 +145,10 @@ fn contact_editing_shows_a_block_cursor_in_normal_and_visual_modes() {
     edit.cursor = 2;
     let visual = super::contact_editor_field_spans("Name", &edit.name, &edit, false, &theme);
     assert_eq!(visual[3].style.bg, Some(Color::White));
+    assert_eq!(
+        visual[1].style,
+        theme.visual_selection(theme.current_line())
+    );
     edit.active_email = true;
     edit.email = "a@example.org".into();
     edit.cursor = 0;
@@ -161,6 +183,7 @@ fn help_descriptions_fit_standard_terminal_and_narrow_layout() {
         crate::app::DESTINATION_HELP_ENTRIES,
         crate::app::PICKER_HELP_ENTRIES,
         crate::app::COMPOSE_HELP_ENTRIES,
+        crate::app::SEND_PREVIEW_HELP_ENTRIES,
     ] {
         for entry in entries {
             assert!(
@@ -1492,4 +1515,527 @@ fn reader_cursor_remains_visible_on_blank_lines() {
     assert_eq!(spans[0].content.as_ref(), " ");
     assert_eq!(spans[0].style.bg, Some(Color::White));
     assert_eq!(spans[0].style.fg, Some(Color::Black));
+}
+
+#[test]
+fn quoted_diff_context_survives_trimmed_blank_lines_in_later_files() {
+    use super::{PatchLineKind, classify_patch_lines_with_quotes};
+    let lines = [
+        "> diff --git a/efi.c b/efi.c",
+        "> --- a/efi.c",
+        "> +++ b/efi.c",
+        "> @@ -1,2 +1,3 @@",
+        ">  * existing comment",
+        "> + * added comment",
+        ">  */",
+        "> diff --git a/tpm.c b/tpm.c",
+        "> index 73f001114732..b8183bfdbaa3 100644",
+        "> --- a/tpm.c",
+        "> +++ b/tpm.c",
+        "> @@ -96,7 +96,7 @@ static void efi_retrieve_tcg2_eventlog(int version, efi_physical_addr_t log_loca",
+        ">         }",
+        ">",
+        ">         /* Allocate space for the logs and copy them. */",
+        "> -       status = efi_bs_call(allocate_pool, EFI_ACPI_RECLAIM_MEMORY,",
+        "> +       status = efi_bs_call(allocate_pool, EFI_LOADER_DATA,",
+        ">                              sizeof(*log_tbl) + log_size, (void **)&log_tbl);",
+        "> ",
+        ">         if (status != EFI_SUCCESS) {",
+        "> --",
+        "> 2.56.1.750.gf70dc682cf-goog",
+        "> +this is prose, not a patch addition",
+        "Thanks for the patch!",
+    ];
+    let kinds = classify_patch_lines_with_quotes(&lines, true);
+    assert_eq!(kinds[5], Some(PatchLineKind::Add));
+    assert_eq!(kinds[11], Some(PatchLineKind::Hunk));
+    assert_eq!(kinds[15], Some(PatchLineKind::Remove));
+    assert_eq!(kinds[16], Some(PatchLineKind::Add));
+    assert!(kinds[20..].iter().all(Option::is_none));
+    assert!(
+        classify_patch_lines_with_quotes(&lines, false)
+            .iter()
+            .all(Option::is_none)
+    );
+}
+
+#[test]
+fn diff_background_fills_physical_rows_with_tabs_unicode_and_word_wrap() {
+    use super::{
+        PatchLineKind, diff_background_rows, diff_line_style, paint_diff_background_rows,
+        plain_reader_line, rich_html_line,
+    };
+    use crate::model::{HtmlLine, HtmlSpan};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        text::Line,
+        widgets::{Paragraph, Wrap},
+    };
+    let theme = load_themes()
+        .into_iter()
+        .find(|t| t.id == "tokyo-night")
+        .unwrap();
+    let width = 32u16;
+    let view = ReaderView {
+        cursor: 0,
+        column: 0,
+        visual: None,
+        active: true,
+        quoted_diff_highlighting: true,
+        theme: &theme,
+    };
+    for html in [false, true] {
+        let mut lines = vec![Line::raw("header")];
+        for (index, (kind, text)) in [
+            (
+                PatchLineKind::Add,
+                ">> +\tnew words with 漢字 and long trailing words",
+            ),
+            (
+                PatchLineKind::Remove,
+                ">> -\told words with 漢字 and long trailing words",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let index = index + 1;
+            let line = if html {
+                let source = HtmlLine {
+                    spans: vec![HtmlSpan {
+                        text: text.to_owned(),
+                        style: Default::default(),
+                    }],
+                };
+                rich_html_line(
+                    &source,
+                    index,
+                    4,
+                    usize::from(width - 5),
+                    view,
+                    Some(kind),
+                    None,
+                )
+            } else {
+                plain_reader_line(
+                    text,
+                    index,
+                    4,
+                    usize::from(width - 5),
+                    view,
+                    Some(kind),
+                    None,
+                )
+            };
+            assert_eq!(line.style.bg, diff_line_style(kind, &theme).bg);
+            lines.push(line);
+        }
+        lines.push(Line::raw("ordinary prose"));
+        let backgrounds = diff_background_rows(&lines, width, true);
+        assert_eq!(backgrounds.len(), 2);
+        assert!(backgrounds.iter().all(|&(_, height, _)| height > 1));
+        // Check the actual terminal cells, not just the styles of the spans.
+        for scroll in [0usize, 1] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            let mut visible_edges = Vec::new();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    frame.render_widget(
+                        Paragraph::new(lines.clone())
+                            .style(theme.text())
+                            .wrap(Wrap { trim: false })
+                            .scroll((scroll as u16, 0)),
+                        area,
+                    );
+                    paint_diff_background_rows(frame, area, scroll, &backgrounds);
+                    let buffer = frame.buffer_mut();
+                    for &(start, height, bg) in &backgrounds {
+                        for row in start.max(scroll)..start + height {
+                            let y = (row - scroll) as u16;
+                            // Check the physical edge in the actual rendered frame,
+                            // including the continuation cell of a wide grapheme.
+                            assert_eq!(
+                                buffer[(width - 1, y)].bg,
+                                bg,
+                                "frame: HTML={html}, scroll={scroll}, row={row}"
+                            );
+                            // Ratatui's terminal diff does not emit a separate cell
+                            // for the trailing half of a wide glyph. TestBackend
+                            // can therefore leave that cell Reset even though the
+                            // terminal paints it with the leading glyph's style.
+                            // Walk the rendered glyphs to find the one covering the
+                            // final column. For real padding this is the final cell.
+                            let mut x = 0u16;
+                            while x < width - 1 {
+                                let cells = UnicodeWidthStr::width(buffer[(x, y)].symbol()).max(1);
+                                let next = usize::from(x).saturating_add(cells);
+                                if next >= usize::from(width) {
+                                    break;
+                                }
+                                x = next as u16;
+                            }
+                            visible_edges.push((x, y, bg));
+                        }
+                    }
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for (x, y, bg) in visible_edges {
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    bg,
+                    "backend: HTML={html}, scroll={scroll}, x={x}, row={y}"
+                );
+            }
+            let (start, height, _) = backgrounds[1];
+            assert_eq!(
+                buffer[(width - 1, (start + height - scroll) as u16)].bg,
+                Color::Reset
+            );
+        }
+    }
+}
+
+#[test]
+fn incoming_reader_current_number_tracks_visual_mode_in_both_representations() {
+    use super::{plain_reader_line, rich_html_line};
+    use crate::app::{ReaderPosition, ReaderSelection};
+    use crate::model::{HtmlLine, HtmlSpan};
+    let theme = load_themes()
+        .into_iter()
+        .find(|t| t.id == "tokyo-night")
+        .unwrap();
+    let html = HtmlLine {
+        spans: vec![HtmlSpan {
+            text: "hello world".into(),
+            style: Default::default(),
+        }],
+    };
+    let pos = ReaderPosition { line: 1, column: 0 };
+    for visual in [
+        None,
+        Some(ReaderSelection {
+            start: pos,
+            end: pos,
+        }),
+        None,
+    ] {
+        let view = ReaderView {
+            cursor: 1,
+            column: 0,
+            visual,
+            active: true,
+            quoted_diff_highlighting: true,
+            theme: &theme,
+        };
+        let expected = if visual.is_some() {
+            theme.visual
+        } else {
+            theme.accent
+        };
+        for line in [
+            plain_reader_line("hello world", 1, 3, 40, view, None, None),
+            rich_html_line(&html, 1, 3, 40, view, None, None),
+        ] {
+            assert_eq!(line.spans[0].content.as_ref(), "   2 ");
+            assert_eq!(line.spans[0].style.fg, Some(expected));
+        }
+        let relative = plain_reader_line("other line", 0, 3, 40, view, None, None);
+        assert_eq!(relative.spans[0].style.fg, Some(theme.muted));
+    }
+}
+
+#[test]
+fn diff_background_fill_preserves_explicit_cursor_and_selection_styles() {
+    use super::paint_diff_background_rows;
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        text::{Line, Span},
+        widgets::Paragraph,
+    };
+    let theme = load_themes()
+        .into_iter()
+        .find(|t| t.id == "tokyo-night")
+        .unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
+    let bg = Color::Rgb(64, 78, 70);
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("a", super::reader_cursor_style()),
+                    Span::styled("b", theme.visual_selection(theme.text())),
+                    Span::styled("c", theme.text().bg(bg)),
+                ])),
+                area,
+            );
+            paint_diff_background_rows(frame, area, 0, &[(0, 1, bg)]);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(0, 0)].bg, Color::White);
+    assert_eq!(buffer[(1, 0)].bg, theme.visual_selection_bg);
+    assert_eq!(buffer[(2, 0)].bg, bg);
+    assert_eq!(buffer[(11, 0)].bg, bg);
+    assert_eq!(buffer[(11, 1)].bg, Color::Reset);
+}
+
+#[test]
+fn visual_text_selection_never_colors_reader_padding() {
+    use super::{
+        PatchLineKind, diff_background_rows, diff_line_style, paint_diff_background_rows,
+        plain_reader_line, rich_html_line,
+    };
+    use crate::app::{ReaderPosition, ReaderSelection};
+    use crate::model::{HtmlLine, HtmlSpan};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        widgets::{Paragraph, Wrap},
+    };
+    let theme = load_themes()
+        .into_iter()
+        .find(|t| t.id == "tokyo-night")
+        .unwrap();
+    let width = 36u16;
+    let texts = ["alpha beta", "> +new code", "", "omega"];
+    for html in [false, true] {
+        for linewise in [false, true] {
+            for reverse in [false, true] {
+                let selection = ReaderSelection {
+                    start: ReaderPosition {
+                        line: 0,
+                        column: if linewise { 0 } else { 2 },
+                    },
+                    end: ReaderPosition {
+                        line: 3,
+                        column: if linewise { usize::MAX } else { 2 },
+                    },
+                };
+                let view = ReaderView {
+                    cursor: if reverse { 0 } else { 3 },
+                    column: 2,
+                    visual: Some(selection),
+                    active: true,
+                    quoted_diff_highlighting: true,
+                    theme: &theme,
+                };
+                let lines: Vec<_> = texts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        let kind = (index == 1).then_some(PatchLineKind::Add);
+                        let content_width = usize::from(width - 5);
+                        if html {
+                            // Exercise selection spanning multiple HTML style spans.
+                            let spans = text
+                                .chars()
+                                .map(|ch| HtmlSpan {
+                                    text: ch.to_string(),
+                                    style: Default::default(),
+                                })
+                                .collect();
+                            rich_html_line(
+                                &HtmlLine { spans },
+                                index,
+                                texts.len(),
+                                content_width,
+                                view,
+                                kind,
+                                None,
+                            )
+                        } else {
+                            plain_reader_line(
+                                text,
+                                index,
+                                texts.len(),
+                                content_width,
+                                view,
+                                kind,
+                                None,
+                            )
+                        }
+                    })
+                    .collect();
+                let diff_rows = diff_background_rows(&lines, width, true);
+                let mut terminal = Terminal::new(TestBackend::new(width, 5)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        frame.render_widget(
+                            Paragraph::new(lines)
+                                .style(theme.text())
+                                .wrap(Wrap { trim: false }),
+                            area,
+                        );
+                        paint_diff_background_rows(frame, area, 0, &diff_rows);
+                        let buffer = frame.buffer_mut();
+                        for (index, text) in texts.iter().enumerate() {
+                            let expected = selection.columns_for_line(index, text.len());
+                            let y = index as u16;
+                            for col in 0..usize::from(width - 5) {
+                                let bg = buffer[(5 + col as u16, y)].bg;
+                                if index == view.cursor && col == view.column {
+                                    assert_eq!(bg, Color::White);
+                                } else if expected
+                                    .is_some_and(|(start, end)| (start..=end).contains(&col))
+                                {
+                                    assert_eq!(
+                                        bg, theme.visual_selection_bg,
+                                        "selected: row={index}, col={col}"
+                                    );
+                                } else {
+                                    assert_ne!(
+                                        bg, theme.visual_selection_bg,
+                                        "padding/unselected: row={index}, col={col}"
+                                    );
+                                }
+                            }
+                        }
+                        // A selected addition still has a semantic diff background
+                        // after its last character, not the Visual selection color.
+                        assert_eq!(
+                            Some(buffer[(width - 1, 1)].bg),
+                            diff_line_style(PatchLineKind::Add, &theme).bg
+                        );
+                        assert_eq!(buffer[(width - 1, view.cursor as u16)].bg, Color::Reset);
+                    })
+                    .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn visual_selection_preserves_composer_and_reader_syntax_in_all_themes() {
+    use crate::app::{ComposeField, Composer, ReaderPosition, ReaderSelection};
+    use ratatui::style::{Modifier, Style};
+    for theme in load_themes() {
+        let mut composer = Composer::new();
+        composer.field = ComposeField::Body;
+        composer.body = "> @@ -1 +1 @@\n> -before\n> +after\n> ordinary quote".into();
+        let original = super::editor_text(&composer.body, &composer, false, &theme, true);
+        composer.mode = ComposeMode::Visual;
+        composer.visual_anchor = Some(0);
+        composer.cursor = composer.body.chars().count();
+        let selected = super::editor_text(&composer.body, &composer, true, &theme, true);
+        for (base, visual) in original.lines.iter().zip(&selected.lines) {
+            for (base, visual) in base.spans.iter().zip(&visual.spans) {
+                assert_eq!(visual.style, theme.visual_selection(base.style));
+            }
+        }
+        assert_eq!(
+            selected
+                .lines
+                .last()
+                .unwrap()
+                .spans
+                .last()
+                .unwrap()
+                .style
+                .bg,
+            Some(Color::White)
+        );
+
+        let view = ReaderView {
+            cursor: 1,
+            column: 0,
+            visual: Some(ReaderSelection {
+                start: ReaderPosition { line: 0, column: 0 },
+                end: ReaderPosition { line: 1, column: 0 },
+            }),
+            active: true,
+            quoted_diff_highlighting: true,
+            theme: &theme,
+        };
+        for fg in [theme.unread, theme.error, theme.visual, theme.accent] {
+            // Same span overlay used by both the plain and HTML reader paths.
+            let base = Style::default()
+                .fg(fg)
+                .add_modifier(Modifier::UNDERLINED | Modifier::ITALIC);
+            let spans = super::reader_fragments("link", base, 0, 4, 0, view, &[]);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].style, theme.visual_selection(base));
+        }
+    }
+}
+
+#[test]
+fn visual_cursor_line_preserves_diff_background_and_blank_cursor_in_all_themes() {
+    use super::{PatchLineKind, diff_line_style, plain_reader_line};
+    use crate::app::{ReaderPosition, ReaderSelection};
+    for theme in load_themes() {
+        let position = ReaderPosition { line: 0, column: 0 };
+        let mut view = ReaderView {
+            cursor: 0,
+            column: 0,
+            visual: Some(ReaderSelection {
+                start: position,
+                end: position,
+            }),
+            active: true,
+            quoted_diff_highlighting: true,
+            theme: &theme,
+        };
+        for kind in [PatchLineKind::Add, PatchLineKind::Remove] {
+            let line = plain_reader_line("+ example", 0, 1, 30, view, Some(kind), None);
+            let bg = diff_line_style(kind, &theme).bg;
+            assert_eq!(line.style.bg, bg);
+            assert_eq!(line.spans.last().unwrap().style.bg, bg);
+            assert_eq!(line.spans[0].style.fg, Some(theme.visual));
+            assert_eq!(line.spans[1].style.bg, Some(Color::White));
+        }
+        let blank = plain_reader_line("", 0, 1, 30, view, None, None);
+        assert_eq!(blank.spans[1].style.bg, Some(Color::White));
+        assert_eq!(blank.spans.last().unwrap().style.bg, None);
+        view.visual = None;
+        let normal = plain_reader_line("", 0, 1, 30, view, None, None);
+        assert_eq!(normal.spans.last().unwrap().style.bg, Some(theme.popup_bg));
+    }
+}
+
+#[test]
+fn compose_visual_removes_current_line_background_but_keeps_cursor() {
+    use crate::app::{App, ComposeField, Composer};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = App::new(&config, vec![]);
+    app.setup = None;
+    let mut composer = Composer::new();
+    composer.field = ComposeField::Body;
+    composer.body = "VISUAL_SENTINEL\nsecond row".into();
+    composer.mode = ComposeMode::Visual;
+    composer.visual_anchor = Some(0);
+    composer.cursor = 1;
+    app.composer = Some(composer);
+    let theme = app.theme().clone();
+    let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    terminal
+        .draw(|frame| {
+            super::draw_composer(frame, &mut app);
+            let area = frame.area();
+            let buffer = frame.buffer_mut();
+            let (x, y) = (0..area.height)
+                .find_map(|y| {
+                    let row = (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>();
+                    row.find("VISUAL_SENTINEL")
+                        .map(|byte| (UnicodeWidthStr::width(&row[..byte]) as u16, y))
+                })
+                .expect("compose body");
+            assert_eq!(buffer[(x, y)].symbol(), "V");
+            assert_eq!(buffer[(x + 1, y)].symbol(), "I");
+            assert_eq!(buffer[(x + 2, y)].symbol(), "S");
+            assert_eq!(buffer[(x, y)].bg, theme.visual_selection_bg);
+            assert_eq!(buffer[(x + 1, y)].bg, Color::White);
+            assert_eq!(buffer[(x + 2, y)].bg, Color::Reset);
+            assert_eq!(buffer[(x + 25, y)].bg, Color::Reset);
+        })
+        .unwrap();
 }

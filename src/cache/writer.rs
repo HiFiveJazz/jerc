@@ -64,8 +64,12 @@ pub(super) fn run_cache_writer(
     pending: Arc<Mutex<PendingChanges>>,
     body_store: BodyStore,
     mut stored: Snapshot,
+    mut index_dirty: IndexCheckpoint,
 ) {
-    let mut index_dirty = false;
+    // Migration is local and happens on the writer, not on the UI thread.
+    if index_dirty.is_dirty() {
+        let _ = index_dirty.flush(&path, &stored);
+    }
     let mut body_writes = 0;
     while rx.recv().is_ok() {
         // Repeated status updates are often identical. Batch real
@@ -110,17 +114,16 @@ pub(super) fn flush_cache_changes(
     stored: &mut Snapshot,
     pending: &Arc<Mutex<PendingChanges>>,
     body_store: &BodyStore,
-    index_dirty: &mut bool,
+    index_dirty: &mut IndexCheckpoint,
 ) -> usize {
-    let (changed, bodies) = if let Ok(mut changes) = pending.lock() {
-        let changed = changes.drain_into(stored);
-        (changed, changes.drain_bodies())
+    let bodies = if let Ok(mut changes) = pending.lock() {
+        changes.drain_tracked(stored, index_dirty);
+        changes.drain_bodies()
     } else {
-        (false, Vec::new())
+        Vec::new()
     };
-    *index_dirty |= changed;
-    if *index_dirty && write_snapshot(path, stored).is_ok() {
-        *index_dirty = false;
+    if index_dirty.is_dirty() {
+        let _ = index_dirty.flush(path, stored);
     }
     let mut writes = 0;
     for (mailbox, validity, body) in bodies {
@@ -133,13 +136,23 @@ pub(super) fn flush_cache_changes(
 
 /// Return true only when the on-disk representation would actually change.
 /// Flags remain mutable, while shared immutable headers compare by value.
+#[cfg(test)]
 pub(super) fn apply(snapshot: &mut Snapshot, change: Change) -> bool {
+    apply_tracked(snapshot, change, &mut IndexCheckpoint::default())
+}
+
+pub(super) fn apply_tracked(
+    snapshot: &mut Snapshot,
+    change: Change,
+    dirty: &mut IndexCheckpoint,
+) -> bool {
     match change {
         Change::Mailboxes(mailboxes) => {
             if snapshot.mailboxes == mailboxes {
                 return false;
             }
             snapshot.mailboxes = mailboxes;
+            dirty.metadata_dirty = true;
             true
         }
         Change::Folder(name, mut folder) => {
@@ -196,17 +209,79 @@ pub(super) fn apply(snapshot: &mut Snapshot, change: Change) -> bool {
             if snapshot.folders.len() >= MAX_FOLDERS && !snapshot.folders.contains_key(&name) {
                 return false;
             }
-            if snapshot
-                .folders
-                .get(&name)
-                .is_some_and(|old| old == &folder)
-            {
-                return false;
+            if let Some(old) = snapshot.folders.get(&name) {
+                if old
+                    .identity
+                    .as_ref()
+                    .zip(folder.identity.as_ref())
+                    .is_some_and(|(old, new)| old.same_generation(new))
+                {
+                    // A refresh or Seen transition is not a navigation
+                    // checkpoint. Retain the last explicitly saved cursor.
+                    folder.message_index = old
+                        .message_index
+                        .min(folder.messages.len().saturating_sub(1));
+                    folder.message_view_offset = old.message_view_offset.min(folder.message_index);
+                    // Compare metadata before touching inline body allocations.
+                    // Selected/prefetched bodies already have their own store.
+                    if old.messages == folder.messages
+                        && old.thread_messages == folder.thread_messages
+                        && old.next_page_offset == folder.next_page_offset
+                        && old.has_more == folder.has_more
+                        && old.identity == folder.identity
+                        && old.uid_next == folder.uid_next
+                    {
+                        return false;
+                    }
+                    // Keep existing warm bodies valid across flag-only updates.
+                    // Fill unused slots only during an actual metadata change.
+                    let mut incoming = std::mem::take(&mut folder.bodies);
+                    folder.bodies = old.bodies.clone();
+                    folder.bodies.retain(|id, _| {
+                        folder
+                            .messages
+                            .iter()
+                            .chain(&folder.thread_messages)
+                            .any(|m| &m.id == id)
+                    });
+                    for message in &folder.messages {
+                        if let Some(body) = incoming.remove(&message.id)
+                            && (folder.bodies.contains_key(&message.id)
+                                || folder.bodies.len() < MAX_BODIES_PER_FOLDER)
+                        {
+                            folder.bodies.insert(message.id.clone(), body);
+                        }
+                    }
+                } else {
+                    dirty.navigation_dirty = true;
+                }
+                if old == &folder {
+                    return false;
+                }
+            } else {
+                dirty.navigation_dirty = true;
             }
+            dirty.note_folder_change(&name, snapshot.folders.get(&name), &folder);
             snapshot.folders.insert(name, folder);
             true
         }
-        Change::RemoveFolder(name) => snapshot.folders.remove(&name).is_some(),
+        Change::RemoveFolder(name) => {
+            if snapshot.folders.remove(&name).is_none() {
+                return false;
+            }
+            dirty.note_folder_removal(name);
+            dirty.navigation_dirty = true;
+            true
+        }
+        Change::Navigation(name, identity, index, offset) => dirty.apply_navigation(
+            snapshot,
+            &name,
+            &NavigationPosition {
+                identity,
+                index,
+                offset,
+            },
+        ),
         Change::Body(..) => false, // Persisted separately; never grows startup JSON.
         Change::DeferredSeen(entries) => {
             let entries: Vec<_> = entries
@@ -218,6 +293,7 @@ pub(super) fn apply(snapshot: &mut Snapshot, change: Change) -> bool {
                 return false;
             }
             snapshot.deferred_seen = entries;
+            dirty.metadata_dirty = true;
             true
         }
     }

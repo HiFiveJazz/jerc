@@ -86,6 +86,7 @@ impl Composer {
             in_reply_to: None,
             references: Vec::new(),
             forwarded_raw: None,
+            reply_html_quote: None,
             original_loading: false,
             original_source: None,
             draft_raw: None,
@@ -94,10 +95,7 @@ impl Composer {
             sending: false,
             confirm_send: false,
             exit_prompt: false,
-            preview_html: true,
-            preview_scroll: 0,
-            preview_rich_lines: None,
-            preview_forwarded_attachments: Vec::new(),
+            send_preview: SendPreview::default(),
             help_visible: false,
             contact_suggestion: 0,
             dismissed_contact_query: None,
@@ -106,6 +104,7 @@ impl Composer {
             help_scroll: 0,
             body_view_width: 72,
             body_scroll: 0,
+            body_saved_cursor: None,
             body_smooth_target: None,
             body_preferred_column: None,
             visual_linewise: false,
@@ -148,7 +147,7 @@ impl Composer {
         }
         let summary =
             crate::mail::parse_summary(id.clone(), &raw, raw.len() as u64, MessageFlags::empty())?;
-        let body = crate::mail::parse_body(id, &raw)?;
+        let body = crate::mail::parse_body_compact(id, &raw)?;
         let mut composer = Self::new();
         composer.to = recipients_in!(parsed.to());
         composer.cc = recipients_in!(parsed.cc());
@@ -198,6 +197,15 @@ impl Composer {
         } else {
             String::new()
         };
+        let reply_html_quote = if quoted.is_empty() {
+            None
+        } else {
+            body.and_then(|body| body.html_source.clone())
+                .map(|source| ReplyHtmlQuote {
+                    source,
+                    quoted_body: format!("{}\n{quoted}\n", reply_attribution(message)),
+                })
+        };
         let body = if quoted.is_empty() {
             "\n\n".to_owned()
         } else {
@@ -242,6 +250,7 @@ impl Composer {
             in_reply_to: message.message_id.clone(),
             references,
             forwarded_raw: None,
+            reply_html_quote,
             original_loading: false,
             original_source: None,
             draft_raw: None,
@@ -250,10 +259,7 @@ impl Composer {
             sending: false,
             confirm_send: false,
             exit_prompt: false,
-            preview_html: true,
-            preview_scroll: 0,
-            preview_rich_lines: None,
-            preview_forwarded_attachments: Vec::new(),
+            send_preview: SendPreview::default(),
             help_visible: false,
             contact_suggestion: 0,
             dismissed_contact_query: None,
@@ -262,6 +268,7 @@ impl Composer {
             help_scroll: 0,
             body_view_width: 72,
             body_scroll: 0,
+            body_saved_cursor: None,
             body_smooth_target: None,
             body_preferred_column: None,
             visual_linewise: false,
@@ -284,7 +291,7 @@ impl Composer {
             ComposeIntent::Forward => Self::forward(message, raw),
             ComposeIntent::Reply { quote, audience } => {
                 let targets = reply_recipients(&raw, audience, own_addresses)?;
-                let body = parse_body(id, &raw)?;
+                let body = crate::mail::parse_body_compact(id, &raw)?;
                 let mut composer = Self::reply(message, Some(&body), quote);
                 composer.to = targets.to;
                 composer.cc = targets.cc;
@@ -323,6 +330,7 @@ impl Composer {
             in_reply_to: None,
             references: Vec::new(),
             forwarded_raw: Some(raw),
+            reply_html_quote: None,
             original_loading: false,
             original_source: None,
             draft_raw: None,
@@ -331,10 +339,7 @@ impl Composer {
             sending: false,
             confirm_send: false,
             exit_prompt: false,
-            preview_html: true,
-            preview_scroll: 0,
-            preview_rich_lines: None,
-            preview_forwarded_attachments: Vec::new(),
+            send_preview: SendPreview::default(),
             help_visible: false,
             contact_suggestion: 0,
             dismissed_contact_query: None,
@@ -343,56 +348,13 @@ impl Composer {
             help_scroll: 0,
             body_view_width: 72,
             body_scroll: 0,
+            body_saved_cursor: None,
             body_smooth_target: None,
             body_preferred_column: None,
             visual_linewise: false,
             vim_sequence: crate::app::vim::VimSequence::default(),
             edit_history: crate::app::vim::VimHistory::new(200),
         })
-    }
-
-    pub(super) fn prepare_send_preview(&mut self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.original_loading,
-            "original message is still loading; cannot preview an incomplete reply/forward"
-        );
-        crate::outgoing::validate_recipients(&self.to, &self.cc, &self.bcc)?;
-        // Only parse/reflow rich mail and attachment metadata upon opening the
-        // preview, never while the terminal draws successive frames.
-        self.preview_forwarded_attachments = self.draft_attachment_names.clone();
-        self.preview_forwarded_attachments.extend(
-            self.forwarded_raw
-                .as_deref()
-                .and_then(|raw| crate::mail::attachment_names(raw).ok())
-                .unwrap_or_default(),
-        );
-        self.preview_rich_lines = self
-            .outgoing_html_preview()?
-            .map(|html| render_html_for_terminal(&html, 90).1);
-        self.preview_html = true;
-        self.preview_scroll = 0;
-        self.confirm_send = true;
-        Ok(())
-    }
-
-    /// The HTML actually used for inline forwards, if present. Normal plain
-    /// messages have no HTML alternative, so T correctly shows the same text.
-    pub fn outgoing_html_preview(&self) -> anyhow::Result<Option<String>> {
-        let Some(raw) = self.forwarded_raw.as_deref() else {
-            return Ok(None);
-        };
-        let parts = crate::outgoing::inline_forward_body(raw)?;
-        Ok(parts.html.map(|html| {
-            let personal_note = self.body.split(FORWARD_SEPARATOR).next().unwrap_or("");
-            let original_headers = self
-                .body
-                .split(FORWARD_SEPARATOR)
-                .nth(1)
-                .and_then(|tail| tail.split("\n\n").next())
-                .unwrap_or("");
-            let attribution = format!("{FORWARD_SEPARATOR}{original_headers}");
-            forward_html(&html, &attribution, personal_note)
-        }))
     }
 
     /// Unsaved mail must never disappear on a stray `q` or `Esc`.
@@ -794,10 +756,22 @@ impl Composer {
     }
 
     pub(super) fn switch_field(&mut self, field: ComposeField) {
+        if self.field == field && field == ComposeField::Body {
+            return;
+        }
+        if self.field == ComposeField::Body {
+            self.body_saved_cursor = Some(self.cursor);
+        }
         self.body_smooth_target = None;
         self.body_preferred_column = None;
         self.field = field;
-        self.cursor = self.char_count();
+        self.cursor = if field == ComposeField::Body {
+            self.body_saved_cursor
+                .unwrap_or_else(|| self.char_count())
+                .min(self.char_count())
+        } else {
+            self.char_count()
+        };
         self.visual_anchor = None;
         if self.mode == ComposeMode::Visual {
             self.mode = ComposeMode::Normal;
@@ -850,6 +824,9 @@ impl Composer {
         let Some((field, text, cursor)) = previous else {
             return;
         };
+        if self.field == ComposeField::Body && field != ComposeField::Body {
+            self.body_saved_cursor = Some(self.cursor);
+        }
         self.field = field;
         *self.field_mut() = text;
         self.cursor = cursor.min(self.char_count());
@@ -972,7 +949,7 @@ impl Composer {
             .take(row.end - row.start)
             .collect::<String>();
         for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(text.as_str(), true) {
-            let width = unicode_width::UnicodeWidthStr::width(grapheme);
+            let width = compose_grapheme_width(grapheme);
             if cells + width > preferred {
                 break;
             }
@@ -1265,8 +1242,16 @@ impl Composer {
         true
     }
 
+    pub fn compose_help_entries(&self) -> &'static [crate::app::HelpEntry] {
+        if self.confirm_send {
+            crate::app::SEND_PREVIEW_HELP_ENTRIES
+        } else {
+            crate::app::COMPOSE_HELP_ENTRIES
+        }
+    }
+
     pub fn compose_help_matches(&self) -> Vec<usize> {
-        crate::app::ranked_help_matches(crate::app::COMPOSE_HELP_ENTRIES, &self.help_query)
+        crate::app::ranked_help_matches(self.compose_help_entries(), &self.help_query)
     }
 
     pub fn visual_range(&self) -> Option<(usize, usize)> {
@@ -1292,11 +1277,11 @@ impl Composer {
             }
             return Some((start, end));
         }
-        Some(if anchor <= cursor {
-            (anchor, cursor.saturating_add(1).min(self.char_count()))
-        } else {
-            (cursor, anchor.saturating_add(1).min(self.char_count()))
-        })
+        Some(crate::app::vim::visual_text_range(
+            anchor,
+            cursor,
+            self.char_count(),
+        ))
     }
 
     /// Copy a Visual character range or entire lines, without touching the OS clipboard.

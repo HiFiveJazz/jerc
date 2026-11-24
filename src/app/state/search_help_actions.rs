@@ -447,7 +447,7 @@ impl App {
         };
         if account.native_view.is_none() {
             account.save_current_cache();
-            account.persist_current_cache();
+            account.persist_current_navigation();
         }
         account.reset_inline_threads();
         account.native_view = Some(view);

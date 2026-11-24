@@ -208,3 +208,22 @@ fn selection_start_and_drag_width_are_safely_bounded() {
     assert_eq!(mouse_width_percent(110, 120), 50);
     assert_eq!(mouse_width_percent(24, 100), 25);
 }
+
+#[test]
+fn revisiting_attachment_promotes_decoded_preview_without_redecoding() {
+    let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
+    let mut app = App::new(&config, vec![]);
+    app.attachment_picker_visible = true;
+    for index in 0..8 {
+        app.attachment_preview_cache
+            .push_back((index, Ok(image::DynamicImage::new_rgba8(2, 2))));
+    }
+    app.attachment_selection = 0;
+    app.ensure_attachment_preview(60, 20);
+    assert_eq!(
+        app.attachment_preview_cache.back().map(|(index, _)| *index),
+        Some(0)
+    );
+    assert_eq!(app.attachment_preview_cache.len(), 8);
+    assert!(app.attachment_preview_decoded());
+}

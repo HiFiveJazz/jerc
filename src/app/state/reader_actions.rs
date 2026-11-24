@@ -11,69 +11,43 @@ impl App {
         // multi-key Vim motion (g or an inner text object) is pending.
         if key.code == KeyCode::Esc {
             self.reader_pending_inner_object = false;
-            self.reader_pending_g = false;
+            self.reader_navigation.pending_g = false;
             return false;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
-        {
-            return match key.code {
-                KeyCode::Char('j') => {
-                    self.count_prefix = None;
-                    self.start_smooth_scroll(SMOOTH_SCROLL_ROWS);
-                    true
+        let control = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT);
+        if !control {
+            self.reader_navigation.smooth_target = None;
+            if self.reader_pending_inner_object {
+                self.reader_pending_inner_object = false;
+                if let KeyCode::Char(delimiter) = key.code
+                    && self.select_reader_inner_object(delimiter)
+                {
+                    return true;
                 }
-                KeyCode::Char('k') => {
-                    self.count_prefix = None;
-                    self.start_smooth_scroll(-SMOOTH_SCROLL_ROWS);
-                    true
-                }
-                KeyCode::Char('d') | KeyCode::Char('u') => {
-                    let distance = isize::try_from(
-                        self.reader_view_height
-                            .saturating_div(2)
-                            .max(1)
-                            .saturating_mul(self.take_count(1)),
-                    )
-                    .unwrap_or(isize::MAX);
-                    self.move_reader_cursor(if key.code == KeyCode::Char('d') {
-                        distance
-                    } else {
-                        -distance
-                    });
-                    true
-                }
-                _ => false,
-            };
-        }
-
-        // Any ordinary reader motion/action interrupts a pending neoscroll.
-        // The next key should always operate from the cursor line currently on
-        // screen rather than allowing an old smooth target to keep advancing.
-        self.reader_smooth_target = None;
-
-        if self.reader_pending_inner_object {
-            self.reader_pending_inner_object = false;
-            if let KeyCode::Char(delimiter) = key.code
-                && self.select_reader_inner_object(delimiter)
-            {
+                self.status = StatusLine::temporary(
+                    "no enclosing quote/bracket at reader cursor",
+                    Duration::from_secs(2),
+                );
                 return true;
             }
-            self.status = StatusLine::temporary(
-                "no enclosing quote/bracket at reader cursor",
-                Duration::from_secs(2),
-            );
+        }
+        use crate::app::vim::read_motion;
+        if let Some(motion) = read_motion(
+            key,
+            &mut self.count_prefix,
+            &mut self.reader_navigation.pending_g,
+            self.reader_line_count,
+            self.reader_view_height,
+            SMOOTH_SCROLL_ROWS,
+            MAX_COUNT_PREFIX,
+        ) {
+            self.execute_reader_motion(motion);
             return true;
         }
-
-        if self.reader_pending_g {
-            self.reader_pending_g = false;
-            if matches!(key.code, KeyCode::Char('g')) {
-                let target = self.take_count(1).saturating_sub(1);
-                self.jump_reader_to_line(target);
-                return true;
-            }
+        if control {
+            return false;
         }
 
         match key.code {
@@ -90,103 +64,9 @@ impl App {
                 self.toggle_header_details();
                 true
             }
-            KeyCode::Char('0') if self.count_prefix.is_none() => {
-                self.reader_column = 0;
-                self.reader_preferred_column = None;
-                true
-            }
-            KeyCode::Char(ch) if ch.is_ascii_digit() => {
-                self.push_count_digit(ch.to_digit(10).unwrap_or_default() as u8);
-                true
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                let count = isize::try_from(self.take_count(1)).unwrap_or(isize::MAX);
-                self.move_reader_cursor(count);
-                true
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                let count = isize::try_from(self.take_count(1)).unwrap_or(isize::MAX);
-                self.move_reader_cursor(-count);
-                true
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                let count = isize::try_from(self.take_count(1)).unwrap_or(isize::MAX);
-                self.move_reader_horizontal(-count);
-                true
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                let count = isize::try_from(self.take_count(1)).unwrap_or(isize::MAX);
-                self.move_reader_horizontal(count);
-                true
-            }
-            KeyCode::Char('w') => {
-                let count = self.take_count(1);
-                for _ in 0..count {
-                    self.move_reader_word(ReaderWordMotion::NextStart);
-                }
-                true
-            }
-            KeyCode::Char('b') => {
-                let count = self.take_count(1);
-                for _ in 0..count {
-                    self.move_reader_word(ReaderWordMotion::PreviousStart);
-                }
-                true
-            }
             KeyCode::Char('e') => {
                 self.count_prefix = None;
                 self.export_selected_raw();
-                true
-            }
-            KeyCode::Char('^') => {
-                self.reader_column = self.reader_first_non_blank();
-                self.reader_preferred_column = None;
-                true
-            }
-            KeyCode::Char('$') | KeyCode::End => {
-                self.reader_column = self.reader_line_len(self.reader_cursor).saturating_sub(1);
-                self.reader_preferred_column = None;
-                true
-            }
-            KeyCode::Home => {
-                self.reader_column = 0;
-                self.reader_preferred_column = None;
-                true
-            }
-            KeyCode::Char('H') => {
-                self.reader_column = 0;
-                self.reader_preferred_column = None;
-                true
-            }
-            KeyCode::Char('L') => {
-                self.reader_column = self.reader_line_len(self.reader_cursor).saturating_sub(1);
-                self.reader_preferred_column = None;
-                true
-            }
-            KeyCode::Char('g') => {
-                self.reader_pending_g = true;
-                true
-            }
-            KeyCode::Char('G') => {
-                if let Some(count) = self.count_prefix.take() {
-                    self.jump_reader_to_line(count.saturating_sub(1));
-                } else {
-                    self.jump_reader_to_line(self.reader_line_count.saturating_sub(1));
-                }
-                true
-            }
-            KeyCode::Char('{') => {
-                let count = self.take_count(1);
-                for _ in 0..count {
-                    self.move_reader_paragraph(false);
-                }
-                true
-            }
-            KeyCode::Char('}') => {
-                let count = self.take_count(1);
-                for _ in 0..count {
-                    self.move_reader_paragraph(true);
-                }
                 true
             }
             KeyCode::Char('v') => {
@@ -199,8 +79,8 @@ impl App {
                 self.toggle_reader_linewise_visual();
                 true
             }
-            KeyCode::Char('i') if self.reader_visual_anchor.is_some() => {
-                self.reader_visual_linewise = false;
+            KeyCode::Char('i') if self.reader_navigation.visual_anchor.is_some() => {
+                self.reader_navigation.visual_linewise = false;
                 self.reader_pending_inner_object = true;
                 self.status = StatusLine::temporary(
                     "inner text object: quote or bracket",
@@ -208,12 +88,14 @@ impl App {
                 );
                 true
             }
-            KeyCode::Char('y') if self.reader_visual_anchor.is_some() => {
+            KeyCode::Char('y') if self.reader_navigation.visual_anchor.is_some() => {
                 self.count_prefix = None;
                 self.yank_reader_selection();
                 true
             }
-            KeyCode::Char('d' | 'c' | 'x' | 'a') if self.reader_visual_anchor.is_some() => {
+            KeyCode::Char('d' | 'c' | 'x' | 'a')
+                if self.reader_navigation.visual_anchor.is_some() =>
+            {
                 self.status = StatusLine::temporary(
                     "reader is read-only; press y to copy the visual selection",
                     Duration::from_secs(2),
@@ -225,7 +107,7 @@ impl App {
                 self.toggle_html();
                 true
             }
-            KeyCode::Char('i') if self.reader_visual_anchor.is_none() => {
+            KeyCode::Char('i') if self.reader_navigation.visual_anchor.is_none() => {
                 self.count_prefix = None;
                 self.toggle_remote_images();
                 true
@@ -246,8 +128,15 @@ impl App {
     /// reader cursor and scroll bounds together makes normal/visual reader
     /// motions deterministic even when the message body is shorter than the
     /// viewport.
+    pub(crate) fn remember_reader_html_width(&mut self, width: usize) {
+        if let Some(account) = self.account_mut() {
+            account.reader_html_width = Some(width.max(20));
+        }
+    }
+
     pub fn ensure_reader_html_layout(&mut self, width: usize) {
         let width = width.max(20);
+        self.remember_reader_html_width(width);
         let Some(account) = self.account_mut() else {
             return;
         };
@@ -258,19 +147,9 @@ impl App {
         let Some(body) = account.bodies.get_mut(&message_id) else {
             return;
         };
-        if !body.has_html_alternative() || !prefer_html || body.html_render_width == width {
-            return;
+        if prefer_html {
+            crate::mail::layout_message_html(body, width);
         }
-        // Only the derived layout is replaced. Borrow the MIME HTML source
-        // instead of cloning potentially megabytes of markup on each reflow.
-        let Some(source) = body.html_source.as_deref() else {
-            return;
-        };
-        let (html_text, html_lines, html_renderer) = render_html_for_terminal(source, width);
-        body.html_text = Some(html_text.into());
-        body.html_lines = Some(std::sync::Arc::new(html_lines));
-        body.html_renderer = Some(html_renderer);
-        body.html_render_width = width;
     }
 
     /// Called by the renderer after laying out the current message. Keeping the
@@ -286,36 +165,13 @@ impl App {
     ) {
         self.reader_line_count = line_count;
         self.reader_view_height = view_height.max(1);
-        if line_count == 0 {
-            self.reader_cursor = 0;
-            self.reader_column = 0;
-            self.reader_visual_anchor = None;
-            self.reader_visual_linewise = false;
-            self.reader_smooth_target = None;
-        } else {
-            self.reader_cursor = self.reader_cursor.min(line_count.saturating_sub(1));
-            self.reader_smooth_target = self
-                .reader_smooth_target
-                .map(|target| target.min(line_count.saturating_sub(1)))
-                .filter(|target| *target != self.reader_cursor);
-            if let Some(anchor) = self.reader_visual_anchor {
-                let line = anchor.line.min(line_count.saturating_sub(1));
-                let line_len = self.reader_line_len(line);
-                self.reader_visual_anchor = Some(ReaderPosition {
-                    line,
-                    column: if line_len == 0 {
-                        0
-                    } else {
-                        anchor.column.min(line_len.saturating_sub(1))
-                    },
-                });
-            }
-            self.clamp_reader_column();
-        }
+        let mut navigation = self.reader_navigation;
+        navigation.clamp_document(self.reader_display_text().unwrap_or_default(), line_count);
+        self.reader_navigation = navigation;
 
         let follow_cursor = self.reader_scroll_follow_pending && line_count > 0;
         self.reader_scroll_follow_pending = false;
-        let cursor_at_start = self.reader_cursor == 0;
+        let cursor_at_start = self.reader_navigation.row == 0;
         let Some(account) = self.account_mut() else {
             return;
         };
@@ -352,130 +208,49 @@ impl App {
         self.reader_display_text()?.lines().nth(line)
     }
 
-    pub(super) fn reader_line_len(&self, line: usize) -> usize {
-        self.reader_line_text(line)
-            .map_or(0, |text| text.chars().count())
-    }
-
-    pub(super) fn clamp_reader_column(&mut self) {
-        let line_len = self.reader_line_len(self.reader_cursor);
-        self.reader_column = if line_len == 0 {
-            0
-        } else {
-            self.reader_column.min(line_len.saturating_sub(1))
-        };
-    }
-
-    pub(super) fn reader_first_non_blank(&self) -> usize {
-        self.reader_line_text(self.reader_cursor)
-            .and_then(|line| line.chars().position(|ch| !ch.is_whitespace()))
-            .unwrap_or(0)
-    }
-
     pub(super) fn move_reader_cursor(&mut self, delta: isize) {
-        if self.reader_line_count == 0 {
-            return;
-        }
-
-        let preferred = self.reader_preferred_column.unwrap_or(self.reader_column);
-        self.reader_cursor = bounded_index(self.reader_cursor, self.reader_line_count, delta);
-        let line_len = self.reader_line_len(self.reader_cursor);
-        self.reader_column = if line_len == 0 {
-            0
-        } else {
-            preferred.min(line_len.saturating_sub(1))
-        };
-        self.reader_preferred_column = Some(preferred);
-        self.keep_reader_cursor_visible();
+        self.execute_reader_motion(crate::app::vim::ReadMotion::Vertical(delta));
     }
 
-    pub(super) fn move_reader_horizontal(&mut self, delta: isize) {
-        let line_len = self.reader_line_len(self.reader_cursor);
-        if line_len == 0 {
-            self.reader_column = 0;
-        } else {
-            self.reader_column = bounded_index(self.reader_column, line_len, delta);
+    fn execute_reader_motion(&mut self, motion: crate::app::vim::ReadMotion) {
+        let mut navigation = self.reader_navigation;
+        let follow = navigation.execute(
+            motion,
+            self.reader_display_text().unwrap_or_default(),
+            self.reader_line_count,
+        );
+        self.reader_navigation = navigation;
+        if follow {
+            self.keep_reader_cursor_visible();
         }
-        self.reader_preferred_column = None;
-    }
-
-    pub(super) fn jump_reader_to_line(&mut self, line: usize) {
-        if self.reader_line_count == 0 {
-            return;
+        if matches!(motion, crate::app::vim::ReadMotion::Smooth(_))
+            && let Some(account) = self.account_mut()
+        {
+            account.smooth_preview_target = None;
         }
-        self.reader_cursor = line.min(self.reader_line_count.saturating_sub(1));
-        self.clamp_reader_column();
-        self.reader_preferred_column = None;
-        self.keep_reader_cursor_visible();
-    }
-
-    pub(super) fn move_reader_word(&mut self, motion: ReaderWordMotion) {
-        let Some(text) = self.reader_display_text() else {
-            return;
-        };
-        let Some(target) = reader_word_target(text, self.reader_cursor, self.reader_column, motion)
-        else {
-            return;
-        };
-        self.reader_cursor = target.line.min(self.reader_line_count.saturating_sub(1));
-        self.reader_column = target.column;
-        self.reader_preferred_column = None;
-        self.keep_reader_cursor_visible();
-    }
-
-    pub(super) fn move_reader_paragraph(&mut self, forward: bool) {
-        let Some(text) = self.reader_display_text() else {
-            return;
-        };
-        let lines = text.lines().collect::<Vec<_>>();
-        if lines.is_empty() {
-            return;
-        }
-        let current = self.reader_cursor.min(lines.len().saturating_sub(1));
-        let target = if forward {
-            (current + 1..lines.len())
-                .find(|index| lines[*index].trim().is_empty())
-                .and_then(|blank| {
-                    (blank + 1..lines.len()).find(|index| !lines[*index].trim().is_empty())
-                })
-                .unwrap_or(lines.len().saturating_sub(1))
-        } else {
-            (0..current)
-                .rev()
-                .find(|index| lines[*index].trim().is_empty())
-                .and_then(|blank| {
-                    (0..blank)
-                        .rev()
-                        .find(|index| !lines[*index].trim().is_empty())
-                })
-                .unwrap_or(0)
-        };
-        self.reader_cursor = target;
-        self.reader_column = self.reader_first_non_blank();
-        self.reader_preferred_column = None;
-        self.keep_reader_cursor_visible();
     }
 
     pub(super) fn select_reader_inner_object(&mut self, delimiter: char) -> bool {
-        if self.reader_visual_anchor.is_none() {
+        if self.reader_navigation.visual_anchor.is_none() {
             return false;
         }
         let Some(line) = self
-            .reader_line_text(self.reader_cursor)
+            .reader_line_text(self.reader_navigation.row)
             .map(ToOwned::to_owned)
         else {
             return false;
         };
-        let Some((start, end)) = inner_text_object_range(&line, self.reader_column, delimiter)
+        let Some((start, end)) =
+            inner_text_object_range(&line, self.reader_navigation.column, delimiter)
         else {
             return false;
         };
-        self.reader_visual_anchor = Some(ReaderPosition {
-            line: self.reader_cursor,
+        self.reader_navigation.visual_anchor = Some(ReaderPosition {
+            line: self.reader_navigation.row,
             column: start,
         });
-        self.reader_column = end;
-        self.reader_preferred_column = None;
+        self.reader_navigation.column = end;
+        self.reader_navigation.preferred_column = None;
         true
     }
 
@@ -494,9 +269,7 @@ impl App {
             if self.reader_line_count == 0 {
                 return;
             }
-            let base = self.reader_smooth_target.unwrap_or(self.reader_cursor);
-            let target = bounded_index(base, self.reader_line_count, delta);
-            self.reader_smooth_target = (target != self.reader_cursor).then_some(target);
+            self.reader_navigation.queue(self.reader_line_count, delta);
             if let Some(account) = self.account_mut() {
                 account.smooth_preview_target = None;
             }
@@ -545,6 +318,7 @@ impl App {
         }
         if account.smooth_mailbox_target.is_none() {
             account.save_current_cache();
+            account.persist_current_navigation();
         }
         let base = account
             .smooth_mailbox_target
@@ -555,15 +329,15 @@ impl App {
     pub(super) fn jump(&mut self, bottom: bool) {
         let focus = self.focus;
         if focus == Focus::Preview {
-            self.reader_cursor = if bottom {
+            self.reader_navigation.row = if bottom {
                 self.reader_line_count.saturating_sub(1)
             } else {
                 0
             };
-            self.reader_column = 0;
-            self.reader_preferred_column = None;
-            self.reader_visual_anchor = None;
-            self.reader_pending_g = false;
+            self.reader_navigation.column = 0;
+            self.reader_navigation.preferred_column = None;
+            self.reader_navigation.visual_anchor = None;
+            self.reader_navigation.pending_g = false;
             self.reader_pending_inner_object = false;
             if let Some(account) = self.account_mut() {
                 account.smooth_preview_target = None;
@@ -576,11 +350,11 @@ impl App {
             return;
         }
 
-        self.reader_cursor = 0;
-        self.reader_column = 0;
-        self.reader_preferred_column = None;
-        self.reader_visual_anchor = None;
-        self.reader_pending_g = false;
+        self.reader_navigation.row = 0;
+        self.reader_navigation.column = 0;
+        self.reader_navigation.preferred_column = None;
+        self.reader_navigation.visual_anchor = None;
+        self.reader_navigation.pending_g = false;
         self.reader_pending_inner_object = false;
         let preview_split = self.preview_split;
         let Some(account) = self.account_mut() else {
@@ -632,13 +406,7 @@ impl App {
                     return;
                 }
                 self.visual_anchor = None;
-                self.reader_cursor = 0;
-                self.reader_column = 0;
-                self.reader_preferred_column = None;
-                self.reader_visual_anchor = None;
-                self.reader_visual_linewise = false;
-                self.reader_smooth_target = None;
-                self.reader_pending_g = false;
+                self.reader_navigation = ReaderNavigation::default();
                 self.reader_pending_inner_object = false;
                 self.reader_line_count = 0;
                 self.reader_image = None;
@@ -664,13 +432,7 @@ impl App {
 
     pub(super) fn close_message(&mut self) {
         self.pending_draft = None;
-        self.reader_cursor = 0;
-        self.reader_column = 0;
-        self.reader_preferred_column = None;
-        self.reader_visual_anchor = None;
-        self.reader_visual_linewise = false;
-        self.reader_smooth_target = None;
-        self.reader_pending_g = false;
+        self.reader_navigation = ReaderNavigation::default();
         self.reader_pending_inner_object = false;
         self.reader_line_count = 0;
         self.reader_image = None;
@@ -721,15 +483,17 @@ impl App {
         let account = self.account()?;
         let body = account.selected_body()?;
         let showing_html = body.has_html_alternative() && account.prefer_html;
-        if showing_html && let Some(url) = body.html_link_at(self.reader_cursor, self.reader_column)
+        if showing_html
+            && let Some(url) =
+                body.html_link_at(self.reader_navigation.row, self.reader_navigation.column)
         {
             return Some(url.to_owned());
         }
         let line = body
             .display_text(showing_html)
             .lines()
-            .nth(self.reader_cursor)?;
-        url_at_cursor(line, self.reader_column)
+            .nth(self.reader_navigation.row)?;
+        url_at_cursor(line, self.reader_navigation.column)
     }
 
     pub(super) fn yank_reader_selection(&mut self) {
@@ -756,12 +520,12 @@ impl App {
             &mut self.yank_register,
             YankRegister {
                 text: selected,
-                linewise: self.reader_visual_linewise,
+                linewise: self.reader_navigation.visual_linewise,
             },
         ) {
             self.status = status;
         }
-        self.reader_visual_anchor = None;
-        self.reader_visual_linewise = false;
+        self.reader_navigation.visual_anchor = None;
+        self.reader_navigation.visual_linewise = false;
     }
 }

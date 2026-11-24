@@ -589,8 +589,12 @@ pub(super) fn draw_compose_help(frame: &mut Frame<'_>, app: &App) {
     draw_help_palette(
         frame,
         app.theme(),
-        " Compose keybindings ",
-        COMPOSE_HELP_ENTRIES,
+        if composer.confirm_send {
+            " Review keybindings "
+        } else {
+            " Compose keybindings "
+        },
+        composer.compose_help_entries(),
         &composer.help_query,
         &matches,
         (composer.help_selected, composer.help_scroll),
@@ -724,7 +728,7 @@ pub(super) fn render_compose_header(
     };
     frame.render_widget(
         Paragraph::new(display.lines)
-            .style(if display.active {
+            .style(if display.active && composer.mode != ComposeMode::Visual {
                 editor_current_line_style(theme)
             } else {
                 theme.text()
@@ -864,9 +868,8 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
     // forwarded line as a single invisible logical line during navigation.
     // Reply prose is hard-wrapped on edit for mailing lists, but the editor
     // must use its whole viewport for quoted lines, URLs and existing text.
-    composer.body_view_width = composer_body_view_width(
-        usize::from(fields[6].width.saturating_sub(4)),
-    );
+    composer.body_view_width =
+        composer_body_view_width(usize::from(fields[6].width.saturating_sub(4)));
     let viewport_height = usize::from(fields[6].height).max(1);
     let rows = composer.body_rows();
     let cursor_row = rows
@@ -885,6 +888,7 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
     let mut display = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         let current = body_active && index == cursor_row;
+        let highlight_current = current && composer.mode != ComposeMode::Visual;
         let number = if row.continuation {
             "    ".to_owned()
         } else {
@@ -917,7 +921,26 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
                 spans.push(cell.clone());
             }
         }
-        display.push(Line::from(spans));
+        let background = raw
+            .lines
+            .get(row.logical_line)
+            .and_then(|line| line.style.bg);
+        let mut line = Line::from(spans);
+        if let Some(bg) = background {
+            if highlight_current {
+                for span in &mut line.spans {
+                    if span.style.bg == Some(bg) {
+                        span.style = span.style.bg(theme.popup_bg);
+                    }
+                }
+            }
+            line = line.style(Style::default().bg(if highlight_current {
+                theme.popup_bg
+            } else {
+                bg
+            }));
+        }
+        display.push(line);
     }
     let mut scroll = composer.body_scroll;
     if body_active {
@@ -930,7 +953,12 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
     }
     scroll = scroll.min(rows.len().saturating_sub(viewport_height));
     composer.body_scroll = scroll;
-    if body_active && cursor_row >= scroll && cursor_row - scroll < viewport_height {
+    let diff_rows = diff_background_rows(&display, fields[6].width, false);
+    if body_active
+        && composer.mode != ComposeMode::Visual
+        && cursor_row >= scroll
+        && cursor_row - scroll < viewport_height
+    {
         let y = fields[6].y.saturating_add((cursor_row - scroll) as u16);
         frame.render_widget(
             Block::default().style(editor_current_line_style(&theme)),
@@ -943,6 +971,7 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
             .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         fields[6],
     );
+    paint_diff_background_rows(frame, fields[6], scroll, &diff_rows);
     if body_active
         && composer.mode == ComposeMode::Insert
         && fields[6].width > 4
@@ -961,7 +990,11 @@ pub(super) fn draw_composer(frame: &mut Frame<'_>, app: &mut App) {
             .skip(rows[cursor_row].start)
             .take(composer.cursor.saturating_sub(rows[cursor_row].start))
             .collect::<String>();
-        let column = UnicodeWidthStr::width(before.as_str());
+        let column = UnicodeWidthStr::width(
+            before
+                .replace('\t', crate::app::COMPOSE_TAB_SPACES)
+                .as_str(),
+        );
         let x = fields[6]
             .x
             .saturating_add(4)
@@ -992,16 +1025,19 @@ pub(super) fn editor_spans(
     for (index, ch) in chars.iter().copied().enumerate() {
         let at_cursor = active && index == cursor;
         let selected = selection.is_some_and(|(start, end)| (start..end).contains(&index));
+        let style = if value.trim().is_empty() {
+            theme.muted()
+        } else {
+            theme.text()
+        };
         spans.push(Span::styled(
             ch.to_string(),
             if at_cursor && composer.mode != ComposeMode::Insert {
                 block
             } else if selected {
-                theme.selected()
-            } else if value.trim().is_empty() {
-                theme.muted()
+                theme.visual_selection(style)
             } else {
-                theme.text()
+                style
             },
         ));
     }
@@ -1036,6 +1072,13 @@ pub(super) fn editor_text(
             (depth, prefix_bytes, is_reply_attribution(line), diff)
         })
         .collect::<Vec<_>>();
+    let row_style = |index: usize| {
+        quote_lines
+            .get(index)
+            .and_then(|(_, _, _, kind)| *kind)
+            .and_then(|kind| diff_line_style(kind, theme).bg)
+            .map_or_else(Style::default, |bg| Style::default().bg(bg))
+    };
     let mut logical_line = 0usize;
     let mut column = 0usize;
     let mut lines = Vec::new();
@@ -1051,7 +1094,7 @@ pub(super) fn editor_text(
             if at_cursor && composer.mode != ComposeMode::Insert {
                 spans.push(Span::styled(" ", block));
             }
-            lines.push(Line::from(std::mem::take(&mut spans)));
+            lines.push(Line::from(std::mem::take(&mut spans)).style(row_style(logical_line)));
             global += 1;
             logical_line += 1;
             column = 0;
@@ -1062,27 +1105,34 @@ pub(super) fn editor_text(
             .get(logical_line)
             .copied()
             .unwrap_or((0, 0, false, None));
+        let style = if depth > 0 && column < quote_marker_len {
+            quoted_prefix_style(depth, theme)
+        } else if let Some(kind) = diff_kind {
+            diff_line_style(kind, theme)
+        } else if depth > 0 {
+            let quoted = quoted_body_style(depth, theme);
+            if attribution {
+                quoted.add_modifier(Modifier::BOLD)
+            } else {
+                quoted
+            }
+        } else if attribution {
+            attribution_style(theme)
+        } else {
+            theme.text()
+        };
         spans.push(Span::styled(
-            ch.to_string(),
+            if ch == '\t' {
+                crate::app::COMPOSE_TAB_SPACES.to_owned()
+            } else {
+                ch.to_string()
+            },
             if at_cursor && composer.mode != ComposeMode::Insert {
                 block
             } else if selected {
-                theme.selected()
-            } else if depth > 0 && column < quote_marker_len {
-                quoted_prefix_style(depth, theme)
-            } else if let Some(kind) = diff_kind {
-                diff_line_style(kind, theme)
-            } else if depth > 0 {
-                let quoted = quoted_body_style(depth, theme);
-                if attribution {
-                    quoted.add_modifier(Modifier::BOLD)
-                } else {
-                    quoted
-                }
-            } else if attribution {
-                attribution_style(theme)
+                theme.visual_selection(style)
             } else {
-                theme.text()
+                style
             },
         ));
         global += 1;
@@ -1091,7 +1141,7 @@ pub(super) fn editor_text(
     if active && global == cursor && composer.mode != ComposeMode::Insert {
         spans.push(Span::styled(" ", block));
     }
-    lines.push(Line::from(spans));
+    lines.push(Line::from(spans).style(row_style(logical_line)));
     Text::from(lines)
 }
 

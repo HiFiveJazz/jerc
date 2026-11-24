@@ -152,7 +152,10 @@ impl App {
                 if completed_current_send {
                     self.pending_send = None;
                 }
-                if completed_current_send && let Some(composer) = &self.composer {
+                if completed_current_send
+                    && self.contacts_writable
+                    && let Some(composer) = &self.composer
+                {
                     let mut changed = false;
                     for field in [&composer.to, &composer.cc, &composer.bcc] {
                         for (name, address) in recipients(field) {

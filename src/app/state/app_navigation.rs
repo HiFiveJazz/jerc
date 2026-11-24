@@ -17,12 +17,12 @@ impl App {
         if let Some(account) = self.account_mut() {
             // Each account retains its own live mailbox while inactive; do
             // not copy its preview bodies into an additional in-memory cache.
-            account.persist_current_cache();
+            account.persist_current_navigation();
         }
         self.count_prefix = None;
         self.message_open = false;
-        self.reader_smooth_target = None;
-        self.reader_visual_linewise = false;
+        self.reader_navigation.smooth_target = None;
+        self.reader_navigation.visual_linewise = false;
         self.pending_compose = None;
         self.pending_draft = None;
         self.visual_anchor = None;
@@ -46,11 +46,11 @@ impl App {
             return;
         }
 
-        self.reader_cursor = 0;
-        self.reader_column = 0;
-        self.reader_preferred_column = None;
-        self.reader_visual_anchor = None;
-        self.reader_pending_g = false;
+        self.reader_navigation.row = 0;
+        self.reader_navigation.column = 0;
+        self.reader_navigation.preferred_column = None;
+        self.reader_navigation.visual_anchor = None;
+        self.reader_navigation.pending_g = false;
         self.reader_pending_inner_object = false;
         let preview_split = self.preview_split;
         let Some(account) = self.account_mut() else {
@@ -114,7 +114,7 @@ impl App {
             return;
         }
         account.save_current_cache();
-        account.persist_current_cache();
+        account.persist_current_navigation();
         account.smooth_mailbox_target = None;
         account.mailbox_index = next;
         account.keep_mailbox_cursor_visible();

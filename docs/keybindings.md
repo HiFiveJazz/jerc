@@ -99,7 +99,8 @@ Normal, Insert, and Visual modes share Vim-style movement. Search the Compose `?
 | Key | Action |
 | --- | --- |
 | `C` (Shift-C) in Normal/Visual | Toggle conversation quote / quoted Git diff colors (session only) |
-| `Tab` / `Shift-Tab` | Next / previous field |
+| `Tab` / `Shift-Tab` (Normal or Insert in headers) | Next / previous field |
+| `Tab` (Insert in body) | Insert a literal tab |
 | `Enter` in Normal | Preview before sending |
 | `Esc` in Insert | Return to Normal mode (also dismisses recipient autocomplete) |
 | `yy` / `Y` (Normal) | Yank whole body line or entire To/Cc/Bcc/Subject field; prefix with a count for multiple body lines |
@@ -117,7 +118,7 @@ Normal, Insert, and Visual modes share Vim-style movement. Search the Compose `?
 | `Alt-c` | Open Contacts |
 | `Ctrl-j` / `Ctrl-k` | Navigate contact suggestions when shown |
 | `Ctrl-n` / `Ctrl-p` | Alternative suggestion navigation when suggestions are active |
-| `Tab` / `Enter` | Accept a contact suggestion when shown |
+| `Enter` | Accept a contact suggestion when shown |
 
 
 

@@ -2,7 +2,7 @@
 //! authorizes a retry of a durable mutation or SMTP Outbox operation.
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ring::digest::{SHA256, digest};
@@ -150,16 +150,14 @@ impl NoticeAcknowledgments {
         }
         let mut sorted = keys.iter().cloned().collect::<Vec<_>>();
         sorted.sort();
-        serde_json::to_writer(
+        crate::cache::write_json_buffered(
             &mut tmp,
             &FileFormat {
                 version: VERSION,
                 keys: sorted,
                 first_seen: first_seen.clone(),
             },
-        )
-        .map_err(std::io::Error::other)?;
-        tmp.flush()?;
+        )?;
         tmp.as_file().sync_all()?;
         tmp.persist(&self.path).map_err(|error| error.error)?;
         #[cfg(unix)]

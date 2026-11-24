@@ -216,31 +216,42 @@ pub(super) fn fetch_attachments(
     Ok(attachments)
 }
 
-/// Best effort: a failed/empty body still yields the sender and subject.
-/// fetch_body uses IMAP BODY.PEEK and must never change the Seen flag.
+/// Read exactly the identity returned by the notification checkpoint. A
+/// missing/deleted/oversized message produces a generic count, never the
+/// unrelated first row of the mailbox. MIME Date is not an arrival clock.
 pub(super) fn new_mail_preview(
     backend: &mut dyn MailBackend,
     mailbox: &str,
     count: usize,
+    candidate: MessageId,
 ) -> WorkerEventKind {
+    let mut id = None;
     let mut sender = String::new();
     let mut subject = String::new();
     let mut excerpt = String::new();
-    if let Ok(page) = backend.open_mailbox(mailbox, 0, 1)
-        && let Some(message) = page.messages.first()
+    if let Ok(raw) = backend.notification_raw(mailbox, &candidate)
+        && raw.len() <= crate::mail::MAX_BODY_MESSAGE_BYTES
+        && let Ok(message) = crate::mail::parse_summary(
+            candidate.clone(),
+            &raw,
+            raw.len() as u64,
+            crate::model::MessageFlags::empty(),
+        )
     {
+        id = Some(candidate.clone());
         sender = if message.from_name.is_empty() {
             message.from_address.clone()
         } else {
             message.from_name.clone()
         };
         subject = message.subject.clone();
-        if let Ok(body) = backend.fetch_body(mailbox, &message.id) {
+        if let Ok(body) = crate::mail::parse_body_compact(candidate, &raw) {
             excerpt = body.display_text(false).chars().take(400).collect();
         }
     }
     WorkerEventKind::NewMailPreview {
         count,
+        id,
         sender,
         subject,
         excerpt,

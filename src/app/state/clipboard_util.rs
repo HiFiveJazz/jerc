@@ -3,7 +3,7 @@ use super::*;
 
 /// Both yanks and explicit Vim cuts share a clipboard/register policy.
 /// The private register keeps Vim p/P working even without an OS clipboard.
-
+///
 /// Record a yank both in the private Vim register and the OS clipboard.
 /// Empty selections must not destroy an earlier successful yank.
 pub(super) fn record_yank(

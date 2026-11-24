@@ -370,9 +370,13 @@ impl MessageBody {
 
     #[must_use]
     pub fn has_html_alternative(&self) -> bool {
-        self.html_text
+        self.html_source
             .as_deref()
-            .is_some_and(|text| !text.trim().is_empty())
+            .is_some_and(|source| !source.trim().is_empty())
+            || self
+                .html_text
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
     }
 
     #[must_use]

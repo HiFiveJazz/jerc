@@ -14,6 +14,7 @@ impl AccountState {
         // A manual refresh can supersede an older mailbox LIST. Its eventual
         // response must not block discovery on the new connection.
         self.abandon_mailbox_list();
+        self.inbox_notifications.reset();
         self.connecting = true;
         self.connect_request_id = Some(id);
         self.sync_progress_at = Some(Instant::now());
@@ -95,6 +96,7 @@ impl AccountState {
         self.body_request_id = None;
         self.pending_bodies.clear();
         self.status_requests.reset_connection();
+        self.inbox_notifications.reset();
         self.unverified_mailboxes
             .extend(self.cache_identities.keys().cloned());
     }
@@ -250,12 +252,19 @@ impl AccountState {
     }
 
     /// Counts refer to known/cached members, not a promise of completeness.
+    #[cfg(test)]
     pub(crate) fn inline_thread_rows(&self) -> Vec<(usize, crate::threading::ThreadRow)> {
+        self.inline_thread_rows_shared().as_ref().clone()
+    }
+
+    pub(crate) fn inline_thread_rows_shared(
+        &self,
+    ) -> Arc<Vec<(usize, crate::threading::ThreadRow)>> {
         if !matches!(
             self.effective_local_thread_view(),
             Some(crate::threading::LocalThreadView::Collapsed)
         ) {
-            return Vec::new();
+            return Arc::default();
         }
         self.local_thread_index.borrow_mut().inline_rows(
             &self.messages,
@@ -333,48 +342,62 @@ impl AccountState {
 
     #[must_use]
     pub fn visible_message_indices(&self) -> Vec<usize> {
+        Arc::try_unwrap(self.visible_message_indices_shared())
+            .unwrap_or_else(|rows| rows.as_ref().clone())
+    }
+
+    /// A snapshot of cached search/thread rows, without copying them on redraw.
+    pub(crate) fn visible_message_indices_shared(&self) -> Arc<Vec<usize>> {
+        if self.search_query.trim().is_empty() {
+            let mut cache = self.local_search_index.borrow_mut();
+            if !cache.query.is_empty() {
+                *cache = LocalSearchIndex::default();
+            }
+        }
         // Cached rows stay navigable while IMAP reconciliation runs. They are
         // provisional, so all server-facing UID actions check verification.
         if self.native_view.is_some() || self.native_search_editing {
-            return (0..self.messages.len()).collect();
+            return Arc::new((0..self.messages.len()).collect());
         }
         if let Some(view) = self.effective_local_thread_view() {
             if matches!(view, crate::threading::LocalThreadView::Collapsed) {
-                return self
-                    .inline_thread_rows()
-                    .into_iter()
-                    .map(|(i, _)| i)
-                    .collect();
+                return self.local_thread_index.borrow_mut().inline_indices(
+                    &self.messages,
+                    &self.expanded_threads,
+                    &self.inline_thread_extra,
+                );
             }
-            return self
-                .local_thread_index
-                .borrow_mut()
-                .visible_indices(&self.messages, &view);
+            return Arc::new(
+                self.local_thread_index
+                    .borrow_mut()
+                    .visible_indices(&self.messages, &view),
+            );
         }
         let query = self.search_query.trim().to_lowercase();
         if query.is_empty() {
-            return (0..self.canonical_messages().len()).collect();
+            return Arc::new((0..self.canonical_messages().len()).collect());
         }
         // Explicit body search examines already-loaded readable text only;
         // do not fetch bodies merely because a local filter is being typed.
         if let Some(query) = query.strip_prefix("body:").filter(|q| !q.is_empty()) {
-            return self
-                .messages
-                .iter()
-                .enumerate()
-                .filter_map(|(i, m)| {
-                    let body = self.bodies.get(&m.id)?;
-                    [
-                        body.plain_text.as_deref(),
-                        body.plain_fallback.as_deref(),
-                        body.html_text.as_deref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .any(|text| text.to_lowercase().contains(query))
-                    .then_some(i)
-                })
-                .collect();
+            return Arc::new(
+                self.messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, m)| {
+                        let body = self.bodies.get(&m.id)?;
+                        [
+                            body.plain_text.as_deref(),
+                            body.plain_fallback.as_deref(),
+                            body.html_text.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .any(|text| text.to_lowercase().contains(query))
+                        .then_some(i)
+                    })
+                    .collect(),
+            );
         }
         self.local_search_index
             .borrow_mut()
@@ -383,13 +406,13 @@ impl AccountState {
 
     #[must_use]
     pub fn visible_message_position(&self) -> Option<usize> {
-        self.visible_message_indices()
+        self.visible_message_indices_shared()
             .iter()
             .position(|index| *index == self.message_index)
     }
 
     pub(super) fn normalize_search_selection(&mut self) {
-        let visible = self.visible_message_indices();
+        let visible = self.visible_message_indices_shared();
         if visible.is_empty() {
             self.message_index = 0;
             self.message_view_offset = 0;
@@ -413,7 +436,7 @@ impl AccountState {
     }
 
     pub(super) fn keep_message_cursor_visible(&mut self) {
-        let visible = self.visible_message_indices();
+        let visible = self.visible_message_indices_shared();
         let Some(position) = visible
             .iter()
             .position(|index| *index == self.message_index)
@@ -597,6 +620,7 @@ impl AccountState {
         if let Ok(request_id) = self.worker.post(ActionKind::FetchBody {
             mailbox,
             id: id.clone(),
+            html_width: self.reader_html_width.filter(|_| self.prefer_html),
         }) {
             crate::perf::record("ui_preview_cache_miss", None, Duration::ZERO, true);
             self.body_request_id = Some(request_id);
@@ -611,7 +635,7 @@ impl AccountState {
     /// Queue only nearby, missing preview bodies. A superseding window is
     /// coalesced by the background worker; the foreground always wins.
     pub(super) fn prefetch_near_cursor(&mut self, direction: isize) {
-        let visible = self.visible_message_indices();
+        let visible = self.visible_message_indices_shared();
         let Some(position) = visible
             .iter()
             .position(|index| *index == self.message_index)
@@ -648,7 +672,7 @@ impl AccountState {
         if self.unverified_mailboxes.contains(&mailbox) {
             return;
         }
-        let visible = self.visible_message_indices();
+        let visible = self.visible_message_indices_shared();
         if position >= visible.len() {
             return;
         }
@@ -722,6 +746,7 @@ impl AccountState {
             .post(ActionKind::PrefetchBodies {
                 mailbox: mailbox.clone(),
                 ids,
+                html_width: self.reader_html_width.filter(|_| self.prefer_html),
             })
             .is_ok()
         {

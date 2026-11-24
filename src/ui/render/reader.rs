@@ -223,8 +223,8 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
     let reader_image_size = app.reader_image_protocol().map(|image| image.size());
 
-    let reader_cursor = app.reader_cursor;
-    let reader_column = app.reader_column;
+    let reader_cursor = app.reader_navigation.row;
+    let reader_column = app.reader_navigation.column;
     let reader_visual = app.reader_visual_range();
     let reader_illuminate = (reader_active && reader_visual.is_none())
         .then(|| {
@@ -432,6 +432,7 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             None
         };
+    let diff_rows = diff_background_rows(&lines, content_area.width, true);
     let paragraph = Paragraph::new(Text::from(lines))
         .style(theme.text())
         .wrap(Wrap { trim: false });
@@ -447,6 +448,7 @@ pub(super) fn draw_message(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
     let scroll = app.account().map_or(0, |account| account.preview_scroll);
     frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
+    paint_diff_background_rows(frame, content_area, usize::from(scroll), &diff_rows);
 
     if let (Some(protocol), Some(start)) = (app.reader_image_protocol(), image_visual_start)
         && start >= usize::from(scroll)
@@ -641,7 +643,13 @@ pub(super) fn classify_patch_lines_with_quotes(
             } else if text.starts_with('-') && old_left > 0 {
                 old_left -= 1;
                 Some(PatchLineKind::Remove)
-            } else if text.starts_with(' ') && old_left > 0 && new_left > 0 {
+            } else if (text.starts_with(' ') || depth > 0 && text.is_empty())
+                && old_left > 0
+                && new_left > 0
+            {
+                // Email clients trim trailing spaces from quoted blank context
+                // rows ("> " becomes ">"). The hunk's remaining old/new
+                // counts still identify them as context, not a prose boundary.
                 old_left -= 1;
                 new_left -= 1;
                 None
@@ -673,6 +681,80 @@ pub(super) fn classify_patch_lines_with_quotes(
 /// keeps the diff foreground and uses the theme's current-line background.
 pub(super) fn reader_active_diff_bg(theme: &Theme, _diff_bg: Color) -> Color {
     theme.popup_bg
+}
+
+/// The line style carries a semantic background across physical wraps without
+/// inserting synthetic spaces into the selectable text.
+fn diff_row_style(background: Option<Color>, index: usize, view: ReaderView<'_>) -> Style {
+    let Some(bg) = background else {
+        return Style::default();
+    };
+    // A Visual selection styles actual text spans only. The row background
+    // represents diff semantics (or the neutral current-line highlight).
+    let bg = if view.highlights_current_line(index) {
+        reader_active_diff_bg(view.theme, bg)
+    } else {
+        bg
+    };
+    Style::default().bg(bg)
+}
+
+/// Paragraph paints glyphs, not unused cells at the end of a wrapped row.
+/// Measure physical rows with its own wrapping rules before filling the
+/// background. Skip the extra layout work entirely for ordinary messages.
+pub(super) fn diff_background_rows(
+    lines: &[Line<'_>],
+    width: u16,
+    wrap: bool,
+) -> Vec<(usize, usize, Color)> {
+    let Some(last) = lines.iter().rposition(|line| line.style.bg.is_some()) else {
+        return Vec::new();
+    };
+    let width = width.max(1);
+    let mut row = 0usize;
+    let mut backgrounds = Vec::new();
+    for line in &lines[..=last] {
+        let height = if wrap && line.width() > usize::from(width) {
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .max(1)
+        } else {
+            1
+        };
+        if let Some(bg) = line.style.bg {
+            backgrounds.push((row, height, bg));
+        }
+        row = row.saturating_add(height);
+    }
+    backgrounds
+}
+
+/// Fill unstyled cells *after* Paragraph renders. Its wrapping renderer can
+/// reset unused cells (including wide-glyph continuation cells), so painting
+/// a Block underneath the paragraph is not sufficient. Keep explicit cell
+/// backgrounds for the block cursor, word illumination and Visual selection.
+pub(super) fn paint_diff_background_rows(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    scroll: usize,
+    rows: &[(usize, usize, Color)],
+) {
+    let end = scroll.saturating_add(usize::from(area.height));
+    let buffer = frame.buffer_mut();
+    for &(start, height, bg) in rows {
+        let first = start.max(scroll);
+        let last = start.saturating_add(height).min(end);
+        for row in first..last {
+            let y = area.y + (row - scroll) as u16;
+            for x in area.x..area.right() {
+                let cell = &mut buffer[(x, y)];
+                if cell.bg == Color::Reset {
+                    cell.bg = bg;
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn diff_line_style(kind: PatchLineKind, theme: &Theme) -> Style {
@@ -733,7 +815,7 @@ pub(super) fn plain_reader_line(
     let illuminate_ranges = illuminate_word
         .map(|word| word_match_ranges(text, word))
         .unwrap_or_default();
-    let mut spans = reader_gutter(line_index, line_count, reader_cursor, reader_active, theme);
+    let mut spans = reader_gutter(line_index, line_count, view);
     let line_len = text.chars().count();
     let view = ReaderView {
         cursor: reader_cursor,
@@ -791,7 +873,11 @@ pub(super) fn plain_reader_line(
         },
         diff.and_then(|style| style.bg),
     );
-    Line::from(spans)
+    Line::from(spans).style(diff_row_style(
+        diff.and_then(|style| style.bg),
+        line_index,
+        view,
+    ))
 }
 
 pub(super) fn rich_html_line(
@@ -811,7 +897,7 @@ pub(super) fn rich_html_line(
         theme,
         ..
     } = view;
-    let mut spans = reader_gutter(line_index, line_count, reader_cursor, reader_active, theme);
+    let mut spans = reader_gutter(line_index, line_count, view);
     let line_len = line
         .spans
         .iter()
@@ -923,31 +1009,46 @@ pub(super) fn rich_html_line(
         },
         diff.and_then(|style| style.bg),
     );
-    Line::from(spans)
+    Line::from(spans).style(diff_row_style(
+        diff.and_then(|style| style.bg),
+        line_index,
+        view,
+    ))
 }
 
 pub(super) fn reader_gutter(
     line_index: usize,
     line_count: usize,
-    reader_cursor: usize,
-    reader_active: bool,
-    theme: &crate::theme::Theme,
+    view: ReaderView<'_>,
 ) -> Vec<Span<'static>> {
-    if !reader_active {
+    if !view.active {
         return Vec::new();
     }
     let digits = line_count.max(1).to_string().len().max(4);
-    let number = if line_index == reader_cursor {
+    let number = if line_index == view.cursor {
         line_index.saturating_add(1)
     } else {
-        line_index.abs_diff(reader_cursor)
+        line_index.abs_diff(view.cursor)
     };
-    let style = if line_index == reader_cursor {
-        theme.accent()
+    vec![Span::styled(
+        format!("{number:>digits$} "),
+        reader_number_style(line_index, view),
+    )]
+}
+
+/// Shared by the incoming and outgoing readers, regardless of gutter width.
+pub(super) fn reader_number_style(line_index: usize, view: ReaderView<'_>) -> Style {
+    if view.active && line_index == view.cursor {
+        if view.visual.is_some() {
+            Style::default()
+                .fg(view.theme.visual)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            view.theme.accent()
+        }
     } else {
-        theme.muted()
-    };
-    vec![Span::styled(format!("{number:>digits$} "), style)]
+        view.theme.muted()
+    }
 }
 
 pub(super) fn reader_fragments(
@@ -1006,7 +1107,7 @@ pub(super) fn reader_fragments(
             continue;
         }
         let mut fragment_style = style;
-        if reader_active && line_index == reader_cursor {
+        if view.highlights_current_line(line_index) {
             // Diff semantics remain tinted, but selection gets a stronger
             // background than ordinary additions/removals.
             let bg = fragment_style
@@ -1030,10 +1131,7 @@ pub(super) fn reader_fragments(
         if selected_columns.is_some_and(|(selected_start, selected_end)| {
             start >= selected_start && start <= selected_end
         }) {
-            fragment_style = fragment_style
-                .fg(theme.selected_fg)
-                .bg(theme.selected_bg)
-                .add_modifier(Modifier::BOLD);
+            fragment_style = theme.visual_selection(fragment_style);
         }
         // Keep the Vim block cursor visually independent from theme selection
         // colours. A white block mirrors the reader/editor cursor users expect
@@ -1043,7 +1141,8 @@ pub(super) fn reader_fragments(
             fragment_style = reader_cursor_style();
         }
         out.push(Span::styled(
-            char_slice(text, start - global_start, end - global_start),
+            char_slice(text, start - global_start, end - global_start)
+                .replace('\t', crate::app::COMPOSE_TAB_SPACES),
             fragment_style,
         ));
     }
@@ -1125,39 +1224,38 @@ pub(super) fn pad_reader_line(
     let ReaderView {
         cursor: reader_cursor,
         column: reader_column,
-        visual: reader_visual,
         active: reader_active,
         theme,
         ..
     } = view;
-    if !reader_active && diff_background.is_none() {
-        return;
-    }
-    let visual_line_selected = reader_visual.is_some_and(|selection| {
-        selection.start.line <= line_index && line_index <= selection.end.line
-    });
-    let linewise_visual = reader_visual
-        .is_some_and(|selection| selection.start.column == 0 && selection.end.column == usize::MAX);
-    if (line_index != reader_cursor || !reader_active)
-        && !visual_line_selected
-        && diff_background.is_none()
-    {
+    // Padding is never part of a Vim text selection, even for V or for
+    // blank lines. In Visual mode retain the original diff background,
+    // not the Normal-mode current-line tint. Keep padding for the cursor.
+    if (line_index != reader_cursor || !reader_active) && diff_background.is_none() {
         return;
     }
     let mut style = theme.text();
     if let Some(bg) = diff_background {
         style = style.bg(bg);
     }
-    if reader_active && line_index == reader_cursor {
+    if view.highlights_current_line(line_index) {
         style = style.bg(diff_background
             .map(|bg| reader_active_diff_bg(theme, bg))
             .unwrap_or(theme.popup_bg));
     }
-    if visual_line_selected && (linewise_visual || content_len == 0) {
-        style = theme.selected();
-    }
+    // The cursor uses character offsets, but padding uses terminal cells.
+    // Tabs, CJK and combining characters can have different widths.
+    let gutter = spans
+        .first()
+        .filter(|_| reader_active)
+        .map_or(0, Span::width);
+    let used = spans
+        .iter()
+        .map(Span::width)
+        .sum::<usize>()
+        .saturating_sub(gutter);
     let padding = content_width
-        .saturating_sub(content_len)
+        .saturating_sub(used)
         .max(usize::from(content_len == 0));
     if padding == 0 {
         return;

@@ -18,9 +18,20 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             theme.accent(),
         ));
+        // The send review is a read-only Vim reader, independent of the
+        // editing mode that will be restored when the review is dismissed.
+        let mode = if composer.confirm_send {
+            if composer.preview_visual_range().is_some() {
+                ComposeMode::Visual
+            } else {
+                ComposeMode::Normal
+            }
+        } else {
+            composer.mode
+        };
         spans.push(Span::styled(
-            format!(" {} ", composer.mode.label()),
-            compose_mode_style(composer.mode, theme),
+            format!(" {} ", mode.label()),
+            compose_mode_style(mode, theme),
         ));
         spans.push(Span::raw(" "));
         if !app.status.text.is_empty() {
@@ -36,7 +47,7 @@ pub(super) fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else if let Some(account) = app.account() {
         spans.push(Span::styled(format!("[{}] ", account.name), theme.accent()));
         let mode = if app.message_open {
-            if app.reader_visual_anchor.is_some() {
+            if app.reader_navigation.visual_anchor.is_some() {
                 "VISUAL"
             } else {
                 "NORMAL"

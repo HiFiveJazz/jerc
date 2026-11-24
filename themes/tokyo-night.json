@@ -13,5 +13,6 @@
   "border": "#414868",
   "selected_fg": "#1a1b26",
   "selected_bg": "#7aa2f7",
+  "visual_selection_bg": "#283457",
   "visual": "#bb9af7"
 }

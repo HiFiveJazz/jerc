@@ -57,6 +57,10 @@ impl RawStore {
         if raw.is_empty() || raw.len() as u64 > MAX_RAW_CACHE_FILE_BYTES {
             return Ok(());
         }
+        let path = self.raw_path(mailbox, validity, id);
+        if identical_raw(&path, raw) {
+            return Ok(());
+        }
         fs::create_dir_all(&self.dir)?;
         secure_private_dir(&self.dir)?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
@@ -68,8 +72,7 @@ impl RawStore {
         }
         tmp.write_all(raw)?;
         tmp.flush()?;
-        tmp.persist(self.raw_path(mailbox, validity, id))
-            .map_err(|error| error.error)?;
+        tmp.persist(path).map_err(|error| error.error)?;
         self.prune()
     }
 
@@ -108,4 +111,25 @@ impl RawStore {
         }
         Ok(())
     }
+}
+
+/// A repeated immutable MIME write should not replace the same file or scan
+/// the raw cache again. Compare regular files in bounded chunks.
+fn identical_raw(path: &Path, raw: &[u8]) -> bool {
+    if !fs::symlink_metadata(path)
+        .is_ok_and(|m| m.file_type().is_file() && m.len() == raw.len() as u64)
+    {
+        return false;
+    }
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut buffer = [0u8; 16 * 1024];
+    for chunk in raw.chunks(buffer.len()) {
+        if file.read_exact(&mut buffer[..chunk.len()]).is_err() || &buffer[..chunk.len()] != chunk {
+            return false;
+        }
+    }
+    // A concurrent replacement must not be mistaken for an equal longer file.
+    file.read(&mut buffer[..1]).is_ok_and(|n| n == 0)
 }

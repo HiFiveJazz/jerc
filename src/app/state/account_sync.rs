@@ -125,10 +125,171 @@ impl MailboxStatusQueue {
     }
 }
 
+/// Counts used for notifications must come from live server observations,
+/// not cached/optimistic UI totals. Keep only one Inbox baseline per account.
+#[derive(Debug, Default)]
+pub(super) struct InboxNotifications {
+    baseline: Option<InboxObservation>,
+    checkpoint: Option<crate::backend::InboxCheckpoint>,
+    pending: VecDeque<(u64, i64)>,
+    previewed: VecDeque<MessageId>,
+}
+
+#[derive(Debug)]
+struct InboxObservation {
+    name: String,
+    total: usize,
+    at: i64,
+    request_id: u64,
+}
+
+impl InboxNotifications {
+    /// Returns the count-only fallback and live observation timestamps.
+    /// The first live observation and reconciliation never announce arrivals.
+    pub(super) fn observe(
+        &mut self,
+        name: &str,
+        total: usize,
+        from_poll: bool,
+        at: i64,
+        request_id: u64,
+    ) -> Option<(usize, i64, i64)> {
+        if self
+            .baseline
+            .as_ref()
+            .is_some_and(|old| request_id <= old.request_id)
+        {
+            return None;
+        }
+        let old = self.baseline.replace(InboxObservation {
+            name: name.to_owned(),
+            total,
+            at,
+            request_id,
+        })?;
+        let count = inbox_new_mail_count(from_poll, old.name == name, old.total, total);
+        (count > 0).then_some((count, old.at, at))
+    }
+
+    pub(super) fn checkpoint_for(&self, name: &str) -> Option<crate::backend::InboxCheckpoint> {
+        self.baseline.as_ref().filter(|old| old.name == name)?;
+        self.checkpoint.clone()
+    }
+
+    pub(super) fn needs_baseline(&self, name: &str) -> bool {
+        self.baseline.as_ref().is_none_or(|old| old.name != name)
+    }
+
+    pub(super) fn observe_check(
+        &mut self,
+        name: &str,
+        total: usize,
+        from_poll: bool,
+        at: i64,
+        request_id: u64,
+        check: Option<crate::backend::InboxCheck>,
+    ) -> Option<(usize, Option<MessageId>, i64)> {
+        if self
+            .baseline
+            .as_ref()
+            .is_some_and(|old| request_id <= old.request_id)
+        {
+            return None;
+        }
+        let had_checkpoint = self.checkpoint_for(name).is_some();
+        let legacy = self.observe(name, total, from_poll, at, request_id);
+        let Some(check) = check else {
+            self.checkpoint = None;
+            return if had_checkpoint {
+                None
+            } else {
+                legacy.map(|(count, _, through)| (count, None, through))
+            };
+        };
+        // If identity support is unavailable, generic count alerts remain
+        // possible only between two count-only observations. Never infer
+        // a subject from a count. Switching generations silently rebaselines.
+        let has_checkpoint = check.checkpoint.is_some();
+        self.checkpoint = check.checkpoint;
+        if from_poll && had_checkpoint && has_checkpoint && check.count > 0 {
+            return Some((check.count, check.candidate, at));
+        }
+        if !had_checkpoint && !has_checkpoint {
+            return legacy.map(|(count, _, through)| (count, None, through));
+        }
+        None
+    }
+
+    pub(super) fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.baseline = None;
+        self.checkpoint = None;
+        self.clear_pending();
+        self.previewed.clear();
+    }
+
+    fn start_preview(&mut self, request_id: u64, at: i64) {
+        self.pending.push_back((request_id, at));
+        // A stalled worker must not accumulate unbounded preview requests.
+        while self.pending.len() > 16 {
+            self.pending.pop_front();
+        }
+    }
+
+    pub(super) fn finish_preview(&mut self, request_id: u64, now: i64) -> bool {
+        let Some(index) = self.pending.iter().position(|(id, _)| *id == request_id) else {
+            return false;
+        };
+        let (_, at) = self.pending.remove(index).expect("located pending preview");
+        // Discard responses that were delayed behind other work or a clock jump.
+        (0..=60).contains(&now.saturating_sub(at))
+    }
+
+    pub(super) fn first_preview(&mut self, id: MessageId) -> bool {
+        if self.previewed.contains(&id) {
+            return false;
+        }
+        self.previewed.push_back(id);
+        while self.previewed.len() > 32 {
+            self.previewed.pop_front();
+        }
+        true
+    }
+}
+
 impl AccountState {
+    /// Only a verified arrival may cause a MIME fetch. A generic count
+    /// notice is sufficient when the backend cannot establish an identity.
+    pub(super) fn queue_new_mail_preview(
+        &mut self,
+        mailbox: String,
+        count: usize,
+        candidate: Option<MessageId>,
+        at: i64,
+    ) -> Option<NewMailNotice> {
+        if let Some(id) = candidate
+            && let Ok(request_id) =
+                self.worker
+                    .post(ActionKind::NewMailPreview { mailbox, count, id })
+        {
+            self.inbox_notifications.start_preview(request_id, at);
+            return None;
+        }
+        Some(NewMailNotice {
+            account: self.name.clone(),
+            count,
+            sender: String::new(),
+            subject: String::new(),
+            excerpt: String::new(),
+        })
+    }
+
     /// A discovery response owns names, roles and ordering. IMAP LIST has no
     /// counts; keep the last known values while scheduling STATUS separately.
-    /// Protocols supplying authoritative counts (e.g. JMAP) need no STATUS.
+    /// Protocols supplying authoritative counts (e.g. JMAP) need no count fanout.
     pub(super) fn reconcile_mailbox_list(&mut self, mut discovered: Vec<Mailbox>) {
         self.status_requests.pending.retain(|request| {
             discovered.iter().any(|mailbox| {
@@ -286,10 +447,18 @@ impl App {
             return;
         }
         if let Some(request) = account.status_requests.pop_ready(&account.mailboxes) {
-            match account
-                .worker
-                .post(ActionKind::MailboxStatus(request.name.clone()))
-            {
+            let kind =
+                if account.mailboxes.iter().any(|mailbox| {
+                    mailbox.name == request.name && mailbox.role == MailboxRole::Inbox
+                }) {
+                    ActionKind::InboxStatus {
+                        name: request.name.clone(),
+                        previous: account.inbox_notifications.checkpoint_for(&request.name),
+                    }
+                } else {
+                    ActionKind::MailboxStatus(request.name.clone())
+                };
+            match account.worker.post(kind) {
                 Ok(request_id) => account.status_requests.start(request_id, request),
                 Err(_) => account
                     .status_requests
@@ -302,6 +471,113 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_baseline_is_live_and_ignores_stale_observations() {
+        let mut notices = InboxNotifications::default();
+        assert_eq!(notices.observe("INBOX", 500, true, 100, 1), None);
+        assert_eq!(
+            notices.observe("INBOX", 502, true, 110, 2),
+            Some((2, 100, 110))
+        );
+        assert_eq!(notices.observe("INBOX", 400, true, 115, 1), None);
+        assert_eq!(notices.observe("INBOX", 502, true, 120, 3), None);
+        assert_eq!(notices.observe("INBOX", 510, false, 130, 4), None);
+        assert_eq!(
+            notices.observe("INBOX", 511, true, 140, 5),
+            Some((1, 130, 140))
+        );
+        assert_eq!(notices.observe("Other Inbox", 900, true, 150, 6), None);
+        notices.reset();
+        assert_eq!(notices.observe("Other Inbox", 950, true, 160, 7), None);
+        assert_eq!(
+            notices.observe("Other Inbox", 951, true, 170, 8),
+            Some((1, 160, 170))
+        );
+    }
+
+    #[test]
+    fn identity_observation_detects_constant_count_and_rejects_stale_generation() {
+        use crate::backend::{InboxCheck, InboxCheckpoint};
+        let mut notices = InboxNotifications::default();
+        let check = |next, count| InboxCheck {
+            checkpoint: Some(InboxCheckpoint::Imap { validity: 1, next }),
+            count,
+            candidate: (count > 0).then(|| MessageId("imap-uid:1:10".into())),
+        };
+        assert!(
+            notices
+                .observe_check("INBOX", 10, true, 100, 1, Some(check(10, 0)))
+                .is_none()
+        );
+        assert_eq!(
+            notices.observe_check("INBOX", 10, true, 101, 2, Some(check(11, 1))),
+            Some((1, Some(MessageId("imap-uid:1:10".into())), 101))
+        );
+        assert!(
+            notices
+                .observe_check("INBOX", 11, true, 102, 1, Some(check(12, 1)))
+                .is_none()
+        );
+        assert!(
+            notices
+                .observe_check("INBOX", 11, true, 103, 3, Some(check(11, 0)))
+                .is_none()
+        );
+        notices.reset();
+        assert!(
+            notices
+                .observe_check("INBOX", 12, true, 104, 4, Some(check(12, 1)))
+                .is_none()
+        );
+        assert!(
+            notices
+                .observe_check("INBOX", 100, true, 105, 5, Some(InboxCheck::default()))
+                .is_none()
+        );
+        assert_eq!(
+            notices.observe_check("INBOX", 101, true, 106, 6, Some(InboxCheck::default())),
+            Some((1, None, 106))
+        );
+    }
+
+    #[test]
+    fn notification_previews_are_single_use_bounded_and_expire() {
+        let mut notices = InboxNotifications::default();
+        notices.start_preview(1, 100);
+        notices.start_preview(2, 101);
+        assert!(!notices.finish_preview(99, 102));
+        assert!(notices.finish_preview(2, 102));
+        assert!(!notices.finish_preview(2, 102));
+        assert!(!notices.finish_preview(1, 161));
+        notices.start_preview(3, 200);
+        assert!(!notices.finish_preview(3, 199));
+        notices.start_preview(4, 210);
+        notices.clear_pending();
+        assert!(!notices.finish_preview(4, 211));
+        notices.start_preview(5, 220);
+        notices.reset();
+        assert!(!notices.finish_preview(5, 221));
+        for id in 6..50 {
+            notices.start_preview(id, 230);
+        }
+        assert_eq!(notices.pending.len(), 16);
+        assert!(!notices.finish_preview(6, 231));
+        assert!(notices.finish_preview(49, 231));
+    }
+
+    #[test]
+    fn notification_preview_identity_is_not_reused() {
+        let mut notices = InboxNotifications::default();
+        let id = MessageId("imap-uid:123:9".into());
+        assert!(notices.first_preview(id.clone()));
+        assert!(!notices.first_preview(id));
+        assert!(notices.first_preview(MessageId("imap-uid:456:9".into())));
+        for i in 10..100 {
+            assert!(notices.first_preview(MessageId(format!("imap-uid:123:{i}"))));
+        }
+        assert_eq!(notices.previewed.len(), 32);
+    }
 
     #[test]
     fn cached_counts_do_not_skip_status_or_trigger_startup_notifications() {

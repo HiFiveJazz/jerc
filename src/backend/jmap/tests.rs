@@ -1171,3 +1171,17 @@ fn live_jmap_mailbox_read_only_smoke() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn inbox_query_delta_counts_membership_additions_not_reordering() {
+    let delta = json!({"oldQueryState":"a", "newQueryState":"b", "removed":["reordered", "gone"],
+        "added":[{"id":"new", "index":0}, {"id":"reordered", "index":1}]});
+    assert_eq!(
+        inbox_query_delta("a", &delta),
+        Some(("b".into(), 1, Some(MessageId("new".into()))))
+    );
+    assert!(inbox_query_delta("other", &delta).is_none());
+    let duplicate = json!({"oldQueryState":"a", "newQueryState":"b", "removed":[],
+        "added":[{"id":"new", "index":0}, {"id":"new", "index":1}]});
+    assert!(inbox_query_delta("a", &duplicate).is_none());
+}

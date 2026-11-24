@@ -629,6 +629,95 @@ pub const DESTINATION_HELP_ENTRIES: &[HelpEntry] = &[
     },
 ];
 
+/// Outgoing-message review shortcuts, separate from the editable draft.
+pub const SEND_PREVIEW_HELP_ENTRIES: &[HelpEntry] = &[
+    HelpEntry {
+        category: "Review",
+        key: "Enter",
+        description: "send outgoing email",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "Esc",
+        description: "exit Visual / return to editing",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "v / V",
+        description: "select text / lines",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "y",
+        description: "yank selected text",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "C",
+        description: "toggle quote / diff colors",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "j / k / ↑ / ↓",
+        description: "move one display row",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "Ctrl-j / Ctrl-k",
+        description: "neoscroll down / up",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "gg / G / {count}G",
+        description: "first / last / numbered body row",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "h / l / w / b",
+        description: "move by character or word",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "0 / ^ / $ / Home / End",
+        description: "move within current body row",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "{ / }",
+        description: "previous / next paragraph",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "Ctrl-u / Ctrl-d",
+        description: "move half a page",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "PageUp / PageDown",
+        description: "scroll one page",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "Mouse wheel",
+        description: "scroll one body row up / down",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "t",
+        description: "toggle plain / HTML",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "O",
+        description: "open preview in browser",
+    },
+    HelpEntry {
+        category: "Review",
+        key: "?",
+        description: "search review shortcuts",
+    },
+];
+
 /// Compose-specific, searchable modal shortcuts. Do not clutter the editor.
 pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry {
@@ -658,7 +747,7 @@ pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         category: "Compose",
-        key: "Tab / Enter (suggestion)",
+        key: "Enter (suggestion)",
         description: "accept suggested recipient",
     },
     HelpEntry {
@@ -713,8 +802,18 @@ pub const COMPOSE_HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         category: "Compose",
-        key: "Tab / Shift-Tab",
+        key: "Tab / Shift-Tab (normal)",
         description: "next / previous compose field",
+    },
+    HelpEntry {
+        category: "Compose",
+        key: "Tab / Shift-Tab (insert)",
+        description: "next / previous field from headers",
+    },
+    HelpEntry {
+        category: "Compose",
+        key: "Tab (insert, body)",
+        description: "insert a literal tab",
     },
     HelpEntry {
         category: "Send preview",

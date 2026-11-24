@@ -98,13 +98,7 @@ impl App {
             );
             return;
         };
-        self.reader_cursor = 0;
-        self.reader_column = 0;
-        self.reader_preferred_column = None;
-        self.reader_visual_anchor = None;
-        self.reader_visual_linewise = false;
-        self.reader_smooth_target = None;
-        self.reader_pending_g = false;
+        self.reader_navigation = ReaderNavigation::default();
         self.reader_pending_inner_object = false;
         self.reader_image = None;
         self.reader_image_pending = None;
@@ -256,7 +250,7 @@ impl App {
 
     pub fn configure_mail_images(&mut self, picker: Picker, runtime_tx: SyncSender<RuntimeEvent>) {
         self.image_picker = Some(picker);
-        self.image_loader = Some(MailImageLoader::spawn(runtime_tx));
+        self.image_runtime_tx = Some(runtime_tx);
     }
 
     pub fn ensure_reader_image(&mut self, width: u16, height: u16) {
@@ -288,6 +282,11 @@ impl App {
         self.reader_image_target_width = width.max(1);
         self.reader_image_target_height = height.max(1);
         self.reader_image_size_hint = Some((candidate.width_px, candidate.height_px));
+        if self.image_loader.is_none()
+            && let Some(tx) = &self.image_runtime_tx
+        {
+            self.image_loader = Some(MailImageLoader::spawn(tx.clone()));
+        }
         if let Some(loader) = &self.image_loader
             && loader.request(source.clone()).is_ok()
         {

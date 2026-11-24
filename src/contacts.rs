@@ -2,7 +2,7 @@
 //! The book is bounded; learned senders never replace a name explicitly saved
 //! by the user. Only contact details (not message bodies) are persisted.
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -98,14 +98,17 @@ impl ContactBook {
         let parent = path
             .parent()
             .context("contacts path has no parent directory")?;
+        // Do not replace the file when a batch ends up with identical contents.
+        // Also preserve a file that became invalid after startup.
+        if path.try_exists()? && Self::load(path)?.entries == self.entries {
+            return Ok(());
+        }
         std::fs::create_dir_all(parent).context("create contacts directory")?;
         // NamedTempFile uses private permissions and a unique name. Persist is
         // an atomic same-directory rename, so a crash cannot truncate the book.
         let mut temp =
             tempfile::NamedTempFile::new_in(parent).context("create contacts temp file")?;
-        serde_json::to_writer_pretty(&mut temp, self).context("serialize contacts")?;
-        temp.write_all(b"\n")?;
-        temp.flush()?;
+        write_contact_json(&mut temp, self)?;
         temp.as_file().sync_all()?;
         temp.persist(path).context("replace contacts file")?;
         Ok(())
@@ -120,6 +123,17 @@ impl ContactBook {
     pub fn upsert(&mut self, name: &str, email: &str, saved: bool) -> Result<bool> {
         let email = email.trim();
         let name = name.trim();
+        let existing = self.find(email);
+        // Automatic learning fills missing names, but conflicting aliases in
+        // repeated envelopes must not churn the book or overwrite user edits.
+        if !saved
+            && let Some(index) = existing
+            && (self.entries[index].saved
+                || !self.entries[index].name.is_empty()
+                || name.is_empty())
+        {
+            return Ok(false);
+        }
         if email.len() > 320
             || name.len() > 200
             || email.chars().any(char::is_control)
@@ -128,20 +142,12 @@ impl ContactBook {
         {
             anyhow::bail!("enter a valid email address and a name without control characters");
         }
-        if let Some(index) = self.find(email) {
+        if let Some(index) = existing {
             let contact = &mut self.entries[index];
-            if contact.saved && !saved {
+            if contact.name == name && contact.saved == (contact.saved || saved) {
                 return Ok(false);
             }
-            let new_name = if name.is_empty() && !saved {
-                contact.name.clone()
-            } else {
-                name.to_owned()
-            };
-            if contact.name == new_name && contact.saved == (contact.saved || saved) {
-                return Ok(false);
-            }
-            contact.name = new_name;
+            contact.name = name.to_owned();
             contact.saved |= saved;
             return Ok(true);
         }
@@ -244,6 +250,14 @@ impl ContactBook {
             .take(MAX_SUGGESTIONS)
             .collect()
     }
+}
+
+fn write_contact_json<W: Write>(sink: W, book: &ContactBook) -> Result<()> {
+    let mut writer = BufWriter::with_capacity(64 * 1024, sink);
+    serde_json::to_writer_pretty(&mut writer, book).context("serialize contacts")?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn match_score(query: &str, contact: &Contact) -> Option<i32> {
@@ -907,6 +921,66 @@ mod tests {
         assert!(!book.upsert("Other", "HI@EXAMPLE.org", false).unwrap());
         assert_eq!(book.entries[0].name, "Original");
     }
+    #[test]
+    fn learned_aliases_do_not_dirty_the_book_and_missing_names_are_filled() {
+        let mut book = ContactBook::default();
+        assert!(book.upsert("", "hi@example.org", false).unwrap());
+        assert!(book.upsert("First", "HI@example.org", false).unwrap());
+        for _ in 0..300 {
+            assert!(!book.upsert("Other", "hi@example.org", false).unwrap());
+            assert!(!book.upsert("First", "hi@example.org", false).unwrap());
+        }
+        assert_eq!(book.entries[0].name, "First");
+        assert!(book.upsert("Manual", "hi@example.org", true).unwrap());
+        assert!(!book.upsert("Other", "hi@example.org", false).unwrap());
+        assert_eq!(book.entries[0].name, "Manual");
+    }
+
+    #[test]
+    fn identical_contact_save_preserves_existing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("contacts.json");
+        let mut book = ContactBook::default();
+        book.upsert("Jane", "jane@example.org", true).unwrap();
+        let compact = serde_json::to_vec(&book).unwrap();
+        std::fs::write(&path, &compact).unwrap();
+        book.save(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), compact);
+        book.upsert("Changed", "jane@example.org", true).unwrap();
+        book.save(&path).unwrap();
+        assert_eq!(ContactBook::load(&path).unwrap().entries, book.entries);
+    }
+
+    #[test]
+    fn contact_json_is_buffered_and_preserves_format() {
+        #[derive(Default)]
+        struct Sink {
+            calls: usize,
+            bytes: Vec<u8>,
+        }
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut book = ContactBook::default();
+        for i in 0..200 {
+            book.upsert("Example", &format!("person{i}@example.org"), false)
+                .unwrap();
+        }
+        let mut sink = Sink::default();
+        super::write_contact_json(&mut sink, &book).unwrap();
+        assert_eq!(sink.calls, 1);
+        let mut expected = serde_json::to_vec_pretty(&book).unwrap();
+        expected.push(b'\n');
+        assert_eq!(sink.bytes, expected);
+    }
+
     #[test]
     fn save_and_load_roundtrip() {
         let temp = tempfile::tempdir().unwrap();

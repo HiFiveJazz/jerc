@@ -194,12 +194,14 @@ fn reply_to_reply_all_and_list_reply_are_distinct() {
     let raw = b"From: Developer <dev@example.org>\r\nReply-To: Maintainer <maintainer@example.org>\r\nTo: Me <me@example.org>, Team <team@example.org>\r\nCc: Reviewer <reviewer@example.org>, Team <TEAM@example.org>\r\nList-Post: <mailto:linux-kernel@vger.kernel.org>\r\n\r\nbody";
     let own = ["me@example.org".to_string()];
     let reply = reply_recipients(raw, ReplyAudience::Sender, &own).unwrap();
-    assert!(reply.to.contains("maintainer@example.org"));
+    assert_eq!(reply.to, "Maintainer <maintainer@example.org>");
     assert!(!reply.to.contains("dev@example.org"));
     let all = reply_recipients(raw, ReplyAudience::All, &own).unwrap();
-    assert!(all.to.contains("maintainer@example.org"));
-    assert!(all.cc.contains("team@example.org"));
-    assert!(all.cc.contains("reviewer@example.org"));
+    assert_eq!(all.to, "Maintainer <maintainer@example.org>");
+    assert_eq!(
+        all.cc,
+        "Team <team@example.org>, Reviewer <reviewer@example.org>"
+    );
     assert!(!all.cc.to_lowercase().contains("me@example.org"));
     assert_eq!(all.cc.to_lowercase().matches("team@example.org").count(), 1);
     let list = reply_recipients(raw, ReplyAudience::List, &own).unwrap();
@@ -244,8 +246,33 @@ fn sending_a_reply_to_yourself_is_supported_but_reply_all_excludes_self() {
     let raw = b"From: Me <me@example.org>\r\nTo: Friend <friend@example.org>\r\n\r\nhello";
     let own = ["me@example.org".to_string()];
     let reply = reply_recipients(raw, ReplyAudience::Sender, &own).unwrap();
-    assert_eq!(reply.to, "me@example.org");
+    assert_eq!(reply.to, "Me <me@example.org>");
     let all = reply_recipients(raw, ReplyAudience::All, &own).unwrap();
-    assert_eq!(all.to, "friend@example.org");
+    assert_eq!(all.to, "Friend <friend@example.org>");
     assert!(all.cc.is_empty());
+}
+
+#[test]
+fn reply_names_survive_bare_same_address_reply_to_and_special_characters() {
+    let raw = b"From: \"Schneider, James\" <james@example.org>\r\nReply-To: james@example.org\r\nTo: Me <me@example.org>, Reviewer <reviewer@example.org>\r\nCc: Duplicate <REVIEWER@example.org>, bare@example.org\r\n\r\nbody";
+    let own = ["me@example.org".to_owned()];
+    for audience in [ReplyAudience::Sender, ReplyAudience::All] {
+        let reply = reply_recipients(raw, audience, &own).unwrap();
+        assert_eq!(reply.to, "\"Schneider, James\" <james@example.org>");
+        if audience == ReplyAudience::All {
+            assert_eq!(
+                reply.cc,
+                "Reviewer <reviewer@example.org>, bare@example.org"
+            );
+        }
+        jerc::outgoing::validate_recipients(&reply.to, &reply.cc, "").unwrap();
+    }
+    let redirected =
+        b"From: James Schneider <james@example.org>\r\nReply-To: other@example.org\r\n\r\nbody";
+    assert_eq!(
+        reply_recipients(redirected, ReplyAudience::Sender, &own)
+            .unwrap()
+            .to,
+        "other@example.org"
+    );
 }

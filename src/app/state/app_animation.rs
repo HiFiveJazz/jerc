@@ -48,6 +48,11 @@ impl App {
             // scroll could keep redrawing contacts at 100 FPS indefinitely.
             return modal.smooth_target.is_some();
         }
+        if let Some(composer) = self.composer.as_ref()
+            && composer.confirm_send
+        {
+            return !composer.help_visible && composer.send_preview.navigation.active();
+        }
         self.composer
             .as_ref()
             .is_some_and(|composer| composer.body_smooth_target.is_some())
@@ -68,7 +73,7 @@ impl App {
                         || picker.pdf_preview_due.is_some()
                         || !picker.pdf_preview_inflight.is_empty()
                 })
-            || self.reader_smooth_target.is_some()
+            || self.reader_navigation.smooth_target.is_some()
             || self.account().is_some_and(|account| {
                 account.smooth_message_target.is_some()
                     || account.smooth_mailbox_target.is_some()
@@ -95,6 +100,14 @@ impl App {
             }
             let length = modal.matches.len();
             modal.advance(length);
+            return;
+        }
+        if let Some(composer) = self.composer.as_mut()
+            && composer.confirm_send
+        {
+            if !composer.help_visible {
+                composer.send_preview.advance();
+            }
             return;
         }
         if let Some(composer) = self.composer.as_mut()
@@ -150,31 +163,15 @@ impl App {
         }
         let focus = self.focus;
         if focus == Focus::Preview {
-            let Some(target) = self.reader_smooth_target else {
-                return;
-            };
-            if self.reader_line_count == 0 {
-                self.reader_smooth_target = None;
-                return;
+            let mut navigation = self.reader_navigation;
+            let moved = navigation.advance(
+                self.reader_display_text().unwrap_or_default(),
+                self.reader_line_count,
+            );
+            self.reader_navigation = navigation;
+            if moved {
+                self.keep_reader_cursor_visible();
             }
-
-            let preferred = self.reader_preferred_column.unwrap_or(self.reader_column);
-            if self.reader_cursor < target {
-                self.reader_cursor = self.reader_cursor.saturating_add(1);
-            } else if self.reader_cursor > target {
-                self.reader_cursor = self.reader_cursor.saturating_sub(1);
-            }
-            let line_len = self.reader_line_len(self.reader_cursor);
-            self.reader_column = if line_len == 0 {
-                0
-            } else {
-                preferred.min(line_len.saturating_sub(1))
-            };
-            self.reader_preferred_column = Some(preferred);
-            if self.reader_cursor == target {
-                self.reader_smooth_target = None;
-            }
-            self.keep_reader_cursor_visible();
             return;
         }
 

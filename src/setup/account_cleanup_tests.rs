@@ -67,6 +67,18 @@ fn artifacts(account: &AccountConfig, roots: &LocalDataRoots) -> Vec<std::path::
             .cache
             .join("jerc/mail-index")
             .join(format!("{stem}.mutations.json")),
+        roots
+            .cache
+            .join("jerc/mail-index")
+            .join(format!("{stem}.navigation.json")),
+        roots
+            .cache
+            .join("jerc/mail-index")
+            .join(format!("{stem}.index.lock")),
+        roots
+            .cache
+            .join("jerc/mail-index")
+            .join(format!("{stem}.folders/folder-abc.json")),
         crate::outgoing::outbox::path_for_account(account, &roots.data),
         crate::outgoing::drafts::path_for(&roots.data.join("jerc/postponed"), &account.name),
     ]

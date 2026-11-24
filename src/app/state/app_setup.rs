@@ -12,6 +12,7 @@ impl App {
     pub fn inherit_image_runtime(&mut self, previous: &mut Self) {
         self.image_picker = previous.image_picker.take();
         self.image_loader = previous.image_loader.take();
+        self.image_runtime_tx = previous.image_runtime_tx.take();
     }
 
     pub fn setup_discovered(

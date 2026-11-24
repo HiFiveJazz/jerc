@@ -57,7 +57,7 @@ pub(super) fn run_selected_idle_worker(
     mut backend: Box<dyn MailBackend>,
     target: Arc<SelectedIdleTarget>,
     wake: SyncSender<Action>,
-) {
+) -> Box<dyn MailBackend> {
     let mut backoff_secs: u64 = 2;
     while let Some((mailbox, revision, cancel)) = target.wait_for_mailbox() {
         if cancel.load(Ordering::Acquire) {
@@ -101,4 +101,6 @@ pub(super) fn run_selected_idle_worker(
             backoff_secs = (backoff_secs * 2).min(60);
         }
     }
+    backend.release_idle_resources();
+    backend
 }

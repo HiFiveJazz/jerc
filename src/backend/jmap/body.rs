@@ -124,7 +124,7 @@ fn selective_body(id: MessageId, email: &Value) -> Result<Option<MessageBody>> {
     if plain.is_none() && html.is_none() {
         return Ok(None);
     }
-    crate::mail::render_message_body(id, plain, html, refs.into_iter().map(|a| a.name).collect())
+    crate::mail::compact_message_body(id, plain, html, refs.into_iter().map(|a| a.name).collect())
         .map(Some)
 }
 

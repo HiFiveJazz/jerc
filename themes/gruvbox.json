@@ -12,5 +12,6 @@
   "border": "#665c54",
   "selected_fg": "#282828",
   "selected_bg": "#83a598",
+  "visual_selection_bg": "#504945",
   "visual": "#d3869b"
 }

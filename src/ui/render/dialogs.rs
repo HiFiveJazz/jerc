@@ -118,6 +118,24 @@ pub(super) fn draw_confirmation_buttons(
     yes_style: Style,
     no_style: Style,
 ) {
+    draw_action_buttons(
+        frame,
+        theme,
+        area,
+        yes_style,
+        no_style,
+        (" [Y]es ", " [N]o "),
+    );
+}
+
+pub(super) fn draw_action_buttons(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+    yes_style: Style,
+    no_style: Style,
+    labels: (&str, &str),
+) {
     if area.height < 2 || area.width == 0 {
         return;
     }
@@ -125,31 +143,29 @@ pub(super) fn draw_confirmation_buttons(
         Paragraph::new("─".repeat(usize::from(area.width))).style(theme.border()),
         Rect::new(area.x, area.y, area.width, 1),
     );
-    let gap = 3u16;
-    let yes_width = 11u16;
-    let no_width = 11u16;
-    let total = yes_width + no_width + gap;
+    let gap = 3u16.min(area.width.saturating_sub(2));
+    let button_width = (UnicodeWidthStr::width(labels.0).max(UnicodeWidthStr::width(labels.1))
+        as u16)
+        .max(11)
+        .min(area.width.saturating_sub(gap) / 2);
+    if button_width == 0 {
+        return;
+    }
+    let total = button_width * 2 + gap;
     let x = area.x + area.width.saturating_sub(total) / 2;
     let y = area.y.saturating_add(1);
     frame.render_widget(
-        Paragraph::new(" [Y]es ")
+        Paragraph::new(labels.0)
             .alignment(Alignment::Center)
             .style(yes_style),
-        Rect::new(x, y, yes_width.min(area.width), 1),
+        Rect::new(x, y, button_width, 1),
     );
-    if area.width > yes_width + gap {
-        frame.render_widget(
-            Paragraph::new(" [N]o ")
-                .alignment(Alignment::Center)
-                .style(no_style),
-            Rect::new(
-                x + yes_width + gap,
-                y,
-                no_width.min(area.right().saturating_sub(x + yes_width + gap)),
-                1,
-            ),
-        );
-    }
+    frame.render_widget(
+        Paragraph::new(labels.1)
+            .alignment(Alignment::Center)
+            .style(no_style),
+        Rect::new(x + button_width + gap, y, button_width, 1),
+    );
 }
 
 /// Shared Yazi-style review: visible item list, scroll position, and the same
@@ -408,226 +424,10 @@ pub(super) fn draw_detach_confirmation(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
-// A full outgoing-message preview, using the same colored headers and rich
-// HTML renderer as the message reader. Enter sends; Esc returns to the editor.
-pub(super) fn draw_send_confirmation(frame: &mut Frame<'_>, app: &App) {
-    let theme = app.theme();
-    let Some(composer) = app
-        .composer
-        .as_ref()
-        .filter(|composer| composer.confirm_send)
-    else {
-        return;
-    };
-    let area = centered_rect(
-        frame.area(),
-        frame.area().width.saturating_sub(4).min(100),
-        88,
-    );
-    let inner = popup_inner(
-        frame,
-        theme,
-        area,
-        " Review outgoing email ",
-        theme.accent(),
-    );
-    if inner.height < 8 {
-        return;
-    }
-    let footer_y = inner.bottom().saturating_sub(1);
-    let headers = [
-        (
-            "From",
-            app.account()
-                .map(|account| account.from.as_str())
-                .unwrap_or(""),
-        ),
-        ("To", composer.to.as_str()),
-        ("Cc", composer.cc.as_str()),
-        ("Bcc", composer.bcc.as_str()),
-        ("Subject", composer.subject.as_str()),
-    ];
-    let mut y = inner.y;
-    for (label, value) in headers {
-        if y >= footer_y.saturating_sub(3) {
-            break;
-        }
-        let value_style = if value.trim().is_empty() {
-            theme.muted()
-        } else {
-            theme.accent()
-        };
-        let line = Line::from(vec![
-            Span::styled(format!(" {label:<8} "), theme.muted()),
-            Span::styled(
-                if value.trim().is_empty() {
-                    "—"
-                } else {
-                    value
-                },
-                value_style,
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
-        y += 1;
-    }
-    let mut filenames = compose_attachment_names(composer);
-    filenames.extend(
-        composer
-            .preview_forwarded_attachments
-            .iter()
-            .filter(|name| !composer.draft_attachment_names.contains(name))
-            .cloned(),
-    );
-    let files = if filenames.is_empty() {
-        "none".to_owned()
-    } else {
-        filenames.join(" · ")
-    };
-    let attachment_text = format!(" Attachments ({})  {files}", filenames.len());
-    let lines = clipped_wrap_text(&attachment_text, usize::from(inner.width), 2);
-    let attachment_height = (lines.len() as u16).min(2);
-    if y.saturating_add(attachment_height) < footer_y.saturating_sub(1) {
-        frame.render_widget(
-            Paragraph::new(
-                lines
-                    .into_iter()
-                    .map(|line| {
-                        Line::styled(
-                            line,
-                            if !filenames.is_empty() {
-                                theme.accent()
-                            } else {
-                                theme.muted()
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            Rect::new(inner.x, y, inner.width, attachment_height),
-        );
-        y += attachment_height;
-    }
-    if y >= footer_y {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from("─".repeat(usize::from(inner.width)))).style(theme.border()),
-        Rect::new(inner.x, y, inner.width, 1),
-    );
-    y += 1;
-    let content_height = footer_y.saturating_sub(y);
-    if content_height > 0 {
-        let body = if composer.preview_html {
-            composer.preview_rich_lines.as_ref().map(|lines| {
-                Text::from(
-                    lines
-                        .iter()
-                        .map(|line| {
-                            Line::from(
-                                line.spans
-                                    .iter()
-                                    .map(|span| {
-                                        Span::styled(
-                                            span.text.clone(),
-                                            rich_html_style(&span.style, &span.text, theme),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-        } else {
-            None
-        };
-        let body = body.unwrap_or_else(|| Text::from(composer.outgoing_plain_body()));
-        let viewport = Rect::new(
-            inner.x.saturating_add(1),
-            y,
-            inner.width.saturating_sub(2),
-            content_height,
-        );
-        let paragraph = Paragraph::new(body)
-            .style(theme.text())
-            .wrap(Wrap { trim: false });
-        // line_count() includes screen rows introduced by word wrapping.
-        // Counting only logical lines clips the bottom of long messages in
-        // half-height terminals, even after pressing G or PageDown.
-        let max_scroll = paragraph
-            .line_count(viewport.width)
-            .saturating_sub(usize::from(viewport.height));
-        let scroll = composer.preview_scroll.min(max_scroll);
-        frame.render_widget(
-            paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
-            viewport,
-        );
-    }
-    let mode = if composer.preview_html && composer.preview_rich_lines.is_some() {
-        "HTML"
-    } else {
-        "Plain"
-    };
-    let footer = Line::from(vec![
-        Span::styled(
-            " Enter ",
-            Style::default()
-                .bg(theme.accent)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" Send   ", theme.text()),
-        Span::styled("Esc", theme.accent()),
-        Span::styled(" Edit   ", theme.muted()),
-        Span::styled("t", theme.accent()),
-        Span::styled(format!(" {mode}   "), theme.muted()),
-        Span::styled("O", theme.accent()),
-        Span::styled(" Browser   ", theme.muted()),
-        Span::styled("j/k", theme.accent()),
-        Span::styled(" Scroll", theme.muted()),
-    ]);
-    frame.render_widget(
-        Paragraph::new(footer),
-        Rect::new(inner.x, footer_y, inner.width, 1),
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::theme::load_themes;
-
-    #[test]
-    fn wrapped_send_preview_reaches_last_row_in_short_and_narrow_terminals() {
-        use ratatui::{Terminal, backend::TestBackend};
-        let config: crate::config::Config = toml::from_str("[ui]\n").unwrap();
-        let mut app = App::new(&config, vec![]);
-        let mut composer = crate::app::Composer::new();
-        composer.confirm_send = true;
-        composer.preview_html = false;
-        composer.to = "to@example.org".into();
-        composer.subject = "Multiline preview".into();
-        composer.body = format!(
-            "{}\nPREVIEW_TAIL_SENTINEL",
-            "A long wrapped line with additional text beyond the short viewport. ".repeat(25)
-        );
-        composer.preview_scroll = usize::MAX;
-        app.composer = Some(composer);
-        for (width, height) in [(60u16, 19u16), (100u16, 30u16)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| draw_send_confirmation(frame, &app)).unwrap();
-            let rendered = (0..height)
-                .map(|y| {
-                    (0..width)
-                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(rendered.contains("PREVIEW_TAIL_SENTINEL"), "{width}x{height}: {rendered}");
-        }
-    }
 
     #[test]
     fn delete_account_confirmation_reuses_yes_no_buttons_without_cleanup_details() {

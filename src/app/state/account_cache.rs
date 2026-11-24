@@ -52,14 +52,7 @@ impl AccountState {
         let messages = self.canonical_messages();
         let truncated = messages.len() > max_messages;
         let retained = messages.len().min(max_messages);
-        let selected = if self.message_index >= messages.len() {
-            self.local_thread_index
-                .borrow_mut()
-                .representative(&self.messages, self.message_index)
-                .unwrap_or(0)
-        } else {
-            self.message_index
-        };
+        let selected = self.cache_selected_index(messages);
         Some(CachedMailbox {
             thread_messages: self
                 .messages
@@ -85,6 +78,17 @@ impl AccountState {
             identity: self.cache_identities.get(name).cloned(),
             uid_next: self.uid_nexts.get(name).copied(),
         })
+    }
+
+    fn cache_selected_index(&self, messages: &[MessageSummary]) -> usize {
+        if self.message_index >= messages.len() {
+            self.local_thread_index
+                .borrow_mut()
+                .representative(&self.messages, self.message_index)
+                .unwrap_or(0)
+        } else {
+            self.message_index
+        }
     }
 
     pub(super) fn save_current_cache(&mut self) {
@@ -138,6 +142,35 @@ impl AccountState {
         if let Some(snapshot) = self.persistent_cache_snapshot() {
             writer.send(cache::Change::Folder(name.to_owned(), snapshot));
         }
+    }
+
+    /// Persist only the small navigation state at deliberate boundaries.
+    pub(super) fn persist_current_navigation(&self) {
+        let (Some(name), Some(writer)) = (self.current_mailbox.as_deref(), &self.cache_writer)
+        else {
+            return;
+        };
+        // Navigation is a display hint, so an offline cached generation
+        // is sufficient; it never authorizes a remote UID operation.
+        if self.native_view.is_some() {
+            return;
+        }
+        let Some(identity) = self.cache_identities.get(name) else {
+            return;
+        };
+        let messages = self.canonical_messages();
+        let selected = self.cache_selected_index(messages).min(
+            messages
+                .len()
+                .min(cache::MAX_MESSAGES_PER_FOLDER)
+                .saturating_sub(1),
+        );
+        writer.send(cache::Change::Navigation(
+            name.to_owned(),
+            identity.generation(),
+            selected,
+            self.message_view_offset,
+        ));
     }
 
     /// Give cold common destinations and changed cached folders a bounded

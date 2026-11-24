@@ -1,5 +1,6 @@
 use std::io::{self, Stdout, Write};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -76,6 +77,8 @@ pub fn run_tui_with_options(config: Config, options: LaunchOptions) -> Result<()
         .transpose()?;
     let workers = create_workers(&config, worker_tx, options.offline)?;
     let mut app = App::new(&config, workers);
+    // Optional user assets; failure to create the directory must not prevent mail.
+    let _ = std::fs::create_dir_all(sound_directory(&app.setup_config_path));
     if let Some(index) = account_index {
         app.account_index = index;
     }
@@ -426,8 +429,8 @@ fn selected_idle_mailbox<'a>(
     })
 }
 
-fn sync_selected_idle_watchers(app: &App) {
-    for (index, account) in app.accounts.iter().enumerate() {
+fn sync_selected_idle_watchers(app: &mut App) {
+    for (index, account) in app.accounts.iter_mut().enumerate() {
         let selected = selected_idle_mailbox(
             index == app.account_index,
             account.capabilities.is_some(),
@@ -531,8 +534,10 @@ fn event_loop(
     let mut next_reconnect = Instant::now() + Duration::from_secs(10);
     let mut next_recovery_check = Instant::now() + Duration::from_secs(2);
     let mut resume_detector = ResumeGapDetector::new();
+    let mut notification_children = Vec::new();
 
     while !app.should_quit {
+        reap_notification_children(&mut notification_children);
         sync_selected_idle_watchers(app);
         app.flush_contacts(false);
         if !offline && resume_detector.check(SystemTime::now(), Instant::now()) {
@@ -619,6 +624,12 @@ fn event_loop(
         let deadline = app
             .status_expiration_deadline()
             .map_or(deadline, |due| deadline.min(due));
+        // Only wake for child reaping while there are notification processes.
+        let deadline = if notification_children.is_empty() {
+            deadline
+        } else {
+            deadline.min(Instant::now() + Duration::from_secs(1))
+        };
         let received =
             match runtime_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(event) => Some(event),
@@ -812,16 +823,19 @@ fn event_loop(
             }
         }
 
-        // The desktop notification server owns the themed sound, not the
-        // terminal. Never invoke a shell or block the TUI on a notification.
+        // User-provided audio and optional desktop sound hints are nonblocking.
+        // Fall back to terminal BEL when neither is available.
+        let mut fallback_bell = false;
         while let Some(notice) = app.take_new_mail_notice() {
-            notify_new_mail(
+            let file = notification_sound_file(&app.setup_config_path, app.new_mail_sound_file());
+            fallback_bell |= notify_new_mail(
                 &notice,
                 app.new_mail_sound_name(),
-                app.new_mail_sound_file(),
+                file.as_deref(),
+                &mut notification_children,
             );
         }
-        if app.take_new_mail_bell() {
+        if app.take_new_mail_bell() || fallback_bell {
             // Terminal bell: honors the user's terminal bell settings and
             // requires no external audio process or extra dependencies.
             io::stdout().write_all(b"\x07")?;
@@ -861,6 +875,7 @@ fn notification_excerpt(value: &str, limit: usize) -> String {
 
 fn notification_text(notice: &NewMailNotice) -> (String, String) {
     let subject = notification_excerpt(&notice.subject, 100);
+    let has_subject = !subject.is_empty();
     let title = if subject.is_empty() {
         format!("New email · {}", notice.account)
     } else {
@@ -877,7 +892,7 @@ fn notification_text(notice: &NewMailNotice) -> (String, String) {
     if !excerpt.is_empty() {
         lines.push(excerpt);
     }
-    if notice.count > 1 {
+    if notice.count > 1 && (has_subject || !lines.is_empty()) {
         lines.push(format!(
             "+{} more new messages · {}",
             notice.count - 1,
@@ -893,19 +908,88 @@ fn notification_text(notice: &NewMailNotice) -> (String, String) {
     (title, lines.join("\n"))
 }
 
-fn notify_new_mail(notice: &NewMailNotice, sound: &str, sound_file: Option<&str>) {
+fn sound_directory(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sounds")
+}
+
+fn notification_sound_file(config_path: &Path, configured: Option<&str>) -> Option<PathBuf> {
+    if let Some(file) = configured {
+        let file = config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(file);
+        return file.is_file().then_some(file);
+    }
+    // Deterministic when users put several files here. Prefer new-mail.*, then
+    // lexicographically first supported audio file. Never download or overwrite.
+    std::fs::read_dir(sound_directory(config_path))
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        matches!(
+                            ext.to_ascii_lowercase().as_str(),
+                            "oga" | "ogg" | "wav" | "flac"
+                        )
+                    })
+        })
+        .min_by_key(|path| {
+            (
+                path.file_stem().and_then(|stem| stem.to_str()) != Some("new-mail"),
+                path.clone(),
+            )
+        })
+}
+
+fn reap_notification_children(children: &mut Vec<Child>) {
+    children.retain_mut(|child| match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) | Err(_) => true,
+    });
+}
+
+/// Return true when the terminal bell is the appropriate fallback.
+fn notify_new_mail(
+    notice: &NewMailNotice,
+    sound: &str,
+    sound_file: Option<&Path>,
+    children: &mut Vec<Child>,
+) -> bool {
     let (title, body) = notification_text(notice);
-    let sound_file = sound_file.filter(|file| std::path::Path::new(file).is_file());
+    let mut playing_file = false;
+    if let Some(file) = sound_file {
+        for player in ["pw-play", "paplay"] {
+            if let Ok(child) = ProcessCommand::new(player)
+                .arg(file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                children.push(child);
+                playing_file = true;
+                break;
+            }
+        }
+    }
     let mut command = ProcessCommand::new("notify-send");
     command.args(["--app-name=jerc", "--icon=mail-unread"]);
-    // Explicit file playback and notification-server playback are mutually
-    // exclusive to avoid playing the same alert twice.
-    if sound_file.is_none() && !sound.trim().is_empty() {
+    if !playing_file && !sound.trim().is_empty() {
         command
             .arg("--hint")
             .arg(format!("string:sound-name:{sound}"));
+    } else {
+        command.arg("--hint").arg("boolean:suppress-sound:true");
     }
-    // Prevent untrusted subjects beginning with '-' from becoming CLI options.
+    // Prevent a subject beginning with '-' from being interpreted as an option.
     command
         .arg("--")
         .arg(title)
@@ -913,23 +997,13 @@ fn notify_new_mail(notice: &NewMailNotice, sound: &str, sound_file: Option<&str>
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let _ = command.spawn();
-    if let Some(file) = sound_file {
-        // Never shell out. If PipeWire's pw-play is absent, try PulseAudio's
-        // compatible paplay command. Both run detached from terminal redraw.
-        for player in ["pw-play", "paplay"] {
-            if ProcessCommand::new(player)
-                .arg(file)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
+    let desktop_started = if let Ok(child) = command.spawn() {
+        children.push(child);
+        true
+    } else {
+        false
+    };
+    !playing_file && (sound.trim().is_empty() || !desktop_started)
 }
 
 fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
@@ -1179,8 +1253,36 @@ mod account_worker_epoch_tests {
 
 #[cfg(test)]
 mod new_mail_notification_tests {
-    use super::{notification_excerpt, notification_text};
+    use super::{
+        notification_excerpt, notification_sound_file, notification_text, sound_directory,
+    };
     use crate::app::NewMailNotice;
+
+    #[test]
+    fn sound_discovery_is_config_relative_deterministic_and_optional() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        let sounds = sound_directory(&config);
+        assert!(notification_sound_file(&config, None).is_none());
+        std::fs::create_dir_all(&sounds).unwrap();
+        std::fs::write(sounds.join("ignored.txt"), b"not audio").unwrap();
+        assert!(notification_sound_file(&config, None).is_none());
+        let other = sounds.join("a.ogg");
+        std::fs::write(&other, b"fixture").unwrap();
+        assert_eq!(notification_sound_file(&config, None), Some(other.clone()));
+        let preferred = sounds.join("new-mail.oga");
+        std::fs::write(&preferred, b"fixture").unwrap();
+        assert_eq!(notification_sound_file(&config, None), Some(preferred));
+        assert_eq!(
+            notification_sound_file(&config, Some("sounds/a.ogg")),
+            Some(other.clone())
+        );
+        assert_eq!(
+            notification_sound_file(&config, Some(other.to_str().unwrap())),
+            Some(other)
+        );
+        assert!(notification_sound_file(&config, Some("missing.oga")).is_none());
+    }
 
     #[test]
     fn includes_sender_subject_and_body_without_newlines_from_content() {
@@ -1196,6 +1298,20 @@ mod new_mail_notification_tests {
         assert!(body.contains("From: Professor Smith"));
         assert!(body.contains("Please review the notes."));
         assert!(body.contains("+1 more"));
+    }
+
+    #[test]
+    fn generic_notification_reports_the_full_count() {
+        let notice = NewMailNotice {
+            account: "University".into(),
+            count: 3,
+            sender: String::new(),
+            subject: String::new(),
+            excerpt: String::new(),
+        };
+        let (title, body) = notification_text(&notice);
+        assert_eq!(title, "New email · University");
+        assert_eq!(body, "3 new message(s) in University");
     }
 
     #[test]

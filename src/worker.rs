@@ -38,15 +38,20 @@ pub enum ActionKind {
     Connect,
     ListMailboxes,
     MailboxStatus(String),
+    InboxStatus {
+        name: String,
+        previous: Option<crate::backend::InboxCheckpoint>,
+    },
     /// Wake token for the independent priority queue; never sent to IMAP.
     WakePriority,
     /// Wake from a dedicated IDLE session; the UI owns STATUS reconciliation.
     WatchMailboxChanged(String),
     WatchAccountChanged,
-    /// A single newest message preview after a known Inbox count increase.
+    /// Best-effort preview of an explicitly identified Inbox arrival.
     NewMailPreview {
         mailbox: String,
         count: usize,
+        id: MessageId,
     },
     OpenMailbox {
         name: String,
@@ -71,11 +76,14 @@ pub enum ActionKind {
     FetchBody {
         mailbox: String,
         id: MessageId,
+        html_width: Option<usize>,
     },
     /// Read-only, opportunistic preview fetches on the background session.
     PrefetchBodies {
         mailbox: String,
         ids: Vec<MessageId>,
+        /// Warm only the first fetched body, not every speculative neighbor.
+        html_width: Option<usize>,
     },
     /// Low-priority read-only header page for another folder. Cache is a
     /// display hint only; the backend must validate UIDVALIDITY.
@@ -263,6 +271,7 @@ pub enum WorkerEventKind {
         name: String,
         total: usize,
         unread: usize,
+        inbox: Option<crate::backend::InboxCheck>,
     },
     MailboxChanged {
         name: String,
@@ -270,6 +279,7 @@ pub enum WorkerEventKind {
     AccountChanged,
     NewMailPreview {
         count: usize,
+        id: Option<MessageId>,
         sender: String,
         subject: String,
         excerpt: String,
@@ -458,11 +468,23 @@ impl SelectedIdleTarget {
     }
 
     fn wait_for_mailbox(&self) -> Option<(String, u64, Arc<AtomicBool>)> {
+        self.wait_for_mailbox_timeout(Duration::from_secs(30))
+    }
+
+    fn wait_for_mailbox_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Option<(String, u64, Arc<AtomicBool>)> {
         let state = self.state.lock().expect("selected IDLE lock");
-        let state = self
+        let (mut state, _) = self
             .changed
-            .wait_while(state, |state| !state.stopped && state.mailbox.is_none())
+            .wait_timeout_while(state, timeout, |state| {
+                !state.stopped && state.mailbox.is_none()
+            })
             .expect("selected IDLE lock");
+        if state.mailbox.is_none() {
+            state.stopped = true;
+        }
         if state.stopped {
             return None;
         }
@@ -509,7 +531,9 @@ pub struct WorkerHandle {
     idle_stop: Arc<AtomicBool>,
     idle_join: Option<JoinHandle<()>>,
     selected_idle: Option<Arc<SelectedIdleTarget>>,
-    selected_idle_join: Option<JoinHandle<()>>,
+    selected_idle_join: Option<JoinHandle<Box<dyn MailBackend>>>,
+    selected_idle_backend: Option<Box<dyn MailBackend>>,
+    selected_idle_account: usize,
     foreground_generation: Arc<AtomicU64>,
     unacknowledged_writes: Mutex<HashSet<u64>>,
     recovery: Option<ForegroundRecovery>,

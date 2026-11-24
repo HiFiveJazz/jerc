@@ -46,7 +46,11 @@ pub(super) fn run_status_worker(
         let queue_wait = action.queued_at.elapsed();
         let started = Instant::now();
         match action.kind {
-            ActionKind::FetchBody { mailbox, id } => {
+            ActionKind::FetchBody {
+                mailbox,
+                id,
+                html_width,
+            } => {
                 // This connection can read a selected message while the
                 // foreground connection is executing a slow header FETCH.
                 let result = (|| {
@@ -66,7 +70,10 @@ pub(super) fn run_status_worker(
                     result.is_ok(),
                 );
                 let kind = match result {
-                    Ok(body) => {
+                    Ok(mut body) => {
+                        if let Some(width) = html_width {
+                            crate::mail::layout_message_html(&mut body, width);
+                        }
                         recent.insert((mailbox, id), Instant::now());
                         WorkerEventKind::BodyLoaded(body)
                     }
@@ -228,16 +235,17 @@ pub(super) fn run_status_worker(
                     break;
                 }
             }
-            ActionKind::NewMailPreview { mailbox, count } => {
+            ActionKind::NewMailPreview { mailbox, count, id } => {
                 let result = (|| {
                     if !connected {
                         backend.connect()?;
                         connected = true;
                     }
-                    Ok::<_, anyhow::Error>(new_mail_preview(&mut *backend, &mailbox, count))
+                    Ok::<_, anyhow::Error>(new_mail_preview(&mut *backend, &mailbox, count, id))
                 })();
                 let kind = result.unwrap_or(WorkerEventKind::NewMailPreview {
                     count,
+                    id: None,
                     sender: String::new(),
                     subject: String::new(),
                     excerpt: String::new(),
@@ -274,6 +282,44 @@ pub(super) fn run_status_worker(
                     // The periodic STATUS poll will reconcile this missed wake.
                 }
             }
+            ActionKind::InboxStatus { name, previous } => {
+                bodies_since_status = 0;
+                let result = (|| {
+                    if !connected {
+                        backend.connect()?;
+                        connected = true;
+                    }
+                    backend.inbox_status(&name, previous.as_ref())
+                })();
+                if result.is_err() {
+                    connected = false;
+                }
+                crate::perf::record(
+                    "background_status",
+                    Some(queue_wait),
+                    started.elapsed(),
+                    result.is_ok(),
+                );
+                let kind = match result {
+                    Ok(((total, unread), inbox)) => WorkerEventKind::MailboxStatus {
+                        name,
+                        total,
+                        unread,
+                        inbox: Some(inbox),
+                    },
+                    Err(error) => WorkerEventKind::Error(WorkerError::background_status(error)),
+                };
+                if runtime_tx
+                    .send(RuntimeEvent::Worker(WorkerEvent {
+                        account,
+                        request_id: action.id,
+                        kind,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
+            }
             ActionKind::MailboxStatus(name) => {
                 bodies_since_status = 0;
                 let result = (|| {
@@ -293,6 +339,7 @@ pub(super) fn run_status_worker(
                         name,
                         total,
                         unread,
+                        inbox: None,
                     },
                     Err(error) => WorkerEventKind::Error(WorkerError::background_status(error)),
                 };
@@ -307,7 +354,11 @@ pub(super) fn run_status_worker(
                     break;
                 }
             }
-            ActionKind::PrefetchBodies { mailbox, ids } => {
+            ActionKind::PrefetchBodies {
+                mailbox,
+                ids,
+                mut html_width,
+            } => {
                 if recent.len() > 256 {
                     recent.retain(|_, at| at.elapsed() < Duration::from_secs(4));
                 }
@@ -343,7 +394,10 @@ pub(super) fn run_status_worker(
                         fetched_at.elapsed(),
                         result.is_ok(),
                     );
-                    if let Ok(body) = result {
+                    if let Ok(mut body) = result {
+                        if let Some(width) = html_width.take() {
+                            crate::mail::layout_message_html(&mut body, width);
+                        }
                         recent.insert(key, Instant::now());
                         if runtime_tx
                             .send(RuntimeEvent::Worker(WorkerEvent {
@@ -384,9 +438,12 @@ pub(super) fn run_status_worker(
                         )
                     });
                     let status_waiting = bodies_since_status >= 4
-                        && pending
-                            .iter()
-                            .any(|next| matches!(&next.kind, ActionKind::MailboxStatus(_)));
+                        && pending.iter().any(|next| {
+                            matches!(
+                                &next.kind,
+                                ActionKind::MailboxStatus(_) | ActionKind::InboxStatus { .. }
+                            )
+                        });
                     if interactive_waiting || status_waiting {
                         // Yield to an explicit reader fetch first, or to STATUS
                         // after a short burst. Resume only if no newer window
@@ -396,6 +453,7 @@ pub(super) fn run_status_worker(
                             pending.push_back(Action::new(ActionKind::PrefetchBodies {
                                 mailbox: mailbox.clone(),
                                 ids: rest,
+                                html_width,
                             }));
                         }
                         break;

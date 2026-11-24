@@ -293,16 +293,8 @@ impl App {
             if self.reader_line_count == 0 {
                 return;
             }
-            if self.reader_visual_anchor.is_some() {
-                self.reader_visual_anchor = None;
-                self.reader_visual_linewise = false;
-            } else {
-                self.reader_visual_linewise = false;
-                self.reader_visual_anchor = Some(ReaderPosition {
-                    line: self.reader_cursor,
-                    column: self.reader_column,
-                });
-            }
+            self.reader_navigation
+                .toggle_visual(false, self.reader_line_count);
             self.reader_pending_inner_object = false;
             return;
         }
@@ -326,52 +318,14 @@ impl App {
             return;
         }
 
-        if self.reader_visual_anchor.is_some() && self.reader_visual_linewise {
-            self.reader_visual_anchor = None;
-            self.reader_visual_linewise = false;
-        } else {
-            let anchor_line = self
-                .reader_visual_anchor
-                .map_or(self.reader_cursor, |anchor| anchor.line);
-            self.reader_visual_anchor = Some(ReaderPosition {
-                line: anchor_line,
-                column: 0,
-            });
-            self.reader_visual_linewise = true;
-        }
+        self.reader_navigation
+            .toggle_visual(true, self.reader_line_count);
         self.reader_pending_inner_object = false;
     }
 
     #[must_use]
     pub fn reader_visual_range(&self) -> Option<ReaderSelection> {
-        let anchor = self.reader_visual_anchor?;
-        if self.reader_visual_linewise {
-            let (start_line, end_line) = if anchor.line <= self.reader_cursor {
-                (anchor.line, self.reader_cursor)
-            } else {
-                (self.reader_cursor, anchor.line)
-            };
-            return Some(ReaderSelection {
-                start: ReaderPosition {
-                    line: start_line,
-                    column: 0,
-                },
-                end: ReaderPosition {
-                    line: end_line,
-                    column: usize::MAX,
-                },
-            });
-        }
-        let cursor = ReaderPosition {
-            line: self.reader_cursor,
-            column: self.reader_column,
-        };
-        let (start, end) = if anchor <= cursor {
-            (anchor, cursor)
-        } else {
-            (cursor, anchor)
-        };
-        Some(ReaderSelection { start, end })
+        self.reader_navigation.visual_range()
     }
 
     #[must_use]

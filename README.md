@@ -71,7 +71,4 @@ The full reference lives in **[Keybindings](docs/keybindings.md)**. Press `?` in
 Copyright (C) 2026 Jerc contributors.
 
 Jerc's original source code is licensed under the [GNU General Public License,
-version 3 only](LICENSE) (`GPL-3.0-only`). The bundled COSMIC notification
-sound is separately licensed under [Creative Commons Attribution-ShareAlike
-4.0](licenses/COSMIC-SOUND-LICENSE). Other third-party material retains its
-respective license and notices.
+version 3 only](LICENSE) (`GPL-3.0-only`).

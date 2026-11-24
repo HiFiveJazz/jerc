@@ -37,7 +37,9 @@ use url::Url;
 use crate::backend::{MailBackend, MailboxSyncHint, MailboxView};
 mod threads;
 use self::threads as imap_threads;
-use crate::mail::{MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body, parse_summary};
+use crate::mail::{
+    MAX_BODY_MESSAGE_BYTES, MAX_RAW_MESSAGE_BYTES, parse_body_compact, parse_summary,
+};
 use crate::model::{
     Capabilities, Mailbox, MailboxRole, MessageBody, MessageFlags, MessageId, MessagePage,
 };
@@ -1148,7 +1150,48 @@ impl ImapBackend {
     }
 }
 
+type MailboxStatusWithUids = ((usize, usize), Option<u32>, Option<u32>);
+
+impl ImapBackend {
+    fn status_with_uids(
+        &mut self,
+        name: &str,
+        include_uids: bool,
+    ) -> Result<MailboxStatusWithUids> {
+        let mailbox = mailbox_from_name(name)?;
+        let started = Instant::now();
+        let mut requested = vec![StatusDataItemName::Messages, StatusDataItemName::Unseen];
+        if include_uids {
+            requested.extend([StatusDataItemName::UidNext, StatusDataItemName::UidValidity]);
+        }
+        let items_result = self
+            .session()?
+            .status(mailbox, Cow::Owned(requested))
+            .with_context(|| format!("reading status for {name:?}"));
+        crate::perf::record("imap_status", None, started.elapsed(), items_result.is_ok());
+        let items = complete_imap_output(items_result?, "STATUS")?;
+        let mut total = 0usize;
+        let mut unread = 0usize;
+        let (mut validity, mut next) = (None, None);
+        for item in items {
+            match item {
+                StatusDataItem::Messages(value) => total = value as usize,
+                StatusDataItem::Unseen(value) => unread = value as usize,
+                StatusDataItem::UidNext(value) => next = Some(value.get()),
+                StatusDataItem::UidValidity(value) => validity = Some(value.get()),
+                _ => {}
+            }
+        }
+        Ok(((total, unread), validity, next))
+    }
+}
+
 impl MailBackend for ImapBackend {
+    fn release_idle_resources(&mut self) {
+        self.session = None;
+        self.idle_checkpoint = None;
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             server_thread: self
@@ -1455,30 +1498,74 @@ impl MailBackend for ImapBackend {
     }
 
     fn mailbox_status(&mut self, name: &str) -> Result<(usize, usize)> {
-        let mailbox = mailbox_from_name(name)?;
-        let started = Instant::now();
-        let items_result = self
-            .session()?
-            .status(
-                mailbox,
-                Cow::Owned(vec![
-                    StatusDataItemName::Messages,
-                    StatusDataItemName::Unseen,
-                ]),
-            )
-            .with_context(|| format!("reading status for {name:?}"));
-        crate::perf::record("imap_status", None, started.elapsed(), items_result.is_ok());
-        let items = complete_imap_output(items_result?, "STATUS")?;
-        let mut total = 0usize;
-        let mut unread = 0usize;
-        for item in items {
-            match item {
-                StatusDataItem::Messages(value) => total = value as usize,
-                StatusDataItem::Unseen(value) => unread = value as usize,
-                _ => {}
+        self.status_with_uids(name, false)
+            .map(|(counts, _, _)| counts)
+    }
+
+    fn inbox_status(
+        &mut self,
+        name: &str,
+        previous: Option<&super::InboxCheckpoint>,
+    ) -> Result<((usize, usize), super::InboxCheck)> {
+        use super::{InboxCheck, InboxCheckpoint};
+        let (counts, validity, next) = self.status_with_uids(name, true)?;
+        let (Some(validity), Some(next)) = (validity, next) else {
+            return Ok((counts, InboxCheck::default()));
+        };
+        let mut check = InboxCheck {
+            checkpoint: Some(InboxCheckpoint::Imap { validity, next }),
+            ..InboxCheck::default()
+        };
+        if let Some(InboxCheckpoint::Imap {
+            validity: old_validity,
+            next: old_next,
+        }) = previous
+            && *old_validity == validity
+            && *old_next < next
+            && next - *old_next <= super::notifications::MAX_ARRIVAL_RANGE
+        {
+            // UIDNEXT may skip numbers. Count actual surviving messages, not
+            // the difference between two allocated UID watermarks.
+            self.select(name)?;
+            if self.selected_uid_validity != Some(validity) {
+                return Ok((counts, InboxCheck::default()));
             }
+            let range = format!("{}:{}", old_next, next - 1);
+            let sequence: SequenceSet = range
+                .as_str()
+                .try_into()
+                .context("building notification UID range")?;
+            let fetched = self.session()?.fetch(
+                sequence,
+                vec![MessageDataItemName::Uid].into(),
+                ImapMessageFetchOptions {
+                    uid: true,
+                    ..Default::default()
+                },
+            )?;
+            let fetched = complete_imap_output(fetched, "notification UID FETCH")?;
+            let mut ids = HashSet::new();
+            for items in fetched.values() {
+                for item in items.as_ref() {
+                    if let MessageDataItem::Uid(value) = item {
+                        let uid = value.get();
+                        if uid >= *old_next && uid < next {
+                            ids.insert(uid);
+                        }
+                    }
+                }
+            }
+            check.count = ids.len();
+            check.candidate = ids
+                .into_iter()
+                .max()
+                .map(|uid| MessageId(format!("imap-uid:{validity}:{uid}")));
         }
-        Ok((total, unread))
+        Ok((counts, check))
+    }
+
+    fn notification_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {
+        self.fetch_raw_limited(mailbox, id, MAX_BODY_MESSAGE_BYTES)
     }
 
     fn mailbox_uid_next(&self, name: &str) -> Option<u32> {
@@ -1503,7 +1590,7 @@ impl MailBackend for ImapBackend {
 
     fn fetch_body(&mut self, mailbox: &str, id: &MessageId) -> Result<MessageBody> {
         let raw = self.fetch_raw_limited(mailbox, id, MAX_BODY_MESSAGE_BYTES)?;
-        parse_body(id.clone(), &raw).context("parsing IMAP message body")
+        parse_body_compact(id.clone(), &raw).context("parsing IMAP message body")
     }
 
     fn fetch_raw(&mut self, mailbox: &str, id: &MessageId) -> Result<Vec<u8>> {

@@ -137,6 +137,14 @@ pub struct LocalThreadIndex {
     group_indices: Vec<usize>,
     representatives: Vec<usize>,
     collapsed: Vec<usize>,
+    inline: Option<InlineProjection>,
+}
+
+struct InlineProjection {
+    expanded: HashSet<MessageId>,
+    extra: HashSet<MessageId>,
+    rows: Arc<Vec<(usize, ThreadRow)>>,
+    indices: Arc<Vec<usize>>,
 }
 
 impl LocalThreadIndex {
@@ -148,6 +156,7 @@ impl LocalThreadIndex {
                 .zip(messages)
                 .any(|(old, msg)| old.as_ptr() != Arc::as_ptr(&msg.headers))
         {
+            self.inline = None;
             self.groups = groups(messages);
             self.headers = messages
                 .iter()
@@ -190,8 +199,35 @@ impl LocalThreadIndex {
         messages: &[MessageSummary],
         expanded: &HashSet<MessageId>,
         extra: &HashSet<MessageId>,
-    ) -> Vec<(usize, ThreadRow)> {
+    ) -> Arc<Vec<(usize, ThreadRow)>> {
+        self.ensure_inline(messages, expanded, extra);
+        Arc::clone(&self.inline.as_ref().expect("inline projection").rows)
+    }
+
+    pub fn inline_indices(
+        &mut self,
+        messages: &[MessageSummary],
+        expanded: &HashSet<MessageId>,
+        extra: &HashSet<MessageId>,
+    ) -> Arc<Vec<usize>> {
+        self.ensure_inline(messages, expanded, extra);
+        Arc::clone(&self.inline.as_ref().expect("inline projection").indices)
+    }
+
+    fn ensure_inline(
+        &mut self,
+        messages: &[MessageSummary],
+        expanded: &HashSet<MessageId>,
+        extra: &HashSet<MessageId>,
+    ) {
         self.refresh(messages);
+        if self
+            .inline
+            .as_ref()
+            .is_some_and(|cached| &cached.expanded == expanded && &cached.extra == extra)
+        {
+            return;
+        }
         let mut rows = Vec::with_capacity(messages.len());
         for &representative in &self.collapsed {
             // Supplemental server results may be older than the normal window.
@@ -226,7 +262,13 @@ impl LocalThreadIndex {
                 }
             }
         }
-        rows
+        let indices = Arc::new(rows.iter().map(|(index, _)| *index).collect());
+        self.inline = Some(InlineProjection {
+            expanded: expanded.clone(),
+            extra: extra.clone(),
+            rows: Arc::new(rows),
+            indices,
+        });
     }
 
     pub fn group_members(&mut self, messages: &[MessageSummary], index: usize) -> &[usize] {
@@ -295,6 +337,33 @@ mod tests {
         m.thread_id = native.map(str::to_owned);
         m.timestamp = time;
         m
+    }
+
+    #[test]
+    fn inline_projection_reuses_rows_and_invalidates_on_expansion_and_header_changes() {
+        let mut messages = vec![msg("a", "a", "", None, 1), msg("b", "b", "<a>", None, 2)];
+        let mut index = LocalThreadIndex::default();
+        let mut expanded = HashSet::new();
+        let extra = HashSet::new();
+        let first = index.inline_rows(&messages, &expanded, &extra);
+        let indices = index.inline_indices(&messages, &expanded, &extra);
+        assert!(Arc::ptr_eq(
+            &first,
+            &index.inline_rows(&messages, &expanded, &extra)
+        ));
+        assert!(Arc::ptr_eq(
+            &indices,
+            &index.inline_indices(&messages, &expanded, &extra)
+        ));
+        assert_eq!(first.len(), 1);
+        expanded.insert(messages[0].id.clone());
+        let opened = index.inline_rows(&messages, &expanded, &extra);
+        assert_eq!(opened.len(), 2);
+        assert!(!Arc::ptr_eq(&first, &opened));
+        messages.push(msg("c", "c", "", None, 3));
+        let changed = index.inline_rows(&messages, &expanded, &extra);
+        assert_eq!(changed.len(), 3);
+        assert!(!Arc::ptr_eq(&opened, &changed));
     }
 
     #[test]

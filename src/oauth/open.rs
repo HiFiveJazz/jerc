@@ -7,7 +7,6 @@ use super::{HTTP_TIMEOUT, OAuthSettings};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use url::Url;
 
@@ -296,8 +295,7 @@ fn save_record(settings: &OAuthSettings, record: &ClientRecord) -> Result<()> {
         temp.as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    serde_json::to_writer(&mut temp, record)?;
-    temp.flush()?;
+    crate::cache::write_json_buffered(&mut temp, record)?;
     temp.persist(&path)
         .map_err(|e| anyhow!("saving OAuth public-client registration: {}", e.error))?;
     Ok(())

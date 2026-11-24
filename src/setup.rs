@@ -1556,11 +1556,17 @@ fn purge_local_account_data_in(
     if crate::cache::supports_mailbox_cache(&account.source) {
         let stem = crate::cache::account_cache_stem(account);
         let base = roots.cache.join("jerc").join("mail-index");
-        for suffix in [".json", ".mutations.json"] {
+        for suffix in [
+            ".json",
+            ".mutations.json",
+            ".navigation.json",
+            ".index.lock",
+        ] {
             files.push((base.join(format!("{stem}{suffix}")), roots.cache.clone()));
         }
         directories.push((base.join(format!("{stem}.bodies")), roots.cache.clone()));
         directories.push((base.join(format!("{stem}.raw")), roots.cache.clone()));
+        directories.push((base.join(format!("{stem}.folders")), roots.cache.clone()));
     }
     if crate::backend::Pop3Source::supports(&account.source) {
         files.push((
